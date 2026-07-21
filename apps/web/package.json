@@ -1,0 +1,19 @@
+{
+  "name": "@obsidian-platform/web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "lint": "eslint src tests",
+    "test": "node --test tests/app.test.js"
+  },
+  "dependencies": {
+    "react": "19.2.7",
+    "react-dom": "19.2.7"
+  },
+  "devDependencies": {
+    "eslint": "10.7.0",
+    "vite": "8.1.5"
+  }
+}

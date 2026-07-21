@@ -1,0 +1,253 @@
+:root {
+  color: #111111;
+  background: #ffffff;
+  font-family: ui-sans-serif, "SF Pro Text", "Segoe UI Variable", "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  min-width: 0;
+  min-height: 100%;
+}
+
+.app-shell {
+  display: grid;
+  min-height: 100vh;
+  grid-template-columns: 224px minmax(0, 1fr);
+  background: #ffffff;
+}
+
+.navigation-rail {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  padding: 22px 12px 14px;
+  border-right: 1px solid #d7d7d2;
+}
+
+.brand {
+  margin: 0;
+  padding: 0 10px 24px;
+  color: #111111;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+nav {
+  display: grid;
+  gap: 3px;
+}
+
+.navigation-link {
+  display: flex;
+  min-height: 40px;
+  align-items: center;
+  padding: 0 10px;
+  border-radius: 4px;
+  color: #545454;
+  text-decoration: none;
+}
+
+.navigation-link[aria-current="page"] {
+  background: #e9e9e4;
+  color: #111111;
+  font-weight: 600;
+}
+
+.rail-status {
+  margin: auto 10px 0;
+  padding-top: 14px;
+  border-top: 1px solid #d7d7d2;
+  color: #72726e;
+  font-size: 12px;
+}
+
+.application-content {
+  display: flex;
+  min-width: 0;
+  min-height: 100vh;
+  flex-direction: column;
+}
+
+.context-bar {
+  display: flex;
+  min-height: 48px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 0 32px;
+  border-bottom: 1px solid #d7d7d2;
+}
+
+.context-location,
+.context-statuses,
+.eyebrow,
+.section-label,
+.empty-state {
+  margin: 0;
+}
+
+.context-location,
+.context-statuses {
+  color: #545454;
+  font-size: 13px;
+}
+
+.context-statuses {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
+.context-statuses span::before {
+  content: "●";
+  margin-right: 5px;
+  color: #1f5139;
+}
+
+.workspace {
+  flex: 1;
+  padding: 34px 32px;
+}
+
+.workspace-inner {
+  max-width: 1280px;
+  margin: 0 auto;
+}
+
+.eyebrow,
+.section-label {
+  color: #72726e;
+  font-size: 13px;
+}
+
+h1 {
+  margin: 6px 0 0;
+  color: #111111;
+  font-size: 24px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.workspace-section {
+  margin-top: 28px;
+  padding: 18px 0;
+  border-top: 1px solid #8a8a84;
+  border-bottom: 1px solid #d7d7d2;
+}
+
+.empty-state {
+  margin-top: 10px;
+  color: #545454;
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.menu-button,
+.panel-close {
+  min-height: 40px;
+  border: 1px solid #8a8a84;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #111111;
+  font: inherit;
+  font-size: 16px;
+}
+
+.menu-button {
+  display: none;
+  width: 40px;
+  padding: 0;
+}
+
+.panel-close {
+  margin-top: 18px;
+  padding: 0 12px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+:focus-visible {
+  outline: 3px solid #111111;
+  outline-offset: 2px;
+}
+
+.navigation-overlay {
+  display: none;
+}
+
+@media (max-width: 1099px) {
+  .app-shell {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .navigation-rail {
+    display: none;
+  }
+
+  .menu-button {
+    display: inline-grid;
+    place-items: center;
+  }
+
+  .context-bar {
+    padding: 0 24px;
+  }
+
+  .navigation-overlay:not([hidden]) {
+    position: fixed;
+    z-index: 10;
+    inset: 0;
+    display: block;
+    background: rgb(17 17 17 / 24%);
+  }
+
+  .navigation-panel {
+    display: flex;
+    width: min(320px, calc(100vw - 32px));
+    min-height: 100%;
+    flex-direction: column;
+    padding: 22px 12px 18px;
+    border-right: 1px solid #8a8a84;
+    background: #ffffff;
+  }
+}
+
+@media (max-width: 899px) {
+  .context-bar {
+    align-items: flex-start;
+    flex-wrap: wrap;
+    padding: 10px 18px;
+  }
+
+  .context-location {
+    padding-top: 10px;
+  }
+
+  .context-statuses {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .workspace {
+    padding: 24px 18px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

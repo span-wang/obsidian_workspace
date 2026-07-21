@@ -1,0 +1,9 @@
+node_modules/
+apps/web/dist/
+apps/service/.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.playwright-cli/
+test-results/
+playwright-report/

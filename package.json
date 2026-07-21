@@ -1,0 +1,26 @@
+{
+  "name": "obsidian-personal-knowledge-platform",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/web"
+  ],
+  "engines": {
+    "node": "24.18.0",
+    "npm": "11.8.0"
+  },
+  "scripts": {
+    "preflight": "node scripts/preflight.mjs",
+    "prestart": "npm run preflight && npm run build",
+    "start": "uv run --directory apps/service python -m api.main",
+    "build": "npm --prefix apps/web run build",
+    "lint": "npm --prefix apps/web run lint && uv run --directory apps/service ruff check .",
+    "unit": "npm --prefix apps/web run test && uv run --directory apps/service pytest tests/unit",
+    "integration": "npm run build && uv run --directory apps/service pytest tests/integration",
+    "browser-test": "npm run build && playwright test --config browser-tests/playwright.config.mjs",
+    "test": "npm run unit && npm run integration && npm run browser-test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.61.1"
+  }
+}
