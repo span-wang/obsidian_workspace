@@ -4,6 +4,7 @@ from fastapi import HTTPException
 from api.main import (
     DEFAULT_BROWSER_URL,
     LOCAL_SESSION_COOKIE_NAME,
+    launch_browser_when_started,
     local_session_status,
     workbench_response,
 )
@@ -39,3 +40,15 @@ def test_local_session_endpoint_contract_rejects_missing_cookie() -> None:
 
 def test_browser_url_is_the_fixed_loopback_root() -> None:
     assert DEFAULT_BROWSER_URL == "http://127.0.0.1:6240/"
+
+
+def test_browser_opens_only_after_the_fixed_loopback_server_has_started() -> None:
+    class StartedServer:
+        started = True
+        should_exit = False
+
+    opened_urls: list[str] = []
+
+    launch_browser_when_started(StartedServer(), opened_urls.append, poll_interval=0)
+
+    assert opened_urls == [DEFAULT_BROWSER_URL]

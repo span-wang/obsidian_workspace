@@ -1,0 +1,9 @@
+from typing import Protocol
+
+
+class CredentialStore(Protocol):
+    def save(self, reference: str, secret: str) -> None: ...
+
+    def read(self, reference: str) -> str: ...
+
+    def delete(self, reference: str) -> None: ...

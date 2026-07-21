@@ -1,0 +1,13 @@
+from typing import Protocol
+
+from domain.vaults import Vault
+
+
+class VaultRepository(Protocol):
+    def save(self, vault: Vault) -> None: ...
+
+    def get(self, vault_id: str) -> Vault: ...
+
+    def list(self) -> list[Vault]: ...
+
+    def delete(self, vault_id: str) -> None: ...
