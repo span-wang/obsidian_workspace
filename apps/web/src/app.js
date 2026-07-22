@@ -3267,6 +3267,7 @@ export function App() {
   const [confirmationError, setConfirmationError] = React.useState("");
   const [confirmationSubmitting, setConfirmationSubmitting] = React.useState(false);
   const actionTriggerRef = React.useRef(null);
+  const sessionListRequestRef = React.useRef(0);
   const menuButtonRef = React.useRef(null);
   const firstMenuLinkRef = React.useRef(null);
   const menuPanelRef = React.useRef(null);
@@ -3306,6 +3307,7 @@ export function App() {
   ), []);
 
   const loadSessions = React.useCallback(async (nextFilters) => {
+    const requestId = ++sessionListRequestRef.current;
     const requested = { query: "", sort: "updated_at", order: "desc", page: 1, ...nextFilters };
     const search = new window.URLSearchParams({
       query: requested.query,
@@ -3318,14 +3320,15 @@ export function App() {
     setSessionsError("");
     try {
       const response = await requestJson(`${SESSIONS_ENDPOINT}?${search}`);
+      if (requestId !== sessionListRequestRef.current) return null;
       setSessionPage(response);
       setSessionFilters({ ...requested, page: response.page });
       return response;
     } catch (requestError) {
-      setSessionsError(requestError.message);
+      if (requestId === sessionListRequestRef.current) setSessionsError(requestError.message);
       return null;
     } finally {
-      setSessionsLoading(false);
+      if (requestId === sessionListRequestRef.current) setSessionsLoading(false);
     }
   }, []);
 
@@ -3439,7 +3442,7 @@ export function App() {
       method: "POST",
       body: JSON.stringify({})
     });
-    await loadSessions({ ...sessionFilters, query: "", page: 1 });
+    await loadSessions({ query: "", sort: "updated_at", order: "desc", page: 1 });
     return response.session;
   }
 
@@ -3512,7 +3515,12 @@ export function App() {
       }
       closeConfirmation();
     } catch (error) {
-      setConfirmationError(error.message);
+      if (request.kind === "session-remove") {
+        closeConfirmation();
+        setSessionsError(error.message);
+      } else {
+        setConfirmationError(error.message);
+      }
     } finally {
       setConfirmationSubmitting(false);
     }

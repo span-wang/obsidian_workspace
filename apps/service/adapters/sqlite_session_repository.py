@@ -1,0 +1,367 @@
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+from domain.sessions import (
+    MAX_SESSION_PAGE,
+    PersistentSession,
+    SessionCitation,
+    SessionDetail,
+    SessionGenerationResult,
+    SessionMessage,
+    SessionPage,
+    SessionTaskState,
+)
+
+
+class SqliteSessionRepository:
+    def __init__(self, database_path: Path) -> None:
+        self.database_path = database_path
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        self._initialize()
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.database_path)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        return connection
+
+    def _initialize(self) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS sessions (
+                    session_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    selected_vault_id TEXT,
+                    selected_vault_label TEXT,
+                    selected_provider_id TEXT,
+                    selected_provider_label TEXT,
+                    selected_model_id TEXT,
+                    selected_model_label TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_activity_at TEXT NOT NULL
+                )"""
+            )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS session_messages (
+                    message_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                    role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant')),
+                    content TEXT NOT NULL,
+                    provider_id TEXT,
+                    model_id TEXT,
+                    created_at TEXT NOT NULL
+                )"""
+            )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS session_task_states (
+                    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                    task_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    snapshot_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (session_id, task_id)
+                )"""
+            )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS session_citations (
+                    citation_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                    vault_id TEXT,
+                    source_id TEXT,
+                    source_content_hash TEXT,
+                    relative_path TEXT,
+                    location TEXT,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )"""
+            )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS session_generation_results (
+                    result_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                    status TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )"""
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS session_list_updated_idx ON sessions(updated_at DESC, session_id)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS session_list_vault_idx ON sessions(selected_vault_id, updated_at DESC)"
+            )
+
+    def create(self, session: PersistentSession) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO sessions (
+                    session_id, title, selected_vault_id, selected_vault_label,
+                    selected_provider_id, selected_provider_label, selected_model_id,
+                    selected_model_label, created_at, updated_at, last_activity_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                self._session_values(session),
+            )
+
+    def get(self, session_id: str) -> PersistentSession:
+        with self._connect() as connection:
+            row = connection.execute(
+                self._session_select("WHERE session_id = ?"), (session_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(session_id)
+        return self._session_from_row(row)
+
+    def get_detail(self, session_id: str) -> SessionDetail:
+        with self._connect() as connection:
+            session_row = connection.execute(
+                self._session_select("WHERE session_id = ?"), (session_id,)
+            ).fetchone()
+            if session_row is None:
+                raise KeyError(session_id)
+            messages = connection.execute(
+                "SELECT * FROM session_messages WHERE session_id = ? ORDER BY created_at, message_id",
+                (session_id,),
+            ).fetchall()
+            task_states = connection.execute(
+                "SELECT * FROM session_task_states WHERE session_id = ? ORDER BY created_at, task_id",
+                (session_id,),
+            ).fetchall()
+            citations = connection.execute(
+                "SELECT * FROM session_citations WHERE session_id = ? ORDER BY created_at, citation_id",
+                (session_id,),
+            ).fetchall()
+            results = connection.execute(
+                "SELECT * FROM session_generation_results WHERE session_id = ? ORDER BY created_at, result_id",
+                (session_id,),
+            ).fetchall()
+        return SessionDetail(
+            self._session_from_row(session_row),
+            tuple(self._message_from_row(row) for row in messages),
+            tuple(self._task_state_from_row(row) for row in task_states),
+            tuple(self._citation_from_row(row) for row in citations),
+            tuple(self._result_from_row(row) for row in results),
+        )
+
+    def list_page(
+        self,
+        *,
+        query: str,
+        vault_id: str | None,
+        sort: str,
+        order: str,
+        page: int,
+        page_size: int,
+    ) -> SessionPage:
+        if page < 1 or page > MAX_SESSION_PAGE or page_size < 1 or page_size > 100:
+            raise ValueError("Session list page is invalid.")
+        sort_columns = {
+            "updated_at": "updated_at",
+            "created_at": "created_at",
+            "title": "title COLLATE NOCASE",
+            "vault": "selected_vault_label COLLATE NOCASE",
+        }
+        if sort not in sort_columns or order not in {"asc", "desc"}:
+            raise ValueError("Session list sort is invalid.")
+        where_parts: list[str] = []
+        parameters: list[object] = []
+        if query:
+            where_parts.append("(title LIKE ? ESCAPE '\\' OR COALESCE(selected_vault_label, '') LIKE ? ESCAPE '\\')")
+            escaped = f"%{self._escape_like(query)}%"
+            parameters.extend((escaped, escaped))
+        if vault_id is not None:
+            where_parts.append("selected_vault_id = ?")
+            parameters.append(vault_id)
+        where = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        offset = (page - 1) * page_size
+        order_direction = order.upper()
+        with self._connect() as connection:
+            total = int(
+                connection.execute(f"SELECT COUNT(*) FROM sessions{where}", parameters).fetchone()[0]
+            )
+            rows = connection.execute(
+                f"{self._session_select(where)} ORDER BY {sort_columns[sort]} {order_direction}, session_id ASC LIMIT ? OFFSET ?",
+                [*parameters, page_size, offset],
+            ).fetchall()
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        return SessionPage(
+            tuple(self._session_from_row(row) for row in rows), page, page_size, total, total_pages
+        )
+
+    def save(self, session: PersistentSession) -> None:
+        with self._connect() as connection:
+            result = connection.execute(
+                """UPDATE sessions SET title = ?, selected_vault_id = ?, selected_vault_label = ?,
+                    selected_provider_id = ?, selected_provider_label = ?, selected_model_id = ?,
+                    selected_model_label = ?, updated_at = ?, last_activity_at = ?
+                    WHERE session_id = ?""",
+                (
+                    session.title,
+                    session.selected_vault_id,
+                    session.selected_vault_label,
+                    session.selected_provider_id,
+                    session.selected_provider_label,
+                    session.selected_model_id,
+                    session.selected_model_label,
+                    session.updated_at,
+                    session.last_activity_at,
+                    session.session_id,
+                ),
+            )
+        if result.rowcount != 1:
+            raise KeyError(session.session_id)
+
+    def delete(self, session_id: str) -> None:
+        with self._connect() as connection:
+            result = connection.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        if result.rowcount != 1:
+            raise KeyError(session_id)
+
+    def append_message(self, message: SessionMessage) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO session_messages (
+                    message_id, session_id, role, content, provider_id, model_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    message.message_id,
+                    message.session_id,
+                    message.role,
+                    message.content,
+                    message.provider_id,
+                    message.model_id,
+                    message.created_at,
+                ),
+            )
+            self._touch_session(connection, message.session_id, message.created_at)
+
+    def record_task_state(self, task_state: SessionTaskState) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO session_task_states (
+                    session_id, task_id, status, snapshot_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id, task_id) DO UPDATE SET status = excluded.status,
+                    snapshot_id = excluded.snapshot_id, updated_at = excluded.updated_at""",
+                (
+                    task_state.session_id,
+                    task_state.task_id,
+                    task_state.status,
+                    task_state.snapshot_id,
+                    task_state.created_at,
+                    task_state.updated_at,
+                ),
+            )
+            self._touch_session(connection, task_state.session_id, task_state.updated_at)
+
+    def record_citation(self, citation: SessionCitation) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO session_citations (
+                    citation_id, session_id, vault_id, source_id, source_content_hash,
+                    relative_path, location, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    citation.citation_id,
+                    citation.session_id,
+                    citation.vault_id,
+                    citation.source_id,
+                    citation.source_content_hash,
+                    citation.relative_path,
+                    citation.location,
+                    citation.status,
+                    citation.created_at,
+                ),
+            )
+            self._touch_session(connection, citation.session_id, citation.created_at)
+
+    def record_generation_result(self, result: SessionGenerationResult) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO session_generation_results (
+                    result_id, session_id, status, content, created_at
+                ) VALUES (?, ?, ?, ?, ?)""",
+                (result.result_id, result.session_id, result.status, result.content, result.created_at),
+            )
+            self._touch_session(connection, result.session_id, result.created_at)
+
+    @staticmethod
+    def _session_select(where: str) -> str:
+        return """SELECT sessions.*, (
+            SELECT COUNT(*) FROM session_messages WHERE session_messages.session_id = sessions.session_id
+        ) AS message_count FROM sessions """ + where
+
+    @staticmethod
+    def _session_values(session: PersistentSession) -> tuple[object, ...]:
+        return (
+            session.session_id,
+            session.title,
+            session.selected_vault_id,
+            session.selected_vault_label,
+            session.selected_provider_id,
+            session.selected_provider_label,
+            session.selected_model_id,
+            session.selected_model_label,
+            session.created_at,
+            session.updated_at,
+            session.last_activity_at,
+        )
+
+    @staticmethod
+    def _escape_like(value: str) -> str:
+        return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    @staticmethod
+    def _touch_session(connection: sqlite3.Connection, session_id: str, timestamp: str) -> None:
+        connection.execute(
+            "UPDATE sessions SET updated_at = ?, last_activity_at = ? WHERE session_id = ?",
+            (timestamp, timestamp, session_id),
+        )
+
+    @staticmethod
+    def _session_from_row(row: sqlite3.Row) -> PersistentSession:
+        return PersistentSession(
+            row["session_id"],
+            row["title"],
+            row["selected_vault_id"],
+            row["selected_vault_label"],
+            row["selected_provider_id"],
+            row["selected_provider_label"],
+            row["selected_model_id"],
+            row["selected_model_label"],
+            row["created_at"],
+            row["updated_at"],
+            row["last_activity_at"],
+            int(row["message_count"]),
+        )
+
+    @staticmethod
+    def _message_from_row(row: sqlite3.Row) -> SessionMessage:
+        return SessionMessage(
+            row["message_id"], row["session_id"], row["role"], row["content"],
+            row["provider_id"], row["model_id"], row["created_at"],
+        )
+
+    @staticmethod
+    def _task_state_from_row(row: sqlite3.Row) -> SessionTaskState:
+        return SessionTaskState(
+            row["session_id"], row["task_id"], row["status"], row["snapshot_id"],
+            row["created_at"], row["updated_at"],
+        )
+
+    @staticmethod
+    def _citation_from_row(row: sqlite3.Row) -> SessionCitation:
+        return SessionCitation(
+            row["citation_id"], row["session_id"], row["vault_id"], row["source_id"],
+            row["source_content_hash"], row["relative_path"], row["location"], row["status"],
+            row["created_at"],
+        )
+
+    @staticmethod
+    def _result_from_row(row: sqlite3.Row) -> SessionGenerationResult:
+        return SessionGenerationResult(
+            row["result_id"], row["session_id"], row["status"], row["content"], row["created_at"]
+        )

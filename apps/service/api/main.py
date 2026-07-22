@@ -11,7 +11,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field
 from fastapi.responses import FileResponse, StreamingResponse
@@ -72,6 +72,7 @@ from domain.indexing import IndexHealth
 from domain.review_commits import CommitJournal, ReviewSnapshot
 from domain.tasks import ImportTask, ImportTaskEvent, ImportTaskItem
 from domain.sessions import (
+    MAX_SESSION_PAGE,
     PersistentSession,
     SessionCitation,
     SessionDetail,
@@ -173,7 +174,7 @@ class SessionListQuery(BaseModel):
     vault_id: str | None = None
     sort: Literal["updated_at", "created_at", "title", "vault"] = "updated_at"
     order: Literal["asc", "desc"] = "desc"
-    page: int = Field(default=1, ge=1)
+    page: int = Field(default=1, ge=1, le=MAX_SESSION_PAGE)
     page_size: int = Field(default=25, ge=1, le=100)
 
 
@@ -1277,6 +1278,10 @@ def create_app(
     app = FastAPI(title="Obsidian Personal Knowledge Platform")
     app.state.runtime = runtime
     app.state.local_session = create_local_session()
+
+    def require_current_local_session(request: Request) -> None:
+        require_local_session(app, request)
+
     app.state.graph_subscribers = {}
     app.state.graph_subscribers_lock = threading.Lock()
     if vault_service is None:
@@ -1392,21 +1397,19 @@ def create_app(
             request.cookies.get(LOCAL_SESSION_COOKIE_NAME),
         )
 
-    @app.post("/api/sessions")
+    @app.post("/api/sessions", dependencies=[Depends(require_current_local_session)])
     def create_persistent_session(
         request: Request, command: SessionCreateCommand
     ) -> dict[str, object]:
-        require_local_session(app, request)
         try:
             return {"session": persistent_session_payload(app.state.session_service.create(command.title))}
         except Exception as error:
             raise session_error(error) from error
 
-    @app.get("/api/sessions")
+    @app.get("/api/sessions", dependencies=[Depends(require_current_local_session)])
     def list_persistent_sessions(
         request: Request, filters: Annotated[SessionListQuery, Query()]
     ) -> dict[str, object]:
-        require_local_session(app, request)
         try:
             return session_page_payload(
                 app.state.session_service.list(
@@ -1421,9 +1424,8 @@ def create_app(
         except Exception as error:
             raise session_error(error) from error
 
-    @app.get("/api/sessions/{session_id}/export")
+    @app.get("/api/sessions/{session_id}/export", dependencies=[Depends(require_current_local_session)])
     def export_persistent_session(request: Request, session_id: str) -> Response:
-        require_local_session(app, request)
         try:
             payload = session_detail_payload(app.state.session_service.export(session_id))
         except Exception as error:
@@ -1434,19 +1436,17 @@ def create_app(
             headers={"Content-Disposition": f'attachment; filename="session-{session_id}.json"'},
         )
 
-    @app.get("/api/sessions/{session_id}")
+    @app.get("/api/sessions/{session_id}", dependencies=[Depends(require_current_local_session)])
     def get_persistent_session(request: Request, session_id: str) -> dict[str, object]:
-        require_local_session(app, request)
         try:
             return session_detail_payload(app.state.session_service.detail(session_id))
         except Exception as error:
             raise session_error(error) from error
 
-    @app.patch("/api/sessions/{session_id}")
+    @app.patch("/api/sessions/{session_id}", dependencies=[Depends(require_current_local_session)])
     def rename_persistent_session(
         request: Request, session_id: str, command: SessionRenameCommand
     ) -> dict[str, object]:
-        require_local_session(app, request)
         try:
             return {"session": persistent_session_payload(
                 app.state.session_service.rename(session_id, command.title)
@@ -1454,9 +1454,8 @@ def create_app(
         except Exception as error:
             raise session_error(error) from error
 
-    @app.delete("/api/sessions/{session_id}")
+    @app.delete("/api/sessions/{session_id}", dependencies=[Depends(require_current_local_session)])
     def delete_persistent_session(request: Request, session_id: str) -> dict[str, str]:
-        require_local_session(app, request)
         try:
             app.state.session_service.delete(session_id)
         except Exception as error:

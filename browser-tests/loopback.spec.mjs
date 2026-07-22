@@ -1160,6 +1160,8 @@ test("configures a chat-only Provider without requiring an Embedding model", asy
 
 test("manages bounded private sessions without inheriting a vault or closing deletion on Escape", async ({ page }) => {
   let nextSessionId = 27;
+  let sessionDeleteAttempts = 0;
+  const sessionListSorts = [];
   let sessions = Array.from({ length: 26 }, (_, index) => ({
     session_id: `session-${index + 1}`,
     title: `会话 ${index + 1}`,
@@ -1198,6 +1200,7 @@ test("manages bounded private sessions without inheriting a vault or closing del
     const parts = url.pathname.split("/").filter(Boolean);
     const sessionId = parts[2];
     if (method === "GET" && !sessionId) {
+      sessionListSorts.push(url.searchParams.get("sort"));
       await route.fulfill({ json: listPayload(url) });
       return;
     }
@@ -1237,6 +1240,14 @@ test("manages bounded private sessions without inheriting a vault or closing del
       return;
     }
     if (method === "DELETE") {
+      sessionDeleteAttempts += 1;
+      if (sessionDeleteAttempts === 1) {
+        await route.fulfill({
+          status: 500,
+          json: { code: "session_operation_failed", message: "Delete failed.", details: {}, retryable: true }
+        });
+        return;
+      }
       sessions = sessions.filter((item) => item.session_id !== sessionId);
       await route.fulfill({ json: { status: "removed" } });
       return;
@@ -1260,7 +1271,10 @@ test("manages bounded private sessions without inheriting a vault or closing del
 
   await page.getByLabel("搜索会话").fill("");
   await page.getByRole("button", { name: "搜索", exact: true }).click();
+  await page.getByLabel("会话排序").selectOption("vault");
+  await expect.poll(() => sessionListSorts.at(-1)).toBe("vault");
   await page.getByRole("button", { name: "新建会话", exact: true }).click();
+  await expect.poll(() => sessionListSorts.at(-1)).toBe("updated_at");
   const titleInput = page.getByLabel("未命名会话 的会话标题");
   await expect(titleInput).toBeFocused();
   await titleInput.fill("代数复习");
@@ -1283,5 +1297,73 @@ test("manages bounded private sessions without inheriting a vault or closing del
   await expect(deleteButton).toBeFocused();
   await deleteButton.click();
   await dialog.getByRole("button", { name: "删除会话", exact: true }).click();
+  await expect(dialog).toBeHidden();
+  await expect(deleteButton).toBeFocused();
+  await expect(page.getByText("Delete failed.", { exact: true })).toBeVisible();
+  await deleteButton.click();
+  await dialog.getByRole("button", { name: "删除会话", exact: true }).click();
   await expect(page.getByText("代数复习", { exact: true })).toHaveCount(0);
+});
+
+test("keeps the latest session list result when an older search resolves last", async ({ page }) => {
+  let releaseOlderSearch;
+  const session = (sessionId, title) => ({
+    session_id: sessionId,
+    title,
+    selected_vault_id: null,
+    selected_vault_label: null,
+    selected_provider_id: null,
+    selected_provider_label: null,
+    selected_model_id: null,
+    selected_model_label: null,
+    message_count: 0,
+    created_at: "2026-07-22T00:00:00+00:00",
+    updated_at: "2026-07-22T00:00:00+00:00",
+    last_activity_at: "2026-07-22T00:00:00+00:00"
+  });
+  const pagePayload = (sessions) => ({
+    sessions,
+    page: 1,
+    page_size: 25,
+    total: sessions.length,
+    total_pages: 1
+  });
+
+  await page.route("**/api/sessions**", async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    if (request.method() === "GET" && url.pathname === "/api/sessions") {
+      const query = url.searchParams.get("query");
+      if (query === "older") {
+        await new Promise((resolve) => {
+          releaseOlderSearch = async () => {
+            await route.fulfill({ json: pagePayload([session("older", "older result")]) });
+            resolve();
+          };
+        });
+        return;
+      }
+      await route.fulfill({
+        json: pagePayload(query === "newer"
+          ? [session("newer", "newer result")]
+          : [session("initial", "initial result")])
+      });
+      return;
+    }
+    await route.fallback();
+  });
+
+  await page.goto("/");
+  await page.getByRole("link", { name: "会话", exact: true }).click();
+  await page.getByLabel("搜索会话").fill("older");
+  await page.getByRole("button", { name: "搜索", exact: true }).click();
+  await expect.poll(() => Boolean(releaseOlderSearch)).toBe(true);
+  await page.getByLabel("搜索会话").fill("newer");
+  await page.getByRole("button", { name: "搜索", exact: true }).click();
+  await expect(page.getByText("newer result", { exact: true })).toBeVisible();
+
+  await releaseOlderSearch();
+
+  await expect(page.getByText("newer result", { exact: true })).toBeVisible();
+  await expect(page.getByText("older result", { exact: true })).toHaveCount(0);
 });
