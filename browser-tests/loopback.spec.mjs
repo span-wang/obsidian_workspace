@@ -560,6 +560,9 @@ test("creates an import task from the workbench and shows its persistent scan sn
   const classificationFolder = page.getByLabel("资料项 1 的目标文件夹");
   await expect(classificationFolder).toHaveValue("platform/notes/unclassified");
   await expect(page.getByRole("button", { name: "接受高置信度建议" })).toBeVisible();
+  const classificationStatus = page.getByText("没有可批量接受的高置信度建议。", { exact: true });
+  await expect(classificationStatus).toBeVisible();
+  await expect(classificationStatus).toHaveAttribute("role", "status");
   await expect(
     page.getByLabel("分类建议").getByRole("button", { name: "确认排除" })
   ).toBeVisible();

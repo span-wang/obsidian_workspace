@@ -265,9 +265,13 @@ class SqliteImportTaskRepository:
                     confidence REAL NOT NULL,
                     decision TEXT,
                     created_at TEXT NOT NULL,
+                    invalidated_at TEXT,
                     UNIQUE(task_id, item_id, revision)
                 )
                 """
+            )
+            self._ensure_column(
+                connection, "import_classification_suggestions", "invalidated_at TEXT"
             )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS import_task_items_task_id ON import_task_items(task_id, item_id)"
@@ -428,6 +432,11 @@ class SqliteImportTaskRepository:
             )
             connection.execute(
                 "UPDATE import_private_index_candidates SET invalidated_at = ? "
+                "WHERE task_id = ? AND invalidated_at IS NULL",
+                (timestamp, task.task_id),
+            )
+            connection.execute(
+                "UPDATE import_classification_suggestions SET invalidated_at = ? "
                 "WHERE task_id = ? AND invalidated_at IS NULL",
                 (timestamp, task.task_id),
             )
@@ -728,34 +737,7 @@ class SqliteImportTaskRepository:
             if row is None:
                 raise KeyError(item_id)
             timestamp = utc_now()
-            proposal_id = connection.execute(
-                """
-                INSERT INTO import_note_proposals (task_id, item_id, proposal_kind, proposal_json, created_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (row["task_id"], item_id, proposal.kind, json.dumps(proposal.to_dict()), timestamp),
-            ).lastrowid
-            for candidate in private_index_candidates(proposal):
-                connection.execute(
-                    """
-                    INSERT INTO import_private_index_candidates (
-                        proposal_id, task_id, item_id, proposal_kind, note_relative_path, block_sequence,
-                        text, source_locators_json, block_location, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        proposal_id,
-                        row["task_id"],
-                        item_id,
-                        candidate.proposal_kind,
-                        candidate.note_relative_path,
-                        candidate.block_sequence,
-                        candidate.text,
-                        json.dumps(candidate.to_dict()["source_locators"]),
-                        candidate.block_location,
-                        timestamp,
-                    ),
-                )
+            self._insert_note_proposal(connection, row, item_id, proposal, timestamp)
             task = self._task_from_connection(connection, row["task_id"])
             updated = replace(
                 task,
@@ -766,6 +748,43 @@ class SqliteImportTaskRepository:
             self._write_task(connection, updated)
             self._append_event(connection, row["task_id"], "derivation-item-completed", timestamp)
         return updated
+
+    @staticmethod
+    def _insert_note_proposal(
+        connection: sqlite3.Connection,
+        item: sqlite3.Row,
+        item_id: int,
+        proposal: NoteProposal,
+        created_at: str,
+    ) -> None:
+        proposal_id = connection.execute(
+            """
+            INSERT INTO import_note_proposals (task_id, item_id, proposal_kind, proposal_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (item["task_id"], item_id, proposal.kind, json.dumps(proposal.to_dict()), created_at),
+        ).lastrowid
+        for candidate in private_index_candidates(proposal):
+            connection.execute(
+                """
+                INSERT INTO import_private_index_candidates (
+                    proposal_id, task_id, item_id, proposal_kind, note_relative_path, block_sequence,
+                    text, source_locators_json, block_location, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    proposal_id,
+                    item["task_id"],
+                    item_id,
+                    candidate.proposal_kind,
+                    candidate.note_relative_path,
+                    candidate.block_sequence,
+                    candidate.text,
+                    json.dumps(candidate.to_dict()["source_locators"]),
+                    candidate.block_location,
+                    created_at,
+                ),
+            )
 
     def get_note_proposal(self, item_id: int) -> NoteProposal | None:
         with self._connect() as connection:
@@ -802,6 +821,11 @@ class SqliteImportTaskRepository:
             timestamp = utc_now()
             connection.execute(
                 "UPDATE import_note_proposals SET invalidated_at = ? "
+                "WHERE task_id = ? AND item_id = ? AND invalidated_at IS NULL",
+                (timestamp, task_id, item_id),
+            )
+            connection.execute(
+                "UPDATE import_classification_suggestions SET invalidated_at = ? "
                 "WHERE task_id = ? AND item_id = ? AND invalidated_at IS NULL",
                 (timestamp, task_id, item_id),
             )
@@ -849,12 +873,52 @@ class SqliteImportTaskRepository:
             self._append_event(connection, row["task_id"], event_type, updated.updated_at)
         return updated
 
+    def record_classification_revision(
+        self, item_id: int, proposal: NoteProposal, suggestion: ClassificationSuggestion
+    ) -> ImportTask:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT task_id, label FROM import_task_items WHERE item_id = ?", (item_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(item_id)
+            if suggestion.item_id != item_id or suggestion.task_id != row["task_id"]:
+                raise ValueError("Classification suggestion does not belong to this import item.")
+            timestamp = utc_now()
+            self._insert_note_proposal(connection, row, item_id, proposal, timestamp)
+            connection.execute(
+                """
+                INSERT INTO import_classification_suggestions (
+                    task_id, item_id, revision, suggestion_json, confidence, decision, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    suggestion.task_id,
+                    item_id,
+                    suggestion.revision,
+                    json.dumps(suggestion.to_dict()),
+                    suggestion.confidence,
+                    suggestion.decision,
+                    suggestion.created_at,
+                ),
+            )
+            task = self._task_from_connection(connection, row["task_id"])
+            updated = replace(
+                task,
+                current_item_label=row["label"],
+                counts=self._counts_from_connection(connection, row["task_id"]),
+                updated_at=timestamp,
+            )
+            self._write_task(connection, updated)
+            self._append_event(connection, row["task_id"], "classification-revised", timestamp)
+        return updated
+
     def get_classification_suggestion(self, item_id: int) -> ClassificationSuggestion | None:
         with self._connect() as connection:
             row = connection.execute(
                 """
                 SELECT suggestion_json FROM import_classification_suggestions
-                WHERE item_id = ? ORDER BY revision DESC LIMIT 1
+                WHERE item_id = ? AND invalidated_at IS NULL ORDER BY revision DESC LIMIT 1
                 """,
                 (item_id,),
             ).fetchone()
@@ -869,10 +933,10 @@ class SqliteImportTaskRepository:
                 JOIN (
                     SELECT item_id, MAX(revision) AS revision
                     FROM import_classification_suggestions
-                    WHERE task_id = ? GROUP BY item_id
+                    WHERE task_id = ? AND invalidated_at IS NULL GROUP BY item_id
                 ) AS latest
                   ON latest.item_id = suggestion.item_id AND latest.revision = suggestion.revision
-                WHERE suggestion.task_id = ?
+                WHERE suggestion.task_id = ? AND suggestion.invalidated_at IS NULL
                 ORDER BY suggestion.item_id
                 """,
                 (task_id, task_id),
@@ -1416,10 +1480,10 @@ class SqliteImportTaskRepository:
                     JOIN (
                         SELECT item_id, MAX(revision) AS revision
                         FROM import_classification_suggestions
-                        WHERE task_id = ? GROUP BY item_id
+                        WHERE task_id = ? AND invalidated_at IS NULL GROUP BY item_id
                     ) AS latest
                       ON latest.item_id = suggestion.item_id AND latest.revision = suggestion.revision
-                    WHERE suggestion.task_id = ?
+                    WHERE suggestion.task_id = ? AND suggestion.invalidated_at IS NULL
                   ), 0) AS classification_required_check_count
                 , COALESCE((
                     SELECT SUM(
@@ -1428,9 +1492,12 @@ class SqliteImportTaskRepository:
                             SELECT 1 FROM import_classification_suggestions AS classification
                             WHERE classification.task_id = proposal.task_id
                               AND classification.item_id = proposal.item_id
+                              AND classification.invalidated_at IS NULL
                               AND classification.revision = (
                                   SELECT MAX(revision) FROM import_classification_suggestions
-                                  WHERE task_id = proposal.task_id AND item_id = proposal.item_id
+                                  WHERE task_id = proposal.task_id
+                                    AND item_id = proposal.item_id
+                                    AND invalidated_at IS NULL
                               )
                               AND classification.confidence < 0.75
                               AND classification.decision IS NULL

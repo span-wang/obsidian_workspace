@@ -7,3 +7,6 @@ __pycache__/
 .playwright-cli/
 test-results/
 playwright-report/
+cloudflare/*.json
+cloudflare/*.pid
+cloudflare/*.log

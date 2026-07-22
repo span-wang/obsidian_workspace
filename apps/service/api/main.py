@@ -557,6 +557,7 @@ def note_proposal_payload(proposal) -> dict[str, object]:
         return {
             "kind": "native",
             "item_id": proposal.item_id,
+            "revision": proposal.revision,
             "relative_path": proposal.relative_path,
             "content_sha256": proposal.content_sha256,
             "heading_locations": list(proposal.heading_locations),

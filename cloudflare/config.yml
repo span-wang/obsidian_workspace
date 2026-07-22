@@ -1,0 +1,10 @@
+tunnel: 30e1153e-ec2a-4140-b0db-7e86b0cca987
+credentials-file: 'C:\Users\panshimao\IdeaProjects\bmad_method\obsidian_workspace\cloudflare\obsidian-panspan-cloud.json'
+
+ingress:
+  - hostname: obsidian.panspan.cloud
+    service: http://127.0.0.1:6240
+  - service: http_status:404
+
+protocol: http2
+no-autoupdate: true

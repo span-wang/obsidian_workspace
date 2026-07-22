@@ -948,6 +948,26 @@ def test_classification_is_private_and_relocates_only_the_derived_proposal_plan(
 
     assert service.list_note_proposals(task.task_id)[0] == original_proposal
 
+    with pytest.raises(ValueError, match="source extension"):
+        service.revise_classification_suggestion(
+            task.task_id,
+            item.item_id,
+            domain="mathematics",
+            target_folder="platform/notes/mathematics",
+            filename="algebra-workbook.md",
+            reason="The source extension must be retained.",
+        )
+
+    with pytest.raises(ValueError, match="reserved by Windows"):
+        service.revise_classification_suggestion(
+            task.task_id,
+            item.item_id,
+            domain="mathematics",
+            target_folder="platform/notes/mathematics",
+            filename="CON.pdf",
+            reason="Windows reserved names are unsafe.",
+        )
+
     updated = service.revise_classification_suggestion(
         task.task_id,
         item.item_id,
@@ -962,11 +982,88 @@ def test_classification_is_private_and_relocates_only_the_derived_proposal_plan(
     assert updated.task_id == task.task_id
     assert revised.revision == 2
     assert revised.decision == "revised"
+    assert revised.proposal_content_sha256 != generated.proposal_content_sha256
     assert relocated.revision == original_proposal.revision + 1
     assert relocated.source_relative_path == "platform/sources/mathematics/advanced/algebra-workbook.pdf"
     assert relocated.notes[0].relative_path.startswith("platform/notes/mathematics/advanced/")
     assert list(vault.source_directory.iterdir()) == []
     assert list(vault.note_directory.iterdir()) == []
+
+
+def test_native_classification_revision_updates_the_private_proposal_plan(tmp_path: Path) -> None:
+    vault_path = tmp_path / "vault"
+    vault_path.mkdir()
+    source_file = tmp_path / "external.md"
+    source_file.write_text("# External\n\nNative body", encoding="utf-8")
+    vault_repository = SqliteVaultRepository(tmp_path / "vaults.sqlite3")
+    vault_service = VaultService(vault_repository, LocalVaultFilesystem())
+    vault = vault_service.authorize(vault_path, "platform")
+    service = ImportTaskService(
+        vault_service,
+        SqliteImportTaskRepository(tmp_path / "tasks.sqlite3"),
+        NativeMarkdownWorker(),
+    )
+
+    task = service.create(vault.vault_id, ImportSelection("session", "files", (source_file,), 999.0))
+    item = service.list_items(task.task_id)[0]
+    original_proposal = service.list_note_proposals(task.task_id)[0]
+    original_suggestion = service.list_classification_suggestions(task.task_id)[0]
+
+    service.revise_classification_suggestion(
+        task.task_id,
+        item.item_id,
+        domain="language",
+        target_folder="platform/notes/language",
+        filename="external.md",
+        reason="Reviewed the native note location.",
+    )
+
+    revised_proposal = service.list_note_proposals(task.task_id)[0]
+    revised_suggestion = service.list_classification_suggestions(task.task_id)[0]
+
+    assert revised_proposal.revision == original_proposal.revision + 1
+    assert revised_proposal.relative_path == "platform/notes/language/external.md"
+    assert revised_suggestion.proposal_revision == revised_proposal.revision
+    assert revised_suggestion.proposal_content_sha256 != original_suggestion.proposal_content_sha256
+    assert list(vault.note_directory.iterdir()) == []
+
+
+def test_classification_revision_rolls_back_the_proposal_when_the_audit_insert_fails(tmp_path: Path) -> None:
+    from domain.derived_notes import relocate_derived_proposal
+
+    vault_path = tmp_path / "vault"
+    vault_path.mkdir()
+    source_file = tmp_path / "algebra-workbook.pdf"
+    source_file.write_bytes(b"original file")
+    vault_repository = SqliteVaultRepository(tmp_path / "vaults.sqlite3")
+    vault_service = VaultService(vault_repository, LocalVaultFilesystem())
+    vault = vault_service.authorize(vault_path, "platform")
+    task_repository = SqliteImportTaskRepository(tmp_path / "tasks.sqlite3")
+    service = ImportTaskService(
+        vault_service,
+        task_repository,
+        DerivationWorker(),
+        source_repository=SqliteSourceRepository(tmp_path / "tasks.sqlite3"),
+    )
+
+    task = service.create(vault.vault_id, ImportSelection("session", "files", (source_file,), 999.0))
+    item = service.list_items(task.task_id)[0]
+    original_proposal = service.list_note_proposals(task.task_id)[0]
+    original_suggestion = service.list_classification_suggestions(task.task_id)[0]
+    conflicting_proposal = relocate_derived_proposal(
+        original_proposal,
+        target_folder="platform/notes/mathematics/advanced",
+        filename="algebra-workbook.pdf",
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        task_repository.record_classification_revision(
+            item.item_id,
+            conflicting_proposal,
+            original_suggestion,
+        )
+
+    assert service.list_note_proposals(task.task_id)[0] == original_proposal
 
 
 def test_low_confidence_classification_cannot_be_batch_accepted(tmp_path: Path) -> None:
@@ -993,6 +1090,31 @@ def test_low_confidence_classification_cannot_be_batch_accepted(tmp_path: Path) 
     assert suggestion.status == "required-check"
     assert suggestion.decision is None
     assert service.get(task.task_id).counts.required_check == 1
+
+
+def test_batch_classification_acceptance_rejects_changed_sources(tmp_path: Path) -> None:
+    vault_path = tmp_path / "vault"
+    vault_path.mkdir()
+    source_file = tmp_path / "algebra.pdf"
+    source_file.write_bytes(b"original file")
+    vault_repository = SqliteVaultRepository(tmp_path / "vaults.sqlite3")
+    vault_service = VaultService(vault_repository, LocalVaultFilesystem())
+    vault = vault_service.authorize(vault_path, "platform")
+    service = ImportTaskService(
+        vault_service,
+        SqliteImportTaskRepository(tmp_path / "tasks.sqlite3"),
+        DerivationWorker(),
+        source_repository=SqliteSourceRepository(tmp_path / "tasks.sqlite3"),
+    )
+
+    task = service.create(vault.vault_id, ImportSelection("session", "files", (source_file,), 999.0))
+    source_file.write_bytes(b"changed file")
+
+    with pytest.raises(ImportTaskError, match="source changed"):
+        service.accept_high_confidence_classifications(task.task_id, "Accept stale suggestions.")
+
+    assert service.get(task.task_id).recovery_actions == ("restart-scan",)
+    assert service.list_classification_suggestions(task.task_id) == []
 
 
 def test_metadata_tags_stay_private_and_create_a_vault_scoped_change_preview(tmp_path: Path) -> None:
@@ -1101,18 +1223,25 @@ def test_source_change_invalidates_current_proposals_before_restart_scan(tmp_pat
 
     task = service.create(vault.vault_id, ImportSelection("session", "files", (source_file,), 999.0))
     item = service.list_items(task.task_id)[0]
+    assert [suggestion.item_id for suggestion in service.list_classification_suggestions(task.task_id)] == [
+        item.item_id
+    ]
     source_file.write_bytes(b"changed file")
 
     changed = service.merge_note_proposal(task.task_id, item.item_id, 1)
 
     assert changed.recovery_actions == ("restart-scan",)
     assert service.list_note_proposals(task.task_id) == []
+    assert service.list_classification_suggestions(task.task_id) == []
 
     restarted = service.resume(task.task_id)
 
     assert restarted.phase == "waiting-for-review"
     assert len(service.list_note_proposals(task.task_id)) == 1
     assert service.list_note_proposals(task.task_id)[0].item_id != item.item_id
+    assert [suggestion.item_id for suggestion in service.list_classification_suggestions(task.task_id)] == [
+        service.list_note_proposals(task.task_id)[0].item_id
+    ]
 
 
 def test_note_proposal_actions_reject_items_from_another_task(tmp_path: Path) -> None:

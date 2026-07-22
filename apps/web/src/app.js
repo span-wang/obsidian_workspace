@@ -1480,6 +1480,13 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
       const response = await requestJson(endpoint, { method: "POST", body: JSON.stringify(body) });
       onTaskChanged(response.task);
       await loadDetail();
+      setStatus(
+        action === "revise"
+          ? "分类建议已修正。"
+          : action === "accepted"
+            ? "分类建议已接受。"
+            : "分类建议已排除。"
+      );
     } catch (error) {
       setStatus(error.message);
     } finally {
@@ -1882,6 +1889,13 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
       "section",
       { className: "classification-list", "aria-label": "分类建议" },
       React.createElement("h3", null, "分类建议"),
+      classificationControlReason || classificationBatchReason
+        ? React.createElement(
+            "p",
+            { className: "status-line", role: "status" },
+            classificationControlReason || classificationBatchReason
+          )
+        : null,
       classifications.length === 0
         ? React.createElement("p", { className: "empty-state" }, "正在等待分类建议。")
         : React.createElement(

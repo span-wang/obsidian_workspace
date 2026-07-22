@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import PurePosixPath
 
 from domain.evidence import EvidenceLocator, ParseEvidence, StructuredContentUnit
@@ -142,6 +142,7 @@ class NativeMarkdownProposal:
     content_sha256: str
     markdown: str
     heading_locations: tuple[str, ...]
+    revision: int = 1
     kind: str = "native"
 
     def to_dict(self) -> dict[str, object]:
@@ -153,6 +154,7 @@ class NativeMarkdownProposal:
             "content_sha256": self.content_sha256,
             "markdown": self.markdown,
             "heading_locations": list(self.heading_locations),
+            "revision": self.revision,
         }
 
 
@@ -275,6 +277,19 @@ def relocate_derived_proposal(
     )
 
 
+def relocate_native_proposal(
+    proposal: NativeMarkdownProposal, *, target_folder: str, filename: str
+) -> NativeMarkdownProposal:
+    target_folder = _normalize_relative_path(target_folder)
+    if "/" in filename or "\\" in filename or filename in {"", ".", ".."}:
+        raise ValueError("Filename must be a single relative path segment.")
+    return replace(
+        proposal,
+        relative_path=(PurePosixPath(target_folder) / filename).as_posix(),
+        revision=proposal.revision + 1,
+    )
+
+
 def native_markdown_proposal(
     *, item_id: int, vault_id: str, relative_path: str, content_sha256: str, markdown: str
 ) -> NativeMarkdownProposal:
@@ -348,6 +363,7 @@ def proposal_from_dict(value: dict[str, object]) -> NoteProposal:
             content_sha256=str(value["content_sha256"]),
             markdown=str(value["markdown"]),
             heading_locations=tuple(str(location) for location in list(value["heading_locations"])),
+            revision=int(value.get("revision", 1)),
         )
     return DerivedMarkdownProposal.from_dict(value)
 

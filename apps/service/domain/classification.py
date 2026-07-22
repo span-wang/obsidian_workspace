@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, replace
+from hashlib import sha256
 from pathlib import PurePosixPath
 
 from domain.derived_notes import DerivedMarkdownProposal, NoteProposal
@@ -9,6 +11,15 @@ from domain.derived_notes import DerivedMarkdownProposal, NoteProposal
 
 LOW_CONFIDENCE_THRESHOLD = 0.75
 _SAFE_FILENAME = re.compile(r"[^a-zA-Z0-9._-]+")
+_WINDOWS_RESERVED_FILENAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{number}" for number in range(1, 10)),
+    *(f"LPT{number}" for number in range(1, 10)),
+}
+_WINDOWS_INVALID_FILENAME_CHARACTERS = frozenset('<>:"/\\|?*')
 _DOMAIN_RULES = (
     ("mathematics", ("algebra", "equation", "geometry", "calculus", "math", "数学", "代数")),
     ("language", ("english", "vocabulary", "grammar", "language", "英语", "词汇", "语法")),
@@ -142,9 +153,7 @@ def suggest_classification(
         item_id=proposal.item_id,
         revision=1,
         proposal_revision=getattr(proposal, "revision", 1),
-        proposal_content_sha256=(
-            proposal.source_sha256 if isinstance(proposal, DerivedMarkdownProposal) else proposal.content_sha256
-        ),
+        proposal_content_sha256=proposal_content_sha256(proposal),
         domain=domain,
         target_vault_id=target_vault_id,
         target_vault_label=target_vault_label,
@@ -161,6 +170,23 @@ def suggest_classification(
     )
     validate_target_within_managed_root(suggestion, managed_root)
     return suggestion
+
+
+def proposal_content_sha256(proposal: NoteProposal) -> str:
+    payload = json.dumps(proposal.to_dict(), ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return sha256(payload.encode("utf-8")).hexdigest()
+
+
+def validate_filename_for_proposal(proposal: NoteProposal, filename: str) -> None:
+    _validate_filename(filename)
+    original_filename = (
+        PurePosixPath(proposal.source_relative_path).name
+        if isinstance(proposal, DerivedMarkdownProposal)
+        else PurePosixPath(proposal.relative_path).name
+    )
+    original_suffix = PurePosixPath(original_filename).suffix.lower()
+    if original_suffix and PurePosixPath(filename).suffix.lower() != original_suffix:
+        raise ValueError("Filename must preserve the source extension.")
 
 
 def validate_target_within_managed_root(
@@ -248,8 +274,16 @@ def _normalize_relative_path(value: str) -> str:
 
 
 def _validate_filename(value: str) -> None:
-    if not value or "/" in value or "\\" in value or value in {".", ".."}:
+    if (
+        not value
+        or value in {".", ".."}
+        or value[-1] in {".", " "}
+        or any(character in _WINDOWS_INVALID_FILENAME_CHARACTERS or ord(character) < 32 for character in value)
+    ):
         raise ValueError("Filename must not contain a path.")
+    stem = value.split(".", maxsplit=1)[0].upper()
+    if stem in _WINDOWS_RESERVED_FILENAMES:
+        raise ValueError("Filename is reserved by Windows.")
 
 
 def _required_text(value: str, message: str) -> str:

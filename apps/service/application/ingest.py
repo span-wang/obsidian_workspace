@@ -13,12 +13,16 @@ from domain.derived_notes import (
     native_markdown_proposal,
     proposal_from_dict,
     relocate_derived_proposal,
+    relocate_native_proposal,
     split_note_at_unit,
 )
 from domain.classification import (
     ClassificationSuggestion,
+    LOW_CONFIDENCE_THRESHOLD,
+    proposal_content_sha256,
     revise_classification,
     suggest_classification,
+    validate_filename_for_proposal,
     validate_target_within_managed_root,
 )
 from domain.metadata_tags import (
@@ -861,11 +865,7 @@ class ImportTaskService:
         for proposal in self.repository.list_note_proposals(task.task_id):
             existing = self.repository.get_classification_suggestion(proposal.item_id)
             proposal_revision = getattr(proposal, "revision", 1)
-            proposal_hash = (
-                proposal.source_sha256
-                if isinstance(proposal, DerivedMarkdownProposal)
-                else proposal.content_sha256
-            )
+            proposal_hash = proposal_content_sha256(proposal)
             if (
                 existing is not None
                 and existing.target_vault_id == task.vault_id
@@ -959,6 +959,8 @@ class ImportTaskService:
             raise ImportTaskError("Classification proposals cannot change the import task vault.")
         if suggestion.proposal_revision != getattr(proposal, "revision", 1):
             raise ImportTaskError("The classification proposal is stale and must be regenerated.")
+        if suggestion.proposal_content_sha256 != proposal_content_sha256(proposal):
+            raise ImportTaskError("The classification proposal content is stale and must be regenerated.")
         return task, vault, suggestion, proposal
 
     def list_note_proposals(self, task_id: str):
@@ -1115,6 +1117,7 @@ class ImportTaskService:
     ) -> ImportTask:
         with self._state_lock:
             _, vault, suggestion, proposal = self._classification_context(task_id, item_id)
+            validate_filename_for_proposal(proposal, filename)
             revised = revise_classification(
                 suggestion,
                 proposal_revision=getattr(proposal, "revision", 1),
@@ -1130,11 +1133,16 @@ class ImportTaskService:
                 revised_proposal = relocate_derived_proposal(
                     proposal, target_folder=target_folder, filename=filename
                 )
-                self.repository.record_note_proposal(item_id, revised_proposal)
-            revised = replace(revised, proposal_revision=getattr(revised_proposal, "revision", 1))
-            updated = self.repository.record_classification_suggestion(
-                item_id, revised, "classification-revised"
+            else:
+                revised_proposal = relocate_native_proposal(
+                    proposal, target_folder=target_folder, filename=filename
+                )
+            revised = replace(
+                revised,
+                proposal_revision=getattr(revised_proposal, "revision", 1),
+                proposal_content_sha256=proposal_content_sha256(revised_proposal),
             )
+            updated = self.repository.record_classification_revision(item_id, revised_proposal, revised)
             self._ensure_metadata_tag_proposals(updated)
             return self.get(task_id)
 
@@ -1154,8 +1162,11 @@ class ImportTaskService:
             self._require_classification_review_task(task)
             self._available_vault(task.vault_id)
             accepted = False
-            for suggestion in self.repository.list_classification_suggestions(task_id):
-                if suggestion.decision is not None or suggestion.requires_review:
+            for candidate in self.repository.list_classification_suggestions(task_id):
+                if candidate.decision is not None or candidate.confidence < LOW_CONFIDENCE_THRESHOLD:
+                    continue
+                _, _, suggestion, _ = self._classification_context(task_id, candidate.item_id)
+                if suggestion.decision is not None or suggestion.confidence < LOW_CONFIDENCE_THRESHOLD:
                     continue
                 self.repository.record_classification_suggestion(
                     suggestion.item_id,

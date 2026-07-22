@@ -31,11 +31,13 @@ def _derived_proposal():
 
 
 def test_suggestion_classifies_private_derived_proposal_in_its_task_vault() -> None:
-    from domain.classification import suggest_classification
+    from domain.classification import proposal_content_sha256, suggest_classification
+
+    proposal = _derived_proposal()
 
     suggestion = suggest_classification(
         task_id="task-1",
-        proposal=_derived_proposal(),
+        proposal=proposal,
         target_vault_id="vault-1",
         target_vault_label="Study vault",
         managed_root="platform",
@@ -49,7 +51,7 @@ def test_suggestion_classifies_private_derived_proposal_in_its_task_vault() -> N
     assert suggestion.confidence == 0.9
     assert suggestion.status == "pending"
     assert suggestion.proposal_revision == 1
-    assert suggestion.proposal_content_sha256 == "a" * 64
+    assert suggestion.proposal_content_sha256 == proposal_content_sha256(proposal)
 
 
 def test_unknown_content_requires_explicit_classification_review() -> None:
@@ -85,6 +87,9 @@ def test_unknown_content_requires_explicit_classification_review() -> None:
         ("platform/notes/../math", "book.pdf"),
         ("platform/notes/math", "../book.pdf"),
         ("platform/notes/math", ""),
+        ("platform/notes/math", "C:.pdf"),
+        ("platform/notes/math", "CON.pdf"),
+        ("platform/notes/math", "book.pdf "),
     ],
 )
 def test_suggestion_rejects_unsafe_target_paths(target_folder: str, filename: str) -> None:
