@@ -82,6 +82,157 @@ test("serves the workbench and its API requests from the fixed loopback origin",
   expect(sessionRequests).toEqual([`${baseUrl}/api/session`]);
 });
 
+test("uses the current-vault graph as the default workbench without widening other scopes", async ({ page }) => {
+  const firstVault = {
+    vault_id: "vault-graph-first",
+    path: "C:\\fixture\\First Graph Vault",
+    authorization_status: "active",
+    access_status: "available",
+    is_current: true,
+    index: { status: "stale", current_count: 2, stale_count: 1, failure_count: 0, pending_count: 0, failed_paths: [], stale_paths: ["notes/old.md"], semantic_status: "unavailable" }
+  };
+  const secondVault = { ...firstVault, vault_id: "vault-graph-second", path: "C:\\fixture\\Second Graph Vault", is_current: false };
+  const primaryGraph = {
+    vault_id: firstVault.vault_id,
+    nodes: [
+      { relative_path: "notes/one.md", title: "one", directory: "notes", tags: ["math"], source: "native" },
+      { relative_path: "notes/two.md", title: "two", directory: "notes", tags: [], source: "derived" }
+    ],
+    edges: [
+      { source_path: "notes/one.md", target_path: "notes/two.md", kind: "confirmed", status: "confirmed" },
+      { source_path: "notes/two.md", target_path: "notes/one.md", kind: "candidate", status: "pending", review_item_id: "candidate-1", reason: "Shared evidence.", evidence: [{ relative_path: "notes/two.md", location: "line:1", source_locations: ["page:1"] }] }
+    ],
+    directories: ["notes"],
+    tags: ["math"],
+    index: firstVault.index
+  };
+  const secondGraph = { ...primaryGraph, vault_id: secondVault.vault_id, nodes: [{ relative_path: "notes/other.md", title: "other", directory: "notes", tags: [], source: "native" }], edges: [] };
+  const refreshedGraph = {
+    ...primaryGraph,
+    index: { ...firstVault.index, status: "failed", failure_count: 1, failed_paths: ["notes/two.md"] }
+  };
+  const graphRequests = [];
+  let graphRefreshSent = false;
+
+  await page.route("**/api/vaults/vault-graph-first/graph**", async (route) => {
+    graphRequests.push(route.request().url());
+    const graph = route.request().url().includes("relationship_state=candidate")
+      ? { ...primaryGraph, nodes: primaryGraph.nodes, edges: [primaryGraph.edges[1]] }
+      : graphRefreshSent ? refreshedGraph : primaryGraph;
+    await route.fulfill({ json: { graph } });
+  });
+  await page.route("**/api/vaults/vault-graph-second/graph**", async (route) => {
+    graphRequests.push(route.request().url());
+    const graph = route.request().url().includes("relationship_state=")
+      ? { ...secondGraph, nodes: [], edges: [] }
+      : secondGraph;
+    await route.fulfill({ json: { graph } });
+  });
+  await page.route("**/api/vaults/vault-graph-second/current", async (route) => {
+    await route.fulfill({ json: { vault: { ...secondVault, is_current: true } } });
+  });
+  await page.route("**/api/vaults/*/graph/events", async (route) => {
+    const body = graphRefreshSent
+      ? ": connected\n\n"
+      : "event: graph-refresh\ndata: {\"reason\":\"changed\"}\n\n";
+    graphRefreshSent = true;
+    await route.fulfill({ contentType: "text/event-stream", body });
+  });
+  await page.route("**/api/vaults", async (route) => {
+    await route.fulfill({ json: { vaults: [firstVault, secondVault] } });
+  });
+
+  await page.goto("/");
+  await expect(page.getByLabel("图谱节点").getByRole("button", { name: /one/ })).toBeVisible();
+  await expect.poll(() => graphRequests.filter((url) => url.includes("/api/vaults/vault-graph-first/graph") && !url.includes("/events")).length).toBeGreaterThanOrEqual(2);
+  await expect(page.getByText("已确认（实线）：notes/one.md -> notes/two.md")).toBeVisible();
+  await expect(page.getByText("失败对象：notes/two.md")).toBeVisible();
+  const candidate = page.getByRole("button", { name: "候选（虚线）：notes/two.md -> notes/one.md" });
+  await candidate.focus();
+  await expect(candidate).toBeFocused();
+  await page.getByLabel("按关系状态筛选图谱").selectOption("candidate");
+  await expect(page.getByText("候选（虚线）：notes/two.md -> notes/one.md")).toBeVisible();
+  await expect(graphRequests.at(-1)).toContain("relationship_state=candidate");
+  await page.getByLabel("当前 vault").selectOption("vault-graph-second");
+  await expect(page.getByRole("button", { name: /other/ })).toBeVisible();
+  expect(graphRequests.at(-1)).not.toContain("relationship_state=");
+  await expect(page.getByText("notes/one.md")).toHaveCount(0);
+});
+
+test("does not render a stale graph while a vault switch is completing", async ({ page }) => {
+  const firstVault = {
+    vault_id: "vault-race-first",
+    path: "C:\\fixture\\First Race Vault",
+    authorization_status: "active",
+    access_status: "available",
+    is_current: true,
+    index: { status: "healthy", current_count: 1, stale_count: 0, failure_count: 0, pending_count: 0, failed_paths: [], stale_paths: [], semantic_status: "unavailable" }
+  };
+  const secondVault = { ...firstVault, vault_id: "vault-race-second", path: "C:\\fixture\\Second Race Vault", is_current: false };
+  const firstGraph = {
+    vault_id: firstVault.vault_id,
+    nodes: [{ relative_path: "notes/first.md", title: "first", directory: "first-directory", tags: [], source: "native" }],
+    edges: [],
+    directories: ["first-directory"],
+    tags: [],
+    index: firstVault.index
+  };
+  const secondGraph = {
+    ...firstGraph,
+    vault_id: secondVault.vault_id,
+    nodes: [{ relative_path: "notes/second.md", title: "second", directory: "second-directory", tags: [], source: "native" }],
+    directories: ["second-directory"],
+    index: secondVault.index
+  };
+  let releaseFirstGraph;
+  let releaseSecondGraph;
+  let releaseSwitch;
+
+  await page.route("**/api/vaults/vault-race-first/graph**", async (route) => {
+    await new Promise((resolve) => {
+      releaseFirstGraph = async () => {
+        await route.fulfill({ json: { graph: firstGraph } });
+        resolve();
+      };
+    });
+  });
+  await page.route("**/api/vaults/vault-race-second/graph**", async (route) => {
+    await new Promise((resolve) => {
+      releaseSecondGraph = async () => {
+        await route.fulfill({ json: { graph: secondGraph } });
+        resolve();
+      };
+    });
+  });
+  await page.route("**/api/vaults/vault-race-second/current", async (route) => {
+    await new Promise((resolve) => {
+      releaseSwitch = async () => {
+        await route.fulfill({ json: { vault: { ...secondVault, is_current: true } } });
+        resolve();
+      };
+    });
+  });
+  await page.route("**/api/vaults/*/graph/events", async (route) => {
+    await route.fulfill({ contentType: "text/event-stream", body: ": connected\n\n" });
+  });
+  await page.route("**/api/vaults", async (route) => {
+    await route.fulfill({ json: { vaults: [firstVault, secondVault] } });
+  });
+
+  await page.goto("/");
+  await expect.poll(() => Boolean(releaseFirstGraph)).toBe(true);
+  await page.getByLabel("当前 vault").selectOption(secondVault.vault_id);
+  await expect.poll(() => Boolean(releaseSwitch)).toBe(true);
+  await releaseFirstGraph();
+  await releaseSwitch();
+  await expect(page.getByLabel("当前 vault")).toHaveValue(secondVault.vault_id);
+  await expect(page.getByLabel("图谱节点").getByRole("button", { name: "first" })).toHaveCount(0);
+  await expect(page.getByLabel("按目录筛选图谱").getByRole("option", { name: "first-directory" })).toHaveCount(0);
+  await expect.poll(() => Boolean(releaseSecondGraph)).toBe(true);
+  await releaseSecondGraph();
+  await expect(page.getByRole("button", { name: /second/ })).toBeVisible();
+});
+
 test("uses a keyboard-accessible single navigation panel at narrow desktop widths", async ({ page }) => {
   await page.setViewportSize({ width: 1000, height: 800 });
   await page.goto("/");
@@ -347,7 +498,7 @@ test("edits vault exclusions and keeps the outbound authorization state visible"
   await expect(page.getByText(/预览：Matched never-send-cloud/)).toBeVisible();
 });
 
-test("creates an import task from the workbench and shows its persistent scan snapshot", async ({ page }) => {
+test("creates an import task from materials and shows its persistent scan snapshot", async ({ page }) => {
   const vault = {
     vault_id: "vault-import",
     path: "C:\\fixture\\Import Vault",
@@ -592,6 +743,7 @@ test("creates an import task from the workbench and shows its persistent scan sn
 
   const eventSubscription = page.waitForRequest("**/api/import-tasks/task-import/events?after=4");
   await page.goto("/");
+  await page.getByRole("link", { name: "资料", exact: true }).click();
   await expect(page.getByText("目标 vault：Import Vault")).toBeVisible();
   await page.getByRole("button", { name: "选择文件", exact: true }).click();
 

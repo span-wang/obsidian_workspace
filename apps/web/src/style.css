@@ -854,6 +854,131 @@ button:disabled {
   color: #8a1f1f;
 }
 
+.knowledge-graph-workbench {
+  display: grid;
+  gap: 16px;
+  margin-top: 24px;
+}
+
+.graph-filter-bar {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr)) auto;
+  gap: 8px;
+  padding: 12px 0;
+  border-top: 1px solid #d7d7d2;
+  border-bottom: 1px solid #d7d7d2;
+}
+
+.graph-filter-bar label {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+  color: #545454;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.graph-filter-bar select {
+  min-width: 0;
+  min-height: 40px;
+  padding: 0 8px;
+  border: 1px solid #8a8a84;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #111111;
+  font: inherit;
+  font-size: 14px;
+}
+
+.graph-filter-bar .secondary-button {
+  align-self: end;
+}
+
+.graph-status {
+  min-height: 20px;
+  margin: 0;
+  color: #545454;
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.graph-index-stale,
+.graph-index-not-initialized {
+  color: #8a5a00;
+}
+
+.graph-index-failed {
+  color: #8a1f1f;
+}
+
+.knowledge-graph {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 24px;
+  padding: 18px 0;
+  border-top: 1px solid #8a8a84;
+  border-bottom: 1px solid #d7d7d2;
+}
+
+.knowledge-graph h2,
+.graph-detail h2 {
+  margin: 0;
+  font-size: 17px;
+  line-height: 1.4;
+}
+
+.graph-node-list,
+.graph-edge-list {
+  display: grid;
+  gap: 8px;
+  padding: 0;
+  margin: 12px 0 0;
+  list-style: none;
+}
+
+.graph-node,
+.graph-edge {
+  display: grid;
+  width: 100%;
+  min-height: 44px;
+  gap: 3px;
+  padding: 8px 10px;
+  border: 1px solid #d7d7d2;
+  border-radius: 4px;
+  background: #ffffff;
+  color: #111111;
+  font: inherit;
+  font-size: 14px;
+  text-align: left;
+}
+
+.graph-node span {
+  color: #72726e;
+  font-size: 12px;
+}
+
+.graph-edge-confirmed {
+  border-style: solid;
+}
+
+.graph-edge-candidate {
+  border-style: dashed;
+}
+
+.graph-detail {
+  padding: 14px 0;
+  border-top: 1px solid #d7d7d2;
+  border-bottom: 1px solid #d7d7d2;
+}
+
+.graph-detail p {
+  margin: 8px 0 0;
+  color: #545454;
+  font-size: 14px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
 .commit-review-list,
 .review-summary {
   display: grid;
@@ -1012,6 +1137,15 @@ button:disabled {
 
   .progress-sequence span::after {
     display: none;
+  }
+
+  .graph-filter-bar,
+  .knowledge-graph {
+    grid-template-columns: 1fr;
+  }
+
+  .graph-filter-bar .secondary-button {
+    justify-self: start;
   }
 }
 

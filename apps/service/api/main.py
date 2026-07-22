@@ -6,12 +6,12 @@ import threading
 import time
 import webbrowser
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field
 from fastapi.responses import FileResponse, StreamingResponse
@@ -34,6 +34,7 @@ from application.directory_selections import DirectorySelectionError, DirectoryS
 from application.import_selections import ImportSelectionError, ImportSelectionStore
 from application.ingest import ImportTaskError, ImportTaskService
 from application.indexing import IndexingService
+from application.knowledge_graph import EmptyGraphCandidateRepository, KnowledgeGraphService
 from application.local_session import LocalSession, create_local_session
 from application.policies import (
     OutboundAuthorizationDenied,
@@ -136,6 +137,15 @@ class VaultPathCommand(BaseModel):
 
     selection_id: str
     managed_root: str = "platform"
+
+
+class KnowledgeGraphQuery(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    directory: str | None = None
+    tag: str | None = None
+    source: Literal["native", "derived"] | None = None
+    relationship_state: Literal["all", "confirmed", "candidate"] | None = None
 
 
 class PendingAssociationResolutionCommand(BaseModel):
@@ -533,6 +543,50 @@ def index_health_payload(health: IndexHealth) -> dict[str, object]:
         "stale_details": list(health.stale_details),
         "pending_count": health.pending_count,
         "pending_paths": list(health.pending_paths),
+    }
+
+
+def knowledge_graph_payload(graph) -> dict[str, object]:
+    def edge_payload(edge) -> dict[str, object]:
+        payload = {
+            "source_path": edge.source_path,
+            "target_path": edge.target_path,
+            "kind": edge.kind,
+            "status": edge.status,
+        }
+        if edge.kind == "candidate":
+            payload.update(
+                {
+                    "review_item_id": edge.review_item_id,
+                    "reason": edge.reason,
+                    "evidence": [
+                        {
+                            "relative_path": evidence.relative_path,
+                            "location": evidence.location,
+                            "source_locations": list(evidence.source_locations),
+                        }
+                        for evidence in edge.evidence
+                    ],
+                }
+            )
+        return payload
+
+    return {
+        "vault_id": graph.vault_id,
+        "nodes": [
+            {
+                "relative_path": node.relative_path,
+                "title": node.title,
+                "directory": node.directory,
+                "tags": list(node.tags),
+                "source": node.source,
+            }
+            for node in graph.nodes
+        ],
+        "edges": [edge_payload(edge) for edge in graph.edges],
+        "directories": list(graph.directories),
+        "tags": list(graph.tags),
+        "index": index_health_payload(graph.health),
     }
 
 
@@ -982,6 +1036,13 @@ def require_local_session(app: FastAPI, request: Request) -> str:
     return candidate
 
 
+def publish_graph_refresh(app: FastAPI, vault_id: str) -> None:
+    with app.state.graph_subscribers_lock:
+        subscribers = tuple(app.state.graph_subscribers.get(vault_id, ()))
+    for loop, queue in subscribers:
+        loop.call_soon_threadsafe(queue.put_nowait, "refresh")
+
+
 def vault_with_policy_payload(app: FastAPI, vault: Vault) -> dict[str, object]:
     policy = app.state.policy_service.get(vault.vault_id)
     payload = vault_payload(
@@ -1003,6 +1064,7 @@ def create_app(
     directory_selections: DirectorySelectionStore | None = None,
     import_task_service: ImportTaskService | None = None,
     indexing_service: IndexingService | None = None,
+    knowledge_graph_service: KnowledgeGraphService | None = None,
     import_picker: WindowsImportPicker | None = None,
     import_selections: ImportSelectionStore | None = None,
 ) -> FastAPI:
@@ -1011,6 +1073,8 @@ def create_app(
     app = FastAPI(title="Obsidian Personal Knowledge Platform")
     app.state.runtime = runtime
     app.state.local_session = create_local_session()
+    app.state.graph_subscribers = {}
+    app.state.graph_subscribers_lock = threading.Lock()
     if vault_service is None:
         repository = SqliteVaultRepository(runtime.data_directory / "vaults.sqlite3")
         vault_service = VaultService(
@@ -1052,6 +1116,11 @@ def create_app(
         )
         import_task_service.recover_interrupted_commits(recovered_tasks)
     app.state.import_task_service = import_task_service
+    app.state.knowledge_graph_service = knowledge_graph_service or KnowledgeGraphService(
+        app.state.vault_service,
+        app.state.indexing_service.repository,
+        getattr(app.state.import_task_service, "repository", EmptyGraphCandidateRepository()),
+    )
     app.state.indexing_service.reconcile_all()
 
     @app.exception_handler(StarletteHTTPException)
@@ -1462,13 +1531,11 @@ def create_app(
     ) -> dict[str, object]:
         require_local_session(app, request)
         try:
-            return {
-                "task": import_task_payload(
-                    app.state.import_task_service.decide_candidate_link_proposal(
-                        task_id, review_item_id, command.decision, command.reason
-                    )
-                )
-            }
+            task = app.state.import_task_service.decide_candidate_link_proposal(
+                task_id, review_item_id, command.decision, command.reason
+            )
+            publish_graph_refresh(app, task.vault_id)
+            return {"task": import_task_payload(task)}
         except Exception as error:
             raise import_task_error(error) from error
 
@@ -1519,6 +1586,7 @@ def create_app(
                 task_id, tuple(command.unit_ids) if command.unit_ids is not None else None
             )
             journals = app.state.import_task_service.list_commit_journals(task_id)
+            publish_graph_refresh(app, task.vault_id)
             return {
                 "task": import_task_payload(task),
                 "commit_journals": [commit_journal_payload(journal) for journal in journals],
@@ -1830,12 +1898,67 @@ def create_app(
         except Exception as error:
             raise vault_error(error) from error
 
+    @app.get("/api/vaults/{vault_id}/graph/events")
+    async def stream_vault_graph_events(request: Request, vault_id: str):
+        require_local_session(app, request)
+        try:
+            app.state.vault_service.get(vault_id)
+        except Exception as error:
+            raise vault_error(error) from error
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[str] = asyncio.Queue()
+        subscriber = (loop, queue)
+        with app.state.graph_subscribers_lock:
+            app.state.graph_subscribers.setdefault(vault_id, set()).add(subscriber)
+
+        async def events():
+            try:
+                yield ": connected\n\n"
+                while True:
+                    try:
+                        await asyncio.wait_for(queue.get(), timeout=15)
+                        yield 'event: graph-refresh\ndata: {"reason":"changed"}\n\n'
+                    except TimeoutError:
+                        yield ": keep-alive\n\n"
+            finally:
+                with app.state.graph_subscribers_lock:
+                    app.state.graph_subscribers.get(vault_id, set()).discard(subscriber)
+
+        return StreamingResponse(
+            events(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @app.get("/api/vaults/{vault_id}/graph")
+    def get_vault_graph(
+        request: Request,
+        vault_id: str,
+        filters: Annotated[KnowledgeGraphQuery, Query()],
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            return {
+                "graph": knowledge_graph_payload(
+                    app.state.knowledge_graph_service.read(
+                        vault_id,
+                        directory=filters.directory,
+                        tag=filters.tag,
+                        source=filters.source,
+                        relationship_state=filters.relationship_state,
+                    )
+                )
+            }
+        except Exception as error:
+            raise vault_error(error) from error
+
     @app.post("/api/vaults/{vault_id}/index/reconcile")
     def reconcile_vault_index(request: Request, vault_id: str) -> dict[str, object]:
         require_local_session(app, request)
         try:
             health = app.state.indexing_service.reconcile(vault_id)
             vault = app.state.vault_service.get(vault_id)
+            publish_graph_refresh(app, vault_id)
             return {"vault": vault_with_policy_payload(app, vault), "index": index_health_payload(health)}
         except Exception as error:
             raise vault_error(error) from error
@@ -1846,6 +1969,7 @@ def create_app(
         try:
             health = app.state.indexing_service.retry(vault_id)
             vault = app.state.vault_service.get(vault_id)
+            publish_graph_refresh(app, vault_id)
             return {"vault": vault_with_policy_payload(app, vault), "index": index_health_payload(health)}
         except Exception as error:
             raise vault_error(error) from error
@@ -1856,6 +1980,7 @@ def create_app(
         try:
             health = app.state.indexing_service.rebuild(vault_id)
             vault = app.state.vault_service.get(vault_id)
+            publish_graph_refresh(app, vault_id)
             return {"vault": vault_with_policy_payload(app, vault), "index": index_health_payload(health)}
         except Exception as error:
             raise vault_error(error) from error
@@ -1870,6 +1995,7 @@ def create_app(
                 vault_id, command.relative_path, command.resolution
             )
             vault = app.state.vault_service.get(vault_id)
+            publish_graph_refresh(app, vault_id)
             return {"vault": vault_with_policy_payload(app, vault), "index": index_health_payload(health)}
         except Exception as error:
             raise vault_error(error) from error

@@ -1240,6 +1240,28 @@ class SqliteImportTaskRepository:
             ).fetchall()
         return [self._candidate_link_from_row(row) for row in rows]
 
+    def list_candidate_link_proposals_for_vault(self, vault_id: str) -> list[CandidateLinkProposal]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT proposal.proposal_json, proposal.invalidated_at, proposal.invalidation_reason
+                FROM import_candidate_link_proposals AS proposal
+                JOIN (
+                    SELECT task_id, review_item_id, MAX(revision) AS revision
+                    FROM import_candidate_link_proposals
+                    WHERE vault_id = ?
+                    GROUP BY task_id, review_item_id
+                ) AS latest
+                  ON latest.task_id = proposal.task_id
+                    AND latest.review_item_id = proposal.review_item_id
+                    AND latest.revision = proposal.revision
+                WHERE proposal.vault_id = ?
+                ORDER BY proposal.source_item_id, proposal.target_item_id, proposal.review_item_id
+                """,
+                (vault_id, vault_id),
+            ).fetchall()
+        return [self._candidate_link_from_row(row) for row in rows]
+
     @staticmethod
     def _candidate_link_from_row(row: sqlite3.Row) -> CandidateLinkProposal:
         proposal = CandidateLinkProposal.from_dict(json.loads(row["proposal_json"]))

@@ -959,6 +959,187 @@ export function VaultIndexStatus({ vault, onUpdate }) {
   );
 }
 
+export function KnowledgeGraphWorkbench({ vaults, currentVault, isLoading, onAddVault, onUpdateVault }) {
+  const [graph, setGraph] = React.useState(null);
+  const [status, setStatus] = React.useState("");
+  const [directory, setDirectory] = React.useState("");
+  const [tag, setTag] = React.useState("");
+  const [source, setSource] = React.useState("");
+  const [relationshipState, setRelationshipState] = React.useState("");
+  const [selected, setSelected] = React.useState(null);
+  const [refreshRevision, setRefreshRevision] = React.useState(0);
+  const graphRequestRevision = React.useRef(0);
+  const vaultSwitchRevision = React.useRef(0);
+
+  React.useEffect(() => {
+    const requestRevision = ++graphRequestRevision.current;
+    if (!currentVault) {
+      setGraph(null);
+      setSelected(null);
+      return undefined;
+    }
+    const parameters = new window.URLSearchParams();
+    if (directory) parameters.set("directory", directory);
+    if (tag) parameters.set("tag", tag);
+    if (source) parameters.set("source", source);
+    if (relationshipState) parameters.set("relationship_state", relationshipState);
+    let active = true;
+    setGraph(null);
+    setSelected(null);
+    setStatus("正在读取当前 vault 图谱。");
+    requestJson(`${VAULTS_ENDPOINT}/${currentVault.vault_id}/graph?${parameters}`)
+      .then((response) => {
+        if (
+          !active
+          || requestRevision !== graphRequestRevision.current
+          || response.graph.vault_id !== currentVault.vault_id
+        ) return;
+        setGraph(response.graph);
+        setStatus(response.graph.index.status === "healthy" ? "图谱已更新。" : "图谱包含不完整的索引状态。");
+      })
+      .catch((error) => {
+        if (!active || requestRevision !== graphRequestRevision.current) return;
+        setGraph(null);
+        setStatus(error.message);
+      });
+    return () => { active = false; };
+  }, [currentVault?.vault_id, directory, tag, source, relationshipState, refreshRevision]);
+
+  React.useEffect(() => {
+    if (!currentVault) return undefined;
+    const eventSource = new window.EventSource(`${VAULTS_ENDPOINT}/${currentVault.vault_id}/graph/events`);
+    eventSource.addEventListener("graph-refresh", () => {
+      setStatus("图谱状态已变化，正在刷新。");
+      setRefreshRevision((current) => current + 1);
+    });
+    return () => eventSource.close();
+  }, [currentVault?.vault_id]);
+
+  if (isLoading) {
+    return React.createElement("p", { className: "empty-state", role: "status" }, "正在加载 vault 授权。");
+  }
+  if (!currentVault) {
+    return React.createElement(
+      "section",
+      { className: "workspace-section graph-empty", "aria-label": "知识图谱" },
+      React.createElement("p", { className: "section-label" }, "当前 vault 图谱"),
+      React.createElement("p", { className: "empty-state" }, "添加 vault 后即可浏览已提交的知识图谱。"),
+      React.createElement("button", { className: "primary-button", type: "button", onClick: onAddVault }, "添加 vault")
+    );
+  }
+
+  async function selectVault(event) {
+    const vaultId = event.target.value;
+    if (!vaultId || vaultId === currentVault.vault_id) return;
+    const switchRevision = ++vaultSwitchRevision.current;
+    setGraph(null);
+    setSelected(null);
+    setStatus("正在切换当前 vault 并替换图谱。");
+    try {
+      const response = await requestJson(`${VAULTS_ENDPOINT}/${vaultId}/current`, { method: "POST" });
+      if (switchRevision !== vaultSwitchRevision.current) return;
+      setDirectory("");
+      setTag("");
+      setSource("");
+      setRelationshipState("");
+      onUpdateVault(response.vault);
+    } catch (error) {
+      if (switchRevision !== vaultSwitchRevision.current) return;
+      setStatus(error.message);
+    }
+  }
+
+  function clearFilters() {
+    setDirectory("");
+    setTag("");
+    setSource("");
+    setRelationshipState("");
+  }
+
+  function updateIndexVault(vault) {
+    onUpdateVault(vault);
+    setStatus("索引状态已更新，正在刷新图谱。");
+    setRefreshRevision((current) => current + 1);
+  }
+
+  const currentGraph = graph?.vault_id === currentVault.vault_id ? graph : null;
+  const index = currentGraph?.index || currentVault.index || { status: "not-initialized" };
+  const indexSummary = index.status === "healthy"
+    ? "索引健康，图谱只显示当前可验证的已提交知识。"
+    : `索引状态：${index.status}；此图谱不是当前完整知识视图。`;
+  const selectedNode = selected?.type === "node" ? currentGraph?.nodes.find((node) => node.relative_path === selected.path) : null;
+  const selectedEdge = selected?.type === "edge" ? currentGraph?.edges[selected.index] : null;
+
+  return React.createElement(
+    "section",
+    { className: "knowledge-graph-workbench", "aria-label": "知识图谱" },
+    React.createElement("p", { className: "scope-summary" }, `当前 vault：${vaultName(currentVault)}；图谱筛选不会改变会话、任务或检索范围。`),
+    React.createElement(
+      "div",
+      { className: "graph-filter-bar" },
+      React.createElement(
+        "label",
+        null,
+        "当前 vault",
+        React.createElement("select", { "aria-label": "当前 vault", value: currentVault.vault_id, onChange: selectVault }, vaults.map((vault) => React.createElement("option", { key: vault.vault_id, value: vault.vault_id }, vaultName(vault))))
+      ),
+      React.createElement(
+        "label",
+        null,
+        "目录",
+        React.createElement("select", { "aria-label": "按目录筛选图谱", value: directory, onChange: (event) => setDirectory(event.target.value) }, [React.createElement("option", { key: "all", value: "" }, "全部目录"), ...(currentGraph?.directories || []).map((value) => React.createElement("option", { key: value, value }, value))])
+      ),
+      React.createElement(
+        "label",
+        null,
+        "标签",
+        React.createElement("select", { "aria-label": "按标签筛选图谱", value: tag, onChange: (event) => setTag(event.target.value) }, [React.createElement("option", { key: "all", value: "" }, "全部标签"), ...(currentGraph?.tags || []).map((value) => React.createElement("option", { key: value, value }, value))])
+      ),
+      React.createElement(
+        "label",
+        null,
+        "来源",
+        React.createElement("select", { "aria-label": "按来源筛选图谱", value: source, onChange: (event) => setSource(event.target.value) }, React.createElement("option", { value: "" }, "全部来源"), React.createElement("option", { value: "native" }, "原生 Markdown"), React.createElement("option", { value: "derived" }, "派生资料"))
+      ),
+      React.createElement(
+        "label",
+        null,
+        "关系状态",
+        React.createElement("select", { "aria-label": "按关系状态筛选图谱", value: relationshipState, onChange: (event) => setRelationshipState(event.target.value) }, React.createElement("option", { value: "" }, "全部关系"), React.createElement("option", { value: "confirmed" }, "已确认"), React.createElement("option", { value: "candidate" }, "候选"))
+      ),
+      React.createElement("button", { className: "secondary-button", type: "button", onClick: clearFilters }, "清除筛选")
+    ),
+    React.createElement("p", { className: "graph-status", role: "status", "aria-live": "polite" }, status),
+    React.createElement("p", { className: `status-marker graph-index-${index.status}` }, indexSummary),
+    React.createElement(VaultIndexStatus, { vault: { ...currentVault, index }, onUpdate: updateIndexVault }),
+    currentGraph && !currentGraph.nodes.length
+      ? React.createElement("p", { className: "empty-state" }, "没有符合当前筛选的图谱节点。")
+      : null,
+    currentGraph
+      ? React.createElement(
+        "div",
+        { className: "knowledge-graph" },
+        React.createElement(
+          "section",
+          { "aria-label": "图谱节点" },
+          React.createElement("h2", null, "节点"),
+          React.createElement("p", { className: "row-note" }, "节点均为当前 vault 中已提交、可验证的 Markdown。"),
+          React.createElement("ul", { className: "graph-node-list" }, currentGraph.nodes.map((node) => React.createElement("li", { key: node.relative_path }, React.createElement("button", { className: "graph-node", type: "button", "aria-expanded": selectedNode?.relative_path === node.relative_path, onClick: () => setSelected({ type: "node", path: node.relative_path }) }, node.title, React.createElement("span", null, `目录：${node.directory}；来源：${node.source === "native" ? "原生" : "派生"}`))))),
+        ),
+        React.createElement(
+          "section",
+          { "aria-label": "图谱关系" },
+          React.createElement("h2", null, "关系"),
+          React.createElement("p", { className: "row-note" }, "已确认：实线；候选：虚线。候选关系尚未写入 vault。"),
+          React.createElement("ul", { className: "graph-edge-list" }, currentGraph.edges.map((edge, indexValue) => React.createElement("li", { key: `${edge.kind}:${edge.source_path}:${edge.target_path}:${edge.review_item_id || ""}` }, React.createElement("button", { className: `graph-edge graph-edge-${edge.kind}`, type: "button", "aria-expanded": selectedEdge === edge, onClick: () => setSelected({ type: "edge", index: indexValue }) }, `${edge.kind === "confirmed" ? "已确认（实线）" : "候选（虚线）"}：${edge.source_path} -> ${edge.target_path}`))))
+        )
+      )
+      : null,
+    selectedNode ? React.createElement("section", { className: "graph-detail", "aria-label": "节点详情", tabIndex: -1 }, React.createElement("h2", null, selectedNode.title), React.createElement("p", null, `路径：${selectedNode.relative_path}`), React.createElement("p", null, `标签：${selectedNode.tags.join("、") || "无"}`)) : null,
+    selectedEdge ? React.createElement("section", { className: "graph-detail", "aria-label": "关系详情", tabIndex: -1 }, React.createElement("h2", null, selectedEdge.kind === "confirmed" ? "已确认关系" : "候选关系"), React.createElement("p", null, `${selectedEdge.source_path} -> ${selectedEdge.target_path}`), selectedEdge.kind === "candidate" ? React.createElement(React.Fragment, null, React.createElement("p", null, `审核项：${selectedEdge.review_item_id}；状态：${selectedEdge.status}`), React.createElement("p", null, `理由：${selectedEdge.reason}`), React.createElement("p", null, `证据位置：${selectedEdge.evidence.map((evidence) => `${evidence.relative_path} ${evidence.location}`).join("；")}`)) : null) : null
+  );
+}
+
 function VaultDetail({ vault, onBack, onUpdate, onRelink, onConfirm }) {
   const [status, setStatus] = React.useState("");
 
@@ -2800,6 +2981,14 @@ export function App() {
       onTaskChanged: updateTask,
       onTaskSnapshot: syncTask,
       vault: currentVault
+    });
+  } else if (activeDestination === "workbench") {
+    workspaceContent = React.createElement(KnowledgeGraphWorkbench, {
+      vaults,
+      currentVault,
+      isLoading: vaultsLoading,
+      onAddVault: () => setFormVault(null),
+      onUpdateVault: updateVault
     });
   } else if (VAULT_SURFACES.has(activeDestination)) {
     workspaceContent = React.createElement(

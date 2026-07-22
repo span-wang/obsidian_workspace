@@ -12,6 +12,7 @@ import {
   ImportTaskCenter,
   IMPORT_TASK_EVENT_NAMES,
   IMPORT_TASKS_ENDPOINT,
+  KnowledgeGraphWorkbench,
   LOCAL_SESSION_ENDPOINT,
   NAVIGATION_DESTINATIONS,
   PROVIDERS_ENDPOINT,
@@ -170,4 +171,19 @@ test("renders index health and explicit recovery controls without exposing conte
   assert.match(markup, /确认重新关联/);
   assert.match(markup, /核对变更/);
   assert.match(markup, /重建索引/);
+});
+
+test("renders the current-vault graph controls with non-color relationship states", () => {
+  const markup = renderToStaticMarkup(
+    React.createElement(KnowledgeGraphWorkbench, {
+      vaults: [],
+      currentVault: null,
+      isLoading: false,
+      onAddVault: () => {},
+      onUpdateVault: () => {}
+    })
+  );
+
+  assert.match(markup, /添加 vault/);
+  assert.match(markup, /知识图谱/);
 });

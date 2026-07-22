@@ -1,11 +1,14 @@
 import asyncio
 import json
+import threading
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import urlsplit
 
 from adapters.windows_directory_picker import WindowsDirectoryPicker
 from application.providers import utc_now
-from api.main import create_app
+from api.main import create_app, publish_graph_refresh
 from api.runtime import RuntimeState
 from domain.providers import ModelSelection, ProbeResult, Provider, ProviderModel, ProviderProbeResults, ResolvedProviderModel
 
@@ -133,6 +136,7 @@ def select_directory(app, cookie: str) -> str:
 
 
 def asgi_request(app, method: str, path: str, *, body: dict[str, object] | None = None, cookie: str = ""):
+    target = urlsplit(path)
     request_body = json.dumps(body).encode() if body is not None else b""
     messages: list[dict[str, object]] = []
     sent = False
@@ -156,9 +160,9 @@ def asgi_request(app, method: str, path: str, *, body: dict[str, object] | None 
         "http_version": "1.1",
         "method": method,
         "scheme": "http",
-        "path": path,
-        "raw_path": path.encode(),
-        "query_string": b"",
+        "path": target.path,
+        "raw_path": target.path.encode(),
+        "query_string": target.query.encode(),
         "headers": headers,
         "client": ("127.0.0.1", 10000),
         "server": ("127.0.0.1", 6240),
@@ -275,6 +279,93 @@ def test_vault_index_api_requires_the_local_session_and_returns_safe_health(tmp_
     assert json.loads(pending_body)["index"]["pending_count"] == 1
     assert resolution_status == 200
     assert json.loads(resolution_body)["index"]["pending_count"] == 0
+
+
+def test_vault_graph_api_is_session_protected_and_never_exposes_absolute_paths(tmp_path: Path) -> None:
+    vault_path = tmp_path / "vault"
+    vault_path.mkdir()
+    (vault_path / "one.md").write_text("# One\n[[two]]\n", encoding="utf-8")
+    (vault_path / "two.md").write_text("# Two\n", encoding="utf-8")
+    app = create_app_for_test(tmp_path, FakeDirectoryPicker(vault_path))
+    _, root_headers, _ = asgi_request(app, "GET", "/")
+    cookie = root_headers["set-cookie"].split(";", maxsplit=1)[0]
+    selection_id = select_directory(app, cookie)
+    _, _, created_body = asgi_request(
+        app,
+        "POST",
+        "/api/vaults",
+        body={"selection_id": selection_id, "managed_root": "platform"},
+        cookie=cookie,
+    )
+    vault_id = json.loads(created_body)["vault"]["vault_id"]
+    asgi_request(app, "POST", f"/api/vaults/{vault_id}/index/reconcile", cookie=cookie)
+
+    denied, _, _ = asgi_request(app, "GET", f"/api/vaults/{vault_id}/graph")
+    status, _, body = asgi_request(app, "GET", f"/api/vaults/{vault_id}/graph", cookie=cookie)
+    filtered_status, _, filtered_body = asgi_request(
+        app,
+        "GET",
+        f"/api/vaults/{vault_id}/graph?relationship_state=confirmed",
+        cookie=cookie,
+    )
+    invalid_status, _, _ = asgi_request(
+        app,
+        "GET",
+        f"/api/vaults/{vault_id}/graph?unknown_filter=blocked",
+        cookie=cookie,
+    )
+    event_status, event_headers, event_body = asgi_request(
+        app,
+        "GET",
+        f"/api/vaults/{vault_id}/graph/events",
+        cookie=cookie,
+    )
+    graph = json.loads(body)["graph"]
+    filtered_graph = json.loads(filtered_body)["graph"]
+
+    assert denied == 403
+    assert status == 200
+    assert filtered_status == 200
+    assert invalid_status == 422
+    assert event_status == 200
+    assert event_headers["cache-control"] == "no-cache"
+    assert event_headers["x-accel-buffering"] == "no"
+    assert event_body == b": connected\n\n"
+    assert [node["relative_path"] for node in graph["nodes"]] == ["one.md", "two.md"]
+    assert graph["edges"] == [{"source_path": "one.md", "target_path": "two.md", "kind": "confirmed", "status": "confirmed"}]
+    assert filtered_graph["edges"] == graph["edges"]
+    assert str(vault_path) not in body.decode()
+
+
+def test_graph_refresh_notifications_remain_vault_scoped() -> None:
+    class Queue:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        def put_nowait(self, message: str) -> None:
+            self.messages.append(message)
+
+    class Loop:
+        def call_soon_threadsafe(self, callback, *arguments) -> None:
+            callback(*arguments)
+
+    current_queue = Queue()
+    other_queue = Queue()
+    loop = Loop()
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            graph_subscribers={
+                "vault-current": {(loop, current_queue)},
+                "vault-other": {(loop, other_queue)},
+            },
+            graph_subscribers_lock=threading.Lock(),
+        )
+    )
+
+    publish_graph_refresh(app, "vault-current")
+
+    assert current_queue.messages == ["refresh"]
+    assert other_queue.messages == []
 
 
 def test_vault_policy_api_requires_the_local_session_and_previews_normalized_rules(
