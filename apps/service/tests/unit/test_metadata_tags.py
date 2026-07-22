@@ -119,3 +119,75 @@ def test_tag_change_preview_includes_every_affected_note_and_rejects_stale_catal
     changed = apply_tag_change(proposal, preview, "2026-07-22T00:01:00+00:00")
     assert changed.tags[0].name == "algebra"
     assert changed.revision == proposal.revision + 1
+
+
+def test_chinese_tags_are_valid_for_definitions_and_suggestions() -> None:
+    from domain.metadata_tags import TagDefinition, normalize_tag, suggest_metadata_tags
+
+    tag = TagDefinition("vault-1", "人工智能", "active", 0, 1, "2026-07-22T00:00:00+00:00")
+    proposal = suggest_metadata_tags(
+        task_id="task-1",
+        proposal=_derived_proposal(),
+        source_type="pdf",
+        source_file="algebra-workbook.pdf",
+        ingested_at="2026-07-22T00:00:00+00:00",
+        processing_status="waiting-for-review",
+        domain="机器学习",
+        domain_confidence=0.9,
+        existing_tags=(),
+    )
+
+    assert tag.name == "人工智能"
+    assert normalize_tag(" 知识 管理 ") == "知识-管理"
+    assert normalize_tag("AI/数学_101") == "ai/数学_101"
+    assert proposal.tags[0].name == "机器学习"
+    assert proposal.tags[0].is_new is True
+
+
+def test_chinese_tags_support_rename_and_merge_previews() -> None:
+    from domain.metadata_tags import TagDefinition, plan_tag_change, suggest_metadata_tags
+
+    proposal = suggest_metadata_tags(
+        task_id="task-1",
+        proposal=_derived_proposal(),
+        source_type="pdf",
+        source_file="algebra-workbook.pdf",
+        ingested_at="2026-07-22T00:00:00+00:00",
+        processing_status="waiting-for-review",
+        domain="机器学习",
+        domain_confidence=0.9,
+        existing_tags=(TagDefinition("vault-1", "机器学习", "active", 3, 1, "2026-07-22T00:00:00+00:00"),),
+    )
+
+    rename = plan_tag_change(
+        vault_id="vault-1",
+        operation="rename",
+        source_tag="机器学习",
+        target_tag="深度学习",
+        catalog_revision=1,
+        proposals=(proposal,),
+    )
+    merge = plan_tag_change(
+        vault_id="vault-1",
+        operation="merge",
+        source_tag="机器学习",
+        target_tag="深度学习",
+        catalog_revision=1,
+        proposals=(proposal,),
+    )
+
+    assert rename.target_tag == "深度学习"
+    assert rename.affected_paths
+    assert merge.operation == "merge"
+    assert merge.target_tag == "深度学习"
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", "  ", "机器学习！", "机器，学习", "café", "тег", "机器📚", "机器　学习"],
+)
+def test_tags_reject_empty_values_and_chinese_punctuation(value: str) -> None:
+    from domain.metadata_tags import normalize_tag
+
+    with pytest.raises(ValueError, match="Tags must use"):
+        normalize_tag(value)

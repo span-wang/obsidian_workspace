@@ -7,7 +7,7 @@ import re
 from domain.derived_notes import DerivedMarkdownProposal, NoteProposal
 
 
-_TAG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9/_-]*$")
+_TAG_PATTERN = re.compile(r"^[a-z0-9\u4e00-\u9fff][a-z0-9\u4e00-\u9fff/_-]*$")
 
 
 @dataclass(frozen=True)
@@ -383,7 +383,7 @@ def apply_tag_change(
 def normalize_tag(value: str) -> str:
     normalized = value.strip().lower().replace(" ", "-")
     if not _TAG_PATTERN.fullmatch(normalized):
-        raise ValueError("Tags must use lowercase letters, numbers, slash, underscore, or hyphen.")
+        raise ValueError("Tags must use lowercase letters, CJK unified ideographs, numbers, slash, underscore, or hyphen.")
     return normalized
 
 
