@@ -1233,7 +1233,26 @@ class ImportTaskService:
                 completed = replace(prepared, status="committed", created_at=utc_now())
                 self.repository.record_commit_journal(completed, "commit-unit-committed")
                 if self.index_service is not None:
-                    self.index_service.index_committed_unit(vault, unit)
+                    indexing_task = replace(
+                        self.get(task_id),
+                        lifecycle="running",
+                        phase="indexing",
+                        current_item_label=unit.source_label,
+                        updated_at=utc_now(),
+                    )
+                    self.repository.save(indexing_task, "indexing-started")
+                    try:
+                        self.index_service.index_committed_unit(vault, unit)
+                    except Exception as error:
+                        report_failure = getattr(self.index_service, "report_failure", None)
+                        if report_failure is not None:
+                            try:
+                                report_failure(vault.vault_id, "committed-unit", error)
+                            except Exception:
+                                pass
+                        self.repository.save(self.get(task_id), "indexing-failed")
+                    else:
+                        self.repository.save(self.get(task_id), "indexing-completed")
             current = self.get(task_id)
             if stale_failure_reason:
                 refreshed = self._record_stale_snapshot(current, snapshot, stale_failure_reason)

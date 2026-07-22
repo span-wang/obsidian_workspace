@@ -222,6 +222,61 @@ def test_vault_commands_persist_application_state_without_changing_existing_vaul
     assert existing_note.read_text(encoding="utf-8") == "keep me"
 
 
+def test_vault_index_api_requires_the_local_session_and_returns_safe_health(tmp_path: Path) -> None:
+    vault_path = tmp_path / "vault"
+    vault_path.mkdir()
+    (vault_path / "existing.md").write_text("# Keep local\n", encoding="utf-8")
+    app = create_app_for_test(tmp_path, FakeDirectoryPicker(vault_path))
+    _, root_headers, _ = asgi_request(app, "GET", "/")
+    cookie = root_headers["set-cookie"].split(";", maxsplit=1)[0]
+    selection_id = select_directory(app, cookie)
+    _, _, created_body = asgi_request(
+        app,
+        "POST",
+        "/api/vaults",
+        body={"selection_id": selection_id, "managed_root": "platform"},
+        cookie=cookie,
+    )
+    vault_id = json.loads(created_body)["vault"]["vault_id"]
+
+    denied, _, _ = asgi_request(app, "GET", f"/api/vaults/{vault_id}/index")
+    reconcile_status, _, reconcile_body = asgi_request(
+        app, "POST", f"/api/vaults/{vault_id}/index/reconcile", cookie=cookie
+    )
+    health_status, _, health_body = asgi_request(
+        app, "GET", f"/api/vaults/{vault_id}/index", cookie=cookie
+    )
+
+    health = json.loads(health_body)["index"]
+    assert denied == 403
+    assert reconcile_status == 200
+    assert json.loads(reconcile_body)["index"]["current_count"] == 1
+    assert health_status == 200
+    assert health["status"] == "healthy"
+    assert health["semantic_status"] == "unavailable"
+    assert all(str(vault_path) not in path for path in health["failed_paths"] + health["stale_paths"])
+
+    existing = vault_path / "existing.md"
+    existing.unlink()
+    replacement = vault_path / "replacement.md"
+    replacement.write_text("# Replacement\n", encoding="utf-8")
+    pending_status, _, pending_body = asgi_request(
+        app, "POST", f"/api/vaults/{vault_id}/index/reconcile", cookie=cookie
+    )
+    resolution_status, _, resolution_body = asgi_request(
+        app,
+        "POST",
+        f"/api/vaults/{vault_id}/index/associations",
+        body={"relative_path": "replacement.md", "resolution": "reassociate"},
+        cookie=cookie,
+    )
+
+    assert pending_status == 200
+    assert json.loads(pending_body)["index"]["pending_count"] == 1
+    assert resolution_status == 200
+    assert json.loads(resolution_body)["index"]["pending_count"] == 0
+
+
 def test_vault_policy_api_requires_the_local_session_and_previews_normalized_rules(
     tmp_path: Path,
 ) -> None:

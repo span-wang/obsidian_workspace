@@ -76,9 +76,9 @@ class FailingCommitter:
         raise OSError("simulated disk failure")
 
 
-def _service(tmp_path: Path, committer) -> tuple[ImportTaskService, object, Path]:
+def _service(tmp_path: Path, committer, index_service=None) -> tuple[ImportTaskService, object, Path]:
     vault_path = tmp_path / "vault"
-    vault_path.mkdir()
+    vault_path.mkdir(parents=True)
     source_file = tmp_path / "book.pdf"
     source_file.write_bytes(b"original PDF")
     vault_repository = SqliteVaultRepository(tmp_path / "vaults.sqlite3")
@@ -91,6 +91,7 @@ def _service(tmp_path: Path, committer) -> tuple[ImportTaskService, object, Path
         DerivingWorker(),
         source_repository=SqliteSourceRepository(database_path),
         vault_committer=committer,
+        index_service=index_service,
     )
     return service, vault, source_file
 
@@ -125,6 +126,55 @@ def test_commit_writes_source_and_derived_markdown_after_a_current_review_snapsh
         "prepared",
         "committed",
     ]
+
+
+def test_only_a_committed_unit_triggers_private_indexing(tmp_path: Path) -> None:
+    class RecordingIndexService:
+        def __init__(self) -> None:
+            self.committed_units = []
+
+        def index_committed_unit(self, vault, unit) -> None:
+            self.committed_units.append((vault.vault_id, unit.unit_id))
+
+    index_service = RecordingIndexService()
+    service, vault, source_file = _service(tmp_path, LocalVaultCommitter(), index_service)
+    task, _ = _reviewable_task(service, vault, source_file)
+
+    service.commit_review(task.task_id)
+
+    assert index_service.committed_units == [(vault.vault_id, "source-1")]
+
+    failed_index_service = RecordingIndexService()
+    failed_service, failed_vault, failed_source = _service(
+        tmp_path / "failed", FailingCommitter(), failed_index_service
+    )
+    failed_task, _ = _reviewable_task(failed_service, failed_vault, failed_source)
+    failed_service.commit_review(failed_task.task_id)
+
+    assert failed_index_service.committed_units == []
+
+
+def test_index_failure_does_not_leave_a_committed_review_task_in_committing(tmp_path: Path) -> None:
+    class FailingIndexService:
+        def index_committed_unit(self, vault, unit) -> None:
+            raise OSError("index database unavailable")
+
+        def report_failure(self, vault_id, reason, error) -> None:
+            return None
+
+    service, vault, source_file = _service(tmp_path, LocalVaultCommitter(), FailingIndexService())
+    task, _ = _reviewable_task(service, vault, source_file)
+
+    completed = service.commit_review(task.task_id)
+
+    assert completed.lifecycle == "complete"
+    assert completed.phase == "complete"
+    assert [journal.status for journal in service.list_commit_journals(task.task_id)] == [
+        "prepared",
+        "committed",
+    ]
+    assert "indexing-started" in [event.event_type for event in service.events_after(task.task_id, 0)]
+    assert "indexing-failed" in [event.event_type for event in service.events_after(task.task_id, 0)]
 
 
 def test_changed_source_invalidates_the_snapshot_and_prevents_vault_writes(tmp_path: Path) -> None:

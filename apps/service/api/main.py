@@ -23,6 +23,7 @@ from adapters.filesystem_vault_committer import LocalVaultCommitter
 from adapters.local_import_task_runner import LocalImportTaskRunner
 from adapters.openai_compatible_provider import OpenAiCompatibleProviderClient
 from adapters.sqlite_provider_repository import SqliteProviderRepository
+from adapters.sqlite_index_repository import SqliteIndexRepository
 from adapters.sqlite_source_repository import SqliteSourceRepository
 from adapters.sqlite_task_repository import SqliteImportTaskRepository
 from adapters.sqlite_vault_repository import SqliteVaultRepository
@@ -32,6 +33,7 @@ from adapters.windows_import_picker import WindowsImportPicker
 from application.directory_selections import DirectorySelectionError, DirectorySelectionStore
 from application.import_selections import ImportSelectionError, ImportSelectionStore
 from application.ingest import ImportTaskError, ImportTaskService
+from application.indexing import IndexingService
 from application.local_session import LocalSession, create_local_session
 from application.policies import (
     OutboundAuthorizationDenied,
@@ -62,6 +64,7 @@ from domain.derived_notes import (
 from domain.classification import ClassificationSuggestion
 from domain.candidate_links import CandidateLinkProposal
 from domain.metadata_tags import MetadataTagProposal, TagChangePreview, TagDefinition
+from domain.indexing import IndexHealth
 from domain.review_commits import CommitJournal, ReviewSnapshot
 from domain.tasks import ImportTask, ImportTaskEvent, ImportTaskItem
 from domain.vaults import Vault
@@ -121,6 +124,9 @@ IMPORT_TASK_SSE_EVENT_NAMES = frozenset(
         "commit-partial-completed",
         "commit-partial-failed",
         "commit-completed",
+        "indexing-started",
+        "indexing-completed",
+        "indexing-failed",
     }
 )
 
@@ -130,6 +136,13 @@ class VaultPathCommand(BaseModel):
 
     selection_id: str
     managed_root: str = "platform"
+
+
+class PendingAssociationResolutionCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    relative_path: str
+    resolution: str
 
 
 class NoteProposalMergeCommand(BaseModel):
@@ -505,6 +518,22 @@ def vault_payload(
     if policy is not None:
         payload["policy"] = policy_payload(policy, rules or [])
     return payload
+
+
+def index_health_payload(health: IndexHealth) -> dict[str, object]:
+    return {
+        "status": health.status,
+        "updated_at": health.updated_at,
+        "current_count": health.current_count,
+        "stale_count": health.stale_count,
+        "failure_count": health.failure_count,
+        "semantic_status": health.semantic_status,
+        "failed_paths": list(health.failed_paths),
+        "stale_paths": list(health.stale_paths),
+        "stale_details": list(health.stale_details),
+        "pending_count": health.pending_count,
+        "pending_paths": list(health.pending_paths),
+    }
 
 
 def import_task_payload(task: ImportTask) -> dict[str, object]:
@@ -955,11 +984,13 @@ def require_local_session(app: FastAPI, request: Request) -> str:
 
 def vault_with_policy_payload(app: FastAPI, vault: Vault) -> dict[str, object]:
     policy = app.state.policy_service.get(vault.vault_id)
-    return vault_payload(
+    payload = vault_payload(
         vault,
         policy=policy,
         rules=app.state.policy_service.list_rules(vault.vault_id),
     )
+    payload["index"] = index_health_payload(app.state.indexing_service.health(vault.vault_id))
+    return payload
 
 
 def create_app(
@@ -971,6 +1002,7 @@ def create_app(
     directory_picker: WindowsDirectoryPicker | None = None,
     directory_selections: DirectorySelectionStore | None = None,
     import_task_service: ImportTaskService | None = None,
+    indexing_service: IndexingService | None = None,
     import_picker: WindowsImportPicker | None = None,
     import_selections: ImportSelectionStore | None = None,
 ) -> FastAPI:
@@ -989,6 +1021,12 @@ def create_app(
     app.state.vault_service = vault_service
     app.state.policy_service = policy_service or PolicyService(
         app.state.vault_service, app.state.vault_service.repository
+    )
+    app.state.indexing_service = indexing_service or IndexingService(
+        app.state.vault_service,
+        SqliteIndexRepository(runtime.data_directory / "indexes.sqlite3"),
+        LocalVaultFilesystem(),
+        app.state.policy_service,
     )
     app.state.provider_service = provider_service or ProviderService(
         repository=SqliteProviderRepository(runtime.data_directory / "vaults.sqlite3"),
@@ -1010,9 +1048,11 @@ def create_app(
             app.state.policy_service,
             SqliteSourceRepository(runtime.data_directory / "tasks.sqlite3"),
             LocalVaultCommitter(),
+            app.state.indexing_service,
         )
         import_task_service.recover_interrupted_commits(recovered_tasks)
     app.state.import_task_service = import_task_service
+    app.state.indexing_service.reconcile_all()
 
     @app.exception_handler(StarletteHTTPException)
     async def http_exception_handler(
@@ -1293,6 +1333,10 @@ def create_app(
             review_snapshot = get_review_snapshot(task_id) if get_review_snapshot is not None else None
             list_commit_journals = getattr(app.state.import_task_service, "list_commit_journals", None)
             commit_journals = list_commit_journals(task_id) if list_commit_journals is not None else []
+            try:
+                index_health = index_health_payload(app.state.indexing_service.health(task.vault_id))
+            except KeyError:
+                index_health = None
             return {
                 "task": import_task_payload(task),
                 "items": [import_task_item_payload(item) for item in items],
@@ -1308,6 +1352,7 @@ def create_app(
                 ],
                 "review_snapshot": review_snapshot_payload(review_snapshot) if review_snapshot else None,
                 "commit_journals": [commit_journal_payload(journal) for journal in commit_journals],
+                "index": index_health,
                 "event_cursor": event_cursor,
             }
         except Exception as error:
@@ -1774,6 +1819,58 @@ def create_app(
                     app, app.state.vault_service.inspect(vault_id)
                 )
             }
+        except Exception as error:
+            raise vault_error(error) from error
+
+    @app.get("/api/vaults/{vault_id}/index")
+    def get_vault_index(request: Request, vault_id: str) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            return {"index": index_health_payload(app.state.indexing_service.health(vault_id))}
+        except Exception as error:
+            raise vault_error(error) from error
+
+    @app.post("/api/vaults/{vault_id}/index/reconcile")
+    def reconcile_vault_index(request: Request, vault_id: str) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            health = app.state.indexing_service.reconcile(vault_id)
+            vault = app.state.vault_service.get(vault_id)
+            return {"vault": vault_with_policy_payload(app, vault), "index": index_health_payload(health)}
+        except Exception as error:
+            raise vault_error(error) from error
+
+    @app.post("/api/vaults/{vault_id}/index/retry")
+    def retry_vault_index(request: Request, vault_id: str) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            health = app.state.indexing_service.retry(vault_id)
+            vault = app.state.vault_service.get(vault_id)
+            return {"vault": vault_with_policy_payload(app, vault), "index": index_health_payload(health)}
+        except Exception as error:
+            raise vault_error(error) from error
+
+    @app.post("/api/vaults/{vault_id}/index/rebuild")
+    def rebuild_vault_index(request: Request, vault_id: str) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            health = app.state.indexing_service.rebuild(vault_id)
+            vault = app.state.vault_service.get(vault_id)
+            return {"vault": vault_with_policy_payload(app, vault), "index": index_health_payload(health)}
+        except Exception as error:
+            raise vault_error(error) from error
+
+    @app.post("/api/vaults/{vault_id}/index/associations")
+    def resolve_pending_index_association(
+        request: Request, vault_id: str, command: PendingAssociationResolutionCommand
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            health = app.state.indexing_service.resolve_pending_association(
+                vault_id, command.relative_path, command.resolution
+            )
+            vault = app.state.vault_service.get(vault_id)
+            return {"vault": vault_with_policy_payload(app, vault), "index": index_health_payload(health)}
         except Exception as error:
             raise vault_error(error) from error
 

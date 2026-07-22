@@ -63,6 +63,10 @@ class VaultService:
     def list(self) -> list[Vault]:
         return [self.inspect(vault.vault_id) for vault in self.repository.list()]
 
+    def stored_vaults(self) -> "list[Vault]":
+        """Return persisted records without probing or writing inside their vaults."""
+        return self.repository.list()
+
     def get(self, vault_id: str) -> Vault:
         return self.repository.get(vault_id)
 
@@ -152,6 +156,15 @@ class VaultService:
             if vault.authorization_status != "active" or vault.access_status != "available":
                 raise VaultValidationError("Only active, available vaults can become current.")
             updated = replace(vault, is_current=True, updated_at=utc_now())
+            self.repository.save(updated)
+            return updated
+
+    def set_index_status(self, vault_id: str, index_status: str) -> Vault:
+        with self._mutation_lock:
+            vault = self.get(vault_id)
+            if vault.index_status == index_status:
+                return vault
+            updated = replace(vault, index_status=index_status, updated_at=utc_now())
             self.repository.save(updated)
             return updated
 

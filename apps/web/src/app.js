@@ -54,7 +54,8 @@ export const IMPORT_TASK_EVENT_NAMES = [
   "commit-unit-failed",
   "commit-partial-completed",
   "commit-partial-failed",
-  "commit-completed"
+  "commit-completed",
+  "indexing-completed"
 ];
 export const NAVIGATION_DESTINATIONS = [
   { id: "workbench", label: "工作台", emptyState: "尚未选择 vault。" },
@@ -864,9 +865,14 @@ export function VaultIndexStatus({ vault, onUpdate }) {
     failure_count: 0,
     semantic_status: "unavailable",
     failed_paths: [],
-    stale_paths: []
+    stale_paths: [],
+    stale_details: [],
+    pending_count: 0,
+    pending_paths: []
   };
+  const staleDetails = index.stale_details || [];
   const healthText = index.status === "not-initialized" ? "未初始化" : index.status;
+  const statusIcon = index.status === "healthy" ? "✓" : index.status === "failed" ? "!" : "?";
 
   async function runIndexAction(action) {
     setIsActing(true);
@@ -884,20 +890,47 @@ export function VaultIndexStatus({ vault, onUpdate }) {
     }
   }
 
+  async function resolveAssociation(relativePath, resolution) {
+    setIsActing(true);
+    setStatus("");
+    try {
+      const response = await requestJson(`${VAULTS_ENDPOINT}/${vault.vault_id}/index/associations`, {
+        method: "POST",
+        body: JSON.stringify({ relative_path: relativePath, resolution })
+      });
+      onUpdate(response.vault);
+      setStatus("待关联项已记录审核处置。");
+    } catch (error) {
+      setStatus(error.message);
+    } finally {
+      setIsActing(false);
+    }
+  }
+
   return React.createElement(
     "section",
     { className: "index-health", "aria-label": "索引健康度" },
     React.createElement("h3", null, "索引健康度"),
-    React.createElement("p", { className: `status-marker${index.status === "failed" ? " status-danger" : ""}` }, `状态：${healthText}`),
-    React.createElement("p", { className: "row-note" }, `已索引 ${index.current_count} 项；失效 ${index.stale_count} 项；失败 ${index.failure_count} 项。`),
+    React.createElement("p", { className: `status-marker index-status index-status-${index.status}` }, `${statusIcon} 状态：${healthText}`),
+    React.createElement("p", { className: "row-note" }, `已索引 ${index.current_count} 项；失效 ${index.stale_count} 项；待关联 ${index.pending_count || 0} 项；失败 ${index.failure_count} 项。`),
     React.createElement("p", { className: "row-note" }, index.updated_at ? `最近更新：${index.updated_at}` : "尚无成功的索引更新。"),
     React.createElement("p", { className: "row-note" }, index.semantic_status === "unavailable" ? "语义索引尚不可用，未向 Provider 发送内容。" : `语义索引：${index.semantic_status}`),
     index.failed_paths.length
       ? React.createElement("p", { className: "row-note status-danger" }, `失败对象：${index.failed_paths.join("、")}`)
       : null,
-    index.stale_paths.length
-      ? React.createElement("p", { className: "row-note" }, `失效证据：${index.stale_paths.join("、")}`)
+    staleDetails.length
+      ? React.createElement("p", { className: "row-note" }, `失效证据：${staleDetails.join("、")}`)
+      : index.stale_paths.length
+        ? React.createElement("p", { className: "row-note" }, `失效证据：${index.stale_paths.join("、")}`)
       : null,
+    (index.pending_paths || []).map((path) => React.createElement(
+      "div",
+      { className: "index-association-row", key: path },
+      React.createElement("span", { className: "row-note" }, `待关联：${path}`),
+      React.createElement("button", { className: "secondary-button", type: "button", disabled: isActing, onClick: () => resolveAssociation(path, "reassociate") }, "确认重新关联"),
+      React.createElement("button", { className: "secondary-button", type: "button", disabled: isActing, onClick: () => resolveAssociation(path, "link-fixed") }, "确认链接已修复"),
+      React.createElement("button", { className: "danger-button", type: "button", disabled: isActing, onClick: () => resolveAssociation(path, "confirm-delete") }, "确认删除")
+    )),
     React.createElement(
       "div",
       { className: "detail-actions" },
@@ -1768,7 +1801,8 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
     metadata_tag_proposals: metadataTagProposals = [],
     candidate_link_proposals: candidateLinkProposals = [],
     review_snapshot: reviewSnapshot = null,
-    commit_journals: commitJournals = []
+    commit_journals: commitJournals = [],
+    index = null
   } = detail;
   const canCancel = task.lifecycle === "running";
   const canResume = task.recovery_actions.includes("restart-scan") || task.recovery_actions.includes("restart-parse") || task.recovery_actions.includes("restart-ocr") || task.recovery_actions.includes("restart-derivation") || task.recovery_actions.includes("create-new-task");
@@ -1836,6 +1870,13 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
     React.createElement("button", { className: "back-button", type: "button", onClick: () => onBack(null) }, "返回任务列表"),
     React.createElement("h2", null, `导入任务 ${task.task_id}`),
     React.createElement("p", { className: "scope-summary" }, `目标 vault：${task.vault_label}；范围：${task.scope_label}`),
+    index
+      ? React.createElement(
+        "p",
+        { className: "row-note", role: "status" },
+        `索引：${index.status}；已索引 ${index.current_count} 项；失效 ${index.stale_count} 项；失败 ${index.failure_count} 项。`
+      )
+      : null,
     React.createElement(
       "div",
       { className: "progress-sequence", "aria-live": "polite" },

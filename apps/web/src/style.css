@@ -821,6 +821,39 @@ button:disabled {
   line-height: 1.5;
 }
 
+.index-health {
+  display: grid;
+  gap: 8px;
+  margin-block: 18px;
+  padding-block: 14px;
+  border-block: 1px solid #d7d7d2;
+}
+
+.index-health h3,
+.index-health p {
+  margin: 0;
+}
+
+.index-association-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.index-status-healthy {
+  color: #176b3a;
+}
+
+.index-status-stale,
+.index-status-not-initialized {
+  color: #8a5a00;
+}
+
+.index-status-failed {
+  color: #8a1f1f;
+}
+
 .commit-review-list,
 .review-summary {
   display: grid;

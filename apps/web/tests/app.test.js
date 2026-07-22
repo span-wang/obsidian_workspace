@@ -87,7 +87,8 @@ test("uses relative same-origin endpoints for health and local session checks", 
     "commit-unit-failed",
     "commit-partial-completed",
     "commit-partial-failed",
-    "commit-completed"
+    "commit-completed",
+    "indexing-completed"
   ]);
 });
 
@@ -153,7 +154,9 @@ test("renders index health and explicit recovery controls without exposing conte
           failure_count: 0,
           semantic_status: "unavailable",
           failed_paths: [],
-          stale_paths: ["notes/old.md"]
+          stale_paths: ["notes/old.md"],
+          pending_count: 1,
+          pending_paths: ["notes/replacement.md"]
         }
       },
       onUpdate: () => {}
@@ -162,6 +165,9 @@ test("renders index health and explicit recovery controls without exposing conte
 
   assert.match(markup, /索引健康度/);
   assert.match(markup, /失效证据：notes\/old.md/);
+  assert.match(markup, /\? 状态：stale/);
+  assert.match(markup, /待关联：notes\/replacement.md/);
+  assert.match(markup, /确认重新关联/);
   assert.match(markup, /核对变更/);
   assert.match(markup, /重建索引/);
 });
