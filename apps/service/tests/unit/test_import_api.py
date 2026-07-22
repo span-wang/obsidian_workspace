@@ -265,6 +265,29 @@ def test_import_api_uses_a_session_bound_selection_and_hides_absolute_paths(tmp_
     applied_tags_status, _, applied_tags = asgi_request(
         app, "GET", f"/api/vaults/{vault_id}/tags", cookie=cookie
     )
+    delete_preview_status, _, delete_preview = asgi_request(
+        app,
+        "POST",
+        f"/api/vaults/{vault_id}/tags/change-preview",
+        body={"operation": "delete", "source_tag": "algebra", "target_tag": None},
+        cookie=cookie,
+    )
+    delete_apply_status, _, deleted = asgi_request(
+        app,
+        "POST",
+        f"/api/vaults/{vault_id}/tags/change",
+        body={
+            "operation": delete_preview["preview"]["operation"],
+            "source_tag": delete_preview["preview"]["source_tag"],
+            "target_tag": delete_preview["preview"]["target_tag"],
+            "catalog_revision": delete_preview["preview"]["catalog_revision"],
+            "proposal_versions": delete_preview["preview"]["proposal_versions"],
+        },
+        cookie=cookie,
+    )
+    deleted_tags_status, _, deleted_tags = asgi_request(
+        app, "GET", f"/api/vaults/{vault_id}/tags", cookie=cookie
+    )
     _, _, invalid_selection = asgi_request(
         app,
         "POST",
@@ -293,6 +316,9 @@ def test_import_api_uses_a_session_bound_selection_and_hides_absolute_paths(tmp_
     assert preview_status == 200
     assert apply_status == 200
     assert applied_tags_status == 200
+    assert delete_preview_status == 200
+    assert delete_apply_status == 200
+    assert deleted_tags_status == 200
     assert detail["task"]["phase"] == "waiting-for-review"
     assert detail["task"]["counts"]["new"] == 1
     assert detail["task"]["counts"]["duplicate"] == 0
@@ -331,6 +357,11 @@ def test_import_api_uses_a_session_bound_selection_and_hides_absolute_paths(tmp_
     assert {tag["name"]: tag["status"] for tag in applied_tags["tags"]} == {
         "mathematics": "inactive",
         "algebra": "active",
+    }
+    assert delete_preview["preview"]["affected_paths"]
+    assert deleted["preview"]["operation"] == "delete"
+    assert {tag["name"]: tag["status"] for tag in deleted_tags["tags"]} == {
+        "mathematics": "inactive"
     }
     assert "source_path" not in detail["items"][0]
     assert str(source_file) not in json.dumps(detail)

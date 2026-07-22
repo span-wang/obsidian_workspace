@@ -73,6 +73,7 @@ class ImportTaskService:
         policy_service=None,
         source_repository: SourceRepository | None = None,
         vault_committer: VaultCommitter | None = None,
+        index_service=None,
     ) -> None:
         self.vault_service = vault_service
         self.repository = repository
@@ -80,6 +81,7 @@ class ImportTaskService:
         self.policy_service = policy_service
         self.source_repository = source_repository
         self.vault_committer = vault_committer
+        self.index_service = index_service
         self._state_lock = threading.RLock()
 
     def create(self, vault_id: str, selection: ImportSelection) -> ImportTask:
@@ -1230,6 +1232,8 @@ class ImportTaskService:
                 committed += 1
                 completed = replace(prepared, status="committed", created_at=utc_now())
                 self.repository.record_commit_journal(completed, "commit-unit-committed")
+                if self.index_service is not None:
+                    self.index_service.index_committed_unit(vault, unit)
             current = self.get(task_id)
             if stale_failure_reason:
                 refreshed = self._record_stale_snapshot(current, snapshot, stale_failure_reason)
@@ -1752,12 +1756,23 @@ class ImportTaskService:
                 raise ImportTaskError("The metadata and tag proposal is stale and must be regenerated.")
             decided = governance.with_decision(decision, reason, utc_now())
             if decision == "accepted":
-                known = {tag.name: tag for tag in self.repository.list_vault_tags(vault.vault_id)}
+                known = {
+                    tag.name: tag
+                    for tag in self.repository.list_vault_tags(vault.vault_id, include_deleted=True)
+                }
                 for tag in decided.tags:
-                    if not tag.is_new or tag.name in known:
+                    existing = known.get(tag.name)
+                    if not tag.is_new or (existing is not None and existing.status != "deleted"):
                         continue
                     self.repository.record_vault_tag(
-                        TagDefinition(vault.vault_id, tag.name, "active", 0, 1, utc_now())
+                        TagDefinition(
+                            vault.vault_id,
+                            tag.name,
+                            "active",
+                            0,
+                            (existing.revision + 1) if existing is not None else 1,
+                            utc_now(),
+                        )
                     )
             return self.repository.record_metadata_tag_proposal(
                 item_id, decided, f"metadata-tags-{decision}"
@@ -1782,10 +1797,26 @@ class ImportTaskService:
         with self._state_lock:
             self._available_vault(vault_id)
             name = normalize_tag(name)
-            existing = next((tag for tag in self.repository.list_vault_tags(vault_id) if tag.name == name), None)
-            if existing is not None:
+            existing = next(
+                (
+                    tag
+                    for tag in self.repository.list_vault_tags(vault_id, include_deleted=True)
+                    if tag.name == name
+                ),
+                None,
+            )
+            if existing is not None and existing.status != "deleted":
                 raise ImportTaskError("This vault tag already exists.")
-            return self.repository.record_vault_tag(TagDefinition(vault_id, name, "active", 0, 1, utc_now()))
+            return self.repository.record_vault_tag(
+                TagDefinition(
+                    vault_id,
+                    name,
+                    "active",
+                    0,
+                    (existing.revision + 1) if existing is not None else 1,
+                    utc_now(),
+                )
+            )
 
     def preview_vault_tag_change(
         self,
@@ -1798,8 +1829,18 @@ class ImportTaskService:
             self._available_vault(vault_id)
             tags = self.repository.list_vault_tags(vault_id)
             source_tag = normalize_tag(source_tag)
-            source = next((tag for tag in tags if tag.name == source_tag and tag.status == "active"), None)
+            source = next(
+                (
+                    tag
+                    for tag in tags
+                    if tag.name == source_tag
+                    and (tag.status == "active" or (operation == "delete" and tag.status == "inactive"))
+                ),
+                None,
+            )
             if source is None:
+                if operation == "delete":
+                    raise ImportTaskError("The source tag is not available for deletion in this vault.")
                 raise ImportTaskError("The source tag is not an active tag in this vault.")
             catalog_revision = sum(tag.revision for tag in tags) or 1
             preview = plan_tag_change(
@@ -1812,16 +1853,20 @@ class ImportTaskService:
             )
             target_tag = normalize_tag(target_tag) if target_tag else None
             target = next((tag for tag in tags if tag.name == target_tag and tag.status == "active"), None)
-            if operation == "rename" and target is not None and target.name != source_tag:
-                preview = replace(
-                    preview,
-                    conflicts=(*preview.conflicts, f"标签 {target.name} 已存在；请改用合并或选择新名称。"),
+            if operation == "rename" and target is not None:
+                message = (
+                    "重命名目标必须不同于当前标签。"
+                    if target.name == source_tag
+                    else f"标签 {target.name} 已存在；请改用合并或选择新名称。"
                 )
+                preview = replace(preview, conflicts=(*preview.conflicts, message))
             if operation == "merge" and target is None:
                 preview = replace(
                     preview,
                     conflicts=(*preview.conflicts, "合并目标必须是当前 vault 中的可用标签。"),
                 )
+            if operation == "merge" and target is not None and target.name == source_tag:
+                preview = replace(preview, conflicts=(*preview.conflicts, "合并目标必须不同于当前标签。"))
             return self.repository.record_tag_change_preview(preview, utc_now())
 
     def apply_vault_tag_change(
@@ -1845,14 +1890,39 @@ class ImportTaskService:
             if expected.conflicts:
                 raise ImportTaskError("Resolve tag conflicts before confirming this change.")
             tags = self.repository.list_vault_tags(vault_id)
-            source = next(tag for tag in tags if tag.name == expected.source_tag and tag.status == "active")
+            source = next(
+                tag
+                for tag in tags
+                if tag.name == expected.source_tag
+                and (tag.status == "active" or (expected.operation == "delete" and tag.status == "inactive"))
+            )
             timestamp = utc_now()
             self.repository.record_vault_tag(
-                replace(source, status="inactive", revision=source.revision + 1, updated_at=timestamp)
+                replace(
+                    source,
+                    status="deleted" if expected.operation == "delete" else "inactive",
+                    revision=source.revision + 1,
+                    updated_at=timestamp,
+                )
             )
             if expected.operation == "rename":
+                historical_target = next(
+                    (
+                        tag
+                        for tag in self.repository.list_vault_tags(vault_id, include_deleted=True)
+                        if tag.name == expected.target_tag
+                    ),
+                    None,
+                )
                 self.repository.record_vault_tag(
-                    TagDefinition(vault_id, expected.target_tag or "", "active", 0, 1, timestamp)
+                    TagDefinition(
+                        vault_id,
+                        expected.target_tag or "",
+                        "active",
+                        0,
+                        (historical_target.revision + 1) if historical_target is not None else 1,
+                        timestamp,
+                    )
                 )
             for proposal in current_proposals:
                 updated = apply_tag_change(proposal, expected, timestamp)

@@ -655,7 +655,7 @@ function VaultPolicyControls({ vault, onUpdate }) {
   );
 }
 
-function TagManagement({ vault }) {
+export function TagManagement({ vault }) {
   const [tags, setTags] = React.useState([]);
   const [search, setSearch] = React.useState("");
   const [newTag, setNewTag] = React.useState("");
@@ -710,7 +710,7 @@ function TagManagement({ vault }) {
         body: JSON.stringify({
           operation,
           source_tag: sourceTag,
-          target_tag: operation === "deactivate" ? null : targetTag
+          target_tag: operation === "deactivate" || operation === "delete" ? null : targetTag
         })
       });
       setPreview(response.preview);
@@ -738,7 +738,11 @@ function TagManagement({ vault }) {
       });
       await loadTags("");
       setPreview(null);
-      setStatus("已更新应用私有标签提案；所有受影响 Markdown 仍需后续审核提交。 ");
+      setStatus(
+        preview.operation === "delete"
+          ? "标签及其私有提案引用已移除；不会修改 vault Markdown。"
+          : "已更新应用私有标签提案；所有受影响 Markdown 仍需后续审核提交。 "
+      );
     } catch (error) {
       setStatus(error.message);
     } finally {
@@ -776,23 +780,40 @@ function TagManagement({ vault }) {
       { className: "tag-controls tag-change-controls" },
       React.createElement(
         "select",
-        { value: operation, onChange: (event) => setOperation(event.target.value), "aria-label": "标签变更类型" },
+        {
+          value: operation,
+          onChange: (event) => {
+            setOperation(event.target.value);
+            setPreview(null);
+            setStatus("");
+          },
+          "aria-label": "标签变更类型"
+        },
         React.createElement("option", { value: "rename" }, "重命名"),
         React.createElement("option", { value: "merge" }, "合并"),
-        React.createElement("option", { value: "deactivate" }, "停用")
+        React.createElement("option", { value: "deactivate" }, "停用"),
+        React.createElement("option", { value: "delete" }, "删除")
       ),
       React.createElement("input", {
         type: "text",
         value: sourceTag,
-        onChange: (event) => setSourceTag(event.target.value),
+        onChange: (event) => {
+          setSourceTag(event.target.value);
+          setPreview(null);
+          setStatus("");
+        },
         placeholder: "当前标签",
         "aria-label": "当前标签"
       }),
-      operation !== "deactivate"
+      operation !== "deactivate" && operation !== "delete"
         ? React.createElement("input", {
             type: "text",
             value: targetTag,
-            onChange: (event) => setTargetTag(event.target.value),
+            onChange: (event) => {
+              setTargetTag(event.target.value);
+              setPreview(null);
+              setStatus("");
+            },
             placeholder: "目标标签",
             "aria-label": "目标标签"
           })
@@ -826,9 +847,82 @@ function TagManagement({ vault }) {
             disabled: isActing || preview.is_stale || preview.conflicts.length > 0,
             title: preview.is_stale ? preview.stale_reason : preview.conflicts[0],
             onClick: applyChange
-          }, "确认标签变更")
+          }, preview.operation === "delete" ? "确认删除标签" : "确认标签变更")
         )
       : null
+  );
+}
+
+export function VaultIndexStatus({ vault, onUpdate }) {
+  const [status, setStatus] = React.useState("");
+  const [isActing, setIsActing] = React.useState(false);
+  const index = vault.index || {
+    status: vault.index_status || "not-initialized",
+    updated_at: null,
+    current_count: 0,
+    stale_count: 0,
+    failure_count: 0,
+    semantic_status: "unavailable",
+    failed_paths: [],
+    stale_paths: []
+  };
+  const healthText = index.status === "not-initialized" ? "未初始化" : index.status;
+
+  async function runIndexAction(action) {
+    setIsActing(true);
+    setStatus("");
+    try {
+      const response = await requestJson(`${VAULTS_ENDPOINT}/${vault.vault_id}/index/${action}`, {
+        method: "POST"
+      });
+      onUpdate(response.vault);
+      setStatus(action === "reconcile" ? "已核对 vault 变更。" : action === "retry" ? "已重试失败索引。" : "已重建私有索引。");
+    } catch (error) {
+      setStatus(error.message);
+    } finally {
+      setIsActing(false);
+    }
+  }
+
+  return React.createElement(
+    "section",
+    { className: "index-health", "aria-label": "索引健康度" },
+    React.createElement("h3", null, "索引健康度"),
+    React.createElement("p", { className: `status-marker${index.status === "failed" ? " status-danger" : ""}` }, `状态：${healthText}`),
+    React.createElement("p", { className: "row-note" }, `已索引 ${index.current_count} 项；失效 ${index.stale_count} 项；失败 ${index.failure_count} 项。`),
+    React.createElement("p", { className: "row-note" }, index.updated_at ? `最近更新：${index.updated_at}` : "尚无成功的索引更新。"),
+    React.createElement("p", { className: "row-note" }, index.semantic_status === "unavailable" ? "语义索引尚不可用，未向 Provider 发送内容。" : `语义索引：${index.semantic_status}`),
+    index.failed_paths.length
+      ? React.createElement("p", { className: "row-note status-danger" }, `失败对象：${index.failed_paths.join("、")}`)
+      : null,
+    index.stale_paths.length
+      ? React.createElement("p", { className: "row-note" }, `失效证据：${index.stale_paths.join("、")}`)
+      : null,
+    React.createElement(
+      "div",
+      { className: "detail-actions" },
+      React.createElement("button", {
+        className: "secondary-button",
+        type: "button",
+        disabled: isActing,
+        onClick: () => runIndexAction("reconcile")
+      }, "核对变更"),
+      index.failure_count
+        ? React.createElement("button", {
+          className: "secondary-button",
+          type: "button",
+          disabled: isActing,
+          onClick: () => runIndexAction("retry")
+        }, "重试索引")
+        : null,
+      React.createElement("button", {
+        className: "secondary-button",
+        type: "button",
+        disabled: isActing,
+        onClick: () => runIndexAction("rebuild")
+      }, "重建索引")
+    ),
+    status ? React.createElement("p", { className: "status-line", role: "status" }, status) : null
   );
 }
 
@@ -872,12 +966,13 @@ function VaultDetail({ vault, onBack, onUpdate, onRelink, onConfirm }) {
         ? React.createElement("dd", null, vault.access_reason)
         : null,
       React.createElement("dt", null, "索引状态"),
-      React.createElement("dd", null, vault.index_status === "not-initialized" ? "未初始化" : vault.index_status),
+      React.createElement("dd", null, vault.index?.status === "not-initialized" ? "未初始化" : vault.index?.status || vault.index_status),
       React.createElement("dt", null, "受管根目录"),
       React.createElement("dd", null, vault.managed_root),
       React.createElement("dt", null, "隔离边界"),
       React.createElement("dd", null, "文件、标签、候选链接、索引和操作状态仅属于此 vault。")
     ),
+    React.createElement(VaultIndexStatus, { vault, onUpdate }),
     React.createElement(VaultPolicyControls, { vault, onUpdate }),
     React.createElement(TagManagement, { vault }),
     status ? React.createElement("p", { className: "status-line", role: "status" }, status) : null,

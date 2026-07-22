@@ -22,7 +22,7 @@ class TagDefinition:
     def __post_init__(self) -> None:
         if not self.vault_id or not _TAG_PATTERN.fullmatch(self.name):
             raise ValueError("Tag identity is invalid.")
-        if self.status not in {"active", "inactive"}:
+        if self.status not in {"active", "inactive", "deleted"}:
             raise ValueError("Tag status is invalid.")
         if self.usage_count < 0 or self.revision < 1 or not self.updated_at:
             raise ValueError("Tag audit data is invalid.")
@@ -205,7 +205,7 @@ class TagChangePreview:
     stale_reason: str | None = None
 
     def __post_init__(self) -> None:
-        if self.operation not in {"rename", "merge", "deactivate"}:
+        if self.operation not in {"rename", "merge", "deactivate", "delete"}:
             raise ValueError("Tag operation is invalid.")
         if not self.vault_id or not _TAG_PATTERN.fullmatch(self.source_tag) or self.catalog_revision < 1:
             raise ValueError("Tag preview identity is invalid.")
@@ -219,7 +219,13 @@ class TagChangePreview:
     def validate(
         self, *, catalog_revision: int, proposals: tuple[MetadataTagProposal, ...]
     ) -> TagChangePreview:
-        expected = tuple(sorted((proposal.item_id, proposal.revision) for proposal in proposals))
+        expected = tuple(
+            sorted(
+                (proposal.item_id, proposal.revision)
+                for proposal in proposals
+                if any(tag.name == self.source_tag for tag in proposal.tags)
+            )
+        )
         if catalog_revision != self.catalog_revision:
             return replace(self, is_stale=True, stale_reason="标签目录已变化；请重新确认受影响范围。")
         if expected != self.proposal_versions:
@@ -351,6 +357,17 @@ def apply_tag_change(
         raise ValueError("Tag change cannot cross vault boundaries.")
     if (proposal.item_id, proposal.revision) not in preview.proposal_versions:
         return proposal
+    if preview.operation == "delete":
+        updated_tags = [tag for tag in proposal.tags if tag.name != preview.source_tag]
+        return replace(
+            proposal,
+            revision=proposal.revision + 1,
+            tags=tuple(updated_tags),
+            decision=None,
+            decision_reason=None,
+            created_at=changed_at,
+        )
+
     updated_tags: list[TagSuggestion] = []
     for tag in proposal.tags:
         if tag.name != preview.source_tag:

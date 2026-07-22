@@ -15,6 +15,8 @@ import {
   LOCAL_SESSION_ENDPOINT,
   NAVIGATION_DESTINATIONS,
   PROVIDERS_ENDPOINT,
+  TagManagement,
+  VaultIndexStatus,
   VAULTS_ENDPOINT
 } from "../src/app.js";
 
@@ -125,4 +127,41 @@ test("shows all identity counts in task center rows", () => {
   assert.match(markup, /识别失败 1/);
   assert.match(markup, /已解析 1/);
   assert.match(markup, /待审核问题 1/);
+});
+
+test("offers a private tag deletion flow without a target tag field", () => {
+  const markup = renderToStaticMarkup(
+    React.createElement(TagManagement, {
+      vault: { vault_id: "vault-1" }
+    })
+  );
+
+  assert.match(markup, /<option value="delete">删除<\/option>/);
+  assert.match(markup, /标签变更先生成私有影响预览；实际 Markdown 写入仍需后续审核提交。/);
+});
+
+test("renders index health and explicit recovery controls without exposing content", () => {
+  const markup = renderToStaticMarkup(
+    React.createElement(VaultIndexStatus, {
+      vault: {
+        vault_id: "vault-1",
+        index: {
+          status: "stale",
+          updated_at: "2026-07-22T00:00:00+00:00",
+          current_count: 3,
+          stale_count: 1,
+          failure_count: 0,
+          semantic_status: "unavailable",
+          failed_paths: [],
+          stale_paths: ["notes/old.md"]
+        }
+      },
+      onUpdate: () => {}
+    })
+  );
+
+  assert.match(markup, /索引健康度/);
+  assert.match(markup, /失效证据：notes\/old.md/);
+  assert.match(markup, /核对变更/);
+  assert.match(markup, /重建索引/);
 });

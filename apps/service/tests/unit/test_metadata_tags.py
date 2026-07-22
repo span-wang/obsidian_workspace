@@ -121,6 +121,45 @@ def test_tag_change_preview_includes_every_affected_note_and_rejects_stale_catal
     assert changed.revision == proposal.revision + 1
 
 
+def test_delete_tag_change_removes_private_references_and_keeps_vaults_isolated() -> None:
+    from dataclasses import replace
+
+    from domain.metadata_tags import apply_tag_change, plan_tag_change, suggest_metadata_tags
+
+    proposal = suggest_metadata_tags(
+        task_id="task-1",
+        proposal=_derived_proposal(),
+        source_type="pdf",
+        source_file="algebra-workbook.pdf",
+        ingested_at="2026-07-22T00:00:00+00:00",
+        processing_status="waiting-for-review",
+        domain="mathematics",
+        domain_confidence=0.9,
+        existing_tags=(),
+    )
+    other_vault_proposal = replace(proposal, task_id="task-2", vault_id="vault-2")
+
+    preview = plan_tag_change(
+        vault_id="vault-1",
+        operation="delete",
+        source_tag="mathematics",
+        target_tag=None,
+        catalog_revision=1,
+        proposals=(proposal, other_vault_proposal),
+    )
+    changed = apply_tag_change(proposal, preview, "2026-07-22T00:01:00+00:00")
+
+    assert preview.affected_paths == (
+        "platform/notes/source-1/01-algebra.md",
+        "platform/notes/source-1/index.md",
+    )
+    assert preview.proposal_versions == ((proposal.item_id, proposal.revision),)
+    assert preview.validate(catalog_revision=2, proposals=(proposal,)).is_stale is True
+    assert changed.tags == ()
+    assert changed.decision is None
+    assert changed.revision == proposal.revision + 1
+
+
 def test_chinese_tags_are_valid_for_definitions_and_suggestions() -> None:
     from domain.metadata_tags import TagDefinition, normalize_tag, suggest_metadata_tags
 

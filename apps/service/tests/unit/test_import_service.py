@@ -1296,7 +1296,7 @@ def test_batch_classification_acceptance_rejects_changed_sources(tmp_path: Path)
     assert service.list_classification_suggestions(task.task_id) == []
 
 
-def test_metadata_tags_stay_private_and_create_a_vault_scoped_change_preview(tmp_path: Path) -> None:
+def test_metadata_tags_stay_private_and_support_deletion_and_recreation(tmp_path: Path) -> None:
     vault_path = tmp_path / "vault"
     vault_path.mkdir()
     source_file = tmp_path / "algebra.pdf"
@@ -1341,6 +1341,70 @@ def test_metadata_tags_stay_private_and_create_a_vault_scoped_change_preview(tmp
         governance.tags[0].name: "inactive",
         "algebra-notes": "active",
     }
+
+    renamed_governance = service.list_metadata_tag_proposals(task.task_id)[0]
+    service.decide_metadata_tag_proposal(
+        task.task_id, renamed_governance.item_id, "accepted", "Reviewed renamed tag."
+    )
+    delete_preview = service.preview_vault_tag_change(vault.vault_id, "delete", "algebra-notes")
+    service.apply_vault_tag_change(
+        vault.vault_id,
+        delete_preview.operation,
+        delete_preview.source_tag,
+        delete_preview.target_tag,
+        delete_preview.catalog_revision,
+        delete_preview.proposal_versions,
+    )
+
+    deleted_governance = service.list_metadata_tag_proposals(task.task_id)[0]
+    assert delete_preview.affected_paths
+    assert deleted_governance.tags == ()
+    assert deleted_governance.decision is None
+    assert "algebra-notes" not in {tag.name for tag in service.list_vault_tags(vault.vault_id)}
+
+    rebuilt = service.create_vault_tag(vault.vault_id, "algebra-notes")
+    assert rebuilt.status == "active"
+    assert rebuilt.revision == 3
+    inactive_preview = service.preview_vault_tag_change(vault.vault_id, "deactivate", "algebra-notes")
+    service.apply_vault_tag_change(
+        vault.vault_id,
+        inactive_preview.operation,
+        inactive_preview.source_tag,
+        inactive_preview.target_tag,
+        inactive_preview.catalog_revision,
+        inactive_preview.proposal_versions,
+    )
+    inactive_delete_preview = service.preview_vault_tag_change(
+        vault.vault_id, "delete", "algebra-notes"
+    )
+    service.apply_vault_tag_change(
+        vault.vault_id,
+        inactive_delete_preview.operation,
+        inactive_delete_preview.source_tag,
+        inactive_delete_preview.target_tag,
+        inactive_delete_preview.catalog_revision,
+        inactive_delete_preview.proposal_versions,
+    )
+
+    assert "algebra-notes" not in {tag.name for tag in service.list_vault_tags(vault.vault_id)}
+
+    service.create_vault_tag(vault.vault_id, "current-tag")
+    deleted_target_preview = service.preview_vault_tag_change(
+        vault.vault_id, "rename", "current-tag", "algebra-notes"
+    )
+    service.apply_vault_tag_change(
+        vault.vault_id,
+        deleted_target_preview.operation,
+        deleted_target_preview.source_tag,
+        deleted_target_preview.target_tag,
+        deleted_target_preview.catalog_revision,
+        deleted_target_preview.proposal_versions,
+    )
+
+    tags = {tag.name: tag for tag in service.list_vault_tags(vault.vault_id)}
+    assert tags["current-tag"].status == "inactive"
+    assert tags["algebra-notes"].status == "active"
+    assert tags["algebra-notes"].revision == 6
     assert [path for path in vault_path.rglob("*") if path.is_file()] == []
 
 

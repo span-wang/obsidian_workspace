@@ -1282,7 +1282,9 @@ class SqliteImportTaskRepository:
             if (proposal := MetadataTagProposal.from_dict(json.loads(row["proposal_json"]))).vault_id == vault_id
         ]
 
-    def list_vault_tags(self, vault_id: str, search: str = "") -> list[TagDefinition]:
+    def list_vault_tags(
+        self, vault_id: str, search: str = "", include_deleted: bool = False
+    ) -> list[TagDefinition]:
         with self._connect() as connection:
             rows = connection.execute(
                 """
@@ -1299,7 +1301,11 @@ class SqliteImportTaskRepository:
             ).fetchall()
         tags = [TagDefinition.from_dict(json.loads(row["tag_json"])) for row in rows]
         needle = search.strip().lower()
-        return [tag for tag in tags if not needle or needle in tag.name]
+        return [
+            tag
+            for tag in tags
+            if (include_deleted or tag.status != "deleted") and (not needle or needle in tag.name)
+        ]
 
     def record_vault_tag(self, tag: TagDefinition) -> TagDefinition:
         with self._connect() as connection:
