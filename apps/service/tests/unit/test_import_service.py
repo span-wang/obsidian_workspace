@@ -909,6 +909,80 @@ def test_external_markdown_gets_a_private_native_candidate_without_a_source_id(t
     assert candidates == [("native", "platform/notes/external.md", "line:1")]
 
 
+def test_candidate_links_stay_private_and_reject_stale_sources(tmp_path: Path) -> None:
+    class MultiNativeMarkdownWorker:
+        def start(self, task, on_event) -> None:
+            for source_path in task.source_paths:
+                on_event(
+                    task.task_id,
+                    {
+                        "type": "item",
+                        "path": str(source_path),
+                        "label": source_path.name,
+                        "category": "supported",
+                        "document_kind": "markdown",
+                        "reason": None,
+                        "content_sha256": sha256(source_path.read_bytes()).hexdigest(),
+                    },
+                )
+            on_event(task.task_id, {"type": "completed"})
+
+        def cancel(self, task_id: str) -> None:
+            return None
+
+    vault_path = tmp_path / "vault"
+    vault_path.mkdir()
+    first_source = tmp_path / "algebra.md"
+    second_source = tmp_path / "practice.md"
+    first_source.write_text("# Algebra\nAlgebra equations are introduced here.", encoding="utf-8")
+    second_source.write_text("# Practice\nAlgebra equations need practice.", encoding="utf-8")
+    vault_repository = SqliteVaultRepository(tmp_path / "vaults.sqlite3")
+    vault_service = VaultService(vault_repository, LocalVaultFilesystem())
+    vault = vault_service.authorize(vault_path, "platform")
+    database_path = tmp_path / "tasks.sqlite3"
+    repository = SqliteImportTaskRepository(database_path)
+    service = ImportTaskService(vault_service, repository, MultiNativeMarkdownWorker())
+
+    task = service.create(
+        vault.vault_id, ImportSelection("session", "files", (first_source, second_source), 999.0)
+    )
+    candidates = service.list_candidate_link_proposals(task.task_id)
+
+    assert task.phase == "waiting-for-review"
+    assert len(candidates) == 1
+    assert candidates[0].is_existing_note_change
+    assert candidates[0].decision is None
+    reopened = SqliteImportTaskRepository(database_path)
+    assert reopened.list_candidate_link_proposals(task.task_id) == candidates
+    before = (first_source.read_bytes(), second_source.read_bytes())
+
+    decided = service.decide_candidate_link_proposal(
+        task.task_id, candidates[0].review_item_id, "accepted", "Evidence was reviewed."
+    )
+
+    assert service.list_candidate_link_proposals(task.task_id)[0].decision == "accepted"
+    assert (first_source.read_bytes(), second_source.read_bytes()) == before
+    assert decided.phase == "waiting-for-review"
+
+    stale_task = service.create(
+        vault.vault_id, ImportSelection("session", "files", (first_source, second_source), 999.0)
+    )
+    stale_candidate = service.list_candidate_link_proposals(stale_task.task_id)[0]
+    second_source.write_text("# Practice\nUnrelated history note.", encoding="utf-8")
+    with pytest.raises(ImportTaskError, match="stale"):
+        service.decide_candidate_link_proposal(
+            stale_task.task_id, stale_candidate.review_item_id, "excluded", "Source changed."
+        )
+    stale_proposals = service.list_candidate_link_proposals(stale_task.task_id)
+    assert len(stale_proposals) == 1
+    assert stale_proposals[0].status == "stale"
+    assert stale_proposals[0].stale_reason is not None
+    assert "Source content changed" in stale_proposals[0].stale_reason
+    stale_task_after_change = service.get(stale_task.task_id)
+    assert stale_task_after_change.phase == "failed"
+    assert stale_task_after_change.recovery_actions == ("restart-scan",)
+
+
 def test_classification_is_private_and_relocates_only_the_derived_proposal_plan(tmp_path: Path) -> None:
     vault_path = tmp_path / "vault"
     vault_path.mkdir()

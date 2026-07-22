@@ -519,9 +519,69 @@ test("creates an import task from the workbench and shows its persistent scan sn
             note_paths: ["platform/notes/source-new/01-chapter-one.md"],
             reason: "New tag proposed from the private domain suggestion."
           }]
+        }],
+        candidate_link_proposals: [{
+          review_item_id: "candidate-1",
+          revision: 1,
+          vault_id: "vault-import",
+          source_item_id: 1,
+          source_path: "platform/notes/source-new/01-chapter-one.md",
+          target_item_id: 1,
+          target_path: "platform/notes/source-new/02-chapter-two.md",
+          reason: "两侧都包含可审计术语：algebra、equations。",
+          confidence: 0.6,
+          source_evidence: {
+            relative_path: "platform/notes/source-new/01-chapter-one.md",
+            block_location: "unit:0",
+            excerpt: "Algebra equations preview.",
+            source_locations: ["page:1"]
+          },
+          target_evidence: {
+            relative_path: "platform/notes/source-new/02-chapter-two.md",
+            block_location: "unit:3",
+            excerpt: "Algebra equations practice.",
+            source_locations: ["page:2"]
+          },
+          is_existing_note_change: false,
+          requires_review: true,
+          status: "required-check",
+          decision: null,
+          decision_reason: null,
+          stale_reason: null
+        }, {
+          review_item_id: "candidate-stale",
+          revision: 1,
+          vault_id: "vault-import",
+          source_item_id: 1,
+          source_path: "platform/notes/previous-source.md",
+          target_item_id: 1,
+          target_path: "platform/notes/previous-target.md",
+          reason: "两侧都包含可审计术语：algebra。",
+          confidence: 0.6,
+          source_evidence: {
+            relative_path: "platform/notes/previous-source.md",
+            block_location: "unit:0",
+            excerpt: "Previous algebra evidence.",
+            source_locations: ["page:1"]
+          },
+          target_evidence: {
+            relative_path: "platform/notes/previous-target.md",
+            block_location: "unit:1",
+            excerpt: "Previous algebra target evidence.",
+            source_locations: ["page:2"]
+          },
+          is_existing_note_change: false,
+          requires_review: false,
+          status: "stale",
+          decision: null,
+          decision_reason: null,
+          stale_reason: "关联笔记提案已更新。"
         }]
       }
     });
+  });
+  await page.route("**/api/import-tasks/task-import/candidate-links/**", async (route) => {
+    await route.fulfill({ json: { task } });
   });
   await page.route("**/api/import-tasks/task-import/events?after=4", async (route) => {
     await route.fulfill({ contentType: "text/event-stream", body: ": keep-alive\n\n" });
@@ -555,8 +615,24 @@ test("creates an import task from the workbench and shows its persistent scan sn
   await expect(page.getByRole("heading", { name: "Markdown 提案" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "分类建议" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "元数据与标签" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "候选链接" })).toBeVisible();
+  await expect(page.getByText("审核决定仅保存在应用私有状态，尚未写入 Markdown。")).toBeVisible();
+  await expect(page.getByText("来源证据（unit:0）：Algebra equations preview.")).toBeVisible();
+  await expect(page.getByText("已陈旧，需重新生成")).toBeVisible();
+  await expect(page.getByText("陈旧原因：关联笔记提案已更新。")).toBeVisible();
+  await expect(
+    page.getByLabel("platform/notes/previous-source.md 到 platform/notes/previous-target.md 的候选链接决定理由")
+  ).toBeDisabled();
+  await expect(page.getByText("必须检查", { exact: true })).toHaveCount(2);
+  const candidateReason = page.getByLabel(
+    "platform/notes/source-new/01-chapter-one.md 到 platform/notes/source-new/02-chapter-two.md 的候选链接决定理由"
+  );
+  await candidateReason.focus();
+  await expect(candidateReason).toBeFocused();
+  await page.getByLabel("候选链接").locator("button.secondary-button:not([disabled])", { hasText: "接受" }).click();
+  await expect(page.getByText("候选链接已接受，尚未写入 Markdown。")).toBeVisible();
   await expect(page.getByRole("button", { name: "接受标签" })).toBeVisible();
-  await expect(page.getByText("必须检查", { exact: true })).toBeVisible();
+  await expect(page.getByLabel("分类建议").getByText("必须检查", { exact: true })).toBeVisible();
   const classificationFolder = page.getByLabel("资料项 1 的目标文件夹");
   await expect(classificationFolder).toHaveValue("platform/notes/unclassified");
   await expect(page.getByRole("button", { name: "接受高置信度建议" })).toBeVisible();

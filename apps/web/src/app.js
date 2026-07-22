@@ -41,7 +41,10 @@ export const IMPORT_TASK_EVENT_NAMES = [
   "classification-excluded",
   "metadata-tags-generated",
   "metadata-tags-accepted",
-  "metadata-tags-excluded"
+  "metadata-tags-excluded",
+  "candidate-links-generated",
+  "candidate-links-accepted",
+  "candidate-links-excluded"
 ];
 export const NAVIGATION_DESTINATIONS = [
   { id: "workbench", label: "工作台", emptyState: "尚未选择 vault。" },
@@ -1309,6 +1312,7 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
   const [ocrDrafts, setOcrDrafts] = React.useState({});
   const [classificationDrafts, setClassificationDrafts] = React.useState({});
   const [metadataTagDrafts, setMetadataTagDrafts] = React.useState({});
+  const [candidateLinkDrafts, setCandidateLinkDrafts] = React.useState({});
   const [splitSelections, setSplitSelections] = React.useState({});
   const refreshTimerRef = React.useRef(null);
 
@@ -1391,6 +1395,10 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
 
   function updateMetadataTagDraft(itemId, value) {
     setMetadataTagDrafts((current) => ({ ...current, [itemId]: value }));
+  }
+
+  function updateCandidateLinkDraft(reviewItemId, value) {
+    setCandidateLinkDrafts((current) => ({ ...current, [reviewItemId]: value }));
   }
 
   function updateSplitSelection(itemId, sequence, value) {
@@ -1541,6 +1549,36 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
     }
   }
 
+  async function runCandidateLinkAction(proposal, decision) {
+    if (isActing) return;
+    const reason = candidateLinkDrafts[proposal.review_item_id]?.trim();
+    if (decision === "excluded" && !reason) {
+      setStatus("请说明排除候选链接的理由。 ");
+      return;
+    }
+    setStatus("");
+    setIsActing(true);
+    try {
+      const response = await requestJson(
+        `${IMPORT_TASKS_ENDPOINT}/${taskId}/candidate-links/${encodeURIComponent(proposal.review_item_id)}/decision`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            decision,
+            reason: reason || "Accepted from the import task detail."
+          })
+        }
+      );
+      onTaskChanged(response.task);
+      await loadDetail();
+      setStatus(decision === "accepted" ? "候选链接已接受，尚未写入 Markdown。" : "候选链接已排除。");
+    } catch (error) {
+      setStatus(error.message);
+    } finally {
+      setIsActing(false);
+    }
+  }
+
   if (!detail) {
     return React.createElement(
       "section",
@@ -1555,7 +1593,8 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
     items,
     note_proposals: noteProposals = [],
     classification_suggestions: classifications = [],
-    metadata_tag_proposals: metadataTagProposals = []
+    metadata_tag_proposals: metadataTagProposals = [],
+    candidate_link_proposals: candidateLinkProposals = []
   } = detail;
   const canCancel = task.lifecycle === "running";
   const canResume = task.recovery_actions.includes("restart-scan") || task.recovery_actions.includes("restart-parse") || task.recovery_actions.includes("restart-ocr") || task.recovery_actions.includes("restart-derivation") || task.recovery_actions.includes("create-new-task");
@@ -1581,6 +1620,11 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
     ? "正在更新元数据与标签提案。"
     : task.lifecycle !== "waiting-for-review"
       ? "元数据与标签提案只能在等待审核时处理。"
+      : "";
+  const candidateLinkControlReason = isActing
+    ? "正在更新候选链接提案。"
+    : task.lifecycle !== "waiting-for-review"
+      ? "候选链接只能在等待审核时处理。"
       : "";
   return React.createElement(
     "section",
@@ -1879,6 +1923,89 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
                       title: metadataTagControlReason || undefined,
                       onClick: () => runMetadataTagAction(proposal, "excluded")
                     }, "排除标签")
+                  )
+                : null
+            );
+          })
+    )
+    ,
+    React.createElement(
+      "section",
+      { className: "candidate-link-list", "aria-label": "候选链接" },
+      React.createElement("h3", null, "候选链接"),
+      React.createElement("p", { className: "row-note" }, "审核决定仅保存在应用私有状态，尚未写入 Markdown。"),
+      candidateLinkProposals.length === 0
+        ? React.createElement("p", { className: "empty-state" }, "尚未发现有充分证据的候选链接。")
+        : candidateLinkProposals.map((proposal) => {
+            const isStale = proposal.status === "stale";
+            const canDecide = task.lifecycle === "waiting-for-review" && !isActing && !proposal.decision && !isStale;
+            const decisionText = isStale
+              ? "已陈旧，需重新生成"
+              : proposal.decision === "accepted"
+              ? "已接受，待后续提交"
+              : proposal.decision === "excluded"
+                ? "已排除"
+                : proposal.requires_review
+                  ? "必须检查"
+                  : "待确认";
+            const decisionControlReason = isStale
+              ? proposal.stale_reason || "候选链接已陈旧，不能再做决定。"
+              : candidateLinkControlReason;
+            const controlReasonId = `candidate-link-control-reason-${proposal.review_item_id}`;
+            return React.createElement(
+              "div",
+              { className: "section-row review-diff-row candidate-link-row", key: proposal.review_item_id },
+              React.createElement("span", { className: "row-title" }, `${proposal.source_path} -> ${proposal.target_path}`),
+              React.createElement("span", { className: "row-note" }, `关系理由：${proposal.reason}`),
+              React.createElement("span", { className: "row-note" }, `来源证据（${proposal.source_evidence.block_location}）：${proposal.source_evidence.excerpt}`),
+              React.createElement("span", { className: "row-note" }, `目标证据（${proposal.target_evidence.block_location}）：${proposal.target_evidence.excerpt}`),
+              React.createElement("span", { className: "row-note" }, `置信度：${proposal.confidence}`),
+              proposal.is_existing_note_change
+                ? React.createElement("span", { className: "row-status" }, "既有笔记独立变更")
+                : null,
+              React.createElement(
+                "span",
+                { className: `row-status${proposal.requires_review && !proposal.decision ? " status-danger" : ""}` },
+                decisionText
+              ),
+              proposal.decision_reason
+                ? React.createElement("span", { className: "row-note" }, `决定理由：${proposal.decision_reason}`)
+                : null,
+              isStale
+                ? React.createElement("span", { className: "row-note" }, `陈旧原因：${proposal.stale_reason}`)
+                : null,
+              !proposal.decision
+                ? React.createElement(
+                    "div",
+                    { className: "classification-controls" },
+                    decisionControlReason
+                      ? React.createElement("span", { id: controlReasonId, className: "row-note", role: "status" }, decisionControlReason)
+                      : null,
+                    React.createElement("input", {
+                      type: "text",
+                      value: candidateLinkDrafts[proposal.review_item_id] || "",
+                      onChange: (event) => updateCandidateLinkDraft(proposal.review_item_id, event.target.value),
+                      disabled: !canDecide,
+                      placeholder: "审核理由（排除时必填）",
+                      "aria-label": `${proposal.source_path} 到 ${proposal.target_path} 的候选链接决定理由`,
+                      "aria-describedby": decisionControlReason ? controlReasonId : undefined
+                    }),
+                    React.createElement("button", {
+                      className: "secondary-button",
+                      type: "button",
+                      disabled: !canDecide,
+                      title: decisionControlReason || undefined,
+                      "aria-describedby": decisionControlReason ? controlReasonId : undefined,
+                      onClick: () => runCandidateLinkAction(proposal, "accepted")
+                    }, "接受"),
+                    React.createElement("button", {
+                      className: "secondary-button",
+                      type: "button",
+                      disabled: !canDecide,
+                      title: decisionControlReason || undefined,
+                      "aria-describedby": decisionControlReason ? controlReasonId : undefined,
+                      onClick: () => runCandidateLinkAction(proposal, "excluded")
+                    }, "确认排除")
                   )
                 : null
             );

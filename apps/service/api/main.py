@@ -6,13 +6,14 @@ import threading
 import time
 import webbrowser
 from pathlib import Path
+from typing import Literal
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -58,6 +59,7 @@ from domain.derived_notes import (
     safe_split_after_unit_indexes,
 )
 from domain.classification import ClassificationSuggestion
+from domain.candidate_links import CandidateLinkProposal
 from domain.metadata_tags import MetadataTagProposal, TagChangePreview, TagDefinition
 from domain.tasks import ImportTask, ImportTaskEvent, ImportTaskItem
 from domain.vaults import Vault
@@ -104,6 +106,9 @@ IMPORT_TASK_SSE_EVENT_NAMES = frozenset(
         "metadata-tags-accepted",
         "metadata-tags-excluded",
         "metadata-tags-tag-change",
+        "candidate-links-generated",
+        "candidate-links-accepted",
+        "candidate-links-excluded",
     }
 )
 
@@ -153,6 +158,13 @@ class MetadataTagDecisionCommand(BaseModel):
 
     decision: str
     reason: str
+
+
+class CandidateLinkDecisionCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: Literal["accepted", "excluded"]
+    reason: str = Field(pattern=r".*\S.*")
 
 
 class VaultTagCommand(BaseModel):
@@ -644,6 +656,28 @@ def metadata_tag_proposal_payload(proposal: MetadataTagProposal) -> dict[str, ob
         "decision": proposal.decision,
         "decision_reason": proposal.decision_reason,
         "tags": [tag.to_dict() for tag in proposal.tags],
+    }
+
+
+def candidate_link_proposal_payload(proposal: CandidateLinkProposal) -> dict[str, object]:
+    return {
+        "review_item_id": proposal.review_item_id,
+        "revision": proposal.revision,
+        "vault_id": proposal.vault_id,
+        "source_item_id": proposal.source_item_id,
+        "source_path": proposal.source_path,
+        "target_item_id": proposal.target_item_id,
+        "target_path": proposal.target_path,
+        "reason": proposal.reason,
+        "confidence": proposal.confidence,
+        "source_evidence": proposal.source_evidence.to_dict(),
+        "target_evidence": proposal.target_evidence.to_dict(),
+        "is_existing_note_change": proposal.is_existing_note_change,
+        "requires_review": proposal.requires_review,
+        "status": proposal.status,
+        "decision": proposal.decision,
+        "decision_reason": proposal.decision_reason,
+        "stale_reason": proposal.stale_reason,
     }
 
 
@@ -1169,6 +1203,10 @@ def create_app(
                 app.state.import_task_service, "list_metadata_tag_proposals", None
             )
             metadata_tags = list_metadata_tags(task_id) if list_metadata_tags is not None else []
+            list_candidate_links = getattr(
+                app.state.import_task_service, "list_candidate_link_proposals", None
+            )
+            candidate_links = list_candidate_links(task_id) if list_candidate_links is not None else []
             return {
                 "task": import_task_payload(task),
                 "items": [import_task_item_payload(item) for item in items],
@@ -1178,6 +1216,9 @@ def create_app(
                 ],
                 "metadata_tag_proposals": [
                     metadata_tag_proposal_payload(proposal) for proposal in metadata_tags
+                ],
+                "candidate_link_proposals": [
+                    candidate_link_proposal_payload(proposal) for proposal in candidate_links
                 ],
                 "event_cursor": event_cursor,
             }
@@ -1260,6 +1301,38 @@ def create_app(
                 "task": import_task_payload(
                     app.state.import_task_service.decide_metadata_tag_proposal(
                         task_id, item_id, command.decision, command.reason
+                    )
+                )
+            }
+        except Exception as error:
+            raise import_task_error(error) from error
+
+    @app.get("/api/import-tasks/{task_id}/candidate-links")
+    def get_import_candidate_links(request: Request, task_id: str) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            return {
+                "candidate_link_proposals": [
+                    candidate_link_proposal_payload(proposal)
+                    for proposal in app.state.import_task_service.list_candidate_link_proposals(task_id)
+                ]
+            }
+        except Exception as error:
+            raise import_task_error(error) from error
+
+    @app.post("/api/import-tasks/{task_id}/candidate-links/{review_item_id}/decision")
+    def decide_import_candidate_link(
+        request: Request,
+        task_id: str,
+        review_item_id: str,
+        command: CandidateLinkDecisionCommand,
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            return {
+                "task": import_task_payload(
+                    app.state.import_task_service.decide_candidate_link_proposal(
+                        task_id, review_item_id, command.decision, command.reason
                     )
                 )
             }

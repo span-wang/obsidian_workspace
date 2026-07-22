@@ -25,6 +25,11 @@ from domain.classification import (
     validate_filename_for_proposal,
     validate_target_within_managed_root,
 )
+from domain.candidate_links import (
+    CandidateLinkProposal,
+    discover_candidate_links,
+    proposal_sha256,
+)
 from domain.metadata_tags import (
     apply_tag_change,
     MetadataTagProposal,
@@ -531,6 +536,11 @@ class ImportTaskService:
         self.repository.record_note_proposal(item_id, proposal)
 
     def _record_source_change(self, task: ImportTask, item_id: int) -> None:
+        self.repository.invalidate_candidate_link_proposals(
+            task.task_id,
+            item_id,
+            "Source content changed after scanning; restart the scan before reviewing this candidate link.",
+        )
         self.repository.invalidate_note_proposals(task.task_id, item_id)
         self.repository.invalidate_metadata_tag_proposals(task.task_id, item_id)
         self.repository.record_parse_failure(
@@ -799,6 +809,7 @@ class ImportTaskService:
         if completed.lifecycle == "waiting-for-review":
             self._ensure_classification_suggestions(completed)
             self._ensure_metadata_tag_proposals(completed)
+            self._ensure_candidate_link_proposals(completed)
         return self.get(task.task_id)
 
     def _generate_native_proposals(self, task: ImportTask) -> bool:
@@ -935,6 +946,26 @@ class ImportTaskService:
                 proposal.item_id, generated, "metadata-tags-generated"
             )
 
+    def _ensure_candidate_link_proposals(self, task: ImportTask) -> None:
+        if task.lifecycle != "waiting-for-review":
+            return
+        proposals = tuple(self.repository.list_note_proposals(task.task_id))
+        existing = {
+            proposal.review_item_id: proposal
+            for proposal in self.repository.list_candidate_link_proposals(task.task_id)
+        }
+        for generated in discover_candidate_links(task.task_id, proposals, utc_now()):
+            current = existing.get(generated.review_item_id)
+            if (
+                current is not None
+                and current.source_proposal_revision == generated.source_proposal_revision
+                and current.source_proposal_sha256 == generated.source_proposal_sha256
+                and current.target_proposal_revision == generated.target_proposal_revision
+                and current.target_proposal_sha256 == generated.target_proposal_sha256
+            ):
+                continue
+            self.repository.record_candidate_link_proposal(generated, "candidate-links-generated")
+
     def _require_classification_review_task(self, task: ImportTask) -> None:
         if task.lifecycle != "waiting-for-review":
             raise ImportTaskError("Classification decisions need a task waiting for review.")
@@ -974,6 +1005,68 @@ class ImportTaskService:
     def list_metadata_tag_proposals(self, task_id: str) -> list[MetadataTagProposal]:
         self.get(task_id)
         return self.repository.list_metadata_tag_proposals(task_id)
+
+    def list_candidate_link_proposals(self, task_id: str) -> list[CandidateLinkProposal]:
+        self.get(task_id)
+        return self.repository.list_candidate_link_proposals(task_id)
+
+    def decide_candidate_link_proposal(
+        self, task_id: str, review_item_id: str, decision: str, reason: str
+    ) -> ImportTask:
+        with self._state_lock:
+            task = self.get(task_id)
+            self._require_classification_review_task(task)
+            self._available_vault(task.vault_id)
+            candidate = self.repository.get_candidate_link_proposal(task_id, review_item_id)
+            if candidate is None or candidate.vault_id != task.vault_id:
+                raise ImportTaskError("This candidate link does not belong to the import task.")
+            if candidate.status == "stale":
+                raise ImportTaskError(
+                    candidate.stale_reason or "The candidate link is stale and must be regenerated."
+                )
+            if candidate.decision is not None:
+                raise ImportTaskError("The candidate link already has a review decision.")
+            items = {item.item_id: item for item in self.repository.list_items(task_id)}
+            source_item = items.get(candidate.source_item_id)
+            target_item = items.get(candidate.target_item_id)
+            source = self.repository.get_note_proposal(candidate.source_item_id)
+            target = self.repository.get_note_proposal(candidate.target_item_id)
+            if source_item is None or target_item is None or source is None or target is None:
+                raise ImportTaskError("The candidate link is stale; regenerate the review proposals.")
+            source_matches = self._source_matches_scanned_content(source_item)
+            target_matches = self._source_matches_scanned_content(target_item)
+            if not source_matches or not target_matches:
+                changed_item_id = (
+                    candidate.source_item_id
+                    if not source_matches
+                    else candidate.target_item_id
+                )
+                self._record_source_change(task, changed_item_id)
+                raise ImportTaskError("The candidate link is stale; restart the scan before reviewing it.")
+            if (
+                candidate.source_proposal_revision != getattr(source, "revision", 1)
+                or candidate.source_proposal_sha256 != proposal_sha256(source)
+                or candidate.target_proposal_revision != getattr(target, "revision", 1)
+                or candidate.target_proposal_sha256 != proposal_sha256(target)
+            ):
+                self.repository.invalidate_candidate_link_proposals(
+                    task_id,
+                    candidate.source_item_id,
+                    "A related note proposal changed; regenerate candidate links.",
+                )
+                self.repository.invalidate_candidate_link_proposals(
+                    task_id,
+                    candidate.target_item_id,
+                    "A related note proposal changed; regenerate candidate links.",
+                )
+                raise ImportTaskError("The candidate link proposal is stale and must be regenerated.")
+            try:
+                decided = candidate.with_decision(decision, reason, utc_now())
+            except ValueError as error:
+                raise ImportTaskError(str(error)) from error
+            return self.repository.record_candidate_link_proposal(
+                decided, f"candidate-links-{decision}"
+            )
 
     def decide_metadata_tag_proposal(
         self, task_id: str, item_id: int, decision: str, reason: str
@@ -1144,6 +1237,7 @@ class ImportTaskService:
             )
             updated = self.repository.record_classification_revision(item_id, revised_proposal, revised)
             self._ensure_metadata_tag_proposals(updated)
+            self._ensure_candidate_link_proposals(updated)
             return self.get(task_id)
 
     def decide_classification_suggestion(
@@ -1194,6 +1288,7 @@ class ImportTaskService:
             updated = self.repository.record_note_proposal(item_id, merge_adjacent_notes(proposal, before_sequence))
             self._ensure_classification_suggestions(updated)
             self._ensure_metadata_tag_proposals(updated)
+            self._ensure_candidate_link_proposals(updated)
             return self.get(task_id)
 
     def split_note_proposal(self, task_id: str, item_id: int, sequence: int, after_unit_index: int):
@@ -1214,6 +1309,7 @@ class ImportTaskService:
             )
             self._ensure_classification_suggestions(updated)
             self._ensure_metadata_tag_proposals(updated)
+            self._ensure_candidate_link_proposals(updated)
             return self.get(task_id)
 
     def retry_ocr_target(self, task_id: str, item_id: int, target_id: str) -> ImportTask:

@@ -463,12 +463,14 @@ button:disabled {
 }
 
 .metadata-tag-list,
+.candidate-link-list,
 .tag-management {
   margin-top: 24px;
   border-top: 1px solid #d7d7d2;
 }
 
 .metadata-tag-list h3,
+.candidate-link-list h3,
 .tag-management h3 {
   margin: 18px 0 0;
   color: #111111;
@@ -478,6 +480,7 @@ button:disabled {
 }
 
 .metadata-tag-row,
+.candidate-link-row,
 .tag-row {
   display: grid;
   gap: 8px;

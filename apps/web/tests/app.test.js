@@ -72,7 +72,10 @@ test("uses relative same-origin endpoints for health and local session checks", 
     "classification-excluded",
     "metadata-tags-generated",
     "metadata-tags-accepted",
-    "metadata-tags-excluded"
+    "metadata-tags-excluded",
+    "candidate-links-generated",
+    "candidate-links-accepted",
+    "candidate-links-excluded"
   ]);
 });
 

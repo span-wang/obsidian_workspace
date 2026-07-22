@@ -4,6 +4,7 @@ from typing import Protocol
 
 from domain.tasks import ImportTask, ImportTaskEvent, ImportTaskItem
 from domain.classification import ClassificationSuggestion
+from domain.candidate_links import CandidateLinkProposal
 from domain.derived_notes import NoteProposal
 from domain.evidence import EvidenceLocator, OcrEvidence, OcrTarget, ParseEvidence
 from domain.metadata_tags import MetadataTagProposal, TagChangePreview, TagDefinition
@@ -94,6 +95,18 @@ class TaskRepository(Protocol):
     def list_metadata_tag_proposals(self, task_id: str) -> list[MetadataTagProposal]: ...
 
     def invalidate_metadata_tag_proposals(self, task_id: str, item_id: int) -> None: ...
+
+    def record_candidate_link_proposal(
+        self, proposal: CandidateLinkProposal, event_type: str
+    ) -> ImportTask: ...
+
+    def get_candidate_link_proposal(
+        self, task_id: str, review_item_id: str
+    ) -> CandidateLinkProposal | None: ...
+
+    def list_candidate_link_proposals(self, task_id: str) -> list[CandidateLinkProposal]: ...
+
+    def invalidate_candidate_link_proposals(self, task_id: str, item_id: int, reason: str) -> None: ...
 
     def list_metadata_tag_proposals_for_vault(self, vault_id: str) -> list[MetadataTagProposal]: ...
 
