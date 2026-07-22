@@ -5,7 +5,9 @@ from pathlib import Path
 
 import pytest
 from docx import Document
+from pypdf import PdfWriter
 
+import workers.document_parser as document_parser
 from workers.document_parser import DocumentParseError, parse_document, parse_items
 
 
@@ -98,6 +100,24 @@ def test_parse_docx_keeps_heading_list_table_and_equivalent_locations(tmp_path: 
     assert all(unit.locator.page is None for unit in evidence.units)
 
 
+def test_parse_docx_without_normal_style_keeps_unstyled_paragraph(tmp_path: Path) -> None:
+    source = tmp_path / "unstyled.docx"
+    document = Document()
+    document.add_paragraph("Unstyled evidence")
+    normal = document.styles["Normal"]
+    document.styles.element.remove(normal._element)
+    document.save(source)
+
+    evidence = parse_document(source, "docx")
+
+    assert any(
+        unit.kind == "paragraph"
+        and unit.text == "Unstyled evidence"
+        and unit.locator.docx_location == "paragraph:1"
+        for unit in evidence.units
+    )
+
+
 def test_parse_empty_pdf_creates_a_locatable_required_check_issue(tmp_path: Path) -> None:
     source = tmp_path / "empty.pdf"
     _write_pdf(source, [[]])
@@ -108,6 +128,21 @@ def test_parse_empty_pdf_creates_a_locatable_required_check_issue(tmp_path: Path
     assert evidence.issues[0].code == "empty-page"
     assert evidence.issues[0].locator.page == 1
     assert evidence.issues[0].severity == "required-check"
+
+
+def test_parse_zero_page_pdf_uses_a_document_region_not_a_docx_locator(tmp_path: Path) -> None:
+    source = tmp_path / "zero-pages.pdf"
+    writer = PdfWriter()
+    with source.open("wb") as output:
+        writer.write(output)
+
+    evidence = parse_document(source, "pdf")
+
+    locator = evidence.issues[0].locator
+    assert evidence.issues[0].code == "missing-pages"
+    assert locator.page is None
+    assert locator.docx_location is None
+    assert locator.region == "document"
 
 
 def test_parse_rejects_unknown_or_unreadable_documents(tmp_path: Path) -> None:
@@ -132,3 +167,87 @@ def test_parse_worker_events_keep_raw_text_off_the_event_log(tmp_path: Path) -> 
     assert events[1]["content_sha256"] == sha256(source.read_bytes()).hexdigest()
     assert events[1]["evidence"]["raw_extraction"]["pages"][0]["text"] == "Chapter One"
     assert events[-1] == {"type": "parse-completed"}
+
+
+def test_parse_worker_hides_source_paths_when_the_file_disappears(tmp_path: Path) -> None:
+    source = tmp_path / "removed.pdf"
+
+    events = list(parse_items(({"item_id": 7, "path": str(source), "document_kind": "pdf"},)))
+
+    assert events[1] == {
+        "type": "parse-failed-item",
+        "item_id": 7,
+        "reason": "The source file is no longer available for local parsing.",
+        "locator_summary": "document",
+    }
+    assert str(source) not in events[1]["reason"]
+
+
+def test_parse_worker_uses_one_snapshot_when_the_source_changes_during_parsing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "lesson.pdf"
+    _write_pdf(source, [["Original chapter"]])
+    original_bytes = source.read_bytes()
+    parse_pdf = document_parser._parse_pdf
+
+    def replace_source_after_snapshot(source_bytes: bytes, should_cancel):
+        _write_pdf(source, [["Replaced chapter"]])
+        return parse_pdf(source_bytes, should_cancel)
+
+    monkeypatch.setattr(document_parser, "_parse_pdf", replace_source_after_snapshot)
+    events = list(parse_items(({"item_id": 7, "path": str(source), "document_kind": "pdf"},)))
+
+    assert events[1]["content_sha256"] == sha256(original_bytes).hexdigest()
+    assert events[1]["evidence"]["raw_extraction"]["pages"][0]["text"] == "Original chapter"
+
+
+def test_parse_worker_cancels_inside_a_document(tmp_path: Path) -> None:
+    source = tmp_path / "lesson.pdf"
+    _write_pdf(source, [["Chapter One"], ["Chapter Two"]])
+    cancellation_checks = iter((False, False, True))
+
+    events = list(
+        parse_items(
+            ({"item_id": 7, "path": str(source), "document_kind": "pdf"},),
+            should_cancel=lambda: next(cancellation_checks),
+        )
+    )
+
+    assert events == [{"type": "parse-started"}, {"type": "parse-cancelled"}]
+
+
+def test_docx_preserves_body_order_heading_levels_and_atomic_question_answers(tmp_path: Path) -> None:
+    source = tmp_path / "ordered.docx"
+    document = Document()
+    document.add_heading("Chapter", level=1)
+    document.add_paragraph("Before table")
+    table = document.add_table(rows=1, cols=1)
+    table.cell(0, 0).text = "Table content"
+    document.add_heading("Scope", level=2)
+    document.add_paragraph("Question: Why?")
+    document.add_paragraph("Answer: Because.")
+    document.add_paragraph("Afterword")
+    document.save(source)
+
+    evidence = parse_document(source, "docx")
+
+    assert [(unit.kind, unit.text) for unit in evidence.units] == [
+        ("heading", "Chapter"),
+        ("paragraph", "Before table"),
+        ("table-cell", "Table content"),
+        ("heading-2", "Scope"),
+        ("question-answer", "Question: Why?\nAnswer: Because."),
+        ("paragraph", "Afterword"),
+    ]
+
+
+def test_pdf_question_answer_is_one_atomic_unit_without_a_duplicate_answer(tmp_path: Path) -> None:
+    source = tmp_path / "question.pdf"
+    _write_pdf(source, [["Question: Why?", "Answer: Because."]])
+
+    evidence = parse_document(source, "pdf")
+
+    assert [(unit.kind, unit.text) for unit in evidence.units] == [
+        ("question-answer", "Question: Why?\nAnswer: Because."),
+    ]

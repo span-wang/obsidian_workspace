@@ -10,6 +10,7 @@ import {
   IMPORT_DIRECTORY_SELECTION_ENDPOINT,
   IMPORT_FILES_SELECTION_ENDPOINT,
   ImportTaskCenter,
+  IMPORT_TASK_EVENT_NAMES,
   IMPORT_TASKS_ENDPOINT,
   LOCAL_SESSION_ENDPOINT,
   NAVIGATION_DESTINATIONS,
@@ -38,6 +39,41 @@ test("uses relative same-origin endpoints for health and local session checks", 
   assert.equal(IMPORT_TASKS_ENDPOINT, "/api/import-tasks");
   assert.equal(IMPORT_FILES_SELECTION_ENDPOINT, "/api/import-selections/files");
   assert.equal(IMPORT_DIRECTORY_SELECTION_ENDPOINT, "/api/import-selections/directory");
+  assert.deepEqual(IMPORT_TASK_EVENT_NAMES, [
+    "task-update",
+    "scan-started",
+    "scan-completed",
+    "scan-failed",
+    "scan-restarted",
+    "parse-started",
+    "parse-item-completed",
+    "parse-item-failed",
+    "parse-completed",
+    "parse-failed",
+    "parse-restarted",
+    "source-changed",
+    "ocr-started",
+    "ocr-target-started",
+    "ocr-target-completed",
+    "ocr-target-failed",
+    "ocr-attempt-failed",
+    "ocr-not-required",
+    "ocr-source-changed",
+    "ocr-completed",
+    "ocr-failed",
+    "ocr-restarted",
+    "derivation-started",
+    "derivation-item-completed",
+    "derivation-completed",
+    "derivation-failed",
+    "classification-generated",
+    "classification-revised",
+    "classification-accepted",
+    "classification-excluded",
+    "metadata-tags-generated",
+    "metadata-tags-accepted",
+    "metadata-tags-excluded"
+  ]);
 });
 
 test("shows all identity counts in task center rows", () => {

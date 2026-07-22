@@ -5,9 +5,19 @@ import sqlite3
 from dataclasses import replace
 from pathlib import Path
 
-from domain.evidence import ParseEvidence
+from domain.derived_notes import NoteProposal, private_index_candidates, proposal_from_dict
+from domain.classification import ClassificationSuggestion
+from domain.evidence import EvidenceLocator, OcrEvidence, OcrTarget, ParseEvidence, ParseIssue
+from domain.metadata_tags import MetadataTagProposal, TagChangePreview, TagDefinition
 from domain.sources import VersionSuggestion
-from domain.tasks import ImportTask, ImportTaskCounts, ImportTaskEvent, ImportTaskItem, utc_now
+from domain.tasks import (
+    ImportTask,
+    ImportTaskCounts,
+    ImportTaskEvent,
+    ImportTaskItem,
+    OcrTargetSummary,
+    utc_now,
+)
 
 
 class SqliteImportTaskRepository:
@@ -46,6 +56,10 @@ class SqliteImportTaskRepository:
                     parsed_count INTEGER NOT NULL DEFAULT 0,
                     parse_failed_count INTEGER NOT NULL DEFAULT 0,
                     required_check_count INTEGER NOT NULL DEFAULT 0,
+                    ocr_completed_count INTEGER NOT NULL DEFAULT 0,
+                    ocr_failed_count INTEGER NOT NULL DEFAULT 0,
+                    confirmed_gap_count INTEGER NOT NULL DEFAULT 0,
+                    derived_note_count INTEGER NOT NULL DEFAULT 0,
                     recovery_actions_json TEXT NOT NULL,
                     failure_reason TEXT,
                     parent_task_id TEXT,
@@ -76,6 +90,11 @@ class SqliteImportTaskRepository:
                     parse_locator_summary TEXT,
                     parse_issue_summary TEXT,
                     parse_evidence_id INTEGER
+                    , ocr_status TEXT NOT NULL DEFAULT 'not-applicable'
+                    , ocr_confidence REAL
+                    , ocr_issue_count INTEGER NOT NULL DEFAULT 0
+                    , ocr_locator_summary TEXT
+                    , ocr_issue_summary TEXT
                 )
                 """
             )
@@ -106,6 +125,10 @@ class SqliteImportTaskRepository:
             self._ensure_column(
                 connection, "import_tasks", "required_check_count INTEGER NOT NULL DEFAULT 0"
             )
+            self._ensure_column(connection, "import_tasks", "ocr_completed_count INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "import_tasks", "ocr_failed_count INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "import_tasks", "confirmed_gap_count INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "import_tasks", "derived_note_count INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(
                 connection, "import_task_items", "parse_status TEXT NOT NULL DEFAULT 'not-applicable'"
             )
@@ -116,6 +139,15 @@ class SqliteImportTaskRepository:
             self._ensure_column(connection, "import_task_items", "parse_locator_summary TEXT")
             self._ensure_column(connection, "import_task_items", "parse_issue_summary TEXT")
             self._ensure_column(connection, "import_task_items", "parse_evidence_id INTEGER")
+            self._ensure_column(
+                connection, "import_task_items", "ocr_status TEXT NOT NULL DEFAULT 'not-applicable'"
+            )
+            self._ensure_column(connection, "import_task_items", "ocr_confidence REAL")
+            self._ensure_column(
+                connection, "import_task_items", "ocr_issue_count INTEGER NOT NULL DEFAULT 0"
+            )
+            self._ensure_column(connection, "import_task_items", "ocr_locator_summary TEXT")
+            self._ensure_column(connection, "import_task_items", "ocr_issue_summary TEXT")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS import_parse_evidence (
@@ -141,6 +173,103 @@ class SqliteImportTaskRepository:
                 """
             )
             connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS import_ocr_targets (
+                    target_record_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL,
+                    target_id TEXT NOT NULL,
+                    locator_json TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    engine TEXT,
+                    status TEXT NOT NULL,
+                    confidence REAL,
+                    issue_count INTEGER NOT NULL DEFAULT 0,
+                    locator_summary TEXT NOT NULL,
+                    issue_summary TEXT,
+                    evidence_json TEXT,
+                    decision TEXT,
+                    decision_reason TEXT,
+                    corrected_text TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(item_id, target_id)
+                )
+                """
+            )
+            self._ensure_column(connection, "import_ocr_targets", "engine TEXT")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS import_ocr_attempts (
+                    attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL,
+                    target_id TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS import_ocr_decisions (
+                    decision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL,
+                    target_id TEXT NOT NULL,
+                    decision TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    corrected_text TEXT,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS import_note_proposals (
+                    proposal_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    item_id INTEGER NOT NULL,
+                    proposal_kind TEXT NOT NULL,
+                    proposal_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    invalidated_at TEXT
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS import_private_index_candidates (
+                    candidate_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    proposal_id INTEGER NOT NULL,
+                    task_id TEXT NOT NULL,
+                    item_id INTEGER NOT NULL,
+                    proposal_kind TEXT NOT NULL,
+                    note_relative_path TEXT NOT NULL,
+                    block_sequence INTEGER NOT NULL,
+                    text TEXT NOT NULL,
+                    source_locators_json TEXT NOT NULL,
+                    block_location TEXT,
+                    created_at TEXT NOT NULL,
+                    invalidated_at TEXT
+                )
+                """
+            )
+            self._ensure_column(connection, "import_note_proposals", "invalidated_at TEXT")
+            self._ensure_column(connection, "import_private_index_candidates", "invalidated_at TEXT")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS import_classification_suggestions (
+                    suggestion_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    item_id INTEGER NOT NULL,
+                    revision INTEGER NOT NULL,
+                    suggestion_json TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    decision TEXT,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(task_id, item_id, revision)
+                )
+                """
+            )
+            connection.execute(
                 "CREATE INDEX IF NOT EXISTS import_task_items_task_id ON import_task_items(task_id, item_id)"
             )
             connection.execute(
@@ -149,6 +278,74 @@ class SqliteImportTaskRepository:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS import_parse_evidence_identity "
                 "ON import_parse_evidence(vault_id, source_id, content_sha256)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS import_ocr_targets_item_id "
+                "ON import_ocr_targets(item_id, target_record_id)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS import_ocr_decisions_target "
+                "ON import_ocr_decisions(item_id, target_id, decision_id)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS import_note_proposals_latest "
+                "ON import_note_proposals(task_id, item_id, proposal_id DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS import_private_index_candidates_proposal "
+                "ON import_private_index_candidates(proposal_id, candidate_id)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS import_classification_suggestions_latest "
+                "ON import_classification_suggestions(task_id, item_id, revision DESC)"
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS import_metadata_tag_proposals (
+                    proposal_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    item_id INTEGER NOT NULL,
+                    revision INTEGER NOT NULL,
+                    proposal_json TEXT NOT NULL,
+                    requires_review INTEGER NOT NULL,
+                    decision TEXT,
+                    created_at TEXT NOT NULL,
+                    invalidated_at TEXT,
+                    UNIQUE(task_id, item_id, revision)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS vault_tag_definitions (
+                    tag_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    vault_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    tag_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(vault_id, name, revision)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS vault_tag_change_previews (
+                    preview_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    vault_id TEXT NOT NULL,
+                    preview_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS import_metadata_tag_proposals_latest "
+                "ON import_metadata_tag_proposals(task_id, item_id, revision DESC)"
+            )
+            self._ensure_column(connection, "import_metadata_tag_proposals", "invalidated_at TEXT")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS vault_tag_definitions_latest "
+                "ON vault_tag_definitions(vault_id, name, revision DESC)"
             )
 
     def create(self, task: ImportTask, event_type: str) -> None:
@@ -223,6 +420,17 @@ class SqliteImportTaskRepository:
 
     def clear_items(self, task: ImportTask, event_type: str) -> None:
         with self._connect() as connection:
+            timestamp = utc_now()
+            connection.execute(
+                "UPDATE import_note_proposals SET invalidated_at = ? "
+                "WHERE task_id = ? AND invalidated_at IS NULL",
+                (timestamp, task.task_id),
+            )
+            connection.execute(
+                "UPDATE import_private_index_candidates SET invalidated_at = ? "
+                "WHERE task_id = ? AND invalidated_at IS NULL",
+                (timestamp, task.task_id),
+            )
             connection.execute("DELETE FROM import_task_items WHERE task_id = ?", (task.task_id,))
             self._write_task(connection, task)
             self._append_event(connection, task.task_id, event_type, task.updated_at)
@@ -334,6 +542,495 @@ class SqliteImportTaskRepository:
             self._append_event(connection, row["task_id"], "parse-item-failed", updated.updated_at)
         return updated
 
+    def record_ocr_started(self, item_id: int, target: OcrTarget) -> ImportTask:
+        with self._connect() as connection:
+            timestamp = utc_now()
+            self._upsert_ocr_target(
+                connection,
+                item_id,
+                target,
+                engine=None,
+                status="processing",
+                confidence=None,
+                issue_count=0,
+                issue_summary=None,
+                evidence_json=None,
+                timestamp=timestamp,
+            )
+            return self._after_ocr_change(connection, item_id, "ocr-target-started", timestamp)
+
+    def record_ocr_evidence(self, item_id: int, evidence: OcrEvidence) -> ImportTask:
+        with self._connect() as connection:
+            timestamp = utc_now()
+            evidence_json = json.dumps(evidence.to_dict())
+            connection.execute(
+                """
+                INSERT INTO import_ocr_attempts (item_id, target_id, evidence_json, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (item_id, evidence.target.target_id, evidence_json, timestamp),
+            )
+            self._upsert_ocr_target(
+                connection,
+                item_id,
+                evidence.target,
+                engine=evidence.engine,
+                status="completed",
+                confidence=evidence.confidence,
+                issue_count=len(evidence.issues),
+                issue_summary=self._ocr_issue_summary(evidence),
+                evidence_json=evidence_json,
+                timestamp=timestamp,
+            )
+            return self._after_ocr_change(connection, item_id, "ocr-target-completed", timestamp)
+
+    def record_ocr_attempt_failure(
+        self, item_id: int, target: OcrTarget, engine: str, reason: str, raw_result: str = ""
+    ) -> ImportTask:
+        with self._connect() as connection:
+            timestamp = utc_now()
+            evidence = OcrEvidence(
+                target=target,
+                engine=engine,
+                raw_tsv=raw_result,
+                regions=(),
+                confidence=0.0,
+                issues=(
+                    ParseIssue(
+                        code="ocr-engine-failed",
+                        message=reason,
+                        locator=target.locator,
+                    ),
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO import_ocr_attempts (item_id, target_id, evidence_json, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (item_id, target.target_id, json.dumps(evidence.to_dict()), timestamp),
+            )
+            return self._after_ocr_change(connection, item_id, "ocr-attempt-failed", timestamp)
+
+    def record_ocr_failure(self, item_id: int, target: OcrTarget, reason: str) -> ImportTask:
+        with self._connect() as connection:
+            timestamp = utc_now()
+            self._upsert_ocr_target(
+                connection,
+                item_id,
+                target,
+                engine=None,
+                status="failed",
+                confidence=None,
+                issue_count=1,
+                issue_summary=reason,
+                evidence_json=None,
+                timestamp=timestamp,
+            )
+            return self._after_ocr_change(connection, item_id, "ocr-target-failed", timestamp)
+
+    def record_ocr_not_required(self, item_id: int) -> ImportTask:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT task_id, label FROM import_task_items WHERE item_id = ?", (item_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(item_id)
+            timestamp = utc_now()
+            connection.execute(
+                """
+                UPDATE import_task_items
+                SET ocr_status = 'not-required', ocr_confidence = NULL, ocr_issue_count = 0,
+                    ocr_locator_summary = NULL, ocr_issue_summary = NULL
+                WHERE item_id = ?
+                """,
+                (item_id,),
+            )
+            return self._after_ocr_change(connection, item_id, "ocr-not-required", timestamp)
+
+    def apply_ocr_decision(
+        self,
+        item_id: int,
+        target_id: str,
+        decision: str,
+        reason: str,
+        corrected_text: str | None = None,
+    ) -> ImportTask:
+        if decision not in {"corrected", "excluded"} or not reason.strip():
+            raise ValueError("OCR decisions need a supported action and a non-empty reason.")
+        if decision == "corrected" and not (corrected_text or "").strip():
+            raise ValueError("An OCR correction needs replacement text.")
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT 1 FROM import_ocr_targets WHERE item_id = ? AND target_id = ?",
+                (item_id, target_id),
+            ).fetchone()
+            if existing is None:
+                raise KeyError(target_id)
+            timestamp = utc_now()
+            connection.execute(
+                """
+                INSERT INTO import_ocr_decisions (
+                    item_id, target_id, decision, reason, corrected_text, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    item_id,
+                    target_id,
+                    decision,
+                    reason.strip(),
+                    corrected_text.strip() if corrected_text else None,
+                    timestamp,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE import_ocr_targets
+                SET decision = ?, decision_reason = ?, corrected_text = ?, updated_at = ?
+                WHERE item_id = ? AND target_id = ?
+                """,
+                (decision, reason.strip(), corrected_text.strip() if corrected_text else None, timestamp, item_id, target_id),
+            )
+            return self._after_ocr_change(connection, item_id, f"ocr-{decision}", timestamp)
+
+    def list_ocr_decisions(self, item_id: int, target_id: str) -> list[sqlite3.Row]:
+        with self._connect() as connection:
+            return connection.execute(
+                """
+                SELECT decision, reason, corrected_text, created_at
+                FROM import_ocr_decisions
+                WHERE item_id = ? AND target_id = ?
+                ORDER BY decision_id
+                """,
+                (item_id, target_id),
+            ).fetchall()
+
+    def get_ocr_target(self, item_id: int, target_id: str) -> OcrTarget:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT target_id, locator_json, label FROM import_ocr_targets
+                WHERE item_id = ? AND target_id = ?
+                """,
+                (item_id, target_id),
+            ).fetchone()
+        if row is None:
+            raise KeyError(target_id)
+        return OcrTarget.from_dict(
+            {"target_id": row["target_id"], "locator": json.loads(row["locator_json"]), "label": row["label"]}
+        )
+
+    def record_note_proposal(self, item_id: int, proposal: NoteProposal) -> ImportTask:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT task_id, label FROM import_task_items WHERE item_id = ?", (item_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(item_id)
+            timestamp = utc_now()
+            proposal_id = connection.execute(
+                """
+                INSERT INTO import_note_proposals (task_id, item_id, proposal_kind, proposal_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (row["task_id"], item_id, proposal.kind, json.dumps(proposal.to_dict()), timestamp),
+            ).lastrowid
+            for candidate in private_index_candidates(proposal):
+                connection.execute(
+                    """
+                    INSERT INTO import_private_index_candidates (
+                        proposal_id, task_id, item_id, proposal_kind, note_relative_path, block_sequence,
+                        text, source_locators_json, block_location, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        proposal_id,
+                        row["task_id"],
+                        item_id,
+                        candidate.proposal_kind,
+                        candidate.note_relative_path,
+                        candidate.block_sequence,
+                        candidate.text,
+                        json.dumps(candidate.to_dict()["source_locators"]),
+                        candidate.block_location,
+                        timestamp,
+                    ),
+                )
+            task = self._task_from_connection(connection, row["task_id"])
+            updated = replace(
+                task,
+                current_item_label=row["label"],
+                counts=self._counts_from_connection(connection, row["task_id"]),
+                updated_at=timestamp,
+            )
+            self._write_task(connection, updated)
+            self._append_event(connection, row["task_id"], "derivation-item-completed", timestamp)
+        return updated
+
+    def get_note_proposal(self, item_id: int) -> NoteProposal | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT proposal_json FROM import_note_proposals
+                WHERE item_id = ? AND invalidated_at IS NULL
+                ORDER BY proposal_id DESC LIMIT 1
+                """,
+                (item_id,),
+            ).fetchone()
+        return proposal_from_dict(json.loads(row["proposal_json"])) if row is not None else None
+
+    def list_note_proposals(self, task_id: str) -> list[NoteProposal]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT proposal.proposal_json
+                FROM import_note_proposals AS proposal
+                JOIN (
+                    SELECT item_id, MAX(proposal_id) AS proposal_id
+                    FROM import_note_proposals
+                    WHERE task_id = ? AND invalidated_at IS NULL
+                    GROUP BY item_id
+                ) AS latest ON latest.proposal_id = proposal.proposal_id
+                ORDER BY proposal.item_id
+                """,
+                (task_id,),
+            ).fetchall()
+        return [proposal_from_dict(json.loads(row["proposal_json"])) for row in rows]
+
+    def invalidate_note_proposals(self, task_id: str, item_id: int) -> None:
+        with self._connect() as connection:
+            timestamp = utc_now()
+            connection.execute(
+                "UPDATE import_note_proposals SET invalidated_at = ? "
+                "WHERE task_id = ? AND item_id = ? AND invalidated_at IS NULL",
+                (timestamp, task_id, item_id),
+            )
+            connection.execute(
+                "UPDATE import_private_index_candidates SET invalidated_at = ? "
+                "WHERE task_id = ? AND item_id = ? AND invalidated_at IS NULL",
+                (timestamp, task_id, item_id),
+            )
+
+    def record_classification_suggestion(
+        self, item_id: int, suggestion: ClassificationSuggestion, event_type: str
+    ) -> ImportTask:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT task_id, label FROM import_task_items WHERE item_id = ?", (item_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(item_id)
+            if suggestion.item_id != item_id or suggestion.task_id != row["task_id"]:
+                raise ValueError("Classification suggestion does not belong to this import item.")
+            connection.execute(
+                """
+                INSERT INTO import_classification_suggestions (
+                    task_id, item_id, revision, suggestion_json, confidence, decision, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    suggestion.task_id,
+                    item_id,
+                    suggestion.revision,
+                    json.dumps(suggestion.to_dict()),
+                    suggestion.confidence,
+                    suggestion.decision,
+                    suggestion.created_at,
+                ),
+            )
+            task = self._task_from_connection(connection, row["task_id"])
+            updated = replace(
+                task,
+                current_item_label=row["label"],
+                counts=self._counts_from_connection(connection, row["task_id"]),
+                updated_at=utc_now(),
+            )
+            self._write_task(connection, updated)
+            self._append_event(connection, row["task_id"], event_type, updated.updated_at)
+        return updated
+
+    def get_classification_suggestion(self, item_id: int) -> ClassificationSuggestion | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT suggestion_json FROM import_classification_suggestions
+                WHERE item_id = ? ORDER BY revision DESC LIMIT 1
+                """,
+                (item_id,),
+            ).fetchone()
+        return ClassificationSuggestion.from_dict(json.loads(row["suggestion_json"])) if row else None
+
+    def list_classification_suggestions(self, task_id: str) -> list[ClassificationSuggestion]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT suggestion.suggestion_json
+                FROM import_classification_suggestions AS suggestion
+                JOIN (
+                    SELECT item_id, MAX(revision) AS revision
+                    FROM import_classification_suggestions
+                    WHERE task_id = ? GROUP BY item_id
+                ) AS latest
+                  ON latest.item_id = suggestion.item_id AND latest.revision = suggestion.revision
+                WHERE suggestion.task_id = ?
+                ORDER BY suggestion.item_id
+                """,
+                (task_id, task_id),
+            ).fetchall()
+        return [ClassificationSuggestion.from_dict(json.loads(row["suggestion_json"])) for row in rows]
+
+    def record_metadata_tag_proposal(
+        self, item_id: int, proposal: MetadataTagProposal, event_type: str
+    ) -> ImportTask:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT task_id, label FROM import_task_items WHERE item_id = ?", (item_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(item_id)
+            if proposal.item_id != item_id or proposal.task_id != row["task_id"]:
+                raise ValueError("Metadata proposal does not belong to this import item.")
+            connection.execute(
+                """
+                INSERT INTO import_metadata_tag_proposals (
+                    task_id, item_id, revision, proposal_json, requires_review, decision, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    proposal.task_id,
+                    item_id,
+                    proposal.revision,
+                    json.dumps(proposal.to_dict()),
+                    int(proposal.requires_review),
+                    proposal.decision,
+                    proposal.created_at,
+                ),
+            )
+            task = self._task_from_connection(connection, row["task_id"])
+            updated = replace(
+                task,
+                current_item_label=row["label"],
+                counts=self._counts_from_connection(connection, row["task_id"]),
+                updated_at=utc_now(),
+            )
+            self._write_task(connection, updated)
+            self._append_event(connection, row["task_id"], event_type, updated.updated_at)
+        return updated
+
+    def get_metadata_tag_proposal(self, item_id: int) -> MetadataTagProposal | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT proposal_json FROM import_metadata_tag_proposals
+                WHERE item_id = ? AND invalidated_at IS NULL ORDER BY revision DESC LIMIT 1
+                """,
+                (item_id,),
+            ).fetchone()
+        return MetadataTagProposal.from_dict(json.loads(row["proposal_json"])) if row else None
+
+    def list_metadata_tag_proposals(self, task_id: str) -> list[MetadataTagProposal]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT proposal.proposal_json
+                FROM import_metadata_tag_proposals AS proposal
+                JOIN (
+                    SELECT item_id, MAX(revision) AS revision
+                    FROM import_metadata_tag_proposals
+                    WHERE task_id = ? AND invalidated_at IS NULL GROUP BY item_id
+                ) AS latest
+                  ON latest.item_id = proposal.item_id AND latest.revision = proposal.revision
+                WHERE proposal.task_id = ?
+                ORDER BY proposal.item_id
+                """,
+                (task_id, task_id),
+            ).fetchall()
+        return [MetadataTagProposal.from_dict(json.loads(row["proposal_json"])) for row in rows]
+
+    def invalidate_metadata_tag_proposals(self, task_id: str, item_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE import_metadata_tag_proposals SET invalidated_at = ? "
+                "WHERE task_id = ? AND item_id = ? AND invalidated_at IS NULL",
+                (utc_now(), task_id, item_id),
+            )
+
+    def list_metadata_tag_proposals_for_vault(self, vault_id: str) -> list[MetadataTagProposal]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT proposal.proposal_json
+                FROM import_metadata_tag_proposals AS proposal
+                JOIN (
+                    SELECT task_id, item_id, MAX(revision) AS revision
+                    FROM import_metadata_tag_proposals WHERE invalidated_at IS NULL GROUP BY task_id, item_id
+                ) AS latest
+                  ON latest.task_id = proposal.task_id AND latest.item_id = proposal.item_id
+                    AND latest.revision = proposal.revision
+                """
+            ).fetchall()
+        return [
+            proposal
+            for row in rows
+            if (proposal := MetadataTagProposal.from_dict(json.loads(row["proposal_json"]))).vault_id == vault_id
+        ]
+
+    def list_vault_tags(self, vault_id: str, search: str = "") -> list[TagDefinition]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT definition.tag_json
+                FROM vault_tag_definitions AS definition
+                JOIN (
+                    SELECT name, MAX(revision) AS revision
+                    FROM vault_tag_definitions WHERE vault_id = ? GROUP BY name
+                ) AS latest ON latest.name = definition.name AND latest.revision = definition.revision
+                WHERE definition.vault_id = ?
+                ORDER BY definition.name
+                """,
+                (vault_id, vault_id),
+            ).fetchall()
+        tags = [TagDefinition.from_dict(json.loads(row["tag_json"])) for row in rows]
+        needle = search.strip().lower()
+        return [tag for tag in tags if not needle or needle in tag.name]
+
+    def record_vault_tag(self, tag: TagDefinition) -> TagDefinition:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO vault_tag_definitions (vault_id, name, revision, tag_json, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (tag.vault_id, tag.name, tag.revision, json.dumps(tag.to_dict()), tag.updated_at),
+            )
+        return tag
+
+    def record_tag_change_preview(self, preview: TagChangePreview, created_at: str) -> TagChangePreview:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO vault_tag_change_previews (vault_id, preview_json, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (preview.vault_id, json.dumps(preview.to_dict()), created_at),
+            )
+        return preview
+
+    def get_ocr_corrections(self, item_id: int) -> tuple[tuple[EvidenceLocator, str], ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT locator_json, corrected_text FROM import_ocr_targets
+                WHERE item_id = ? AND decision = 'corrected' AND corrected_text IS NOT NULL
+                ORDER BY target_record_id
+                """,
+                (item_id,),
+            ).fetchall()
+        return tuple(
+            (EvidenceLocator(**json.loads(row["locator_json"])), str(row["corrected_text"]))
+            for row in rows
+        )
+
     def find_parse_evidence(
         self, vault_id: str, source_id: str, content_sha256: str
     ) -> ParseEvidence | None:
@@ -352,7 +1049,7 @@ class SqliteImportTaskRepository:
             rows = connection.execute(
                 "SELECT * FROM import_task_items WHERE task_id = ? ORDER BY item_id", (task_id,)
             ).fetchall()
-        return [self._item_from_row(row) for row in rows]
+            return [self._item_from_row(connection, row) for row in rows]
 
     def events_after(self, task_id: str, event_id: int) -> list[ImportTaskEvent]:
         with self._connect() as connection:
@@ -391,15 +1088,29 @@ class SqliteImportTaskRepository:
             for row in rows:
                 previous_task = self._task_from_row(row)
                 was_parsing = previous_task.phase == "parsing"
+                was_ocr = previous_task.phase == "ocr"
+                was_deriving = previous_task.phase == "deriving-markdown"
                 task = replace(
                     previous_task,
                     lifecycle="recoverable",
                     phase="interrupted",
                     current_item_label=None,
-                    recovery_actions=("restart-parse",) if was_parsing else ("restart-scan",),
+                    recovery_actions=(
+                        ("restart-parse",)
+                        if was_parsing
+                        else ("restart-ocr",)
+                        if was_ocr
+                        else ("restart-derivation",)
+                        if was_deriving
+                        else ("restart-scan",)
+                    ),
                     failure_reason=(
                         "The local parse was interrupted before completion."
                         if was_parsing
+                        else "The local OCR was interrupted before completion."
+                        if was_ocr
+                        else "The private Markdown derivation was interrupted before completion."
+                        if was_deriving
                         else "The local scan was interrupted before completion."
                     ),
                     updated_at=utc_now(),
@@ -408,6 +1119,155 @@ class SqliteImportTaskRepository:
                 self._append_event(connection, task.task_id, "interrupted", task.updated_at)
                 recovered.append(task)
         return recovered
+
+    def _upsert_ocr_target(
+        self,
+        connection: sqlite3.Connection,
+        item_id: int,
+        target: OcrTarget,
+        *,
+        engine: str | None,
+        status: str,
+        confidence: float | None,
+        issue_count: int,
+        issue_summary: str | None,
+        evidence_json: str | None,
+        timestamp: str,
+    ) -> None:
+        locator_summary = self._target_locator_summary(target)
+        connection.execute(
+            """
+            INSERT INTO import_ocr_targets (
+                item_id, target_id, locator_json, label, engine, status, confidence, issue_count,
+                locator_summary, issue_summary, evidence_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(item_id, target_id) DO UPDATE SET
+                locator_json = excluded.locator_json,
+                label = excluded.label,
+                engine = COALESCE(excluded.engine, import_ocr_targets.engine),
+                status = excluded.status,
+                confidence = excluded.confidence,
+                issue_count = excluded.issue_count,
+                locator_summary = excluded.locator_summary,
+                issue_summary = excluded.issue_summary,
+                evidence_json = COALESCE(excluded.evidence_json, import_ocr_targets.evidence_json),
+                updated_at = excluded.updated_at
+            """,
+            (
+                item_id,
+                target.target_id,
+                json.dumps(target.to_dict()["locator"]),
+                target.label,
+                engine,
+                status,
+                confidence,
+                issue_count,
+                locator_summary,
+                issue_summary,
+                evidence_json,
+                timestamp,
+                timestamp,
+            ),
+        )
+
+    def _after_ocr_change(
+        self, connection: sqlite3.Connection, item_id: int, event_type: str, timestamp: str
+    ) -> ImportTask:
+        row = connection.execute(
+            "SELECT task_id, label FROM import_task_items WHERE item_id = ?", (item_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(item_id)
+        self._refresh_ocr_item(connection, item_id)
+        task = self._task_from_connection(connection, row["task_id"])
+        updated = replace(
+            task,
+            current_item_label=row["label"],
+            counts=self._counts_from_connection(connection, row["task_id"]),
+            updated_at=timestamp,
+        )
+        self._write_task(connection, updated)
+        self._append_event(connection, row["task_id"], event_type, timestamp)
+        return updated
+
+    def _refresh_ocr_item(self, connection: sqlite3.Connection, item_id: int) -> None:
+        rows = connection.execute(
+            "SELECT * FROM import_ocr_targets WHERE item_id = ? ORDER BY target_record_id", (item_id,)
+        ).fetchall()
+        if not rows:
+            return
+        statuses = {row["status"] for row in rows}
+        has_gap = any(row["decision"] == "excluded" for row in rows)
+        unresolved_rows = [row for row in rows if row["issue_count"] and row["decision"] is None]
+        if "processing" in statuses:
+            status = "ocr-processing"
+        elif "failed" in statuses:
+            status = "ocr-failed"
+        elif unresolved_rows:
+            status = "required-check"
+        elif has_gap:
+            status = "completed-with-confirmed-gaps"
+        else:
+            status = "ocr-completed"
+        confidences = [row["confidence"] for row in rows if row["confidence"] is not None]
+        issue_summaries = [row["issue_summary"] for row in unresolved_rows if row["issue_summary"]]
+        connection.execute(
+            """
+            UPDATE import_task_items
+            SET ocr_status = ?, ocr_confidence = ?, ocr_issue_count = ?,
+                ocr_locator_summary = ?, ocr_issue_summary = ?
+            WHERE item_id = ?
+            """,
+            (
+                status,
+                sum(confidences) / len(confidences) if confidences else None,
+                sum(int(row["issue_count"]) for row in unresolved_rows),
+                ", ".join(row["locator_summary"] for row in rows),
+                "; ".join(issue_summaries) if issue_summaries else None,
+                item_id,
+            ),
+        )
+
+    @staticmethod
+    def _target_locator_summary(target: OcrTarget) -> str:
+        locator = target.locator
+        location = f"page {locator.page}" if locator.page is not None else locator.docx_location
+        return f"{location} {locator.region}".strip() if locator.region else str(location)
+
+    @classmethod
+    def _ocr_issue_summary(cls, evidence: OcrEvidence) -> str | None:
+        if not evidence.issues:
+            return None
+        return "; ".join(
+            f"{cls._target_locator_summary(OcrTarget('', issue.locator, ''))}: {issue.message}"
+            for issue in evidence.issues
+        )
+
+    def _ocr_target_summaries(
+        self, connection: sqlite3.Connection, item_id: int
+    ) -> tuple[OcrTargetSummary, ...]:
+        rows = connection.execute(
+            """
+            SELECT target_id, label, locator_summary, engine, status, confidence, issue_count, decision,
+                   decision_reason
+            FROM import_ocr_targets WHERE item_id = ? ORDER BY target_record_id
+            """,
+            (item_id,),
+        ).fetchall()
+        return tuple(
+            OcrTargetSummary(
+                target_id=row["target_id"],
+                label=row["label"],
+                locator_summary=row["locator_summary"],
+                engine=row["engine"],
+                status=row["status"],
+                confidence=row["confidence"],
+                issue_count=row["issue_count"],
+                decision=row["decision"],
+                decision_reason=row["decision_reason"],
+            )
+            for row in rows
+        )
 
     def _task_from_connection(self, connection: sqlite3.Connection, task_id: str) -> ImportTask:
         row = connection.execute(
@@ -425,9 +1285,10 @@ class SqliteImportTaskRepository:
                 task_id, vault_id, vault_label, source_paths_json, scope_label, lifecycle, phase,
                 current_item_label, discovered_count, supported_count, skipped_count, unsupported_count,
                 failed_count, new_count, duplicate_count, possible_version_count, identity_failed_count,
-                parsed_count, parse_failed_count, required_check_count,
+                parsed_count, parse_failed_count, required_check_count, ocr_completed_count,
+                ocr_failed_count, confirmed_gap_count, derived_note_count,
                 recovery_actions_json, failure_reason, parent_task_id, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(task_id) DO UPDATE SET
                 vault_id = excluded.vault_id,
                 vault_label = excluded.vault_label,
@@ -448,6 +1309,10 @@ class SqliteImportTaskRepository:
                 parsed_count = excluded.parsed_count,
                 parse_failed_count = excluded.parse_failed_count,
                 required_check_count = excluded.required_check_count,
+                ocr_completed_count = excluded.ocr_completed_count,
+                ocr_failed_count = excluded.ocr_failed_count,
+                confirmed_gap_count = excluded.confirmed_gap_count,
+                derived_note_count = excluded.derived_note_count,
                 recovery_actions_json = excluded.recovery_actions_json,
                 failure_reason = excluded.failure_reason,
                 parent_task_id = excluded.parent_task_id,
@@ -474,6 +1339,10 @@ class SqliteImportTaskRepository:
                 counts.parsed,
                 counts.parse_failed,
                 counts.required_check,
+                counts.ocr_completed,
+                counts.ocr_failed,
+                counts.confirmed_gaps,
+                counts.derived_notes,
                 json.dumps(task.recovery_actions),
                 task.failure_reason,
                 task.parent_task_id,
@@ -512,10 +1381,73 @@ class SqliteImportTaskRepository:
                 COALESCE(SUM(identity_status = 'identity-failed'), 0) AS identity_failed_count
                 , COALESCE(SUM(parse_status = 'parsed'), 0) AS parsed_count
                 , COALESCE(SUM(parse_status = 'parse-failed'), 0) AS parse_failed_count
-                , COALESCE(SUM(parse_issue_count > 0), 0) AS required_check_count
+                , COALESCE(SUM(parse_issue_count > 0), 0)
+                  + COALESCE((
+                      SELECT SUM(target.issue_count > 0 AND target.decision IS NULL)
+                      FROM import_ocr_targets AS target
+                      JOIN import_task_items AS ocr_item ON ocr_item.item_id = target.item_id
+                      WHERE ocr_item.task_id = ?
+                    ), 0) AS required_check_count
+                , COALESCE((
+                    SELECT SUM(target.status = 'completed')
+                    FROM import_ocr_targets AS target
+                    JOIN import_task_items AS ocr_item ON ocr_item.item_id = target.item_id
+                    WHERE ocr_item.task_id = ?
+                  ), 0) AS ocr_completed_count
+                , COALESCE((
+                    SELECT SUM(target.status = 'failed')
+                    FROM import_ocr_targets AS target
+                    JOIN import_task_items AS ocr_item ON ocr_item.item_id = target.item_id
+                    WHERE ocr_item.task_id = ?
+                  ), 0) AS ocr_failed_count
+                , COALESCE((
+                    SELECT SUM(target.decision = 'excluded')
+                    FROM import_ocr_targets AS target
+                    JOIN import_task_items AS ocr_item ON ocr_item.item_id = target.item_id
+                    WHERE ocr_item.task_id = ?
+                  ), 0) AS confirmed_gap_count
+                , COALESCE((
+                    SELECT COUNT(DISTINCT item_id) FROM import_note_proposals
+                    WHERE task_id = ? AND invalidated_at IS NULL
+                  ), 0) AS derived_note_count
+                , COALESCE((
+                    SELECT SUM(suggestion.confidence < 0.75 AND suggestion.decision IS NULL)
+                    FROM import_classification_suggestions AS suggestion
+                    JOIN (
+                        SELECT item_id, MAX(revision) AS revision
+                        FROM import_classification_suggestions
+                        WHERE task_id = ? GROUP BY item_id
+                    ) AS latest
+                      ON latest.item_id = suggestion.item_id AND latest.revision = suggestion.revision
+                    WHERE suggestion.task_id = ?
+                  ), 0) AS classification_required_check_count
+                , COALESCE((
+                    SELECT SUM(
+                        proposal.requires_review = 1 AND proposal.decision IS NULL
+                        AND NOT EXISTS (
+                            SELECT 1 FROM import_classification_suggestions AS classification
+                            WHERE classification.task_id = proposal.task_id
+                              AND classification.item_id = proposal.item_id
+                              AND classification.revision = (
+                                  SELECT MAX(revision) FROM import_classification_suggestions
+                                  WHERE task_id = proposal.task_id AND item_id = proposal.item_id
+                              )
+                              AND classification.confidence < 0.75
+                              AND classification.decision IS NULL
+                        )
+                    )
+                    FROM import_metadata_tag_proposals AS proposal
+                    JOIN (
+                        SELECT item_id, MAX(revision) AS revision
+                        FROM import_metadata_tag_proposals
+                        WHERE task_id = ? GROUP BY item_id
+                    ) AS latest
+                      ON latest.item_id = proposal.item_id AND latest.revision = proposal.revision
+                    WHERE proposal.task_id = ? AND proposal.invalidated_at IS NULL
+                  ), 0) AS metadata_tag_required_check_count
             FROM import_task_items WHERE task_id = ?
             """,
-            (task_id,),
+            (task_id, task_id, task_id, task_id, task_id, task_id, task_id, task_id, task_id, task_id),
         ).fetchone()
         return ImportTaskCounts(
             discovered=row["discovered"],
@@ -529,7 +1461,15 @@ class SqliteImportTaskRepository:
             identity_failed=row["identity_failed_count"],
             parsed=row["parsed_count"],
             parse_failed=row["parse_failed_count"],
-            required_check=row["required_check_count"],
+            required_check=(
+                row["required_check_count"]
+                + row["classification_required_check_count"]
+                + row["metadata_tag_required_check_count"]
+            ),
+            ocr_completed=row["ocr_completed_count"],
+            ocr_failed=row["ocr_failed_count"],
+            confirmed_gaps=row["confirmed_gap_count"],
+            derived_notes=row["derived_note_count"],
         )
 
     @staticmethod
@@ -539,8 +1479,7 @@ class SqliteImportTaskRepository:
         if column_name not in columns:
             connection.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
 
-    @staticmethod
-    def _item_from_row(row: sqlite3.Row) -> ImportTaskItem:
+    def _item_from_row(self, connection: sqlite3.Connection, row: sqlite3.Row) -> ImportTaskItem:
         suggestion = None
         if row["version_candidate_source_id"] is not None:
             suggestion = VersionSuggestion(
@@ -565,6 +1504,12 @@ class SqliteImportTaskRepository:
             parse_issue_count=row["parse_issue_count"],
             parse_locator_summary=row["parse_locator_summary"],
             parse_issue_summary=row["parse_issue_summary"],
+            ocr_status=row["ocr_status"],
+            ocr_confidence=row["ocr_confidence"],
+            ocr_issue_count=row["ocr_issue_count"],
+            ocr_locator_summary=row["ocr_locator_summary"],
+            ocr_issue_summary=row["ocr_issue_summary"],
+            ocr_targets=self._ocr_target_summaries(connection, row["item_id"]),
         )
 
     @staticmethod
@@ -591,6 +1536,10 @@ class SqliteImportTaskRepository:
                 parsed=row["parsed_count"],
                 parse_failed=row["parse_failed_count"],
                 required_check=row["required_check_count"],
+                ocr_completed=row["ocr_completed_count"],
+                ocr_failed=row["ocr_failed_count"],
+                confirmed_gaps=row["confirmed_gap_count"],
+                derived_notes=row["derived_note_count"],
             ),
             recovery_actions=tuple(json.loads(row["recovery_actions_json"])),
             failure_reason=row["failure_reason"],
@@ -607,7 +1556,10 @@ class SqliteImportTaskRepository:
         pages = [locator.page for locator in locators if locator.page is not None]
         if pages:
             return f"page {min(pages)}"
-        return next(locator.docx_location for locator in locators if locator.docx_location is not None)
+        docx_locations = [locator.docx_location for locator in locators if locator.docx_location]
+        if docx_locations:
+            return docx_locations[0]
+        return next(locator.region for locator in locators if locator.region is not None)
 
     @staticmethod
     def _issue_summary(evidence: ParseEvidence) -> str | None:
@@ -616,8 +1568,13 @@ class SqliteImportTaskRepository:
         parts = []
         for issue in evidence.issues:
             locator = issue.locator
-            location = f"page {locator.page}" if locator.page is not None else locator.docx_location
-            if locator.region:
+            if locator.page is not None:
+                location = f"page {locator.page}"
+            elif locator.docx_location is not None:
+                location = locator.docx_location
+            else:
+                location = locator.region or "document"
+            if locator.region and locator.region != location:
                 location = f"{location} {locator.region}"
             parts.append(f"{location}: {issue.message}")
         return "; ".join(parts)

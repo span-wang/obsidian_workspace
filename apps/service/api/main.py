@@ -52,6 +52,13 @@ from domain.policies import (
     VaultPolicy,
 )
 from domain.providers import ModelSelection, ProbeResult, Provider, ProviderModel
+from domain.derived_notes import (
+    DerivedMarkdownProposal,
+    NativeMarkdownProposal,
+    safe_split_after_unit_indexes,
+)
+from domain.classification import ClassificationSuggestion
+from domain.metadata_tags import MetadataTagProposal, TagChangePreview, TagDefinition
 from domain.tasks import ImportTask, ImportTaskEvent, ImportTaskItem
 from domain.vaults import Vault
 
@@ -62,6 +69,43 @@ SERVICE_NAME = "obsidian-personal-knowledge-platform"
 WEB_BUILD_DIRECTORY = Path(__file__).resolve().parents[2] / "web" / "dist"
 LOCAL_SESSION_COOKIE_NAME = "obsidian_platform_session"
 DEFAULT_BROWSER_URL = f"http://{DEFAULT_HOST}:{DEFAULT_PORT}/"
+IMPORT_TASK_SSE_EVENT_NAMES = frozenset(
+    {
+        "scan-started",
+        "scan-completed",
+        "scan-failed",
+        "scan-restarted",
+        "parse-started",
+        "parse-item-completed",
+        "parse-item-failed",
+        "parse-completed",
+        "parse-failed",
+        "parse-restarted",
+        "source-changed",
+        "ocr-started",
+        "ocr-target-started",
+        "ocr-target-completed",
+        "ocr-target-failed",
+        "ocr-attempt-failed",
+        "ocr-not-required",
+        "ocr-source-changed",
+        "ocr-completed",
+        "ocr-failed",
+        "ocr-restarted",
+        "derivation-started",
+        "derivation-item-completed",
+        "derivation-completed",
+        "derivation-failed",
+        "classification-generated",
+        "classification-revised",
+        "classification-accepted",
+        "classification-excluded",
+        "metadata-tags-generated",
+        "metadata-tags-accepted",
+        "metadata-tags-excluded",
+        "metadata-tags-tag-change",
+    }
+)
 
 
 class VaultPathCommand(BaseModel):
@@ -69,6 +113,65 @@ class VaultPathCommand(BaseModel):
 
     selection_id: str
     managed_root: str = "platform"
+
+
+class NoteProposalMergeCommand(BaseModel):
+    item_id: int
+    before_sequence: int
+
+
+class NoteProposalSplitCommand(BaseModel):
+    item_id: int
+    sequence: int
+    after_unit_index: int
+
+
+class ClassificationRevisionCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    domain: str
+    target_folder: str
+    filename: str
+    reason: str
+
+
+class ClassificationDecisionCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: str
+    reason: str
+
+
+class ClassificationBatchDecisionCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str
+
+
+class MetadataTagDecisionCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: str
+    reason: str
+
+
+class VaultTagCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+
+
+class VaultTagChangeCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    operation: str
+    source_tag: str
+    target_tag: str | None = None
+
+
+class VaultTagChangeApplyCommand(VaultTagChangeCommand):
+    catalog_revision: int
+    proposal_versions: list[list[int]]
 
 
 class PolicyModeCommand(BaseModel):
@@ -157,6 +260,11 @@ class ImportTaskCommand(BaseModel):
 
     vault_id: str
     selection_id: str
+
+
+class OcrDecisionCommand(BaseModel):
+    reason: str
+    corrected_text: str | None = None
 
 
 class PortInUseError(RuntimeError):
@@ -384,6 +492,10 @@ def import_task_payload(task: ImportTask) -> dict[str, object]:
             "parsed": task.counts.parsed,
             "parse_failed": task.counts.parse_failed,
             "required_check": task.counts.required_check,
+            "ocr_completed": task.counts.ocr_completed,
+            "ocr_failed": task.counts.ocr_failed,
+            "confirmed_gaps": task.counts.confirmed_gaps,
+            "derived_notes": task.counts.derived_notes,
         },
         "recovery_actions": list(task.recovery_actions),
         "failure_reason": task.failure_reason,
@@ -408,6 +520,25 @@ def import_task_item_payload(item: ImportTaskItem) -> dict[str, object]:
         "parse_issue_count": item.parse_issue_count,
         "parse_locator_summary": item.parse_locator_summary,
         "parse_issue_summary": item.parse_issue_summary,
+        "ocr_status": item.ocr_status,
+        "ocr_confidence": item.ocr_confidence,
+        "ocr_issue_count": item.ocr_issue_count,
+        "ocr_locator_summary": item.ocr_locator_summary,
+        "ocr_issue_summary": item.ocr_issue_summary,
+        "ocr_targets": [
+            {
+                "target_id": target.target_id,
+                "label": target.label,
+                "locator_summary": target.locator_summary,
+                "engine": target.engine,
+                "status": target.status,
+                "confidence": target.confidence,
+                "issue_count": target.issue_count,
+                "decision": target.decision,
+                "decision_reason": target.decision_reason,
+            }
+            for target in item.ocr_targets
+        ],
         "version_suggestion": (
             {
                 "candidate_source_id": item.version_suggestion.candidate_source_id,
@@ -421,12 +552,120 @@ def import_task_item_payload(item: ImportTaskItem) -> dict[str, object]:
     }
 
 
+def note_proposal_payload(proposal) -> dict[str, object]:
+    if isinstance(proposal, NativeMarkdownProposal):
+        return {
+            "kind": "native",
+            "item_id": proposal.item_id,
+            "relative_path": proposal.relative_path,
+            "content_sha256": proposal.content_sha256,
+            "heading_locations": list(proposal.heading_locations),
+            "markdown": proposal.markdown,
+        }
+    if not isinstance(proposal, DerivedMarkdownProposal):
+        raise TypeError("Unsupported note proposal.")
+    return {
+        "kind": "derived",
+        "item_id": proposal.item_id,
+        "revision": proposal.revision,
+        "source_relative_path": proposal.source_relative_path,
+        "risks": list(proposal.risks),
+        "index_note": {
+            "relative_path": proposal.index_note.relative_path,
+            "markdown": proposal.index_note.markdown,
+        },
+        "notes": [
+            {
+                "note_id": note.note_id,
+                "title": note.title,
+                "sequence": note.sequence,
+                "relative_path": note.relative_path,
+                "source_locators": [
+                    {
+                        key: value
+                        for key, value in {
+                            "page": locator.page,
+                            "docx_location": locator.docx_location,
+                            "region": locator.region,
+                        }.items()
+                        if value is not None
+                    }
+                    for locator in note.source_locators
+                ],
+                "unit_indexes": list(note.unit_indexes),
+                "safe_split_after_unit_indexes": list(
+                    safe_split_after_unit_indexes(proposal, note.sequence)
+                ),
+                "provenance_verifiable": note.provenance_verifiable,
+                "provenance_reason": note.provenance_reason,
+                "markdown": note.markdown,
+            }
+            for note in proposal.notes
+        ],
+    }
+
+
+def classification_suggestion_payload(suggestion: ClassificationSuggestion) -> dict[str, object]:
+    return {
+        "item_id": suggestion.item_id,
+        "revision": suggestion.revision,
+        "proposal_revision": suggestion.proposal_revision,
+        "domain": suggestion.domain,
+        "target_vault_id": suggestion.target_vault_id,
+        "target_vault_label": suggestion.target_vault_label,
+        "target_folder": suggestion.target_folder,
+        "filename": suggestion.filename,
+        "confidence": suggestion.confidence,
+        "status": suggestion.status,
+        "decision": suggestion.decision,
+        "decision_reason": suggestion.decision_reason,
+        "origin": suggestion.origin,
+        "reason": suggestion.reason,
+        "created_at": suggestion.created_at,
+        "decided_at": suggestion.decided_at,
+    }
+
+
+def metadata_tag_proposal_payload(proposal: MetadataTagProposal) -> dict[str, object]:
+    return {
+        "item_id": proposal.item_id,
+        "revision": proposal.revision,
+        "vault_id": proposal.vault_id,
+        "proposal_revision": proposal.proposal_revision,
+        "content_sha256": proposal.content_sha256,
+        "source_type": proposal.source_type,
+        "source_file": proposal.source_file,
+        "ingested_at": proposal.ingested_at,
+        "processing_status": proposal.processing_status,
+        "domain": proposal.domain,
+        "domain_confidence": proposal.domain_confidence,
+        "requires_review": proposal.requires_review,
+        "decision": proposal.decision,
+        "decision_reason": proposal.decision_reason,
+        "tags": [tag.to_dict() for tag in proposal.tags],
+    }
+
+
+def vault_tag_payload(tag: TagDefinition) -> dict[str, object]:
+    return tag.to_dict()
+
+
+def tag_change_preview_payload(preview: TagChangePreview) -> dict[str, object]:
+    return preview.to_dict()
+
+
 def import_task_event_payload(event: ImportTaskEvent) -> dict[str, object]:
     return {
         "event_id": event.event_id,
         "event_type": event.event_type,
         "created_at": event.created_at,
     }
+
+
+def import_task_sse_event_name(event: ImportTaskEvent) -> str:
+    if event.event_type in IMPORT_TASK_SSE_EVENT_NAMES:
+        return event.event_type
+    return "task-update"
 
 
 def vault_error(error: Exception) -> HTTPException:
@@ -919,9 +1158,26 @@ def create_app(
         require_local_session(app, request)
         try:
             task, items, event_cursor = app.state.import_task_service.detail_snapshot(task_id)
+            list_note_proposals = getattr(app.state.import_task_service, "list_note_proposals", None)
+            note_proposals = list_note_proposals(task_id) if list_note_proposals is not None else []
+            list_classifications = getattr(
+                app.state.import_task_service, "list_classification_suggestions", None
+            )
+            classifications = list_classifications(task_id) if list_classifications is not None else []
+            list_metadata_tags = getattr(
+                app.state.import_task_service, "list_metadata_tag_proposals", None
+            )
+            metadata_tags = list_metadata_tags(task_id) if list_metadata_tags is not None else []
             return {
                 "task": import_task_payload(task),
                 "items": [import_task_item_payload(item) for item in items],
+                "note_proposals": [note_proposal_payload(proposal) for proposal in note_proposals],
+                "classification_suggestions": [
+                    classification_suggestion_payload(suggestion) for suggestion in classifications
+                ],
+                "metadata_tag_proposals": [
+                    metadata_tag_proposal_payload(proposal) for proposal in metadata_tags
+                ],
                 "event_cursor": event_cursor,
             }
         except Exception as error:
@@ -940,6 +1196,269 @@ def create_app(
         require_local_session(app, request)
         try:
             return {"task": import_task_payload(app.state.import_task_service.resume(task_id))}
+        except Exception as error:
+            raise import_task_error(error) from error
+
+    @app.post("/api/import-tasks/{task_id}/parse")
+    def start_import_task_parsing(request: Request, task_id: str) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            return {"task": import_task_payload(app.state.import_task_service.start_parsing(task_id))}
+        except Exception as error:
+            raise import_task_error(error) from error
+
+    @app.get("/api/import-tasks/{task_id}/note-proposals")
+    def get_import_note_proposals(request: Request, task_id: str) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            return {
+                "note_proposals": [
+                    note_proposal_payload(proposal)
+                    for proposal in app.state.import_task_service.list_note_proposals(task_id)
+                ]
+            }
+        except Exception as error:
+            raise import_task_error(error) from error
+
+    @app.get("/api/import-tasks/{task_id}/classifications")
+    def get_import_classifications(request: Request, task_id: str) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            return {
+                "classification_suggestions": [
+                    classification_suggestion_payload(suggestion)
+                    for suggestion in app.state.import_task_service.list_classification_suggestions(task_id)
+                ]
+            }
+        except Exception as error:
+            raise import_task_error(error) from error
+
+    @app.get("/api/import-tasks/{task_id}/metadata-tags")
+    def get_import_metadata_tags(request: Request, task_id: str) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            return {
+                "metadata_tag_proposals": [
+                    metadata_tag_proposal_payload(proposal)
+                    for proposal in app.state.import_task_service.list_metadata_tag_proposals(task_id)
+                ]
+            }
+        except Exception as error:
+            raise import_task_error(error) from error
+
+    @app.post("/api/import-tasks/{task_id}/metadata-tags/{item_id}/decision")
+    def decide_import_metadata_tags(
+        request: Request,
+        task_id: str,
+        item_id: int,
+        command: MetadataTagDecisionCommand,
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            return {
+                "task": import_task_payload(
+                    app.state.import_task_service.decide_metadata_tag_proposal(
+                        task_id, item_id, command.decision, command.reason
+                    )
+                )
+            }
+        except Exception as error:
+            raise import_task_error(error) from error
+
+    @app.get("/api/vaults/{vault_id}/tags")
+    def get_vault_tags(request: Request, vault_id: str, search: str = "") -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            return {
+                "tags": [
+                    vault_tag_payload(tag)
+                    for tag in app.state.import_task_service.list_vault_tags(vault_id, search)
+                ]
+            }
+        except Exception as error:
+            raise import_task_error(error) from error
+
+    @app.post("/api/vaults/{vault_id}/tags")
+    def create_vault_tag(
+        request: Request, vault_id: str, command: VaultTagCommand
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            return {"tag": vault_tag_payload(app.state.import_task_service.create_vault_tag(vault_id, command.name))}
+        except Exception as error:
+            raise import_task_error(error) from error
+
+    @app.post("/api/vaults/{vault_id}/tags/change-preview")
+    def preview_vault_tag_change(
+        request: Request, vault_id: str, command: VaultTagChangeCommand
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            return {
+                "preview": tag_change_preview_payload(
+                    app.state.import_task_service.preview_vault_tag_change(
+                        vault_id, command.operation, command.source_tag, command.target_tag
+                    )
+                )
+            }
+        except Exception as error:
+            raise import_task_error(error) from error
+
+    @app.post("/api/vaults/{vault_id}/tags/change")
+    def apply_vault_tag_change(
+        request: Request, vault_id: str, command: VaultTagChangeApplyCommand
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            return {
+                "preview": tag_change_preview_payload(
+                    app.state.import_task_service.apply_vault_tag_change(
+                        vault_id,
+                        command.operation,
+                        command.source_tag,
+                        command.target_tag,
+                        command.catalog_revision,
+                        tuple((int(version[0]), int(version[1])) for version in command.proposal_versions),
+                    )
+                )
+            }
+        except Exception as error:
+            raise import_task_error(error) from error
+
+    @app.post("/api/import-tasks/{task_id}/classifications/accept-high-confidence")
+    def accept_high_confidence_classifications(
+        request: Request, task_id: str, command: ClassificationBatchDecisionCommand
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            return {
+                "task": import_task_payload(
+                    app.state.import_task_service.accept_high_confidence_classifications(
+                        task_id, command.reason
+                    )
+                )
+            }
+        except Exception as error:
+            raise import_task_error(error) from error
+
+    @app.post("/api/import-tasks/{task_id}/classifications/{item_id}/revise")
+    def revise_import_classification(
+        request: Request,
+        task_id: str,
+        item_id: int,
+        command: ClassificationRevisionCommand,
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            return {
+                "task": import_task_payload(
+                    app.state.import_task_service.revise_classification_suggestion(
+                        task_id,
+                        item_id,
+                        domain=command.domain,
+                        target_folder=command.target_folder,
+                        filename=command.filename,
+                        reason=command.reason,
+                    )
+                )
+            }
+        except Exception as error:
+            raise import_task_error(error) from error
+
+    @app.post("/api/import-tasks/{task_id}/classifications/{item_id}/decision")
+    def decide_import_classification(
+        request: Request,
+        task_id: str,
+        item_id: int,
+        command: ClassificationDecisionCommand,
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            return {
+                "task": import_task_payload(
+                    app.state.import_task_service.decide_classification_suggestion(
+                        task_id, item_id, command.decision, command.reason
+                    )
+                )
+            }
+        except Exception as error:
+            raise import_task_error(error) from error
+
+    @app.post("/api/import-tasks/{task_id}/note-proposals/merge")
+    def merge_import_note_proposal(
+        request: Request, task_id: str, command: NoteProposalMergeCommand
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            return {
+                "task": import_task_payload(
+                    app.state.import_task_service.merge_note_proposal(
+                        task_id, command.item_id, command.before_sequence
+                    )
+                )
+            }
+        except Exception as error:
+            raise import_task_error(error) from error
+
+    @app.post("/api/import-tasks/{task_id}/note-proposals/split")
+    def split_import_note_proposal(
+        request: Request, task_id: str, command: NoteProposalSplitCommand
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            return {
+                "task": import_task_payload(
+                    app.state.import_task_service.split_note_proposal(
+                        task_id, command.item_id, command.sequence, command.after_unit_index
+                    )
+                )
+            }
+        except Exception as error:
+            raise import_task_error(error) from error
+
+    @app.post("/api/import-tasks/{task_id}/items/{item_id}/ocr/{target_id}/retry")
+    def retry_import_ocr_target(
+        request: Request, task_id: str, item_id: int, target_id: str
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            return {
+                "task": import_task_payload(
+                    app.state.import_task_service.retry_ocr_target(task_id, item_id, target_id)
+                )
+            }
+        except Exception as error:
+            raise import_task_error(error) from error
+
+    @app.post("/api/import-tasks/{task_id}/items/{item_id}/ocr/{target_id}/correct")
+    def correct_import_ocr_target(
+        request: Request, task_id: str, item_id: int, target_id: str, command: OcrDecisionCommand
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            return {
+                "task": import_task_payload(
+                    app.state.import_task_service.correct_ocr_target(
+                        task_id, item_id, target_id, command.corrected_text or "", command.reason
+                    )
+                )
+            }
+        except Exception as error:
+            raise import_task_error(error) from error
+
+    @app.post("/api/import-tasks/{task_id}/items/{item_id}/ocr/{target_id}/exclude")
+    def exclude_import_ocr_target(
+        request: Request, task_id: str, item_id: int, target_id: str, command: OcrDecisionCommand
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            return {
+                "task": import_task_payload(
+                    app.state.import_task_service.exclude_ocr_target(
+                        task_id, item_id, target_id, command.reason
+                    )
+                )
+            }
         except Exception as error:
             raise import_task_error(error) from error
 
@@ -965,7 +1484,10 @@ def create_app(
                 for event in events:
                     event_id = event.event_id
                     data = json.dumps(import_task_event_payload(event))
-                    yield f"id: {event.event_id}\nevent: task-update\ndata: {data}\n\n"
+                    yield (
+                        f"id: {event.event_id}\nevent: {import_task_sse_event_name(event)}\n"
+                        f"data: {data}\n\n"
+                    )
                 if not events:
                     yield ": keep-alive\n\n"
                 await asyncio.sleep(0.25)

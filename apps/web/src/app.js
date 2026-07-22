@@ -8,6 +8,41 @@ export const PROVIDERS_ENDPOINT = "/api/providers";
 export const IMPORT_TASKS_ENDPOINT = "/api/import-tasks";
 export const IMPORT_FILES_SELECTION_ENDPOINT = "/api/import-selections/files";
 export const IMPORT_DIRECTORY_SELECTION_ENDPOINT = "/api/import-selections/directory";
+export const IMPORT_TASK_EVENT_NAMES = [
+  "task-update",
+  "scan-started",
+  "scan-completed",
+  "scan-failed",
+  "scan-restarted",
+  "parse-started",
+  "parse-item-completed",
+  "parse-item-failed",
+  "parse-completed",
+  "parse-failed",
+  "parse-restarted",
+  "source-changed",
+  "ocr-started",
+  "ocr-target-started",
+  "ocr-target-completed",
+  "ocr-target-failed",
+  "ocr-attempt-failed",
+  "ocr-not-required",
+  "ocr-source-changed",
+  "ocr-completed",
+  "ocr-failed",
+  "ocr-restarted",
+  "derivation-started",
+  "derivation-item-completed",
+  "derivation-completed",
+  "derivation-failed",
+  "classification-generated",
+  "classification-revised",
+  "classification-accepted",
+  "classification-excluded",
+  "metadata-tags-generated",
+  "metadata-tags-accepted",
+  "metadata-tags-excluded"
+];
 export const NAVIGATION_DESTINATIONS = [
   { id: "workbench", label: "工作台", emptyState: "尚未选择 vault。" },
   { id: "materials", label: "资料", emptyState: "当前没有已授权的 vault。" },
@@ -17,7 +52,7 @@ export const NAVIGATION_DESTINATIONS = [
 ];
 
 const VAULT_SURFACES = new Set(["workbench", "materials"]);
-const IMPORT_PROGRESS_PHASES = ["queued", "scanning", "parsing", "ocr", "waiting-for-review", "committing", "indexing"];
+const IMPORT_PROGRESS_PHASES = ["queued", "scanning", "parsing", "ocr", "deriving-markdown", "waiting-for-review", "committing", "indexing"];
 
 function importLifecycleText(lifecycle) {
   return {
@@ -38,6 +73,7 @@ function importPhaseText(phase) {
     interrupted: "扫描已中断",
     parsing: "解析",
     ocr: "OCR",
+    "deriving-markdown": "生成笔记提案",
     "waiting-for-review": "等待审核",
     committing: "提交",
     indexing: "索引",
@@ -68,6 +104,7 @@ function importRecoveryActionText(action) {
   return {
     cancel: "取消",
     "restart-scan": "重新扫描",
+    "restart-ocr": "重新 OCR",
     "create-new-task": "创建新任务"
   }[action] || action;
 }
@@ -88,6 +125,22 @@ function importParseStatusText(status) {
     parsed: "已解析",
     "parse-failed": "解析失败"
   }[status] || "未解析";
+}
+
+function importOcrStatusText(status) {
+  return {
+    "not-applicable": "不适用",
+    "not-required": "无需 OCR",
+    "ocr-processing": "OCR 中",
+    "ocr-completed": "OCR 完成",
+    "ocr-failed": "OCR 失败",
+    "required-check": "OCR 待审核",
+    "completed-with-confirmed-gaps": "带已确认缺口完成"
+  }[status] || "待 OCR";
+}
+
+function importOcrTargetStatusText(status) {
+  return { processing: "处理中", completed: "已完成", failed: "失败" }[status] || status;
 }
 
 function progressPhaseStatus(task, phase) {
@@ -586,6 +639,183 @@ function VaultPolicyControls({ vault, onUpdate }) {
   );
 }
 
+function TagManagement({ vault }) {
+  const [tags, setTags] = React.useState([]);
+  const [search, setSearch] = React.useState("");
+  const [newTag, setNewTag] = React.useState("");
+  const [operation, setOperation] = React.useState("rename");
+  const [sourceTag, setSourceTag] = React.useState("");
+  const [targetTag, setTargetTag] = React.useState("");
+  const [preview, setPreview] = React.useState(null);
+  const [status, setStatus] = React.useState("");
+  const [isActing, setIsActing] = React.useState(false);
+
+  const loadTags = React.useCallback(async (term = search) => {
+    setIsActing(true);
+    try {
+      const response = await requestJson(`${VAULTS_ENDPOINT}/${vault.vault_id}/tags?search=${encodeURIComponent(term)}`);
+      setTags(response.tags);
+      setStatus("");
+    } catch (error) {
+      setStatus(error.message);
+    } finally {
+      setIsActing(false);
+    }
+  }, [search, vault.vault_id]);
+
+  React.useEffect(() => {
+    void loadTags("");
+  }, [loadTags]);
+
+  async function createTag() {
+    if (!newTag.trim() || isActing) return;
+    setIsActing(true);
+    try {
+      const response = await requestJson(`${VAULTS_ENDPOINT}/${vault.vault_id}/tags`, {
+        method: "POST",
+        body: JSON.stringify({ name: newTag })
+      });
+      setTags((current) => [...current, response.tag].sort((left, right) => left.name.localeCompare(right.name)));
+      setNewTag("");
+      setStatus("标签已加入应用私有目录；尚未写入任何 Markdown。 ");
+    } catch (error) {
+      setStatus(error.message);
+    } finally {
+      setIsActing(false);
+    }
+  }
+
+  async function previewChange() {
+    if (!sourceTag.trim() || ((operation === "rename" || operation === "merge") && !targetTag.trim()) || isActing) return;
+    setIsActing(true);
+    try {
+      const response = await requestJson(`${VAULTS_ENDPOINT}/${vault.vault_id}/tags/change-preview`, {
+        method: "POST",
+        body: JSON.stringify({
+          operation,
+          source_tag: sourceTag,
+          target_tag: operation === "deactivate" ? null : targetTag
+        })
+      });
+      setPreview(response.preview);
+      setStatus(response.preview.conflicts.length ? "预览包含冲突；请先修正后再进入后续审核。" : "已生成私有影响预览；不会写入 vault。 ");
+    } catch (error) {
+      setStatus(error.message);
+    } finally {
+      setIsActing(false);
+    }
+  }
+
+  async function applyChange() {
+    if (!preview || preview.is_stale || preview.conflicts.length || isActing) return;
+    setIsActing(true);
+    try {
+      await requestJson(`${VAULTS_ENDPOINT}/${vault.vault_id}/tags/change`, {
+        method: "POST",
+        body: JSON.stringify({
+          operation: preview.operation,
+          source_tag: preview.source_tag,
+          target_tag: preview.target_tag,
+          catalog_revision: preview.catalog_revision,
+          proposal_versions: preview.proposal_versions
+        })
+      });
+      await loadTags("");
+      setPreview(null);
+      setStatus("已更新应用私有标签提案；所有受影响 Markdown 仍需后续审核提交。 ");
+    } catch (error) {
+      setStatus(error.message);
+    } finally {
+      setIsActing(false);
+    }
+  }
+
+  return React.createElement(
+    "section",
+    { className: "tag-management", "aria-labelledby": `tag-management-${vault.vault_id}` },
+    React.createElement("h3", { id: `tag-management-${vault.vault_id}` }, "标签管理"),
+    React.createElement("p", { className: "row-note" }, "标签变更先生成私有影响预览；实际 Markdown 写入仍需后续审核提交。"),
+    React.createElement(
+      "div",
+      { className: "tag-controls" },
+      React.createElement("input", {
+        type: "search",
+        value: search,
+        onChange: (event) => setSearch(event.target.value),
+        placeholder: "搜索标签",
+        "aria-label": "搜索 vault 标签"
+      }),
+      React.createElement("button", { className: "secondary-button", type: "button", disabled: isActing, onClick: () => loadTags() }, "搜索"),
+      React.createElement("input", {
+        type: "text",
+        value: newTag,
+        onChange: (event) => setNewTag(event.target.value),
+        placeholder: "新标签",
+        "aria-label": "新建 vault 标签"
+      }),
+      React.createElement("button", { className: "secondary-button", type: "button", disabled: isActing || !newTag.trim(), onClick: createTag }, "新建标签")
+    ),
+    React.createElement(
+      "div",
+      { className: "tag-controls tag-change-controls" },
+      React.createElement(
+        "select",
+        { value: operation, onChange: (event) => setOperation(event.target.value), "aria-label": "标签变更类型" },
+        React.createElement("option", { value: "rename" }, "重命名"),
+        React.createElement("option", { value: "merge" }, "合并"),
+        React.createElement("option", { value: "deactivate" }, "停用")
+      ),
+      React.createElement("input", {
+        type: "text",
+        value: sourceTag,
+        onChange: (event) => setSourceTag(event.target.value),
+        placeholder: "当前标签",
+        "aria-label": "当前标签"
+      }),
+      operation !== "deactivate"
+        ? React.createElement("input", {
+            type: "text",
+            value: targetTag,
+            onChange: (event) => setTargetTag(event.target.value),
+            placeholder: "目标标签",
+            "aria-label": "目标标签"
+          })
+        : null,
+      React.createElement("button", { className: "secondary-button", type: "button", disabled: isActing, onClick: previewChange }, "检查标签影响")
+    ),
+    status ? React.createElement("p", { className: "status-line", role: "status" }, status) : null,
+    tags.length === 0
+      ? React.createElement("p", { className: "empty-state" }, "当前没有匹配的私有标签目录记录。")
+      : React.createElement(
+          "div",
+          { className: "tag-list", "aria-label": "vault 标签目录" },
+          tags.map((tag) => React.createElement(
+            "div",
+            { className: "section-row tag-row", key: tag.name },
+            React.createElement("span", { className: "row-title" }, tag.name),
+            React.createElement("span", { className: "row-note" }, `使用数：${tag.usage_count}`),
+            React.createElement("span", { className: "row-status" }, tag.status === "active" ? "可用" : "已停用")
+          ))
+        ),
+    preview
+      ? React.createElement(
+          "div",
+          { className: "tag-impact-preview", "aria-label": "标签变更影响预览" },
+          React.createElement("p", { className: preview.is_stale || preview.conflicts.length ? "row-status status-danger" : "row-status" }, preview.is_stale ? `预览已陈旧：${preview.stale_reason}` : `受影响 Markdown：${preview.affected_paths.length}`),
+          preview.conflicts.map((conflict) => React.createElement("p", { className: "row-note", key: conflict }, conflict)),
+          preview.affected_paths.map((path) => React.createElement("p", { className: "row-note", key: path }, path)),
+          React.createElement("button", {
+            className: "secondary-button",
+            type: "button",
+            disabled: isActing || preview.is_stale || preview.conflicts.length > 0,
+            title: preview.is_stale ? preview.stale_reason : preview.conflicts[0],
+            onClick: applyChange
+          }, "确认标签变更")
+        )
+      : null
+  );
+}
+
 function VaultDetail({ vault, onBack, onUpdate, onRelink, onConfirm }) {
   const [status, setStatus] = React.useState("");
 
@@ -633,6 +863,7 @@ function VaultDetail({ vault, onBack, onUpdate, onRelink, onConfirm }) {
       React.createElement("dd", null, "文件、标签、候选链接、索引和操作状态仅属于此 vault。")
     ),
     React.createElement(VaultPolicyControls, { vault, onUpdate }),
+    React.createElement(TagManagement, { vault }),
     status ? React.createElement("p", { className: "status-line", role: "status" }, status) : null,
     React.createElement(
       "div",
@@ -1075,6 +1306,10 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
   const [detail, setDetail] = React.useState(null);
   const [status, setStatus] = React.useState("");
   const [isActing, setIsActing] = React.useState(false);
+  const [ocrDrafts, setOcrDrafts] = React.useState({});
+  const [classificationDrafts, setClassificationDrafts] = React.useState({});
+  const [metadataTagDrafts, setMetadataTagDrafts] = React.useState({});
+  const [splitSelections, setSplitSelections] = React.useState({});
   const refreshTimerRef = React.useRef(null);
 
   const loadDetail = React.useCallback(async () => {
@@ -1106,7 +1341,9 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
       eventSource = new window.EventSource(
         `${IMPORT_TASKS_ENDPOINT}/${taskId}/events?after=${loaded.event_cursor || 0}`
       );
-      eventSource.addEventListener("task-update", scheduleDetailRefresh);
+      for (const eventName of IMPORT_TASK_EVENT_NAMES) {
+        eventSource.addEventListener(eventName, scheduleDetailRefresh);
+      }
     });
     return () => {
       disposed = true;
@@ -1137,6 +1374,166 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
     }
   }
 
+  function updateOcrDraft(itemId, targetId, field, value) {
+    const key = `${itemId}:${targetId}`;
+    setOcrDrafts((current) => ({
+      ...current,
+      [key]: { ...(current[key] || {}), [field]: value }
+    }));
+  }
+
+  function updateClassificationDraft(itemId, field, value) {
+    setClassificationDrafts((current) => ({
+      ...current,
+      [itemId]: { ...(current[itemId] || {}), [field]: value }
+    }));
+  }
+
+  function updateMetadataTagDraft(itemId, value) {
+    setMetadataTagDrafts((current) => ({ ...current, [itemId]: value }));
+  }
+
+  function updateSplitSelection(itemId, sequence, value) {
+    setSplitSelections((current) => ({
+      ...current,
+      [`${itemId}:${sequence}`]: Number(value)
+    }));
+  }
+
+  async function runOcrAction(itemId, targetId, action) {
+    if (isActing) return;
+    const draft = ocrDrafts[`${itemId}:${targetId}`] || {};
+    if (action !== "retry" && !draft.reason?.trim()) {
+      setStatus("请说明本次 OCR 决定的理由。");
+      return;
+    }
+    if (action === "correct" && !draft.corrected_text?.trim()) {
+      setStatus("请提供修正后的文本。");
+      return;
+    }
+    setStatus("");
+    setIsActing(true);
+    try {
+      const response = await requestJson(
+        `${IMPORT_TASKS_ENDPOINT}/${taskId}/items/${itemId}/ocr/${encodeURIComponent(targetId)}/${action}`,
+        {
+          method: "POST",
+          body: action === "retry" ? undefined : JSON.stringify({
+            reason: draft.reason,
+            corrected_text: action === "correct" ? draft.corrected_text : undefined
+          })
+        }
+      );
+      onTaskChanged(response.task);
+      await loadDetail();
+    } catch (error) {
+      setStatus(error.message);
+    } finally {
+      setIsActing(false);
+    }
+  }
+
+  async function runNoteProposalAction(action, payload) {
+    if (isActing) return;
+    setStatus("");
+    setIsActing(true);
+    try {
+      const response = await requestJson(`${IMPORT_TASKS_ENDPOINT}/${taskId}/note-proposals/${action}`, {
+        method: "POST",
+        body: JSON.stringify(payload)
+      });
+      onTaskChanged(response.task);
+      await loadDetail();
+      setStatus(action === "merge" ? "笔记提案已合并。" : "笔记提案已按所选边界拆分。");
+    } catch (error) {
+      setStatus(error.message);
+    } finally {
+      setIsActing(false);
+    }
+  }
+
+  async function runClassificationAction(suggestion, action) {
+    if (isActing) return;
+    const draft = classificationDrafts[suggestion.item_id] || {};
+    const reason = draft.reason?.trim();
+    if ((action === "revise" || action === "excluded") && !reason) {
+      setStatus("请说明本次分类决定的理由。");
+      return;
+    }
+    setStatus("");
+    setIsActing(true);
+    try {
+      const endpoint = action === "revise"
+        ? `${IMPORT_TASKS_ENDPOINT}/${taskId}/classifications/${suggestion.item_id}/revise`
+        : `${IMPORT_TASKS_ENDPOINT}/${taskId}/classifications/${suggestion.item_id}/decision`;
+      const body = action === "revise"
+        ? {
+            domain: draft.domain ?? suggestion.domain,
+            target_folder: draft.target_folder ?? suggestion.target_folder,
+            filename: draft.filename ?? suggestion.filename,
+            reason
+          }
+        : {
+            decision: action,
+            reason: reason || "Accepted from the import task detail."
+          };
+      const response = await requestJson(endpoint, { method: "POST", body: JSON.stringify(body) });
+      onTaskChanged(response.task);
+      await loadDetail();
+    } catch (error) {
+      setStatus(error.message);
+    } finally {
+      setIsActing(false);
+    }
+  }
+
+  async function acceptHighConfidenceClassifications() {
+    if (isActing) return;
+    setStatus("");
+    setIsActing(true);
+    try {
+      const response = await requestJson(
+        `${IMPORT_TASKS_ENDPOINT}/${taskId}/classifications/accept-high-confidence`,
+        { method: "POST", body: JSON.stringify({ reason: "Accepted from the import task detail." }) }
+      );
+      onTaskChanged(response.task);
+      await loadDetail();
+    } catch (error) {
+      setStatus(error.message);
+    } finally {
+      setIsActing(false);
+    }
+  }
+
+  async function runMetadataTagAction(proposal, decision) {
+    if (isActing) return;
+    const reason = metadataTagDrafts[proposal.item_id]?.trim();
+    if (decision === "excluded" && !reason) {
+      setStatus("请说明排除元数据与标签提案的理由。 ");
+      return;
+    }
+    setStatus("");
+    setIsActing(true);
+    try {
+      const response = await requestJson(
+        `${IMPORT_TASKS_ENDPOINT}/${taskId}/metadata-tags/${proposal.item_id}/decision`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            decision,
+            reason: reason || "Accepted from the import task detail."
+          })
+        }
+      );
+      onTaskChanged(response.task);
+      await loadDetail();
+    } catch (error) {
+      setStatus(error.message);
+    } finally {
+      setIsActing(false);
+    }
+  }
+
   if (!detail) {
     return React.createElement(
       "section",
@@ -1146,9 +1543,38 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
     );
   }
 
-  const { task, items } = detail;
+  const {
+    task,
+    items,
+    note_proposals: noteProposals = [],
+    classification_suggestions: classifications = [],
+    metadata_tag_proposals: metadataTagProposals = []
+  } = detail;
   const canCancel = task.lifecycle === "running";
-  const canResume = task.recovery_actions.includes("restart-scan") || task.recovery_actions.includes("restart-parse") || task.recovery_actions.includes("create-new-task");
+  const canResume = task.recovery_actions.includes("restart-scan") || task.recovery_actions.includes("restart-parse") || task.recovery_actions.includes("restart-ocr") || task.recovery_actions.includes("restart-derivation") || task.recovery_actions.includes("create-new-task");
+  const canAdjustNoteProposals = task.lifecycle === "waiting-for-review" && !isActing;
+  const noteProposalActionReason = isActing
+    ? "正在更新提案。"
+    : task.lifecycle !== "waiting-for-review"
+      ? "笔记边界只能在等待审核时调整。"
+      : "";
+  const canManageClassifications = task.lifecycle === "waiting-for-review" && !isActing;
+  const hasHighConfidenceSuggestion = classifications.some(
+    (suggestion) => !suggestion.decision && suggestion.status !== "required-check"
+  );
+  const classificationControlReason = isActing
+    ? "正在更新分类建议。"
+    : task.lifecycle !== "waiting-for-review"
+      ? "分类建议只能在等待审核时处理。"
+      : "";
+  const classificationBatchReason = classificationControlReason || (
+    !hasHighConfidenceSuggestion ? "没有可批量接受的高置信度建议。" : ""
+  );
+  const metadataTagControlReason = isActing
+    ? "正在更新元数据与标签提案。"
+    : task.lifecycle !== "waiting-for-review"
+      ? "元数据与标签提案只能在等待审核时处理。"
+      : "";
   return React.createElement(
     "section",
     { className: "import-task-detail", "aria-label": "导入任务详情" },
@@ -1176,6 +1602,10 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
       React.createElement("span", null, `识别失败 ${task.counts.identity_failed || 0}`),
       React.createElement("span", null, `已解析 ${task.counts.parsed || 0}`),
       React.createElement("span", null, `解析失败 ${task.counts.parse_failed || 0}`),
+      React.createElement("span", null, `OCR 完成 ${task.counts.ocr_completed || 0}`),
+      React.createElement("span", null, `OCR 失败 ${task.counts.ocr_failed || 0}`),
+      React.createElement("span", null, `已确认缺口 ${task.counts.confirmed_gaps || 0}`),
+      React.createElement("span", null, `已生成笔记 ${task.counts.derived_notes || 0}`),
       React.createElement("span", null, `待审核问题 ${task.counts.required_check || 0}`)
     ),
     task.current_item_label ? React.createElement("p", { className: "status-line" }, `当前文件：${task.current_item_label}`) : null,
@@ -1190,7 +1620,7 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
         ? React.createElement(
             "button",
             { className: "primary-button", type: "button", disabled: isActing, onClick: () => runAction("resume") },
-            task.lifecycle === "cancelled" ? "创建新任务" : task.recovery_actions.includes("restart-parse") ? "重新解析" : "重新扫描"
+            task.lifecycle === "cancelled" ? "创建新任务" : task.recovery_actions.includes("restart-parse") ? "重新解析" : task.recovery_actions.includes("restart-ocr") ? "重新 OCR" : task.recovery_actions.includes("restart-derivation") ? "重新生成笔记" : "重新扫描"
           )
         : null
     ),
@@ -1209,7 +1639,7 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
             React.createElement(
               "span",
               { className: "row-status" },
-              `${importCategoryText(item.category)} · ${importIdentityStatusText(item.identity_status)} · ${importParseStatusText(item.parse_status)}`
+              `${importCategoryText(item.category)} · ${importIdentityStatusText(item.identity_status)} · ${importParseStatusText(item.parse_status)} · ${importOcrStatusText(item.ocr_status)}`
             ),
             item.source_id ? React.createElement("span", { className: "row-note" }, `来源：${item.source_id}`) : null,
             item.content_sha256 ? React.createElement("span", { className: "row-note" }, `哈希：${item.content_sha256}`) : null,
@@ -1225,6 +1655,56 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
             item.parse_issue_summary
               ? React.createElement("span", { className: "row-note" }, item.parse_issue_summary)
               : null,
+            item.ocr_confidence !== null && item.ocr_confidence !== undefined
+              ? React.createElement("span", { className: "row-note" }, `OCR 置信度：${item.ocr_confidence}`)
+              : null,
+            item.ocr_locator_summary
+              ? React.createElement("span", { className: "row-note" }, `OCR 位置：${item.ocr_locator_summary}`)
+              : null,
+            item.ocr_issue_count
+              ? React.createElement("span", { className: "row-status status-danger" }, `OCR 待审核 ${item.ocr_issue_count}`)
+              : null,
+            item.ocr_issue_summary
+              ? React.createElement("span", { className: "row-note" }, item.ocr_issue_summary)
+              : null,
+            ...(item.ocr_targets || []).map((target) => {
+              const draft = ocrDrafts[`${item.item_id}:${target.target_id}`] || {};
+              const needsDecision = target.issue_count > 0 && !target.decision;
+              return React.createElement(
+                "div",
+                { className: "ocr-target-actions", key: `${item.item_id}:${target.target_id}` },
+                React.createElement("span", { className: "row-title" }, target.label),
+                React.createElement("span", { className: "row-meta" }, `${target.locator_summary} · ${importOcrTargetStatusText(target.status)}${target.engine ? ` · ${target.engine}` : ""}`),
+                target.confidence !== null && target.confidence !== undefined
+                  ? React.createElement("span", { className: "row-note" }, `置信度：${target.confidence}`)
+                  : null,
+                target.decision
+                  ? React.createElement("span", { className: "row-status" }, `${target.decision === "excluded" ? "已排除" : "已修正"}：${target.decision_reason}`)
+                  : null,
+                needsDecision
+                  ? React.createElement(
+                      React.Fragment,
+                      null,
+                      React.createElement("input", {
+                        type: "text",
+                        value: draft.reason || "",
+                        onChange: (event) => updateOcrDraft(item.item_id, target.target_id, "reason", event.target.value),
+                        "aria-label": `${target.label} 的处理理由`,
+                        placeholder: "处理理由"
+                      }),
+                      React.createElement("textarea", {
+                        value: draft.corrected_text || "",
+                        onChange: (event) => updateOcrDraft(item.item_id, target.target_id, "corrected_text", event.target.value),
+                        "aria-label": `${target.label} 的修正文本`,
+                        placeholder: "修正文本"
+                      }),
+                      React.createElement("button", { type: "button", className: "secondary-button", disabled: isActing, onClick: () => runOcrAction(item.item_id, target.target_id, "retry") }, "重试此页"),
+                      React.createElement("button", { type: "button", className: "secondary-button", disabled: isActing, onClick: () => runOcrAction(item.item_id, target.target_id, "correct") }, "保存修正"),
+                      React.createElement("button", { type: "button", className: "secondary-button", disabled: isActing, onClick: () => runOcrAction(item.item_id, target.target_id, "exclude") }, "确认排除")
+                    )
+                  : null
+              );
+            }),
             item.version_suggestion
               ? React.createElement(
                   React.Fragment,
@@ -1239,7 +1719,274 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
               : null,
             item.reason ? React.createElement("span", { className: "row-note" }, item.reason) : null
           ))
-        )
+        ),
+    React.createElement(
+      "section",
+      { className: "note-proposal-list", "aria-label": "派生 Markdown 提案" },
+      React.createElement("h3", null, "Markdown 提案"),
+      noteProposals.length === 0
+        ? React.createElement("p", { className: "empty-state" }, "正在等待可预览的 Markdown 提案。")
+        : noteProposals.map((proposal) => React.createElement(
+            "div",
+            { className: "note-proposal", key: `${proposal.kind}:${proposal.item_id}` },
+            proposal.kind === "native"
+              ? React.createElement(
+                  React.Fragment,
+                  null,
+                  React.createElement("p", { className: "row-title" }, "原生 Markdown"),
+                  React.createElement("p", { className: "row-note" }, `位置：${proposal.relative_path}`),
+                  React.createElement("pre", { className: "markdown-preview" }, proposal.markdown)
+                )
+              : React.createElement(
+                  React.Fragment,
+                  null,
+                  React.createElement("p", { className: "row-title" }, `派生笔记提案（版本 ${proposal.revision}）`),
+                  React.createElement("p", { className: "row-note" }, `计划源位置：${proposal.source_relative_path}`),
+                  proposal.risks?.length
+                    ? React.createElement("p", { className: "row-status status-danger" }, `待审核范围：${proposal.risks.join("；")}`)
+                    : null,
+                  noteProposalActionReason
+                    ? React.createElement("p", { className: "row-note" }, `边界调整不可用：${noteProposalActionReason}`)
+                    : null,
+                  React.createElement("pre", { className: "markdown-preview" }, proposal.index_note.markdown),
+                  proposal.notes.map((note, index) => {
+                    const splitKey = `${proposal.item_id}:${note.sequence}`;
+                    const safeBoundaries = note.safe_split_after_unit_indexes || [];
+                    const selectedBoundary = splitSelections[splitKey] ?? safeBoundaries[0];
+                    return React.createElement(
+                      "div",
+                      { className: "section-row note-proposal-row", key: note.note_id },
+                      React.createElement("span", { className: "row-title" }, `${note.sequence}. ${note.title}`),
+                      React.createElement("span", { className: "row-note" }, `位置：${note.relative_path}`),
+                      React.createElement("span", { className: "row-note" }, `来源：${note.source_locators.map((locator) => locator.page ? `第 ${locator.page} 页` : locator.docx_location).join("、")}`),
+                      note.provenance_verifiable === false
+                        ? React.createElement("span", { className: "row-status status-danger" }, `来源信息不可验证：${note.provenance_reason || "schema 不受支持。"}`)
+                        : null,
+                      React.createElement("pre", { className: "markdown-preview" }, note.markdown),
+                      index < proposal.notes.length - 1
+                        ? React.createElement("button", {
+                            className: "secondary-button",
+                            type: "button",
+                            disabled: !canAdjustNoteProposals,
+                            title: noteProposalActionReason || undefined,
+                            onClick: () => runNoteProposalAction("merge", { item_id: proposal.item_id, before_sequence: note.sequence }),
+                            "aria-label": `合并 ${note.title} 与下一篇笔记`
+                          }, "与下一篇合并")
+                        : null,
+                      safeBoundaries.length
+                        ? React.createElement(
+                            React.Fragment,
+                            null,
+                            React.createElement(
+                              "select",
+                              {
+                                "aria-label": `${note.title} 的安全拆分边界`,
+                                disabled: !canAdjustNoteProposals,
+                                value: selectedBoundary,
+                                onChange: (event) => updateSplitSelection(proposal.item_id, note.sequence, event.target.value)
+                              },
+                              safeBoundaries.map((afterUnitIndex) => React.createElement(
+                                "option",
+                                { key: afterUnitIndex, value: afterUnitIndex },
+                                `在第 ${afterUnitIndex + 1} 个单元后拆分`
+                              ))
+                            ),
+                            React.createElement("button", {
+                              className: "secondary-button",
+                              type: "button",
+                              disabled: !canAdjustNoteProposals,
+                              title: noteProposalActionReason || undefined,
+                              onClick: () => runNoteProposalAction("split", {
+                                item_id: proposal.item_id,
+                                sequence: note.sequence,
+                                after_unit_index: selectedBoundary
+                              }),
+                              "aria-label": `在 ${note.title} 的安全边界拆分笔记`
+                            }, "拆分")
+                          )
+                        : React.createElement("span", { className: "row-note" }, "没有可安全拆分的边界。")
+                    );
+                  })
+                )
+          ))
+    )
+    ,
+    React.createElement(
+      "section",
+      { className: "metadata-tag-list", "aria-label": "元数据与标签" },
+      React.createElement("h3", null, "元数据与标签"),
+      metadataTagProposals.length === 0
+        ? React.createElement("p", { className: "empty-state" }, "正在等待元数据与标签治理提案。")
+        : metadataTagProposals.map((proposal) => {
+            const canDecide = task.lifecycle === "waiting-for-review" && !isActing && !proposal.decision;
+            const decisionText = proposal.decision === "accepted"
+              ? "已接受"
+              : proposal.decision === "excluded"
+                ? "已排除"
+                : proposal.requires_review
+                  ? "标签必须检查"
+                  : "待确认";
+            return React.createElement(
+              "div",
+              { className: "section-row review-diff-row metadata-tag-row", key: proposal.item_id },
+              React.createElement("span", { className: "row-title" }, `资料项 ${proposal.item_id}：${proposal.source_file}`),
+              React.createElement("span", { className: "row-meta" }, `来源类型：${proposal.source_type}；处理状态：${proposal.processing_status}`),
+              React.createElement("span", { className: "row-note" }, `内容哈希：${proposal.content_sha256}`),
+              React.createElement("span", { className: "row-note" }, `领域：${proposal.domain}；置信度：${proposal.domain_confidence}`),
+              React.createElement(
+                "span",
+                { className: `row-status${proposal.requires_review && !proposal.decision ? " status-danger" : ""}` },
+                decisionText
+              ),
+              proposal.tags.map((tag) => React.createElement(
+                "span",
+                { className: "row-note", key: tag.name },
+                `标签：${tag.name}${tag.is_new ? "（新建，待审核）" : "（复用）"}；文档 ${tag.document_paths.length}，笔记 ${tag.note_paths.length}；置信度：${tag.confidence}`
+              )),
+              proposal.decision_reason
+                ? React.createElement("span", { className: "row-note" }, `决定理由：${proposal.decision_reason}`)
+                : null,
+              !proposal.decision
+                ? React.createElement(
+                    "div",
+                    { className: "classification-controls" },
+                    React.createElement("input", {
+                      type: "text",
+                      value: metadataTagDrafts[proposal.item_id] || "",
+                      onChange: (event) => updateMetadataTagDraft(proposal.item_id, event.target.value),
+                      disabled: !canDecide,
+                      placeholder: "排除理由",
+                      "aria-label": `资料项 ${proposal.item_id} 的元数据与标签决定理由`
+                    }),
+                    React.createElement("button", {
+                      className: "secondary-button",
+                      type: "button",
+                      disabled: !canDecide,
+                      title: metadataTagControlReason || undefined,
+                      onClick: () => runMetadataTagAction(proposal, "accepted")
+                    }, "接受标签"),
+                    React.createElement("button", {
+                      className: "secondary-button",
+                      type: "button",
+                      disabled: !canDecide,
+                      title: metadataTagControlReason || undefined,
+                      onClick: () => runMetadataTagAction(proposal, "excluded")
+                    }, "排除标签")
+                  )
+                : null
+            );
+          })
+    )
+    ,
+    React.createElement(
+      "section",
+      { className: "classification-list", "aria-label": "分类建议" },
+      React.createElement("h3", null, "分类建议"),
+      classifications.length === 0
+        ? React.createElement("p", { className: "empty-state" }, "正在等待分类建议。")
+        : React.createElement(
+            React.Fragment,
+            null,
+            React.createElement(
+              "div",
+              { className: "detail-actions" },
+              React.createElement("button", {
+                className: "secondary-button",
+                type: "button",
+                disabled: !canManageClassifications || !hasHighConfidenceSuggestion,
+                title: classificationBatchReason || "仅接受尚未决定的高置信度建议。",
+                onClick: acceptHighConfidenceClassifications
+              }, "接受高置信度建议")
+            ),
+            classifications.map((suggestion) => {
+              const draft = classificationDrafts[suggestion.item_id] || {};
+              const canDecide = canManageClassifications && !suggestion.decision;
+              const decisionText = suggestion.decision === "accepted"
+                ? "已接受"
+                : suggestion.decision === "excluded"
+                  ? "已排除"
+                  : suggestion.decision === "revised"
+                    ? "已修正"
+                    : suggestion.status === "required-check"
+                      ? "必须检查"
+                      : "待确认";
+              return React.createElement(
+                "div",
+                { className: "section-row review-diff-row classification-row", key: suggestion.item_id },
+                React.createElement("span", { className: "row-title" }, `资料项 ${suggestion.item_id}：${suggestion.domain}`),
+                React.createElement("span", { className: "row-meta" }, `目标 vault：${suggestion.target_vault_label}`),
+                React.createElement("span", { className: "row-note" }, `目标文件夹：${suggestion.target_folder}`),
+                React.createElement("span", { className: "row-note" }, `文件名：${suggestion.filename}`),
+                React.createElement("span", { className: "row-note" }, `置信度：${suggestion.confidence}`),
+                React.createElement(
+                  "span",
+                  { className: `row-status${suggestion.status === "required-check" && !suggestion.decision ? " status-danger" : ""}` },
+                  decisionText
+                ),
+                React.createElement("span", { className: "row-note" }, suggestion.reason),
+                suggestion.decision_reason
+                  ? React.createElement("span", { className: "row-note" }, `决定理由：${suggestion.decision_reason}`)
+                  : null,
+                !suggestion.decision
+                  ? React.createElement(
+                      "div",
+                      { className: "classification-controls" },
+                      React.createElement("input", {
+                        type: "text",
+                        value: draft.domain ?? suggestion.domain,
+                        onChange: (event) => updateClassificationDraft(suggestion.item_id, "domain", event.target.value),
+                        disabled: !canDecide,
+                        "aria-label": `资料项 ${suggestion.item_id} 的领域`
+                      }),
+                      React.createElement("input", {
+                        type: "text",
+                        value: draft.target_folder ?? suggestion.target_folder,
+                        onChange: (event) => updateClassificationDraft(suggestion.item_id, "target_folder", event.target.value),
+                        disabled: !canDecide,
+                        "aria-label": `资料项 ${suggestion.item_id} 的目标文件夹`
+                      }),
+                      React.createElement("input", {
+                        type: "text",
+                        value: draft.filename ?? suggestion.filename,
+                        onChange: (event) => updateClassificationDraft(suggestion.item_id, "filename", event.target.value),
+                        disabled: !canDecide,
+                        "aria-label": `资料项 ${suggestion.item_id} 的目标文件名`
+                      }),
+                      React.createElement("input", {
+                        type: "text",
+                        value: draft.reason || "",
+                        onChange: (event) => updateClassificationDraft(suggestion.item_id, "reason", event.target.value),
+                        disabled: !canDecide,
+                        placeholder: "修正或排除理由",
+                        "aria-label": `资料项 ${suggestion.item_id} 的分类决定理由`
+                      }),
+                      React.createElement("button", {
+                        className: "secondary-button",
+                        type: "button",
+                        disabled: !canDecide,
+                        title: classificationControlReason || undefined,
+                        onClick: () => runClassificationAction(suggestion, "accepted")
+                      }, "接受"),
+                      React.createElement("button", {
+                        className: "secondary-button",
+                        type: "button",
+                        disabled: !canDecide,
+                        title: classificationControlReason || undefined,
+                        onClick: () => runClassificationAction(suggestion, "revise")
+                      }, "保存修正"),
+                      React.createElement("button", {
+                        className: "secondary-button",
+                        type: "button",
+                        disabled: !canDecide,
+                        title: classificationControlReason || undefined,
+                        onClick: () => runClassificationAction(suggestion, "excluded")
+                      }, "确认排除")
+                    )
+                  : null
+              );
+            })
+          )
+    )
   );
 }
 

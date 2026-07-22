@@ -22,6 +22,23 @@ class ImportTaskCounts:
     parsed: int = 0
     parse_failed: int = 0
     required_check: int = 0
+    ocr_completed: int = 0
+    ocr_failed: int = 0
+    confirmed_gaps: int = 0
+    derived_notes: int = 0
+
+
+@dataclass(frozen=True)
+class OcrTargetSummary:
+    target_id: str
+    label: str
+    locator_summary: str
+    engine: str | None
+    status: str
+    confidence: float | None
+    issue_count: int
+    decision: str | None
+    decision_reason: str | None
 
 
 @dataclass(frozen=True)
@@ -61,6 +78,12 @@ class ImportTaskItem:
     parse_issue_count: int = 0
     parse_locator_summary: str | None = None
     parse_issue_summary: str | None = None
+    ocr_status: str = "not-applicable"
+    ocr_confidence: float | None = None
+    ocr_issue_count: int = 0
+    ocr_locator_summary: str | None = None
+    ocr_issue_summary: str | None = None
+    ocr_targets: tuple[OcrTargetSummary, ...] = ()
 
 
 @dataclass(frozen=True)

@@ -383,7 +383,11 @@ test("creates an import task from the workbench and shows its persistent scan sn
       identity_failed: 0,
       parsed: 1,
       parse_failed: 0,
-      required_check: 1
+      ocr_completed: 1,
+      ocr_failed: 0,
+      confirmed_gaps: 0,
+      required_check: 1,
+      derived_notes: 1
     },
     recovery_actions: [],
     failure_reason: null,
@@ -421,12 +425,100 @@ test("creates an import task from the workbench and shows its persistent scan sn
           parse_issue_count: 1,
           parse_locator_summary: "page 2",
           parse_issue_summary: "Table columns need review.",
+          ocr_status: "required-check",
+          ocr_confidence: 56,
+          ocr_issue_count: 1,
+          ocr_locator_summary: "page 2 box:10,20,60,12",
+          ocr_issue_summary: "OCR confidence needs review.",
+          ocr_targets: [{
+            target_id: "page:2",
+            label: "Page 2",
+            locator_summary: "page 2",
+            engine: "paddleocr-vl-1.6",
+            status: "completed",
+            confidence: 56,
+            issue_count: 1,
+            decision: null,
+            decision_reason: null
+          }],
           version_suggestion: {
             candidate_source_id: "source-old",
             previous_content_sha256: "a".repeat(64),
             reason: "同名文件的内容不同。",
             status: "required-check"
           }
+        }],
+        note_proposals: [{
+          kind: "derived",
+          item_id: 1,
+          revision: 1,
+          source_relative_path: "platform/sources/source-new-bbbbbbbbbbbbbbbb.pdf",
+          risks: ["Table columns need review."],
+          index_note: {
+            relative_path: "platform/notes/source-new/index.md",
+            markdown: "# Book index\n\n[[platform/notes/source-new/01-chapter-one|Chapter One]]"
+          },
+          notes: [{
+            note_id: "note-1",
+            title: "Chapter One",
+            sequence: 1,
+            relative_path: "platform/notes/source-new/01-chapter-one.md",
+            source_locators: [{ page: 1 }],
+            unit_indexes: [0, 1, 2],
+            safe_split_after_unit_indexes: [1],
+            markdown: "# Chapter One\n\nPreview text"
+          }, {
+            note_id: "note-2",
+            title: "Chapter Two",
+            sequence: 2,
+            relative_path: "platform/notes/source-new/02-chapter-two.md",
+            source_locators: [{ page: 2 }],
+            unit_indexes: [3],
+            markdown: "# Chapter Two\n\nMore preview text"
+          }]
+        }],
+        classification_suggestions: [{
+          item_id: 1,
+          revision: 1,
+          proposal_revision: 1,
+          domain: "unclassified",
+          target_vault_id: "vault-import",
+          target_vault_label: "Import Vault",
+          target_folder: "platform/notes/unclassified",
+          filename: "book.pdf",
+          confidence: 0.4,
+          status: "required-check",
+          decision: null,
+          decision_reason: null,
+          origin: "generated",
+          reason: "No supported domain terms were found in the private proposal.",
+          created_at: "2026-07-22T00:00:00+00:00",
+          decided_at: null
+        }],
+        metadata_tag_proposals: [{
+          item_id: 1,
+          revision: 1,
+          vault_id: "vault-import",
+          proposal_revision: 1,
+          content_sha256: "b".repeat(64),
+          source_type: "pdf",
+          source_file: "book.pdf",
+          ingested_at: "2026-07-22T00:00:00+00:00",
+          processing_status: "waiting-for-review",
+          domain: "unclassified",
+          domain_confidence: 0.4,
+          requires_review: true,
+          decision: null,
+          decision_reason: null,
+          tags: [{
+            name: "unclassified",
+            confidence: 0.4,
+            status: "required-check",
+            is_new: true,
+            document_paths: ["platform/notes/source-new/index.md"],
+            note_paths: ["platform/notes/source-new/01-chapter-one.md"],
+            reason: "New tag proposed from the private domain suggestion."
+          }]
         }]
       }
     });
@@ -451,11 +543,37 @@ test("creates an import task from the workbench and shows its persistent scan sn
   await expect(page.getByText("新资料 1")).toBeVisible();
   await expect(page.getByText("可能版本 1")).toBeVisible();
   await expect(page.getByText("已解析 1")).toBeVisible();
+  await expect(page.getByText("OCR 完成 1")).toBeVisible();
+  await expect(page.getByText("支持 · 新资料 · 已解析 · OCR 待审核")).toBeVisible();
+  await expect(page.getByLabel("Page 2 的处理理由")).toBeVisible();
+  await expect(page.getByRole("button", { name: "重试此页" })).toBeVisible();
   await expect(page.locator(".progress-sequence").getByText("待审核问题 1")).toBeVisible();
   await expect(page.getByText("证据位置：page 2")).toBeVisible();
-  await expect(page.getByText("Table columns need review.")).toBeVisible();
+  await expect(page.getByText("Table columns need review.", { exact: true })).toBeVisible();
   await expect(page.getByText("待审核确认")).toBeVisible();
   await expect(page.getByText("PDF（电子/扫描待识别）")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Markdown 提案" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "分类建议" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "元数据与标签" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "接受标签" })).toBeVisible();
+  await expect(page.getByText("必须检查", { exact: true })).toBeVisible();
+  const classificationFolder = page.getByLabel("资料项 1 的目标文件夹");
+  await expect(classificationFolder).toHaveValue("platform/notes/unclassified");
+  await expect(page.getByRole("button", { name: "接受高置信度建议" })).toBeVisible();
+  await expect(
+    page.getByLabel("分类建议").getByRole("button", { name: "确认排除" })
+  ).toBeVisible();
+  await expect(page.getByText("派生笔记提案（版本 1）")).toBeVisible();
+  await expect(page.getByText("来源：第 1 页")).toBeVisible();
+  await expect(page.locator(".markdown-preview").nth(1)).toContainText("Preview text");
+  const mergeButton = page.getByRole("button", { name: "合并 Chapter One 与下一篇笔记" });
+  await expect(mergeButton).toBeVisible();
+  await expect(page.getByLabel("Chapter One 的安全拆分边界")).toBeVisible();
+  await expect(page.getByRole("button", { name: "在 Chapter One 的安全边界拆分笔记" })).toBeVisible();
+  await mergeButton.focus();
+  await expect(mergeButton).toBeFocused();
+  await classificationFolder.focus();
+  await expect(classificationFolder).toBeFocused();
 });
 
 test("shows a task loading failure instead of an empty task list", async ({ page }) => {

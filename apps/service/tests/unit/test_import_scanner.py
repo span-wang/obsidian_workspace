@@ -26,7 +26,7 @@ def test_recursive_scan_classifies_supported_and_unsupported_files_without_writi
     assert events[-1]["type"] == "completed"
 
 
-def test_scan_hashes_binary_pdf_and_docx_but_leaves_markdown_without_a_source_identity(tmp_path: Path) -> None:
+def test_scan_hashes_supported_files_without_assigning_markdown_a_source_identity(tmp_path: Path) -> None:
     pdf = tmp_path / "book.pdf"
     docx = tmp_path / "outline.docx"
     markdown = tmp_path / "notes.md"
@@ -40,7 +40,7 @@ def test_scan_hashes_binary_pdf_and_docx_but_leaves_markdown_without_a_source_id
     expected_hash = sha256(b"same binary content").hexdigest()
     assert by_label["book.pdf"]["content_sha256"] == expected_hash
     assert by_label["outline.docx"]["content_sha256"] == expected_hash
-    assert "content_sha256" not in by_label["notes.md"]
+    assert by_label["notes.md"]["content_sha256"] == sha256(b"native note").hexdigest()
 
 
 def test_scan_skips_configured_paths_before_hashing(monkeypatch, tmp_path: Path) -> None:

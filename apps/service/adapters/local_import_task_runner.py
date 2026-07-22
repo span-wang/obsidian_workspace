@@ -7,9 +7,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 
+from domain.evidence import OcrTarget
 from domain.tasks import ImportTask, ImportTaskItem
+from workers.document_ocr import run_ocr_worker
 from workers.document_parser import run_parse_worker
 from workers.import_scanner import run_scan_worker
+from workers.markdown_deriver import run_derivation_worker
 
 
 @dataclass
@@ -54,6 +57,62 @@ class LocalImportTaskRunner:
             (parser_items,),
             on_event,
             "Parser process stopped unexpectedly.",
+        )
+
+    def start_ocr(
+        self,
+        task: ImportTask,
+        items: list[ImportTaskItem],
+        on_event: Callable[[str, dict[str, object]], None],
+    ) -> None:
+        self._start_ocr(task, items, {}, on_event)
+
+    def start_ocr_targets(
+        self,
+        task: ImportTask,
+        items: list[ImportTaskItem],
+        targets: dict[int, tuple[OcrTarget, ...]],
+        on_event: Callable[[str, dict[str, object]], None],
+    ) -> None:
+        self._start_ocr(task, items, targets, on_event)
+
+    def start_derivation(
+        self,
+        task: ImportTask,
+        items: tuple[dict[str, object], ...],
+        on_event: Callable[[str, dict[str, object]], None],
+    ) -> None:
+        self._start_process(
+            task.task_id,
+            run_derivation_worker,
+            (items,),
+            on_event,
+            "Markdown derivation process stopped unexpectedly.",
+        )
+
+    def _start_ocr(
+        self,
+        task: ImportTask,
+        items: list[ImportTaskItem],
+        targets: dict[int, tuple[OcrTarget, ...]],
+        on_event: Callable[[str, dict[str, object]], None],
+    ) -> None:
+        ocr_items = tuple(
+            {
+                "item_id": item.item_id,
+                "path": str(item.source_path),
+                "document_kind": item.document_kind,
+                "content_sha256": item.content_sha256,
+                "targets": [target.to_dict() for target in targets.get(item.item_id, ())],
+            }
+            for item in items
+        )
+        self._start_process(
+            task.task_id,
+            run_ocr_worker,
+            (ocr_items,),
+            on_event,
+            "OCR process stopped unexpectedly.",
         )
 
     def _start_process(
@@ -120,6 +179,12 @@ class LocalImportTaskRunner:
                     "parse-completed",
                     "parse-cancelled",
                     "parse-failed",
+                    "ocr-completed",
+                    "ocr-cancelled",
+                    "ocr-failed",
+                    "derivation-completed",
+                    "derivation-cancelled",
+                    "derivation-failed",
                 }
             while True:
                 try:
@@ -134,9 +199,23 @@ class LocalImportTaskRunner:
                     "parse-completed",
                     "parse-cancelled",
                     "parse-failed",
+                    "ocr-completed",
+                    "ocr-cancelled",
+                    "ocr-failed",
+                    "derivation-completed",
+                    "derivation-cancelled",
+                    "derivation-failed",
                 }
             if process.exitcode not in {0, None} and not terminal_event_seen:
-                event_type = "parse-failed" if unexpected_exit_reason.startswith("Parser") else "failed"
+                event_type = (
+                    "ocr-failed"
+                    if unexpected_exit_reason.startswith("OCR")
+                    else "parse-failed"
+                    if unexpected_exit_reason.startswith("Parser")
+                    else "derivation-failed"
+                    if unexpected_exit_reason.startswith("Markdown derivation")
+                    else "failed"
+                )
                 on_event(task_id, {"type": event_type, "reason": unexpected_exit_reason})
         finally:
             process.join(timeout=0.1)

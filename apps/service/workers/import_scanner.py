@@ -110,7 +110,7 @@ def _classify_file(path: Path, should_cancel: Callable[[], bool]) -> dict[str, o
     if _is_link_or_reparse_point(path):
         return _item(path, "skipped", reason="Symbolic links are not scanned.")
     document_kind = SUPPORTED_EXTENSIONS.get(path.suffix.casefold())
-    if document_kind in {"pdf", "docx"}:
+    if document_kind in {"pdf", "docx", "markdown"}:
         try:
             return _item(
                 path,

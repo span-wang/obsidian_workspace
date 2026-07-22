@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import re
+from io import BytesIO
 from hashlib import sha256
 from collections.abc import Callable, Iterator
 from multiprocessing.synchronize import Event
 from pathlib import Path
 
 from docx import Document
+from docx.oxml.ns import qn
+from docx.table import Table
+from docx.text.paragraph import Paragraph
 from pypdf import PdfReader
 
 from domain.evidence import EvidenceLocator, ParseEvidence, ParseIssue, StructuredContentUnit
@@ -14,6 +18,10 @@ from domain.evidence import EvidenceLocator, ParseEvidence, ParseIssue, Structur
 
 class DocumentParseError(ValueError):
     """Raised when a local electronic document cannot be parsed safely."""
+
+
+class DocumentParseCancelled(Exception):
+    """Raised internally when a local parse is cancelled."""
 
 
 def parse_items(
@@ -28,19 +36,34 @@ def parse_items(
         path = Path(str(item["path"]))
         item_id = int(item["item_id"])
         try:
-            content_sha256 = _content_sha256(path)
-            evidence = parse_document(path, str(item["document_kind"]))
+            source_bytes = path.read_bytes()
+            content_sha256 = sha256(source_bytes).hexdigest()
+            evidence = _parse_document_bytes(source_bytes, str(item["document_kind"]), should_cancel)
+            if should_cancel():
+                yield {"type": "parse-cancelled"}
+                return
             yield {
                 "type": "parse-item",
                 "item_id": item_id,
                 "content_sha256": content_sha256,
                 "evidence": evidence.to_dict(),
             }
-        except (DocumentParseError, OSError) as error:
+        except DocumentParseCancelled:
+            yield {"type": "parse-cancelled"}
+            return
+        except DocumentParseError as error:
             yield {
                 "type": "parse-failed-item",
                 "item_id": item_id,
                 "reason": str(error) or "The document could not be parsed.",
+                "locator_summary": "document",
+            }
+        except OSError:
+            yield {
+                "type": "parse-failed-item",
+                "item_id": item_id,
+                "reason": "The source file is no longer available for local parsing.",
+                "locator_summary": "document",
             }
     yield {"type": "parse-completed"}
 
@@ -51,24 +74,27 @@ def run_parse_worker(items: tuple[dict[str, object], ...], queue, cancelled: Eve
 
 
 def parse_document(path: Path, document_kind: str) -> ParseEvidence:
+    return _parse_document_bytes(path.read_bytes(), document_kind)
+
+
+def _parse_document_bytes(
+    source_bytes: bytes,
+    document_kind: str,
+    should_cancel: Callable[[], bool] | None = None,
+) -> ParseEvidence:
+    should_cancel = should_cancel or (lambda: False)
+    if should_cancel():
+        raise DocumentParseCancelled
     if document_kind == "pdf":
-        return _parse_pdf(path)
+        return _parse_pdf(source_bytes, should_cancel)
     if document_kind == "docx":
-        return _parse_docx(path)
+        return _parse_docx(source_bytes, should_cancel)
     raise DocumentParseError("Only PDF and DOCX documents can be parsed.")
 
 
-def _content_sha256(path: Path) -> str:
-    digest = sha256()
-    with path.open("rb") as file_handle:
-        while chunk := file_handle.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _parse_pdf(path: Path) -> ParseEvidence:
+def _parse_pdf(source_bytes: bytes, should_cancel: Callable[[], bool]) -> ParseEvidence:
     try:
-        reader = PdfReader(path)
+        reader = PdfReader(BytesIO(source_bytes))
         if reader.is_encrypted and reader.decrypt("") == 0:
             raise DocumentParseError("The PDF is encrypted and cannot be read locally.")
     except DocumentParseError:
@@ -80,6 +106,8 @@ def _parse_pdf(path: Path) -> ParseEvidence:
     units: list[StructuredContentUnit] = []
     issues: list[ParseIssue] = []
     for page_number, page in enumerate(reader.pages, start=1):
+        if should_cancel():
+            raise DocumentParseCancelled
         locator = EvidenceLocator(page=page_number)
         try:
             text = page.extract_text() or ""
@@ -103,7 +131,7 @@ def _parse_pdf(path: Path) -> ParseEvidence:
             ParseIssue(
                 code="missing-pages",
                 message="The PDF has no readable pages.",
-                locator=EvidenceLocator(docx_location="document"),
+                locator=EvidenceLocator(region="document"),
             )
         )
     confidence = max(0.0, 0.95 - (0.25 * len(issues)))
@@ -116,42 +144,60 @@ def _parse_pdf(path: Path) -> ParseEvidence:
     )
 
 
-def _parse_docx(path: Path) -> ParseEvidence:
+def _parse_docx(source_bytes: bytes, should_cancel: Callable[[], bool]) -> ParseEvidence:
     try:
-        document = Document(path)
+        document = Document(BytesIO(source_bytes))
     except Exception as error:
         raise DocumentParseError("The DOCX could not be read.") from error
 
     paragraphs: list[dict[str, str]] = []
-    units: list[StructuredContentUnit] = []
-    issues: list[ParseIssue] = []
-    paragraph_pairs: list[tuple[str, EvidenceLocator]] = []
-    for index, paragraph in enumerate(document.paragraphs, start=1):
-        text = paragraph.text.strip()
-        location = f"paragraph:{index}"
-        paragraphs.append({"location": location, "style": paragraph.style.name, "text": paragraph.text})
-        if not text:
-            continue
-        locator = EvidenceLocator(docx_location=location)
-        paragraph_pairs.append((text, locator))
-        units.append(
-            StructuredContentUnit(
-                kind=_docx_paragraph_kind(paragraph.style.name), text=text, locator=locator
-            )
-        )
-
-    _append_question_answer_units(paragraph_pairs, units)
     tables: list[dict[str, object]] = []
-    for table_index, table in enumerate(document.tables, start=1):
+    body_items: list[tuple[str, object]] = []
+    issues: list[ParseIssue] = []
+    paragraph_index = 0
+    table_index = 0
+    for child in document.element.body.iterchildren():
+        if should_cancel():
+            raise DocumentParseCancelled
+        if child.tag == qn("w:p"):
+            paragraph_index += 1
+            paragraph = Paragraph(child, document)
+            location = f"paragraph:{paragraph_index}"
+            style_name = getattr(paragraph.style, "name", None)
+            if not isinstance(style_name, str):
+                style_name = ""
+            paragraphs.append({"location": location, "style": style_name, "text": paragraph.text})
+            text = paragraph.text.strip()
+            if text:
+                body_items.append(
+                    (
+                        "paragraph",
+                        StructuredContentUnit(
+                            kind=_docx_paragraph_kind(style_name),
+                            text=text,
+                            locator=EvidenceLocator(docx_location=location),
+                        ),
+                    )
+                )
+            continue
+        if child.tag != qn("w:tbl"):
+            continue
+        table_index += 1
+        table = Table(child, document)
         rows: list[list[dict[str, str]]] = []
+        table_units: list[StructuredContentUnit] = []
         for row_index, row in enumerate(table.rows, start=1):
+            if should_cancel():
+                raise DocumentParseCancelled
             cells: list[dict[str, str]] = []
             for cell_index, cell in enumerate(row.cells, start=1):
+                if should_cancel():
+                    raise DocumentParseCancelled
                 location = f"table:{table_index}/row:{row_index}/cell:{cell_index}"
                 text = cell.text.strip()
                 cells.append({"location": location, "text": cell.text})
                 if text:
-                    units.append(
+                    table_units.append(
                         StructuredContentUnit(
                             kind="table-cell",
                             text=text,
@@ -160,6 +206,35 @@ def _parse_docx(path: Path) -> ParseEvidence:
                     )
             rows.append(cells)
         tables.append({"table": table_index, "rows": rows})
+
+        body_items.append(("table", tuple(table_units)))
+
+    units: list[StructuredContentUnit] = []
+    index = 0
+    while index < len(body_items):
+        kind, value = body_items[index]
+        if kind == "table":
+            units.extend(value)
+            index += 1
+            continue
+        unit = value
+        if (
+            _is_question(unit.text)
+            and index + 1 < len(body_items)
+            and body_items[index + 1][0] == "paragraph"
+            and _is_answer(body_items[index + 1][1].text)
+        ):
+            units.append(
+                StructuredContentUnit(
+                    kind="question-answer",
+                    text=f"{unit.text}\n{body_items[index + 1][1].text}",
+                    locator=unit.locator,
+                )
+            )
+            index += 2
+            continue
+        units.append(unit)
+        index += 1
 
     if not units:
         issues.append(
@@ -193,8 +268,9 @@ def _units_from_lines(
                 locator=locator,
             )
         ]
-    pairs = [(line, locator) for line in normalized]
-    for index, line in enumerate(normalized):
+    index = 0
+    while index < len(normalized):
+        line = normalized[index]
         if _is_question(line) and index + 1 < len(normalized) and _is_answer(normalized[index + 1]):
             units.append(
                 StructuredContentUnit(
@@ -203,23 +279,11 @@ def _units_from_lines(
                     locator=locator,
                 )
             )
+            index += 2
             continue
         units.append(StructuredContentUnit(kind=_pdf_line_kind(line, index), text=line, locator=locator))
-    _append_question_answer_units(pairs, units)
+        index += 1
     return units, issues
-
-
-def _append_question_answer_units(
-    paragraphs: list[tuple[str, EvidenceLocator]], units: list[StructuredContentUnit]
-) -> None:
-    for index, (text, locator) in enumerate(paragraphs[:-1]):
-        following_text, _ = paragraphs[index + 1]
-        if _is_question(text) and _is_answer(following_text):
-            candidate = StructuredContentUnit(
-                kind="question-answer", text=f"{text}\n{following_text}", locator=locator
-            )
-            if candidate not in units:
-                units.append(candidate)
 
 
 def _pdf_line_kind(text: str, index: int) -> str:
@@ -234,6 +298,10 @@ def _pdf_line_kind(text: str, index: int) -> str:
 
 def _docx_paragraph_kind(style_name: str) -> str:
     lowered = style_name.casefold()
+    heading_match = re.search(r"heading\s*([0-9]+)", lowered)
+    if heading_match:
+        level = int(heading_match.group(1))
+        return "heading" if level == 1 else f"heading-{level}"
     if "heading" in lowered:
         return "heading"
     if "list" in lowered:

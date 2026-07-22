@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -9,10 +10,11 @@ from adapters.sqlite_task_repository import SqliteImportTaskRepository
 from adapters.sqlite_vault_repository import SqliteVaultRepository
 from application.ingest import ImportTaskService
 from application.vaults import VaultService
-from api.main import create_app
+from workers.markdown_deriver import derive_items
+from api.main import create_app, import_task_sse_event_name
 from api.runtime import RuntimeState
 from domain.evidence import EvidenceLocator, ParseEvidence, StructuredContentUnit
-from domain.tasks import new_import_task
+from domain.tasks import ImportTaskEvent, new_import_task
 
 
 class FakeDirectoryPicker:
@@ -54,10 +56,10 @@ class ImmediateWorker:
         item = items[0]
         evidence = ParseEvidence(
             document_kind="pdf",
-            raw_extraction={"pages": [{"page": 1, "text": "Private source text."}]},
+            raw_extraction={"pages": [{"page": 1, "text": "Private raw extraction."}]},
             units=(
                 StructuredContentUnit(
-                    kind="paragraph", text="Private source text.", locator=EvidenceLocator(page=1)
+                    kind="paragraph", text="Derived preview text.", locator=EvidenceLocator(page=1)
                 ),
             ),
             confidence=0.91,
@@ -74,6 +76,18 @@ class ImmediateWorker:
         )
         on_event(task.task_id, {"type": "parse-completed"})
 
+    def start_ocr(self, task, items, on_event) -> None:
+        for item in items:
+            on_event(task.task_id, {"type": "ocr-not-required", "item_id": item.item_id})
+        on_event(task.task_id, {"type": "ocr-completed"})
+
+    def start_ocr_targets(self, task, items, target_ids, on_event) -> None:
+        self.start_ocr(task, items, on_event)
+
+    def start_derivation(self, task, items, on_event) -> None:
+        for event in derive_items(items):
+            on_event(task.task_id, event)
+
     def cancel(self, task_id: str) -> None:
         raise AssertionError(f"Unexpected cancellation for {task_id}")
 
@@ -86,6 +100,12 @@ class SnapshotTaskService:
     def detail_snapshot(self, task_id: str):
         self.requested_task_id = task_id
         return self.task, [], 7
+
+
+class StartParsingTaskService(SnapshotTaskService):
+    def start_parsing(self, task_id: str):
+        self.requested_task_id = task_id
+        return self.task
 
 
 def asgi_request(app, method: str, path: str, *, body=None, cookie: str = ""):
@@ -180,6 +200,55 @@ def test_import_api_uses_a_session_bound_selection_and_hides_absolute_paths(tmp_
     )
     task_id = created_task["task"]["task_id"]
     detail_status, _, detail = asgi_request(app, "GET", f"/api/import-tasks/{task_id}", cookie=cookie)
+    revision_status, _, revision = asgi_request(
+        app,
+        "POST",
+        f"/api/import-tasks/{task_id}/classifications/{detail['items'][0]['item_id']}/revise",
+        body={
+            "domain": "mathematics",
+            "target_folder": "platform/notes/mathematics",
+            "filename": "algebra-workbook.pdf",
+            "reason": "Reviewed the target location."
+        },
+        cookie=cookie,
+    )
+    revised_detail_status, _, revised_detail = asgi_request(
+        app, "GET", f"/api/import-tasks/{task_id}", cookie=cookie
+    )
+    metadata_status, _, metadata = asgi_request(
+        app, "GET", f"/api/import-tasks/{task_id}/metadata-tags", cookie=cookie
+    )
+    metadata_decision_status, _, metadata_decision = asgi_request(
+        app,
+        "POST",
+        f"/api/import-tasks/{task_id}/metadata-tags/{detail['items'][0]['item_id']}/decision",
+        body={"decision": "accepted", "reason": "Reviewed metadata and tags."},
+        cookie=cookie,
+    )
+    tags_status, _, tags = asgi_request(app, "GET", f"/api/vaults/{vault_id}/tags", cookie=cookie)
+    preview_status, _, preview = asgi_request(
+        app,
+        "POST",
+        f"/api/vaults/{vault_id}/tags/change-preview",
+        body={"operation": "rename", "source_tag": "mathematics", "target_tag": "algebra"},
+        cookie=cookie,
+    )
+    apply_status, _, applied = asgi_request(
+        app,
+        "POST",
+        f"/api/vaults/{vault_id}/tags/change",
+        body={
+            "operation": preview["preview"]["operation"],
+            "source_tag": preview["preview"]["source_tag"],
+            "target_tag": preview["preview"]["target_tag"],
+            "catalog_revision": preview["preview"]["catalog_revision"],
+            "proposal_versions": preview["preview"]["proposal_versions"],
+        },
+        cookie=cookie,
+    )
+    applied_tags_status, _, applied_tags = asgi_request(
+        app, "GET", f"/api/vaults/{vault_id}/tags", cookie=cookie
+    )
     _, _, invalid_selection = asgi_request(
         app,
         "POST",
@@ -198,6 +267,16 @@ def test_import_api_uses_a_session_bound_selection_and_hides_absolute_paths(tmp_
     assert selection_status == 200
     assert task_status == 200
     assert detail_status == 200
+    assert revision_status == 200
+    assert revision["task"]["task_id"] == task_id
+    assert revised_detail_status == 200
+    assert metadata_status == 200
+    assert metadata_decision_status == 200
+    assert metadata_decision["task"]["task_id"] == task_id
+    assert tags_status == 200
+    assert preview_status == 200
+    assert apply_status == 200
+    assert applied_tags_status == 200
     assert detail["task"]["phase"] == "waiting-for-review"
     assert detail["task"]["counts"]["new"] == 1
     assert detail["task"]["counts"]["duplicate"] == 0
@@ -209,10 +288,37 @@ def test_import_api_uses_a_session_bound_selection_and_hides_absolute_paths(tmp_
     assert detail["items"][0]["parse_status"] == "parsed"
     assert detail["items"][0]["parse_confidence"] == 0.91
     assert detail["items"][0]["parse_locator_summary"] == "page 1"
+    assert detail["note_proposals"][0]["kind"] == "derived"
+    assert "Derived preview text." in detail["note_proposals"][0]["notes"][0]["markdown"]
+    classification = detail["classification_suggestions"][0]
+    assert classification["target_vault_id"] == vault_id
+    assert classification["target_folder"].startswith("platform/notes/")
+    assert classification["filename"] == "book.pdf"
+    assert classification["status"] == "required-check"
+    assert "proposal_content_sha256" not in classification
+    assert "source_path" not in classification
+    assert revised_detail["classification_suggestions"][0]["revision"] == 2
+    assert revised_detail["classification_suggestions"][0]["decision"] == "revised"
+    assert revised_detail["note_proposals"][0]["source_relative_path"] == (
+        "platform/sources/mathematics/algebra-workbook.pdf"
+    )
     assert detail["event_cursor"] > 0
+    governance = metadata["metadata_tag_proposals"][0]
+    assert governance["source_type"] == "pdf"
+    assert governance["source_file"] == "book.pdf"
+    assert governance["vault_id"] == vault_id
+    assert governance["tags"][0]["name"] == "mathematics"
+    assert "source_path" not in governance
+    assert tags["tags"][0]["name"] == "mathematics"
+    assert preview["preview"]["affected_paths"]
+    assert applied["preview"]["is_stale"] is False
+    assert {tag["name"]: tag["status"] for tag in applied_tags["tags"]} == {
+        "mathematics": "inactive",
+        "algebra": "active",
+    }
     assert "source_path" not in detail["items"][0]
     assert str(source_file) not in json.dumps(detail)
-    assert "Private source text." not in json.dumps(detail)
+    assert "Private raw extraction." not in json.dumps(detail)
     assert invalid_status == 400
     assert invalid_task["code"] == "import_task_validation_failed"
 
@@ -241,3 +347,46 @@ def test_import_task_detail_uses_an_atomic_snapshot(tmp_path: Path) -> None:
     assert task_service.requested_task_id == task.task_id
     assert detail["event_cursor"] == 7
     assert detail["items"] == []
+
+
+def test_import_task_sse_names_distinguish_parse_stages() -> None:
+    event = ImportTaskEvent(
+        event_id=1,
+        task_id="task-1",
+        event_type="parse-completed",
+        created_at="2026-07-21T00:00:00+00:00",
+    )
+
+    assert import_task_sse_event_name(event) == "parse-completed"
+
+
+def test_import_task_parse_action_starts_a_waiting_task(tmp_path: Path) -> None:
+    task = replace(
+        new_import_task(
+            vault_id="vault-1",
+            vault_label="Vault",
+            source_paths=(tmp_path / "book.pdf",),
+            scope_label="book.pdf",
+        ),
+        lifecycle="queued",
+        phase="waiting-for-next-stage",
+        recovery_actions=(),
+    )
+    task_service = StartParsingTaskService(task)
+    runtime = RuntimeState(data_directory=tmp_path / "app-data", sqlite_version="3.45.1")
+    app = create_app(
+        runtime=runtime,
+        directory_picker=FakeDirectoryPicker(tmp_path),
+        import_picker=FakeImportPicker(tmp_path / "book.pdf"),
+        import_task_service=task_service,
+    )
+    _, headers, _ = asgi_request(app, "GET", "/")
+    cookie = headers["set-cookie"].split(";", maxsplit=1)[0]
+
+    status, _, payload = asgi_request(
+        app, "POST", f"/api/import-tasks/{task.task_id}/parse", cookie=cookie
+    )
+
+    assert status == 200
+    assert task_service.requested_task_id == task.task_id
+    assert payload["task"]["phase"] == "waiting-for-next-stage"

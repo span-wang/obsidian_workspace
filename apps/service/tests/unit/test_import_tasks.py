@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from adapters.sqlite_task_repository import SqliteImportTaskRepository
+from domain.classification import ClassificationSuggestion
 from domain.evidence import EvidenceLocator, ParseEvidence, ParseIssue, StructuredContentUnit
 from domain.sources import VersionSuggestion
 from domain.tasks import ImportTask, ImportTaskCounts, ImportTaskItem, new_import_task
@@ -104,6 +105,31 @@ def test_interrupted_parsing_can_restart_without_rescanning(tmp_path: Path) -> N
     assert recovered.failure_reason == "The local parse was interrupted before completion."
 
 
+def test_interrupted_derivation_can_restart_without_rescanning(tmp_path: Path) -> None:
+    repository = SqliteImportTaskRepository(tmp_path / "tasks.sqlite3")
+    task = new_import_task(
+        vault_id="vault-1",
+        vault_label="English Vault",
+        source_paths=(tmp_path / "book.pdf",),
+        scope_label="book.pdf",
+    )
+    deriving = ImportTask(
+        **{
+            **task.__dict__,
+            "lifecycle": "running",
+            "phase": "deriving-markdown",
+            "counts": ImportTaskCounts(discovered=1, supported=1, new=1, parsed=1),
+        }
+    )
+    repository.create(deriving, "derivation-started")
+
+    recovered = SqliteImportTaskRepository(tmp_path / "tasks.sqlite3").recover_interrupted_tasks()[0]
+
+    assert recovered.phase == "interrupted"
+    assert recovered.recovery_actions == ("restart-derivation",)
+    assert recovered.failure_reason == "The private Markdown derivation was interrupted before completion."
+
+
 def test_import_task_persists_private_parse_evidence_and_safe_item_summary(tmp_path: Path) -> None:
     repository = SqliteImportTaskRepository(tmp_path / "tasks.sqlite3")
     task = new_import_task(
@@ -163,3 +189,64 @@ def test_import_task_persists_private_parse_evidence_and_safe_item_summary(tmp_p
     assert persisted_item.parse_locator_summary == "page 1"
     assert persisted_item.parse_issue_summary == "page 1 table:1: Table columns need review."
     assert reopened.get_parse_evidence(persisted_item.item_id) == evidence
+
+
+def test_import_task_persists_classification_history_and_counts_unresolved_low_confidence(
+    tmp_path: Path,
+) -> None:
+    repository = SqliteImportTaskRepository(tmp_path / "tasks.sqlite3")
+    task = new_import_task(
+        vault_id="vault-1",
+        vault_label="Study Vault",
+        source_paths=(tmp_path / "notes.md",),
+        scope_label="notes.md",
+    )
+    repository.create(task, "created")
+    repository.append_item(
+        task.task_id,
+        ImportTaskItem(
+            item_id=0,
+            task_id=task.task_id,
+            source_path=tmp_path / "notes.md",
+            label="notes.md",
+            category="supported",
+            document_kind="markdown",
+            reason=None,
+            content_sha256="a" * 64,
+        ),
+    )
+    item = repository.list_items(task.task_id)[0]
+    pending = ClassificationSuggestion(
+        task_id=task.task_id,
+        item_id=item.item_id,
+        revision=1,
+        proposal_revision=1,
+        proposal_content_sha256="a" * 64,
+        domain="unclassified",
+        target_vault_id="vault-1",
+        target_vault_label="Study Vault",
+        target_folder="platform/notes/unclassified",
+        filename="notes.md",
+        confidence=0.4,
+        status="required-check",
+        decision=None,
+        decision_reason=None,
+        origin="generated",
+        reason="No supported domain terms.",
+        created_at="2026-07-22T00:00:00+00:00",
+        decided_at=None,
+    )
+
+    repository.record_classification_suggestion(item.item_id, pending, "classification-generated")
+    accepted = pending.with_decision("accepted", "Reviewed manually.", "2026-07-22T00:01:00+00:00")
+    repository.record_classification_suggestion(item.item_id, accepted, "classification-accepted")
+
+    reopened = SqliteImportTaskRepository(tmp_path / "tasks.sqlite3")
+    latest = reopened.get_classification_suggestion(item.item_id)
+
+    assert latest == accepted
+    assert reopened.get(task.task_id).counts.required_check == 0
+    assert [event.event_type for event in reopened.events_after(task.task_id, 0)][-2:] == [
+        "classification-generated",
+        "classification-accepted",
+    ]
