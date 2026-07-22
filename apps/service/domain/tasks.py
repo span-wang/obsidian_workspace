@@ -78,6 +78,11 @@ class ImportTaskItem:
     parse_issue_count: int = 0
     parse_locator_summary: str | None = None
     parse_issue_summary: str | None = None
+    conversion_status: str = "not-applicable"
+    conversion_attempt_id: str | None = None
+    conversion_graph_id: str | None = None
+    conversion_engine: str | None = None
+    conversion_fallback_reason: str | None = None
     ocr_status: str = "not-applicable"
     ocr_confidence: float | None = None
     ocr_issue_count: int = 0

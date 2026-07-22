@@ -14,6 +14,13 @@ class TaskWorker(Protocol):
         on_event: Callable[[str, dict[str, object]], None],
     ) -> None: ...
 
+    def start_conversion(
+        self,
+        task: ImportTask,
+        items: list[ImportTaskItem],
+        on_event: Callable[[str, dict[str, object]], None],
+    ) -> None: ...
+
     def start_ocr(
         self,
         task: ImportTask,

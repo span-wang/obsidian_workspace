@@ -17,20 +17,32 @@ class CommitFile:
     content: str | None
     content_sha256: str
     expected_existing_sha256: str | None
+    content_base64: str | None = None
 
     def __post_init__(self) -> None:
         _validate_relative_path(self.relative_path)
-        if self.kind not in {"source", "markdown"}:
+        if self.kind not in {"source", "markdown", "asset"}:
             raise ValueError("Commit file kind is invalid.")
         _validate_sha256(self.content_sha256, "Commit file content hash is invalid.")
         if self.expected_existing_sha256 is not None:
             _validate_sha256(self.expected_existing_sha256, "Expected existing file hash is invalid.")
         if self.kind == "markdown":
-            if self.content is None:
+            if self.content is None or self.content_base64 is not None:
                 raise ValueError("Markdown commit files need content.")
             if _sha256_text(self.content) != self.content_sha256:
                 raise ValueError("Markdown commit file content hash does not match its content.")
-        elif self.content is not None:
+        elif self.kind == "asset":
+            if self.content is not None or self.content_base64 is None:
+                raise ValueError("Asset commit files need binary content.")
+            if PurePosixPath(self.relative_path).suffix.lower() in {".svg", ".html", ".htm", ".js"}:
+                raise ValueError("Active asset formats cannot be promoted to the vault.")
+            try:
+                binary = b64decode(self.content_base64.encode("ascii"), validate=True)
+            except (UnicodeEncodeError, ValueError) as error:
+                raise ValueError("Asset commit content is invalid.") from error
+            if hashlib.sha256(binary).hexdigest() != self.content_sha256:
+                raise ValueError("Asset commit file content hash does not match its content.")
+        elif self.content is not None or self.content_base64 is not None:
             raise ValueError("Source commit files must be read from their scanned source.")
 
     def to_dict(self) -> dict[str, object]:
@@ -40,6 +52,7 @@ class CommitFile:
             "content": self.content,
             "content_sha256": self.content_sha256,
             "expected_existing_sha256": self.expected_existing_sha256,
+            "content_base64": self.content_base64,
         }
 
     @classmethod
@@ -54,7 +67,26 @@ class CommitFile:
                 if value.get("expected_existing_sha256") is not None
                 else None
             ),
+            content_base64=str(value["content_base64"]) if value.get("content_base64") else None,
         )
+
+    @classmethod
+    def asset(
+        cls, *, relative_path: str, content: bytes, expected_existing_sha256: str | None = None
+    ) -> CommitFile:
+        return cls(
+            relative_path=relative_path,
+            kind="asset",
+            content=None,
+            content_sha256=hashlib.sha256(content).hexdigest(),
+            expected_existing_sha256=expected_existing_sha256,
+            content_base64=b64encode(content).decode("ascii"),
+        )
+
+    def binary_content(self) -> bytes:
+        if self.kind != "asset" or self.content_base64 is None:
+            raise ValueError("Only asset commit files have binary content.")
+        return b64decode(self.content_base64.encode("ascii"))
 
 
 @dataclass(frozen=True)

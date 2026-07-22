@@ -4,8 +4,11 @@ import re
 from io import BytesIO
 from hashlib import sha256
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from multiprocessing.synchronize import Event
 from pathlib import Path
+from zipfile import ZipFile
+from xml.etree import ElementTree
 
 from docx import Document
 from docx.oxml.ns import qn
@@ -22,6 +25,26 @@ class DocumentParseError(ValueError):
 
 class DocumentParseCancelled(Exception):
     """Raised internally when a local parse is cancelled."""
+
+
+@dataclass(frozen=True)
+class DocumentPreflight:
+    """A non-canonical inventory used by the v2 converter quality gate."""
+
+    document_kind: str
+    source_sha256: str
+    inventory: dict[str, object]
+
+
+def preflight_document(path: Path, document_kind: str) -> DocumentPreflight:
+    """Inspect local source structure without producing Markdown or canonical evidence."""
+
+    source_bytes = path.read_bytes()
+    if document_kind == "pdf":
+        return DocumentPreflight(document_kind, sha256(source_bytes).hexdigest(), _pdf_preflight(source_bytes))
+    if document_kind == "docx":
+        return DocumentPreflight(document_kind, sha256(source_bytes).hexdigest(), _docx_preflight(source_bytes))
+    raise DocumentParseError("Only PDF and DOCX documents can be preflighted.")
 
 
 def parse_items(
@@ -74,7 +97,57 @@ def run_parse_worker(items: tuple[dict[str, object], ...], queue, cancelled: Eve
 
 
 def parse_document(path: Path, document_kind: str) -> ParseEvidence:
+    """Legacy V1 reader path retained for completed tasks, never a V2 converter."""
     return _parse_document_bytes(path.read_bytes(), document_kind)
+
+
+def _pdf_preflight(source_bytes: bytes) -> dict[str, object]:
+    try:
+        reader = PdfReader(BytesIO(source_bytes))
+        encrypted = reader.is_encrypted
+        if encrypted and reader.decrypt("") == 0:
+            return {"encrypted": True, "page_count": len(reader.pages), "text_pages": 0}
+        text_pages = sum(1 for page in reader.pages if (page.extract_text() or "").strip())
+        return {
+            "encrypted": False,
+            "page_count": len(reader.pages),
+            "text_pages": text_pages,
+            "text_coverage": text_pages / len(reader.pages) if reader.pages else 0.0,
+        }
+    except Exception as error:
+        raise DocumentParseError("The PDF could not be preflighted.") from error
+
+
+def _docx_preflight(source_bytes: bytes) -> dict[str, object]:
+    try:
+        with ZipFile(BytesIO(source_bytes)) as archive:
+            document_xml = archive.read("word/document.xml")
+    except Exception as error:
+        raise DocumentParseError("The DOCX could not be preflighted.") from error
+    root = ElementTree.fromstring(document_xml)
+    namespace = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    body = root.find(f"{namespace}body")
+    if body is None:
+        raise DocumentParseError("The DOCX main body is missing.")
+    required_anchors: list[str] = []
+    classifications: list[dict[str, str]] = []
+    paragraph = table = 0
+    for child in body:
+        if child.tag == f"{namespace}p":
+            paragraph += 1
+            anchor = f"body/p[{paragraph}]"
+            required_anchors.append(anchor)
+            classifications.append({"anchor": anchor, "kind": "paragraph"})
+        elif child.tag == f"{namespace}tbl":
+            table += 1
+            anchor = f"body/tbl[{table}]"
+            required_anchors.append(anchor)
+            classifications.append({"anchor": anchor, "kind": "table"})
+    return {
+        "package_part_uri": "/word/document.xml",
+        "required_anchors": required_anchors,
+        "classifications": classifications,
+    }
 
 
 def _parse_document_bytes(

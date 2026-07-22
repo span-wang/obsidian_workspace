@@ -5,6 +5,7 @@ export const LOCAL_SESSION_ENDPOINT = "/api/session";
 export const VAULTS_ENDPOINT = "/api/vaults";
 export const VAULT_DIRECTORY_PICKER_ENDPOINT = "/api/vaults/select-directory";
 export const PROVIDERS_ENDPOINT = "/api/providers";
+export const SESSIONS_ENDPOINT = "/api/sessions";
 export const IMPORT_TASKS_ENDPOINT = "/api/import-tasks";
 export const IMPORT_FILES_SELECTION_ENDPOINT = "/api/import-selections/files";
 export const IMPORT_DIRECTORY_SELECTION_ENDPOINT = "/api/import-selections/directory";
@@ -20,6 +21,12 @@ export const IMPORT_TASK_EVENT_NAMES = [
   "parse-completed",
   "parse-failed",
   "parse-restarted",
+  "conversion-started",
+  "conversion-item-selected",
+  "conversion-item-rejected",
+  "conversion-completed",
+  "conversion-failed",
+  "conversion-profile-rejected",
   "source-changed",
   "ocr-started",
   "ocr-target-started",
@@ -66,7 +73,7 @@ export const NAVIGATION_DESTINATIONS = [
 ];
 
 const VAULT_SURFACES = new Set(["workbench", "materials"]);
-const IMPORT_PROGRESS_PHASES = ["queued", "scanning", "parsing", "ocr", "deriving-markdown", "waiting-for-review", "committing", "indexing"];
+const IMPORT_PROGRESS_PHASES = ["queued", "scanning", "converting", "parsing", "ocr", "deriving-markdown", "waiting-for-review", "committing", "indexing"];
 
 function importLifecycleText(lifecycle) {
   return {
@@ -87,6 +94,7 @@ function importPhaseText(phase) {
     "waiting-for-next-stage": "等待后续处理",
     interrupted: "扫描已中断",
     parsing: "解析",
+    converting: "保真转换",
     ocr: "OCR",
     "deriving-markdown": "生成笔记提案",
     "waiting-for-review": "等待审核",
@@ -144,6 +152,15 @@ function importParseStatusText(status) {
   }[status] || "未解析";
 }
 
+function importConversionStatusText(status) {
+  return {
+    "not-applicable": "未转换",
+    pending: "待转换",
+    selected: "已选择完整转换图",
+    rejected: "转换需审核"
+  }[status] || "转换未就绪";
+}
+
 function importOcrStatusText(status) {
   return {
     "not-applicable": "不适用",
@@ -158,6 +175,146 @@ function importOcrStatusText(status) {
 
 function importOcrTargetStatusText(status) {
   return { processing: "处理中", completed: "已完成", failed: "失败" }[status] || status;
+}
+
+const DOCUMENT_BLOCK_KINDS = ["heading", "paragraph", "list", "table", "formula", "image", "caption", "code", "unresolved"];
+
+export function conversionItemIdFromReviewItem(reviewItemId) {
+  const matched = /^conversion-(\d+)(?:-|$)/.exec(reviewItemId || "");
+  return matched ? Number(matched[1]) : null;
+}
+
+function conversionReviewHasGraphIssue(reviewItemId) {
+  const parts = (reviewItemId || "").split("-");
+  return parts.length >= 4 && /^\d+$/.test(parts[1]) && /^\d+$/.test(parts.at(-1));
+}
+
+export function conversionCorrectionDraft(draft = {}) {
+  const blockId = draft.block_id?.trim();
+  const kind = draft.kind || "paragraph";
+  const retrievalProjection = draft.retrieval_projection?.trim();
+  const reason = draft.reason?.trim();
+  if (!blockId) return { error: "请提供要替换的转换块 ID。" };
+  if (!DOCUMENT_BLOCK_KINDS.includes(kind)) return { error: "请选择受支持的转换块类型。" };
+  if (!draft.payload?.trim()) return { error: "请提供符合块类型的 JSON 内容。" };
+  let payload;
+  try {
+    payload = JSON.parse(draft.payload);
+  } catch {
+    return { error: "修正内容必须是有效 JSON。" };
+  }
+  if (payload === null || Array.isArray(payload) || typeof payload !== "object") {
+    return { error: "修正内容必须是 JSON 对象。" };
+  }
+  if (!retrievalProjection) return { error: "请提供检索投影。" };
+  if (!reason) return { error: "请说明本次结构修正的理由。" };
+  return { blockId, kind, payload, retrievalProjection, reason, error: "" };
+}
+
+function sourceLocatorText(locator) {
+  if (locator.type === "pdf-region") return `第 ${locator.page} 页`;
+  if (locator.type === "docx-ooxml") return `DOCX ${locator.element_path}`;
+  if (locator.type === "source-scope") return `来源范围：${locator.scope}`;
+  return locator.page ? `第 ${locator.page} 页` : locator.docx_location || locator.region || "未定位";
+}
+
+export function ConversionReviewControls({
+  reviewItem,
+  lifecycle,
+  isActing,
+  draft,
+  blocks,
+  onDraftChange,
+  onRetry,
+  onCorrect
+}) {
+  if (
+    reviewItem.object_type !== "conversion"
+    || !["required-check", "blocking"].includes(reviewItem.risk)
+  ) return null;
+  const itemId = conversionItemIdFromReviewItem(reviewItem.review_item_id);
+  const canAct = lifecycle === "waiting-for-review" && !isActing && itemId !== null;
+  const correction = conversionCorrectionDraft(draft);
+  const retryTitle = canAct ? undefined : "转换重试只能在等待审核时执行。";
+  const correctionTitle = !canAct ? retryTitle : correction.error || undefined;
+  const availableBlocks = blocks || [];
+  return React.createElement(
+    "div",
+    { className: "conversion-remediation-controls", "aria-label": "转换整改操作" },
+    availableBlocks.length
+      ? React.createElement(
+          "select",
+          {
+            value: draft.block_id || "",
+            disabled: !canAct,
+            onChange: (event) => onDraftChange("block_id", event.target.value),
+            "aria-label": "要修正的转换块 ID"
+          },
+          React.createElement("option", { value: "" }, "选择转换块"),
+          availableBlocks.map((block) => React.createElement(
+            "option",
+            { key: block.block_id, value: block.block_id },
+            `${block.kind} · ${(block.locators || []).map(sourceLocatorText).join("、")}`
+          ))
+        )
+      : React.createElement("input", {
+          type: "text",
+          value: draft.block_id || "",
+          disabled: !canAct,
+          onChange: (event) => onDraftChange("block_id", event.target.value),
+          "aria-label": "要修正的转换块 ID",
+          placeholder: "转换块 ID"
+        }),
+    React.createElement(
+      "select",
+      {
+        value: draft.kind || "paragraph",
+        disabled: !canAct,
+        onChange: (event) => onDraftChange("kind", event.target.value),
+        "aria-label": "修正后的块类型"
+      },
+      DOCUMENT_BLOCK_KINDS.map((kind) => React.createElement("option", { key: kind, value: kind }, kind))
+    ),
+    React.createElement("textarea", {
+      value: draft.payload || "",
+      disabled: !canAct,
+      onChange: (event) => onDraftChange("payload", event.target.value),
+      "aria-label": "修正后的块 JSON 内容",
+      placeholder: "块 JSON"
+    }),
+    React.createElement("textarea", {
+      value: draft.retrieval_projection || "",
+      disabled: !canAct,
+      onChange: (event) => onDraftChange("retrieval_projection", event.target.value),
+      "aria-label": "修正后的检索投影",
+      placeholder: "检索投影"
+    }),
+    React.createElement("input", {
+      type: "text",
+      value: draft.reason || "",
+      disabled: !canAct,
+      onChange: (event) => onDraftChange("reason", event.target.value),
+      "aria-label": "结构修正理由",
+      placeholder: "结构修正理由"
+    }),
+    React.createElement("button", {
+      type: "button",
+      className: "secondary-button",
+      disabled: !canAct,
+      title: retryTitle,
+      onClick: onRetry
+    }, "重试转换"),
+    React.createElement("button", {
+      type: "button",
+      className: "secondary-button",
+      disabled: !canAct || Boolean(correction.error),
+      title: correctionTitle,
+      onClick: onCorrect
+    }, "保存结构修正"),
+    correction.error
+      ? React.createElement("span", { className: "row-note", role: "status" }, correction.error)
+      : null
+  );
 }
 
 function progressPhaseStatus(task, phase) {
@@ -207,7 +364,7 @@ function requestJson(endpoint, options = {}) {
       ...options.headers
     }
   }).then(async (response) => {
-    const payload = await response.json();
+    const payload = response.status === 204 ? {} : await response.json();
     if (!response.ok) throw new Error(payload.message || "请求未完成。");
     return payload;
   });
@@ -377,7 +534,7 @@ function ConfirmationPanel({ request, error, isSubmitting, onClose, onConfirm })
   function handleKeyDown(event) {
     if (event.key === "Escape") {
       event.preventDefault();
-      onClose();
+      if (request.kind !== "session-remove") onClose();
       return;
     }
     if (event.key !== "Tab") return;
@@ -394,8 +551,11 @@ function ConfirmationPanel({ request, error, isSubmitting, onClose, onConfirm })
   }
 
   const isProviderRemoval = request.kind === "provider-remove";
+  const isSessionRemoval = request.kind === "session-remove";
   const isRemoval = request.kind === "remove" || isProviderRemoval;
-  const targetName = isProviderRemoval ? request.target.name : vaultName(request.target);
+  const targetName = isSessionRemoval
+    ? request.target.title
+    : isProviderRemoval ? request.target.name : vaultName(request.target);
   return React.createElement(
     "div",
     { className: "confirmation-overlay" },
@@ -412,12 +572,14 @@ function ConfirmationPanel({ request, error, isSubmitting, onClose, onConfirm })
       React.createElement(
         "h2",
         { id: "confirmation-title" },
-        isProviderRemoval ? "删除 Provider" : isRemoval ? "移除 vault 授权" : "停用 vault"
+        isSessionRemoval ? `删除会话“${targetName}”？` : isProviderRemoval ? "删除 Provider" : isRemoval ? "移除 vault 授权" : "停用 vault"
       ),
       React.createElement(
         "p",
         null,
-        isProviderRemoval
+        isSessionRemoval
+          ? "这会删除该会话的私有消息、范围、模型记录、任务状态、引用和结果。不会删除、移动或改写已审核写入 vault 的资料、笔记或标签。"
+          : isProviderRemoval
           ? `将删除“${targetName}”的应用内配置、模型缓存和 Windows 凭据，并使关联外发授权失效。`
           : isRemoval
             ? `将移除“${targetName}”的应用内授权与私有状态。不会删除、移动或改写 vault 中的文件。`
@@ -435,8 +597,200 @@ function ConfirmationPanel({ request, error, isSubmitting, onClose, onConfirm })
         React.createElement(
           "button",
           { className: "danger-button", type: "button", disabled: isSubmitting, onClick: onConfirm },
-          isProviderRemoval ? "删除 Provider" : isRemoval ? "移除授权" : "停用"
+          isSessionRemoval ? "删除会话" : isProviderRemoval ? "删除 Provider" : isRemoval ? "移除授权" : "停用"
         )
+      )
+    )
+  );
+}
+
+export function SessionManagement({
+  sessionPage,
+  filters,
+  isLoading,
+  error,
+  onLoad,
+  onCreate,
+  onRename,
+  onExport,
+  onDelete
+}) {
+  const [query, setQuery] = React.useState(filters.query || "");
+  const [editingSessionId, setEditingSessionId] = React.useState(null);
+  const [editingTitle, setEditingTitle] = React.useState("");
+  const [status, setStatus] = React.useState("");
+  const [isSubmitting, setIsSubmitting] = React.useState(false);
+  const renameInputRef = React.useRef(null);
+  const page = sessionPage?.page || 1;
+  const totalPages = sessionPage?.total_pages || 1;
+  const sessions = sessionPage?.sessions || [];
+
+  React.useEffect(() => {
+    setQuery(filters.query || "");
+  }, [filters.query]);
+
+  React.useEffect(() => {
+    if (editingSessionId) renameInputRef.current?.focus();
+  }, [editingSessionId]);
+
+  function load(nextFilters) {
+    setStatus("");
+    onLoad(nextFilters);
+  }
+
+  function openRename(session) {
+    setStatus("");
+    setEditingSessionId(session.session_id);
+    setEditingTitle(session.title);
+  }
+
+  async function createSession() {
+    setStatus("");
+    setIsSubmitting(true);
+    try {
+      const session = await onCreate();
+      openRename(session);
+    } catch (requestError) {
+      setStatus(requestError.message);
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  async function saveRename(event, sessionId) {
+    event.preventDefault();
+    setStatus("");
+    setIsSubmitting(true);
+    try {
+      await onRename(sessionId, editingTitle);
+      setEditingSessionId(null);
+    } catch (requestError) {
+      setStatus(requestError.message);
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  async function exportSession(session) {
+    setStatus("");
+    try {
+      await onExport(session);
+    } catch (requestError) {
+      setStatus(requestError.message);
+    }
+  }
+
+  if (isLoading && !sessions.length) {
+    return React.createElement("p", { className: "empty-state", role: "status" }, "正在加载会话。");
+  }
+
+  return React.createElement(
+    "section",
+    { className: "workspace-section session-management", "aria-label": "持久会话" },
+    React.createElement("p", { className: "section-label" }, "持久会话"),
+    React.createElement(
+      "div",
+      { className: "session-toolbar" },
+      React.createElement(
+        "form",
+        {
+          className: "session-search",
+          onSubmit: (event) => {
+            event.preventDefault();
+            load({ ...filters, query: query.trim(), page: 1 });
+          }
+        },
+        React.createElement("input", {
+          value: query,
+          onChange: (event) => setQuery(event.target.value),
+          "aria-label": "搜索会话",
+          placeholder: "按标题或所用 vault 搜索"
+        }),
+        React.createElement("button", { className: "secondary-button", type: "submit", disabled: isSubmitting }, "搜索")
+      ),
+      React.createElement(
+        "label",
+        { className: "session-sort" },
+        React.createElement("span", null, "排序"),
+        React.createElement(
+          "select",
+          {
+            value: filters.sort,
+            "aria-label": "会话排序",
+            onChange: (event) => load({ ...filters, sort: event.target.value, page: 1 })
+          },
+          React.createElement("option", { value: "updated_at" }, "最近更新"),
+          React.createElement("option", { value: "title" }, "标题"),
+          React.createElement("option", { value: "vault" }, "所用 vault")
+        )
+      ),
+      React.createElement(
+        "button",
+        { className: "primary-button", type: "button", disabled: isSubmitting, onClick: createSession },
+        "新建会话"
+      )
+    ),
+    error || status
+      ? React.createElement("p", { className: "form-error", role: "alert" }, error || status)
+      : null,
+    sessions.length
+      ? React.createElement(
+          "div",
+          { className: "session-list" },
+          sessions.map((session) => React.createElement(
+            "article",
+            { className: "section-row session-row", key: session.session_id },
+            editingSessionId === session.session_id
+              ? React.createElement(
+                  "form",
+                  { className: "session-rename", onSubmit: (event) => saveRename(event, session.session_id) },
+                  React.createElement("input", {
+                    ref: renameInputRef,
+                    value: editingTitle,
+                    onChange: (event) => setEditingTitle(event.target.value),
+                    "aria-label": `${session.title} 的会话标题`
+                  }),
+                  React.createElement("button", { className: "secondary-button", type: "button", disabled: isSubmitting, onClick: () => setEditingSessionId(null) }, "取消"),
+                  React.createElement("button", { className: "primary-button", type: "submit", disabled: isSubmitting }, "保存")
+                )
+              : React.createElement(
+                  React.Fragment,
+                  null,
+                  React.createElement(
+                    "div",
+                    { className: "session-row-summary" },
+                    React.createElement("strong", null, session.title),
+                    React.createElement("span", null, `所用 vault：${session.selected_vault_label || "未设置"}`),
+                    React.createElement("span", null, `消息 ${session.message_count || 0} 条`)
+                  ),
+                  React.createElement(
+                    "div",
+                    { className: "session-row-actions" },
+                    React.createElement("button", { className: "text-button", type: "button", onClick: () => openRename(session) }, "重命名"),
+                    React.createElement("button", { className: "text-button", type: "button", onClick: () => exportSession(session) }, "导出"),
+                    React.createElement(
+                      "button",
+                      { className: "text-button danger-text-button", type: "button", onClick: (event) => onDelete(session, event.currentTarget) },
+                      "删除"
+                    )
+                  )
+                )
+          ))
+        )
+      : React.createElement("p", { className: "empty-state" }, "当前没有已保存的会话。"),
+    React.createElement(
+      "div",
+      { className: "session-pagination", "aria-label": "会话分页" },
+      React.createElement(
+        "button",
+        { className: "secondary-button", type: "button", disabled: isSubmitting || page <= 1, onClick: () => load({ ...filters, page: page - 1 }) },
+        "上一页"
+      ),
+      React.createElement("span", { role: "status" }, `第 ${page} / ${totalPages} 页`),
+      React.createElement(
+        "button",
+        { className: "secondary-button", type: "button", disabled: isSubmitting || page >= totalPages, onClick: () => load({ ...filters, page: page + 1 }) },
+        "下一页"
       )
     )
   );
@@ -1636,6 +1990,7 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
   const [metadataTagDrafts, setMetadataTagDrafts] = React.useState({});
   const [candidateLinkDrafts, setCandidateLinkDrafts] = React.useState({});
   const [reviewItemDrafts, setReviewItemDrafts] = React.useState({});
+  const [conversionDrafts, setConversionDrafts] = React.useState({});
   const [splitSelections, setSplitSelections] = React.useState({});
   const [selectedCommitUnits, setSelectedCommitUnits] = React.useState({});
   const [commitFilter, setCommitFilter] = React.useState("all");
@@ -1728,6 +2083,13 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
 
   function updateReviewItemDraft(reviewItemId, value) {
     setReviewItemDrafts((current) => ({ ...current, [reviewItemId]: value }));
+  }
+
+  function updateConversionDraft(reviewItemId, field, value) {
+    setConversionDrafts((current) => ({
+      ...current,
+      [reviewItemId]: { ...(current[reviewItemId] || {}), [field]: value }
+    }));
   }
 
   function updateSplitSelection(itemId, sequence, value) {
@@ -1946,6 +2308,67 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
     }
   }
 
+  async function retryConversionReviewItem(reviewItem) {
+    if (isActing) return;
+    const itemId = conversionItemIdFromReviewItem(reviewItem.review_item_id);
+    if (itemId === null) {
+      setStatus("该转换审核项没有可重试的资料项。");
+      return;
+    }
+    setStatus("");
+    setIsActing(true);
+    try {
+      const response = await requestJson(
+        `${IMPORT_TASKS_ENDPOINT}/${taskId}/conversion-items/${itemId}/retry`,
+        { method: "POST" }
+      );
+      onTaskChanged(response.task);
+      await loadDetail();
+      setStatus("已提交转换重试。");
+    } catch (error) {
+      setStatus(error.message);
+    } finally {
+      setIsActing(false);
+    }
+  }
+
+  async function correctConversionReviewBlock(reviewItem) {
+    if (isActing) return;
+    const itemId = conversionItemIdFromReviewItem(reviewItem.review_item_id);
+    const correction = conversionCorrectionDraft(conversionDrafts[reviewItem.review_item_id] || {});
+    if (itemId === null) {
+      setStatus("该转换审核项没有可修正的资料项。");
+      return;
+    }
+    if (correction.error) {
+      setStatus(correction.error);
+      return;
+    }
+    setStatus("");
+    setIsActing(true);
+    try {
+      const response = await requestJson(
+        `${IMPORT_TASKS_ENDPOINT}/${taskId}/conversion-items/${itemId}/blocks/${encodeURIComponent(correction.blockId)}/correct`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            kind: correction.kind,
+            payload: correction.payload,
+            retrieval_projection: correction.retrievalProjection,
+            reason: correction.reason
+          })
+        }
+      );
+      onTaskChanged(response.task);
+      await loadDetail();
+      setStatus("结构修正已保存并重新生成提案。");
+    } catch (error) {
+      setStatus(error.message);
+    } finally {
+      setIsActing(false);
+    }
+  }
+
   async function runCommitReview(unitIds) {
     if (isActing || unitIds.length === 0) return;
     setStatus("");
@@ -1981,13 +2404,21 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
     classification_suggestions: classifications = [],
     metadata_tag_proposals: metadataTagProposals = [],
     candidate_link_proposals: candidateLinkProposals = [],
+    conversion_graphs: conversionGraphs = [],
     review_snapshot: reviewSnapshot = null,
     commit_journals: commitJournals = [],
     index = null
   } = detail;
   const canCancel = task.lifecycle === "running";
   const canResume = task.recovery_actions.includes("restart-scan") || task.recovery_actions.includes("restart-parse") || task.recovery_actions.includes("restart-ocr") || task.recovery_actions.includes("restart-derivation") || task.recovery_actions.includes("create-new-task");
+  const canStartConversion = task.lifecycle === "queued" && task.phase === "waiting-for-next-stage";
   const canAdjustNoteProposals = task.lifecycle === "waiting-for-review" && !isActing;
+  const canManageReviewItems = task.lifecycle === "waiting-for-review" && !isActing;
+  const reviewItemControlReason = isActing
+    ? "正在更新审核状态。"
+    : task.lifecycle !== "waiting-for-review"
+      ? "审核决定只能在等待审核时处理。"
+      : "";
   const noteProposalActionReason = isActing
     ? "正在更新提案。"
     : task.lifecycle !== "waiting-for-review"
@@ -2021,6 +2452,9 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
     current.push(reviewItem);
     reviewItemsByUnit.set(reviewItem.unit_id, current);
   }
+  const conversionBlocksByItem = new Map(
+    conversionGraphs.map((graph) => [graph.item_id, graph.blocks || []])
+  );
   const unitRisk = (unit) => {
     const itemsForUnit = reviewItemsByUnit.get(unit.unit_id) || [];
     if (itemsForUnit.some((item) => item.risk === "blocking")) return "blocking";
@@ -2099,6 +2533,9 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
             { className: "primary-button", type: "button", disabled: isActing, onClick: () => runAction("resume") },
             task.lifecycle === "cancelled" ? "创建新任务" : task.recovery_actions.includes("restart-parse") ? "重新解析" : task.recovery_actions.includes("restart-ocr") ? "重新 OCR" : task.recovery_actions.includes("restart-derivation") ? "重新生成笔记" : "重新扫描"
           )
+        : null
+      , canStartConversion
+        ? React.createElement("button", { className: "primary-button", type: "button", disabled: isActing, onClick: () => runAction("convert") }, "开始保真转换")
         : null
     ),
     status ? React.createElement("p", { className: "status-line", role: "status" }, status) : null,
@@ -2208,25 +2645,55 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
                   `${file.kind === "source" ? "来源" : file.modifies_existing ? "修改" : "新增"}：${file.relative_path}`
                 )),
                 ...(reviewItemsByUnit.get(unit.unit_id) || [])
-                  .filter((item) => ["parse", "existing-note"].includes(item.object_type) && item.risk === "required-check")
+                  .filter((item) => (
+                    ["parse", "existing-note"].includes(item.object_type) && item.risk === "required-check"
+                  ) || (
+                    item.object_type === "conversion" && ["required-check", "blocking"].includes(item.risk)
+                  ))
                   .map((item) => React.createElement(
                     "div",
                     { className: "detail-actions", key: item.review_item_id },
-                    React.createElement("span", { className: "row-note" }, `${item.object_type === "parse" ? "解析" : "既有笔记"}：${item.reason}`),
+                    React.createElement("span", { className: "row-note" }, `${item.object_type === "parse" ? "解析" : item.object_type === "conversion" ? "转换" : "既有笔记"}：${item.reason}`),
                     item.status === "pending"
                       ? React.createElement(
                           React.Fragment,
                           null,
-                          React.createElement("input", {
-                            type: "text",
-                            value: reviewItemDrafts[item.review_item_id] || "",
-                            disabled: isActing,
-                            onChange: (event) => updateReviewItemDraft(item.review_item_id, event.target.value),
-                            "aria-label": `${unit.source_label} 的审核决定理由`
-                          }),
-                          React.createElement("button", { type: "button", disabled: isActing, onClick: () => runReviewItemAction(item, "accepted") }, "接受"),
-                          React.createElement("button", { type: "button", disabled: isActing, onClick: () => runReviewItemAction(item, "revised") }, "确认修正"),
-                          React.createElement("button", { type: "button", disabled: isActing, onClick: () => runReviewItemAction(item, "excluded") }, "排除")
+                          item.object_type !== "conversion" || (
+                            item.risk === "required-check" && conversionReviewHasGraphIssue(item.review_item_id)
+                          )
+                            ? React.createElement("input", {
+                                type: "text",
+                                value: reviewItemDrafts[item.review_item_id] || "",
+                                disabled: isActing,
+                                onChange: (event) => updateReviewItemDraft(item.review_item_id, event.target.value),
+                                "aria-label": `${unit.source_label} 的审核决定理由`
+                              })
+                            : null,
+                          item.object_type !== "conversion" || (
+                            item.risk === "required-check" && conversionReviewHasGraphIssue(item.review_item_id)
+                          )
+                            ? React.createElement("button", { type: "button", disabled: !canManageReviewItems, title: reviewItemControlReason || undefined, onClick: () => runReviewItemAction(item, "accepted") }, "接受")
+                            : null,
+                          item.object_type !== "conversion"
+                            ? React.createElement("button", { type: "button", disabled: !canManageReviewItems, title: reviewItemControlReason || undefined, onClick: () => runReviewItemAction(item, "revised") }, "确认修正")
+                            : null,
+                          item.object_type !== "conversion" || (
+                            item.risk === "required-check" && conversionReviewHasGraphIssue(item.review_item_id)
+                          )
+                            ? React.createElement("button", { type: "button", disabled: !canManageReviewItems, title: reviewItemControlReason || undefined, onClick: () => runReviewItemAction(item, "excluded") }, "排除")
+                            : null,
+                          item.object_type === "conversion"
+                            ? React.createElement(ConversionReviewControls, {
+                                reviewItem: item,
+                                lifecycle: task.lifecycle,
+                                isActing,
+                                draft: conversionDrafts[item.review_item_id] || {},
+                                blocks: conversionBlocksByItem.get(conversionItemIdFromReviewItem(item.review_item_id)) || [],
+                                onDraftChange: (field, value) => updateConversionDraft(item.review_item_id, field, value),
+                                onRetry: () => retryConversionReviewItem(item),
+                                onCorrect: () => correctConversionReviewBlock(item)
+                              })
+                            : null
                         )
                       : React.createElement("span", { className: "row-status" }, `已${item.status === "accepted" ? "接受" : item.status === "revised" ? "修正" : "排除"}`)
                   ))
@@ -2249,12 +2716,18 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
             React.createElement(
               "span",
               { className: "row-status" },
-              `${importCategoryText(item.category)} · ${importIdentityStatusText(item.identity_status)} · ${importParseStatusText(item.parse_status)} · ${importOcrStatusText(item.ocr_status)}`
+              `${importCategoryText(item.category)} · ${importIdentityStatusText(item.identity_status)}${item.conversion_status && item.conversion_status !== "not-applicable" ? ` · ${importConversionStatusText(item.conversion_status)}` : ""} · ${importParseStatusText(item.parse_status)} · ${importOcrStatusText(item.ocr_status)}`
             ),
             item.source_id ? React.createElement("span", { className: "row-note" }, `来源：${item.source_id}`) : null,
             item.content_sha256 ? React.createElement("span", { className: "row-note" }, `哈希：${item.content_sha256}`) : null,
             item.parse_confidence !== null && item.parse_confidence !== undefined
               ? React.createElement("span", { className: "row-note" }, `解析置信度：${item.parse_confidence}`)
+              : null,
+            item.conversion_engine
+              ? React.createElement("span", { className: "row-note" }, `转换器：${item.conversion_engine}`)
+              : null,
+            item.conversion_fallback_reason
+              ? React.createElement("span", { className: "row-note" }, item.conversion_fallback_reason)
               : null,
             item.parse_locator_summary
               ? React.createElement("span", { className: "row-note" }, `证据位置：${item.parse_locator_summary}`)
@@ -2368,7 +2841,7 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
                       { className: "section-row note-proposal-row", key: note.note_id },
                       React.createElement("span", { className: "row-title" }, `${note.sequence}. ${note.title}`),
                       React.createElement("span", { className: "row-note" }, `位置：${note.relative_path}`),
-                      React.createElement("span", { className: "row-note" }, `来源：${note.source_locators.map((locator) => locator.page ? `第 ${locator.page} 页` : locator.docx_location).join("、")}`),
+                      React.createElement("span", { className: "row-note" }, `来源：${note.source_locators.map(sourceLocatorText).join("、")}`),
                       note.provenance_verifiable === false
                         ? React.createElement("span", { className: "row-status status-danger" }, `来源信息不可验证：${note.provenance_reason || "schema 不受支持。"}`)
                         : null,
@@ -2690,7 +3163,29 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
   );
 }
 
-export function ImportTaskCenter({ tasks, error, isLoading, selectedTaskId, onSelect, onTaskChanged, onTaskSnapshot, vault }) {
+export function ImportTaskCenter({ tasks, error, isLoading, selectedTaskId, onSelect, onTaskChanged, onTaskDeleted, onTaskSnapshot, vault }) {
+  const [deleteError, setDeleteError] = React.useState("");
+  const [deletingTaskId, setDeletingTaskId] = React.useState(null);
+  const listRef = React.useRef(null);
+
+  async function deleteTask(task) {
+    if (deletingTaskId) return;
+    const confirmed = window.confirm(
+      `删除任务“${task.scope_label}”及其未提交的处理数据？\n\n不会删除 vault 中已存在或已提交的文件。`
+    );
+    if (!confirmed) return;
+    setDeleteError("");
+    setDeletingTaskId(task.task_id);
+    try {
+      await onTaskDeleted(task.task_id);
+      listRef.current?.focus();
+    } catch (deleteFailure) {
+      setDeleteError(deleteFailure.message);
+    } finally {
+      setDeletingTaskId(null);
+    }
+  }
+
   if (selectedTaskId) {
     return React.createElement(ImportTaskDetail, {
       taskId: selectedTaskId,
@@ -2705,22 +3200,40 @@ export function ImportTaskCenter({ tasks, error, isLoading, selectedTaskId, onSe
     React.createElement(ImportTaskLauncher, { vault, onCreated: onTaskChanged }),
     React.createElement(
       "section",
-      { className: "import-task-list", "aria-label": "导入任务列表" },
+      { className: "import-task-list", "aria-label": "导入任务列表", ref: listRef, tabIndex: -1 },
       React.createElement("p", { className: "section-label" }, "任务"),
       error ? React.createElement("p", { className: "status-line status-danger", role: "status" }, `无法读取导入任务：${error}`) : null,
+      deleteError ? React.createElement("p", { className: "status-line status-danger", role: "status" }, `无法删除导入任务：${deleteError}`) : null,
       isLoading
         ? React.createElement("p", { className: "empty-state", role: "status" }, "正在读取任务快照。")
         : tasks.length === 0 && !error
           ? React.createElement("p", { className: "empty-state" }, "当前没有导入任务。")
           : tasks.map((task) => React.createElement(
-              "button",
-              { className: "section-row import-task-row", type: "button", key: task.task_id, onClick: () => onSelect(task.task_id) },
-              React.createElement("span", { className: "row-title" }, task.scope_label),
-              React.createElement("span", { className: "row-meta" }, `目标：${task.vault_label}`),
-              React.createElement("span", { className: "row-status" }, `${importLifecycleText(task.lifecycle)} · ${importPhaseText(task.phase)}`),
-              React.createElement("span", { className: "row-note" }, task.recovery_actions.length
-                ? `恢复：${task.recovery_actions.map(importRecoveryActionText).join("、")}`
-                : `发现 ${task.counts.discovered}；新资料 ${task.counts.new || 0}；重复资料 ${task.counts.duplicate || 0}；可能版本 ${task.counts.possible_version || 0}；识别失败 ${task.counts.identity_failed || 0}；已解析 ${task.counts.parsed || 0}；解析失败 ${task.counts.parse_failed || 0}；待审核问题 ${task.counts.required_check || 0}；失败 ${task.counts.failed}`)
+              "div",
+              { className: "section-row import-task-row", key: task.task_id },
+              React.createElement(
+                "button",
+                { className: "import-task-open", type: "button", onClick: () => onSelect(task.task_id) },
+                React.createElement("span", { className: "row-title" }, task.scope_label),
+                React.createElement("span", { className: "row-meta" }, `目标：${task.vault_label}`),
+                React.createElement("span", { className: "row-status" }, `${importLifecycleText(task.lifecycle)} · ${importPhaseText(task.phase)}`),
+                React.createElement("span", { className: "row-note" }, task.recovery_actions.length
+                  ? `恢复：${task.recovery_actions.map(importRecoveryActionText).join("、")}`
+                  : `发现 ${task.counts.discovered}；新资料 ${task.counts.new || 0}；重复资料 ${task.counts.duplicate || 0}；可能版本 ${task.counts.possible_version || 0}；识别失败 ${task.counts.identity_failed || 0}；已解析 ${task.counts.parsed || 0}；解析失败 ${task.counts.parse_failed || 0}；待审核问题 ${task.counts.required_check || 0}；失败 ${task.counts.failed}`)
+              ),
+              task.lifecycle !== "running"
+                ? React.createElement(
+                    "button",
+                    {
+                      className: "text-button danger-text-button import-task-delete",
+                      type: "button",
+                      "aria-label": `删除任务 ${task.scope_label}`,
+                      disabled: deletingTaskId !== null,
+                      onClick: () => deleteTask(task)
+                    },
+                    deletingTaskId === task.task_id ? "删除中" : "删除"
+                  )
+                : null
             ))
     )
   );
@@ -2738,6 +3251,10 @@ export function App() {
   const [tasks, setTasks] = React.useState([]);
   const [tasksLoading, setTasksLoading] = React.useState(true);
   const [tasksError, setTasksError] = React.useState("");
+  const [sessionPage, setSessionPage] = React.useState({ sessions: [], page: 1, page_size: 25, total: 0, total_pages: 1 });
+  const [sessionFilters, setSessionFilters] = React.useState({ query: "", sort: "updated_at", order: "desc", page: 1 });
+  const [sessionsLoading, setSessionsLoading] = React.useState(true);
+  const [sessionsError, setSessionsError] = React.useState("");
   const [modelDefaults, setModelDefaults] = React.useState({
     chat: { default: null, status: "unconfigured", reason: "正在加载对话/文本生成 Model。" },
     embedding: { default: null, status: "unconfigured", reason: "正在加载 Embedding Model。" }
@@ -2788,6 +3305,30 @@ export function App() {
       }))
   ), []);
 
+  const loadSessions = React.useCallback(async (nextFilters) => {
+    const requested = { query: "", sort: "updated_at", order: "desc", page: 1, ...nextFilters };
+    const search = new window.URLSearchParams({
+      query: requested.query,
+      sort: requested.sort,
+      order: requested.order,
+      page: String(requested.page),
+      page_size: "25"
+    });
+    setSessionsLoading(true);
+    setSessionsError("");
+    try {
+      const response = await requestJson(`${SESSIONS_ENDPOINT}?${search}`);
+      setSessionPage(response);
+      setSessionFilters({ ...requested, page: response.page });
+      return response;
+    } catch (requestError) {
+      setSessionsError(requestError.message);
+      return null;
+    } finally {
+      setSessionsLoading(false);
+    }
+  }, []);
+
   React.useEffect(() => {
     fetch(HEALTH_ENDPOINT)
       .then((response) => {
@@ -2804,15 +3345,17 @@ export function App() {
       })
       .then(() => {
         setSessionStatus("本机会话已建立");
-        return Promise.all([loadVaults(), loadProviders(), loadModelDefaults(), loadTasks()]);
+        return Promise.all([loadVaults(), loadProviders(), loadModelDefaults(), loadTasks(), loadSessions()]);
       })
       .catch(() => {
         setSessionStatus("本机会话不可用");
         setVaultsLoading(false);
         setTasksLoading(false);
         setTasksError("本机会话不可用。");
+        setSessionsLoading(false);
+        setSessionsError("本机会话不可用。");
       });
-  }, [loadModelDefaults, loadProviders, loadTasks, loadVaults]);
+  }, [loadModelDefaults, loadProviders, loadSessions, loadTasks, loadVaults]);
 
   React.useEffect(() => {
     if (menuOpen) firstMenuLinkRef.current?.focus();
@@ -2881,6 +3424,48 @@ export function App() {
     setActiveDestination("tasks");
   }, [syncTask]);
 
+  const deleteTask = React.useCallback(async (taskId) => {
+    setTasksError("");
+    try {
+      await requestJson(`${IMPORT_TASKS_ENDPOINT}/${taskId}`, { method: "DELETE" });
+      setSelectedTaskId((current) => current === taskId ? null : current);
+    } finally {
+      await loadTasks();
+    }
+  }, [loadTasks]);
+
+  async function createPersistentSession() {
+    const response = await requestJson(SESSIONS_ENDPOINT, {
+      method: "POST",
+      body: JSON.stringify({})
+    });
+    await loadSessions({ ...sessionFilters, query: "", page: 1 });
+    return response.session;
+  }
+
+  async function renamePersistentSession(sessionId, title) {
+    const response = await requestJson(`${SESSIONS_ENDPOINT}/${sessionId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ title })
+    });
+    await loadSessions(sessionFilters);
+    return response.session;
+  }
+
+  async function exportPersistentSession(session) {
+    const response = await fetch(`${SESSIONS_ENDPOINT}/${session.session_id}/export`);
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.message || "导出会话失败。");
+    }
+    const link = document.createElement("a");
+    const objectUrl = window.URL.createObjectURL(await response.blob());
+    link.href = objectUrl;
+    link.download = `session-${session.session_id}.json`;
+    link.click();
+    window.URL.revokeObjectURL(objectUrl);
+  }
+
   function completeVaultForm(vault) {
     setVaults((current) => {
       const withoutUpdated = current.filter((item) => item.vault_id !== vault.vault_id);
@@ -2911,6 +3496,12 @@ export function App() {
         await requestJson(`${PROVIDERS_ENDPOINT}/${request.target.provider_id}`, { method: "DELETE" });
         setProviders((current) => current.filter((item) => item.provider_id !== request.target.provider_id));
         await loadModelDefaults();
+      } else if (request.kind === "session-remove") {
+        await requestJson(`${SESSIONS_ENDPOINT}/${request.target.session_id}`, { method: "DELETE" });
+        const updated = await loadSessions(sessionFilters);
+        if (updated && updated.sessions.length === 0 && updated.page > 1) {
+          await loadSessions({ ...sessionFilters, page: updated.page - 1 });
+        }
       } else if (request.kind === "remove") {
         await requestJson(`${VAULTS_ENDPOINT}/${request.target.vault_id}`, { method: "DELETE" });
         setVaults((current) => current.filter((item) => item.vault_id !== request.target.vault_id));
@@ -2979,8 +3570,21 @@ export function App() {
       selectedTaskId,
       onSelect: setSelectedTaskId,
       onTaskChanged: updateTask,
+      onTaskDeleted: deleteTask,
       onTaskSnapshot: syncTask,
       vault: currentVault
+    });
+  } else if (activeDestination === "sessions") {
+    workspaceContent = React.createElement(SessionManagement, {
+      sessionPage,
+      filters: sessionFilters,
+      isLoading: sessionsLoading,
+      error: sessionsError,
+      onLoad: loadSessions,
+      onCreate: createPersistentSession,
+      onRename: renamePersistentSession,
+      onExport: exportPersistentSession,
+      onDelete: (session, trigger) => openConfirmation("session-remove", session, trigger)
     });
   } else if (activeDestination === "workbench") {
     workspaceContent = React.createElement(KnowledgeGraphWorkbench, {

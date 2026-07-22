@@ -143,6 +143,91 @@ h1 {
   border-bottom: 1px solid #d7d7d2;
 }
 
+.session-toolbar,
+.session-search,
+.session-pagination,
+.session-row-actions,
+.session-rename {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.session-toolbar {
+  justify-content: space-between;
+  margin-top: 16px;
+}
+
+.session-search {
+  flex: 1 1 320px;
+}
+
+.session-search input,
+.session-rename input,
+.session-sort select {
+  min-height: 40px;
+  padding: 0 12px;
+  border: 1px solid #8a8a84;
+  border-radius: 4px;
+  background: #ffffff;
+  color: #111111;
+  font: inherit;
+}
+
+.session-search input,
+.session-rename input {
+  min-width: 0;
+  flex: 1 1 220px;
+}
+
+.session-sort {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #545454;
+  font-size: 14px;
+}
+
+.session-list {
+  margin-top: 16px;
+  border-bottom: 1px solid #d7d7d2;
+}
+
+.session-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 0;
+}
+
+.session-row-summary {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.session-row-summary span {
+  color: #545454;
+  font-size: 13px;
+}
+
+.session-row-actions {
+  flex: 0 0 auto;
+}
+
+.session-rename {
+  width: 100%;
+}
+
+.session-pagination {
+  justify-content: flex-end;
+  margin-top: 16px;
+  color: #545454;
+  font-size: 14px;
+}
+
 .empty-state {
   margin-top: 10px;
   color: #545454;
@@ -760,17 +845,39 @@ button:disabled {
   padding: 10px 0;
 }
 
-.import-task-row:hover {
+.import-task-open {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 16px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #111111;
+  font: inherit;
+  text-align: left;
+}
+
+.import-task-open .row-note {
+  grid-column: 1 / -1;
+}
+
+.import-task-row:hover,
+.import-task-open:hover {
   background: #f6f6f4;
 }
 
-.import-task-row .row-note,
 .import-item-row .row-note {
   grid-column: 1 / -1;
 }
 
 .import-item-row .row-status,
-.import-task-row .row-status {
+.import-task-open .row-status {
+  align-self: start;
+}
+
+.import-task-delete {
+  min-height: 40px;
   align-self: start;
 }
 
@@ -1128,7 +1235,11 @@ button:disabled {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .import-task-row .row-status,
+  .import-task-open {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .import-task-open .row-status,
   .import-item-row .row-status {
     grid-column: 1;
     grid-row: auto;

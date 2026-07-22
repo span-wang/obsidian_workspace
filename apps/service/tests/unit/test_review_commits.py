@@ -90,3 +90,12 @@ def test_commit_file_rejects_path_escape_and_nonmatching_content_hash() -> None:
             content_sha256="0" * 64,
             expected_existing_sha256=None,
         )
+
+
+def test_asset_commit_file_is_content_addressed_binary_and_rejects_active_formats() -> None:
+    asset = CommitFile.asset(relative_path=f"platform/assets/{'a' * 64}.png", content=b"png-bytes")
+
+    assert asset.binary_content() == b"png-bytes"
+    assert CommitFile.from_dict(asset.to_dict()) == asset
+    with pytest.raises(ValueError, match="Active asset"):
+        CommitFile.asset(relative_path=f"platform/assets/{'a' * 64}.svg", content=b"<svg />")

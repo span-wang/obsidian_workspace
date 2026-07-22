@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Mapping
 from dataclasses import replace
 from hashlib import sha256
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from application.import_selections import ImportSelection
 from application.vaults import VaultService
@@ -40,7 +41,20 @@ from domain.metadata_tags import (
     plan_tag_change,
     suggest_metadata_tags,
 )
-from domain.evidence import EvidenceLocator, OcrEvidence, OcrTarget, ParseEvidence, StructuredContentUnit
+from domain.evidence import (
+    ConversionAttempt,
+    ConversionEvidence,
+    BlockPayload,
+    correct_document_graph,
+    DocumentBlock,
+    exclude_document_issue,
+    EvidenceLocator,
+    OcrEvidence,
+    OcrTarget,
+    ParseEvidence,
+    resolve_document_issue,
+    StructuredContentUnit,
+)
 from domain.review_commits import (
     CommitBackup,
     CommitFile,
@@ -58,6 +72,8 @@ from ports.source_repository import SourceRepository
 from ports.task_repository import TaskRepository
 from ports.task_worker import TaskWorker
 from ports.vault_committer import VaultCommitError, VaultCommitter, VaultWrite
+from workers.converters.profiles import ConverterProfile, require_profile
+from workers.converters.artifact_store import PrivateArtifactStore
 
 
 class ImportTaskError(ValueError):
@@ -74,6 +90,8 @@ class ImportTaskService:
         source_repository: SourceRepository | None = None,
         vault_committer: VaultCommitter | None = None,
         index_service=None,
+        converter_profile: ConverterProfile | Mapping[str, ConverterProfile] | None = None,
+        artifact_store: PrivateArtifactStore | None = None,
     ) -> None:
         self.vault_service = vault_service
         self.repository = repository
@@ -82,6 +100,8 @@ class ImportTaskService:
         self.source_repository = source_repository
         self.vault_committer = vault_committer
         self.index_service = index_service
+        self.converter_profile = converter_profile
+        self.artifact_store = artifact_store
         self._state_lock = threading.RLock()
 
     def create(self, vault_id: str, selection: ImportSelection) -> ImportTask:
@@ -112,6 +132,15 @@ class ImportTaskService:
         self.get(task_id)
         return self.repository.list_items(task_id)
 
+    def list_conversion_review_graphs(self, task_id: str):
+        with self._state_lock:
+            self.get(task_id)
+            return tuple(
+                (item.item_id, evidence.graph)
+                for item in self.repository.list_items(task_id)
+                if (evidence := self.repository.get_conversion_evidence(item.item_id)) is not None
+            )
+
     def events_after(self, task_id: str, event_id: int):
         self.get(task_id)
         return self.repository.events_after(task_id, event_id)
@@ -138,6 +167,17 @@ class ImportTaskService:
             self.repository.save(cancelled, "cancelled")
             return cancelled
 
+    def delete(self, task_id: str) -> None:
+        with self._state_lock:
+            task = self.get(task_id)
+            if task.lifecycle == "running":
+                raise ImportTaskError(
+                    "A running import task must be cancelled before it can be deleted."
+                )
+            if self.artifact_store is not None:
+                self.artifact_store.remove_task(task.task_id)
+            self.repository.delete(task_id)
+
     def start_parsing(self, task_id: str) -> ImportTask:
         with self._state_lock:
             task = self.get(task_id)
@@ -157,6 +197,14 @@ class ImportTaskService:
             )
             self.repository.save(starting, "parse-requested")
             return self._start_parsing(starting, persist_start=False)
+
+    def start_conversion(self, task_id: str) -> ImportTask:
+        with self._state_lock:
+            task = self.get(task_id)
+            self._available_vault(task.vault_id)
+            if task.lifecycle != "queued" or task.phase != "waiting-for-next-stage":
+                raise ImportTaskError("Only a completed scan waiting for conversion can be started.")
+            return self._start_conversion(task)
 
     def resume(self, task_id: str) -> ImportTask:
         with self._state_lock:
@@ -281,7 +329,10 @@ class ImportTaskService:
                     )
                     self.repository.save(completed, "scan-completed")
                     return
-                self._start_parsing(task)
+                if getattr(self.worker, "start_conversion", None) is not None:
+                    self._start_conversion(task)
+                else:
+                    self._start_parsing(task)
                 return
             if event_type == "cancelled":
                 self.repository.save(
@@ -312,6 +363,45 @@ class ImportTaskService:
 
             if event_type == "parse-item":
                 self._record_parse_item(task, event)
+                return
+            if event_type == "conversion-item":
+                self._record_conversion_item(task, event)
+                return
+            if event_type == "conversion-attempted":
+                attempt = ConversionAttempt.from_dict(dict(event["attempt"]))
+                if attempt.task_id != task.task_id:
+                    return
+                if not any(
+                    item.item_id == attempt.item_id
+                    for item in self.repository.list_items(task.task_id)
+                ):
+                    return
+                self.repository.record_conversion_attempt(attempt)
+                return
+            if event_type == "conversion-failed-item":
+                self.repository.record_conversion_rejection(
+                    int(event["item_id"]),
+                    str(event.get("reason") or "Conversion failed before graph selection."),
+                )
+                return
+            if event_type == "conversion-completed":
+                self._start_derivation(self.get(task_id))
+                return
+            if event_type == "conversion-cancelled":
+                self.repository.save(
+                    replace(
+                        task,
+                        lifecycle="cancelled",
+                        phase="cancelled",
+                        current_item_label=None,
+                        recovery_actions=("create-new-task",),
+                        updated_at=utc_now(),
+                    ),
+                    "conversion-cancelled",
+                )
+                return
+            if event_type == "conversion-failed":
+                self._finish_waiting_for_review(self.get(task_id), "conversion-failed")
                 return
             if event_type == "parse-failed-item":
                 locator_summary = event.get("locator_summary")
@@ -353,6 +443,15 @@ class ImportTaskService:
                 return
             if event_type == "derivation-item":
                 self._record_derivation_item(task, event)
+                return
+            if event_type == "derivation-v2-item":
+                item_id = int(event["item_id"])
+                item = next(
+                    (candidate for candidate in self.repository.list_items(task.task_id) if candidate.item_id == item_id),
+                    None,
+                )
+                if item is None or event.get("content_sha256") != item.content_sha256:
+                    self._record_source_change(task, item_id)
                 return
             if event_type == "derivation-failed-item":
                 self.repository.save(
@@ -518,6 +617,91 @@ class ImportTaskService:
             return failed
         return self.get(running.task_id)
 
+    def _start_conversion(
+        self, task: ImportTask, candidates: tuple[ImportTaskItem, ...] | None = None
+    ) -> ImportTask:
+        if candidates is None:
+            candidates = tuple(
+                item for item in self.repository.list_items(task.task_id) if self._is_parse_candidate(item)
+            )
+        else:
+            candidates = tuple(
+                item
+                for item in candidates
+                if item.task_id == task.task_id and self._is_parse_candidate(item)
+            )
+        if not candidates:
+            return self._finish_waiting_for_review(task, "conversion-not-required")
+        eligible: list[ImportTaskItem] = []
+        for item in candidates:
+            engine = "mineru" if item.document_kind == "pdf" else "pandoc"
+            gate = require_profile(self._converter_profile_for(engine), engine)
+            if not gate.allowed:
+                self.repository.record_conversion_rejection(
+                    item.item_id, gate.reason or "No approved converter profile is available."
+                )
+                continue
+            eligible.append(item)
+        if not eligible:
+            return self._finish_waiting_for_review(self.get(task.task_id), "conversion-profile-rejected")
+        start_conversion = getattr(self.worker, "start_conversion", None)
+        if start_conversion is None:
+            return self._finish_waiting_for_review(task, "conversion-worker-unavailable")
+        running = replace(
+            self.get(task.task_id),
+            lifecycle="running",
+            phase="converting",
+            current_item_label=None,
+            recovery_actions=("cancel",),
+            failure_reason=None,
+            updated_at=utc_now(),
+        )
+        self.repository.save(running, "conversion-started")
+        try:
+            start_conversion(running, eligible, self._handle_worker_event)
+        except Exception:
+            failed = replace(
+                running,
+                lifecycle="recoverable",
+                phase="failed",
+                current_item_label=None,
+                recovery_actions=("restart-conversion",),
+                failure_reason="The local converter worker could not be started.",
+                updated_at=utc_now(),
+            )
+            self.repository.save(failed, "conversion-start-failed")
+            return failed
+        return self.get(task.task_id)
+
+    def _record_conversion_item(self, task: ImportTask, event: dict[str, object]) -> None:
+        item_id = int(event["item_id"])
+        item = next(
+            (candidate for candidate in self.repository.list_items(task.task_id) if candidate.item_id == item_id),
+            None,
+        )
+        if item is None or event.get("content_sha256") != item.content_sha256:
+            self._record_source_change(task, item_id)
+            return
+        evidence = ConversionEvidence.from_dict(dict(event["evidence"]))
+        if evidence.attempt.task_id != task.task_id or evidence.attempt.item_id != item_id:
+            self.repository.record_conversion_rejection(item_id, "Conversion event identity did not match its task item.")
+            return
+        decision = event.get("quality_gate_decision")
+        if not isinstance(decision, dict) or decision.get("action") != "accepted":
+            self.repository.record_conversion_rejection(
+                item_id, "The selected conversion graph has no accepted structural quality decision."
+            )
+            return
+        if decision.get("decision_id") != evidence.attempt.quality_gate_decision_id:
+            self.repository.record_conversion_rejection(
+                item_id, "The selected conversion graph quality decision does not match its attempt."
+            )
+            return
+        self.repository.record_conversion_quality_gate_decision(
+            evidence.attempt, evidence.graph.graph_id, decision
+        )
+        self.repository.record_conversion_evidence(item_id, evidence)
+
     def _record_parse_item(self, task: ImportTask, event: dict[str, object]) -> None:
         item_id = int(event["item_id"])
         item = next(
@@ -643,6 +827,11 @@ class ImportTaskService:
             return failed
         return self.get(running.task_id)
 
+    def _converter_profile_for(self, engine: str) -> ConverterProfile | None:
+        if isinstance(self.converter_profile, Mapping):
+            return self.converter_profile.get(engine)
+        return self.converter_profile
+
     def _record_ocr_item(self, task: ImportTask, event: dict[str, object]) -> None:
         item_id = int(event["item_id"])
         item = next(
@@ -696,6 +885,25 @@ class ImportTaskService:
         inputs: list[dict[str, object]] = []
         for item in self.repository.list_items(task.task_id):
             if not self._is_derivation_candidate(item):
+                conversion = self.repository.get_conversion_evidence(item.item_id)
+                if conversion is None or conversion.graph.has_blocking_unresolved_content():
+                    continue
+                if not self._source_matches_scanned_content(item):
+                    self._record_source_change(task, item.item_id)
+                    return self.get(task.task_id)
+                inputs.append(
+                    {
+                        "item_id": item.item_id,
+                        "vault_id": task.vault_id,
+                        "source_id": item.source_id,
+                        "processing_task_id": task.task_id,
+                        "content_sha256": item.content_sha256,
+                        "managed_root": vault.managed_root_relative_path,
+                        "source_suffix": item.source_path.suffix,
+                        "source_label": item.label,
+                        "evidence": conversion.to_dict(),
+                    }
+                )
                 continue
             if not self._source_matches_scanned_content(item):
                 self._record_source_change(task, item.item_id)
@@ -799,6 +1007,12 @@ class ImportTaskService:
         if not self._generate_native_proposals(task):
             return self.get(task.task_id)
         current = self.get(task.task_id)
+        has_conversion_required_check = any(
+            item.conversion_status == "rejected" for item in self.repository.list_items(current.task_id)
+        )
+        has_selected_conversion = any(
+            item.conversion_status == "selected" for item in self.repository.list_items(current.task_id)
+        )
         proposals = self.repository.list_note_proposals(current.task_id)
         recovery_actions: list[str] = []
         if current.counts.parse_failed:
@@ -809,12 +1023,26 @@ class ImportTaskService:
             current,
             lifecycle=(
                 "waiting-for-review"
-                if current.counts.parsed or proposals or current.counts.parse_failed or current.counts.ocr_failed
+                if (
+                    current.counts.parsed
+                    or proposals
+                    or current.counts.parse_failed
+                    or current.counts.ocr_failed
+                    or has_conversion_required_check
+                    or has_selected_conversion
+                )
                 else "queued"
             ),
             phase=(
                 "waiting-for-review"
-                if current.counts.parsed or proposals or current.counts.parse_failed or current.counts.ocr_failed
+                if (
+                    current.counts.parsed
+                    or proposals
+                    or current.counts.parse_failed
+                    or current.counts.ocr_failed
+                    or has_conversion_required_check
+                    or has_selected_conversion
+                )
                 else "waiting-for-next-stage"
             ),
             current_item_label=None,
@@ -1112,6 +1340,8 @@ class ImportTaskService:
             )
             if review_item is None or review_item.risk != "required-check":
                 raise ImportTaskError("This review item does not need an explicit decision.")
+            if review_item.object_type == "conversion":
+                return self._decide_conversion_review_item(task, review_item, decision, reason)
             if review_item.object_type not in {"parse", "existing-note"}:
                 raise ImportTaskError("This review item must be handled by its dedicated review action.")
             if not review_item.context_sha256:
@@ -1131,6 +1361,127 @@ class ImportTaskService:
             refreshed = self._build_review_snapshot(task)
             self.repository.record_review_snapshot(refreshed, "review-snapshot-created")
             return self.get(task_id)
+
+    def correct_conversion_block(
+        self,
+        task_id: str,
+        item_id: int,
+        block_id: str,
+        replacement: DocumentBlock,
+        reason: str,
+    ) -> ImportTask:
+        with self._state_lock:
+            task = self.get(task_id)
+            self._require_classification_review_task(task)
+            evidence = self._conversion_evidence_for_item(task, item_id)
+            corrected = correct_document_graph(evidence.graph, {block_id: replacement})
+            return self._replace_selected_conversion_graph(task, item_id, evidence, corrected, reason)
+
+    def correct_conversion_block_payload(
+        self,
+        task_id: str,
+        item_id: int,
+        block_id: str,
+        kind: str,
+        payload: dict[str, object],
+        retrieval_projection: str,
+        reason: str,
+    ) -> ImportTask:
+        with self._state_lock:
+            task = self.get(task_id)
+            self._require_classification_review_task(task)
+            evidence = self._conversion_evidence_for_item(task, item_id)
+            original = next((block for block in evidence.graph.blocks if block.block_id == block_id), None)
+            if original is None:
+                raise ImportTaskError("The conversion block is not in the selected graph.")
+            try:
+                replacement = DocumentBlock(
+                    block_id=original.block_id,
+                    kind=kind,
+                    reading_order=original.reading_order,
+                    locators=original.locators,
+                    confidence=original.confidence,
+                    payload=BlockPayload.from_dict(kind, payload),
+                    evidence_refs=original.evidence_refs,
+                    retrieval_projection=retrieval_projection,
+                )
+            except ValueError as error:
+                raise ImportTaskError(str(error)) from error
+            corrected = correct_document_graph(evidence.graph, {block_id: replacement})
+            return self._replace_selected_conversion_graph(task, item_id, evidence, corrected, reason)
+
+    def retry_conversion_item(self, task_id: str, item_id: int) -> ImportTask:
+        with self._state_lock:
+            task = self.get(task_id)
+            self._require_classification_review_task(task)
+            item = next((candidate for candidate in self.repository.list_items(task_id) if candidate.item_id == item_id), None)
+            if item is None or item.document_kind not in {"pdf", "docx"}:
+                raise ImportTaskError("The conversion item is unavailable for retry.")
+            engine = "mineru" if item.document_kind == "pdf" else "pandoc"
+            gate = require_profile(self._converter_profile_for(engine), engine)
+            if not gate.allowed:
+                raise ImportTaskError(gate.reason or "No approved converter profile is available.")
+            return self._start_conversion(task, (item,))
+
+    def _decide_conversion_review_item(
+        self, task: ImportTask, review_item: ReviewItem, decision: str, reason: str
+    ) -> ImportTask:
+        if decision == "revised":
+            raise ImportTaskError("Conversion corrections require a typed replacement block.")
+        if not review_item.context_sha256:
+            raise ImportTaskError("This conversion review item cannot be decided safely.")
+        item_id, issue_index = self._conversion_review_target(review_item.review_item_id)
+        evidence = self._conversion_evidence_for_item(task, item_id)
+        graph = (
+            resolve_document_issue(evidence.graph, issue_index, "accepted")
+            if decision == "accepted"
+            else exclude_document_issue(evidence.graph, issue_index, reason)
+        )
+        self.repository.record_review_decision(
+            ReviewDecision(
+                task_id=task.task_id,
+                review_item_id=review_item.review_item_id,
+                decision=decision,
+                reason=reason,
+                context_sha256=review_item.context_sha256,
+                decided_at=utc_now(),
+            ),
+            "conversion-review-decided",
+        )
+        return self._replace_selected_conversion_graph(task, item_id, evidence, graph, reason)
+
+    def _replace_selected_conversion_graph(
+        self,
+        task: ImportTask,
+        item_id: int,
+        evidence: ConversionEvidence,
+        graph,
+        reason: str,
+    ) -> ImportTask:
+        updated_evidence = ConversionEvidence(evidence.document_kind, graph, evidence.attempt)
+        self.repository.record_conversion_evidence(item_id, updated_evidence)
+        self.repository.invalidate_note_proposals(task.task_id, item_id)
+        self.repository.invalidate_candidate_link_proposals(task.task_id, item_id, reason)
+        self.repository.invalidate_metadata_tag_proposals(task.task_id, item_id)
+        return self._start_derivation(self.get(task.task_id))
+
+    def _conversion_evidence_for_item(self, task: ImportTask, item_id: int) -> ConversionEvidence:
+        if not any(item.item_id == item_id for item in self.repository.list_items(task.task_id)):
+            raise ImportTaskError("The conversion item does not belong to this import task.")
+        evidence = self.repository.get_conversion_evidence(item_id)
+        if evidence is None:
+            raise ImportTaskError("The selected conversion graph is unavailable.")
+        return evidence
+
+    @staticmethod
+    def _conversion_review_target(review_item_id: str) -> tuple[int, int]:
+        parts = review_item_id.split("-")
+        if len(parts) < 4 or parts[0] != "conversion":
+            raise ImportTaskError("The conversion review item has no graph issue target.")
+        try:
+            return int(parts[1]), int(parts[-1]) - 1
+        except ValueError as error:
+            raise ImportTaskError("The conversion review item has an invalid graph issue target.") from error
 
     def commit_review(self, task_id: str, unit_ids: tuple[str, ...] | None = None) -> ImportTask:
         with self._state_lock:
@@ -1485,6 +1836,76 @@ class ImportTaskService:
         for item_id, item in items.items():
             if item_id in proposal_item_ids:
                 continue
+            if item.conversion_status == "rejected":
+                unit_id = f"conversion-{item_id}"
+                unit_ids[item_id] = unit_id
+                units.append(
+                    CommitUnit(
+                        unit_id=unit_id,
+                        source_item_id=item_id,
+                        source_label=item.label,
+                        kind="unresolved",
+                        files=(),
+                    )
+                )
+                review_items.append(
+                    self._review_item(
+                        task.task_id,
+                        f"conversion-{item_id}",
+                        unit_id,
+                        "conversion",
+                        "required-check",
+                        item.conversion_fallback_reason
+                        or "No approved converter profile selected a complete document graph.",
+                        sha256(
+                            f"{item.content_sha256}:{item.conversion_fallback_reason or ''}".encode("utf-8")
+                        ).hexdigest(),
+                    )
+                )
+                continue
+            if item.conversion_status == "selected":
+                unit_id = f"conversion-{item_id}"
+                unit_ids[item_id] = unit_id
+                units.append(
+                    CommitUnit(
+                        unit_id=unit_id,
+                        source_item_id=item_id,
+                        source_label=item.label,
+                        kind="unresolved",
+                        files=(),
+                    )
+                )
+                evidence = self.repository.get_conversion_evidence(item_id)
+                if evidence is not None:
+                    for index, issue in enumerate(evidence.graph.issues, start=1):
+                        if issue.severity not in {"required-check", "blocking"}:
+                            continue
+                        if issue.severity == "blocking":
+                            review_items.append(
+                                ReviewItem(
+                                    f"conversion-{item_id}-{evidence.graph.graph_id}-{index}",
+                                    unit_id,
+                                    "conversion",
+                                    "blocking",
+                                    "blocking",
+                                    issue.message,
+                                )
+                            )
+                        else:
+                            review_items.append(
+                                self._review_item(
+                                    task.task_id,
+                                    f"conversion-{item_id}-{evidence.graph.graph_id}-{index}",
+                                    unit_id,
+                                    "conversion",
+                                    "required-check",
+                                    issue.message,
+                                    sha256(
+                                        f"{evidence.graph.graph_id}:{issue.code}:{issue.locator.to_dict()}".encode("utf-8")
+                                    ).hexdigest(),
+                                )
+                            )
+                continue
             if item.parse_status == "parse-failed":
                 unit_id = f"unresolved-{item_id}"
                 unit_ids[item_id] = unit_id
@@ -1600,6 +2021,7 @@ class ImportTaskService:
             note_contents = [(proposal.index_note.relative_path, proposal.index_note.markdown)] + [
                 (note.relative_path, note.markdown) for note in proposal.notes
             ]
+            files.extend(self._commit_asset_files(proposal, item, vault_path))
         else:
             note_contents = [(proposal.relative_path, proposal.markdown)]
         accepted_tags = ()
@@ -1635,6 +2057,39 @@ class ImportTaskService:
             )
         return tuple(files)
 
+    def _commit_asset_files(
+        self, proposal: DerivedMarkdownProposal, item: ImportTaskItem, vault_path: Path
+    ) -> tuple[CommitFile, ...]:
+        if proposal.graph_id is None:
+            return ()
+        evidence = self.repository.get_conversion_evidence(item.item_id)
+        if evidence is None or evidence.graph.graph_id != proposal.graph_id:
+            raise ImportTaskError("The selected conversion graph is unavailable for asset review.")
+        if not evidence.graph.assets:
+            return ()
+        if self.artifact_store is None:
+            raise ImportTaskError("Verified conversion assets are unavailable for this review.")
+        managed_root = str(PurePosixPath(proposal.source_relative_path).parent.parent)
+        files_by_path: dict[str, CommitFile] = {}
+        for asset in evidence.graph.assets:
+            try:
+                content = self.artifact_store.read_artifact(asset.artifact_ref)
+            except ValueError as error:
+                raise ImportTaskError(str(error)) from error
+            relative_path = f"{managed_root}/assets/{asset.sha256}{asset.safe_extension.lower()}"
+            file = CommitFile.asset(
+                relative_path=relative_path,
+                content=content,
+                expected_existing_sha256=self._existing_file_hash(vault_path, relative_path),
+            )
+            existing = files_by_path.get(relative_path)
+            if existing is not None:
+                if existing.content_sha256 != file.content_sha256:
+                    raise ImportTaskError("Conversion assets conflict on their planned vault path.")
+                continue
+            files_by_path[relative_path] = file
+        return tuple(files_by_path.values())
+
     @staticmethod
     def _render_accepted_governance(
         markdown: str,
@@ -1664,12 +2119,27 @@ class ImportTaskService:
         writes: list[VaultWrite] = []
         for file in unit.files:
             if file.kind == "source":
-                try:
-                    content = item.source_path.read_bytes()
-                except OSError as error:
-                    raise ImportTaskError("The reviewed source file is no longer available.") from error
+                evidence = self.repository.get_conversion_evidence(item.item_id)
+                if evidence is not None:
+                    if self.artifact_store is None:
+                        raise ImportTaskError("The verified conversion snapshot is unavailable for commit.")
+                    try:
+                        content = self.artifact_store.read_input_snapshot(
+                            task_id=task.task_id,
+                            item_id=item.item_id,
+                            expected_sha256=evidence.attempt.input_snapshot_hash,
+                        )
+                    except ValueError as error:
+                        raise ImportTaskError(str(error)) from error
+                else:
+                    try:
+                        content = item.source_path.read_bytes()
+                    except OSError as error:
+                        raise ImportTaskError("The reviewed source file is no longer available.") from error
                 if sha256(content).hexdigest() != file.content_sha256:
                     raise ImportTaskError("The source content changed after the review snapshot.")
+            elif file.kind == "asset":
+                content = file.binary_content()
             else:
                 content = (file.content or "").encode("utf-8")
             writes.append(
@@ -1947,9 +2417,14 @@ class ImportTaskService:
                 updated = apply_tag_change(proposal, expected, timestamp)
                 if updated is proposal:
                     continue
-                self.repository.record_metadata_tag_proposal(
-                    proposal.item_id, updated, "metadata-tags-tag-change"
-                )
+                try:
+                    self.repository.get(proposal.task_id)
+                except KeyError:
+                    self.repository.record_vault_metadata_tag_proposal(updated)
+                else:
+                    self.repository.record_metadata_tag_proposal(
+                        proposal.item_id, updated, "metadata-tags-tag-change"
+                    )
             return expected
 
     def revise_classification_suggestion(

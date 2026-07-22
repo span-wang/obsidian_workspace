@@ -6,7 +6,14 @@ from domain.tasks import ImportTask, ImportTaskEvent, ImportTaskItem
 from domain.classification import ClassificationSuggestion
 from domain.candidate_links import CandidateLinkProposal
 from domain.derived_notes import NoteProposal
-from domain.evidence import EvidenceLocator, OcrEvidence, OcrTarget, ParseEvidence
+from domain.evidence import (
+    ConversionAttempt,
+    ConversionEvidence,
+    EvidenceLocator,
+    OcrEvidence,
+    OcrTarget,
+    ParseEvidence,
+)
 from domain.metadata_tags import MetadataTagProposal, TagChangePreview, TagDefinition
 from domain.review_commits import CommitJournal, ReviewDecision, ReviewSnapshot
 
@@ -19,6 +26,8 @@ class TaskRepository(Protocol):
     def list(self) -> list[ImportTask]: ...
 
     def save(self, task: ImportTask, event_type: str) -> None: ...
+
+    def delete(self, task_id: str) -> None: ...
 
     def append_item(self, task_id: str, item: ImportTaskItem) -> ImportTask: ...
 
@@ -39,6 +48,20 @@ class TaskRepository(Protocol):
     def find_parse_evidence(
         self, vault_id: str, source_id: str, content_sha256: str
     ) -> ParseEvidence | None: ...
+
+    def record_conversion_attempt(self, attempt: ConversionAttempt) -> ConversionAttempt: ...
+
+    def record_conversion_quality_gate_decision(
+        self, attempt: ConversionAttempt, graph_id: str, decision: dict[str, object]
+    ) -> None: ...
+
+    def record_conversion_evidence(self, item_id: int, evidence: ConversionEvidence) -> ImportTask: ...
+
+    def get_conversion_evidence(self, item_id: int) -> ConversionEvidence | None: ...
+
+    def list_conversion_attempts(self, item_id: int) -> tuple[ConversionAttempt, ...]: ...
+
+    def record_conversion_rejection(self, item_id: int, reason: str) -> ImportTask: ...
 
     def record_parse_failure(
         self, item_id: int, reason: str, locator_summary: str | None = None
@@ -90,6 +113,8 @@ class TaskRepository(Protocol):
     def record_metadata_tag_proposal(
         self, item_id: int, proposal: MetadataTagProposal, event_type: str
     ) -> ImportTask: ...
+
+    def record_vault_metadata_tag_proposal(self, proposal: MetadataTagProposal) -> None: ...
 
     def get_metadata_tag_proposal(self, item_id: int) -> MetadataTagProposal | None: ...
 

@@ -39,13 +39,16 @@ def test_derivation_keeps_atomic_content_without_same_source_navigation() -> Non
 
     assert proposal.source_relative_path == "platform/sources/source-1-aaaaaaaaaaaaaaaa.pdf"
     assert proposal.index_note.relative_path == "platform/notes/source-1/index.md"
-    assert len(proposal.notes) == 2
-    assert proposal.notes[0].source_locators == (EvidenceLocator(page=1), EvidenceLocator(page=2))
+    assert len(proposal.notes) == 1
+    assert proposal.notes[0].source_locators == (
+        EvidenceLocator(page=1),
+        EvidenceLocator(page=2),
+        EvidenceLocator(page=3),
+    )
     assert "[[platform/sources/source-1-aaaaaaaaaaaaaaaa.pdf|原始资料]]" in proposal.notes[0].markdown
     assert "[[platform/notes/source-1/index|目录]]" not in proposal.notes[0].markdown
-    assert "[[platform/notes/source-1/02-unit-two|下一篇：Unit Two]]" not in proposal.notes[0].markdown
-    assert "Question: Why?" in proposal.notes[1].markdown
-    assert "Answer: Because." in proposal.notes[1].markdown
+    assert "Question: Why?" in proposal.notes[0].markdown
+    assert "Answer: Because." in proposal.notes[0].markdown
     assert "[[platform/notes/source-1/01-unit-one|Unit One]]" not in proposal.index_note.markdown
     assert "[[platform/sources/source-1-aaaaaaaaaaaaaaaa.pdf|原始资料]]" in proposal.index_note.markdown
 
@@ -101,7 +104,7 @@ def test_provenance_rejects_unknown_schema_and_invalid_locator() -> None:
     assert validate_platform_provenance(mixed_locator).verifiable is False
 
 
-def test_derivation_splits_only_a_long_chapter_at_subheadings() -> None:
+def test_derivation_uses_heading_three_to_split_an_oversized_chapter() -> None:
     from domain.derived_notes import derive_markdown_proposal
 
     proposal = derive_markdown_proposal(
@@ -114,16 +117,103 @@ def test_derivation_splits_only_a_long_chapter_at_subheadings() -> None:
         source_suffix=".pdf",
         source_label="Book",
         evidence=_evidence(
-            StructuredContentUnit("heading", "Chapter", EvidenceLocator(page=1)),
-            StructuredContentUnit("paragraph", "A" * 3_100, EvidenceLocator(page=1)),
-            StructuredContentUnit("heading-2", "Scope", EvidenceLocator(page=2)),
-            StructuredContentUnit("table-row", "word | meaning", EvidenceLocator(page=2)),
-            StructuredContentUnit("table-row", "source | evidence", EvidenceLocator(page=2)),
+            StructuredContentUnit("heading", "Book", EvidenceLocator(page=1)),
+            StructuredContentUnit("heading-2", "Chapter", EvidenceLocator(page=1)),
+            StructuredContentUnit("heading-3", "Scope", EvidenceLocator(page=1)),
+            StructuredContentUnit("paragraph", "A" * 4_000, EvidenceLocator(page=1)),
+            StructuredContentUnit("heading-3", "Limits", EvidenceLocator(page=2)),
+            StructuredContentUnit("paragraph", "B" * 4_000, EvidenceLocator(page=2)),
         ),
     )
 
-    assert [note.title for note in proposal.notes] == ["Chapter", "Scope"]
-    assert proposal.notes[1].unit_indexes == (2, 3, 4)
+    assert [note.title for note in proposal.notes] == ["Book", "Limits"]
+    assert proposal.notes[0].unit_indexes == (0, 1, 2, 3)
+    assert proposal.notes[1].unit_indexes == (4, 5)
+
+
+def test_derivation_keeps_a_document_at_or_below_eight_thousand_characters_together() -> None:
+    from domain.derived_notes import derive_markdown_proposal
+
+    proposal = derive_markdown_proposal(
+        item_id=7,
+        vault_id="vault-1",
+        source_id="source-1",
+        processing_task_id="task-1",
+        source_sha256="e" * 64,
+        managed_root="platform",
+        source_suffix=".pdf",
+        source_label="Book",
+        evidence=_evidence(
+            StructuredContentUnit("heading", "Book", EvidenceLocator(page=1)),
+            StructuredContentUnit("paragraph", "A" * 2_500, EvidenceLocator(page=1)),
+            StructuredContentUnit("heading-2", "Chapter", EvidenceLocator(page=2)),
+            StructuredContentUnit("paragraph", "B" * 2_500, EvidenceLocator(page=2)),
+            StructuredContentUnit("heading-3", "Detail", EvidenceLocator(page=3)),
+            StructuredContentUnit("paragraph", "C" * 2_800, EvidenceLocator(page=3)),
+        ),
+    )
+
+    assert proposal.groups == (tuple(range(6)),)
+    assert [note.title for note in proposal.notes] == ["Book"]
+
+
+def test_derivation_groups_large_documents_at_heading_one_and_two_boundaries() -> None:
+    from domain.derived_notes import derive_markdown_proposal
+
+    units = [
+        StructuredContentUnit("heading", "Book", EvidenceLocator(page=1)),
+        StructuredContentUnit("paragraph", "A" * 1_900, EvidenceLocator(page=1)),
+    ]
+    for chapter in range(1, 8):
+        units.extend(
+            (
+                StructuredContentUnit(
+                    "heading-2", f"Chapter {chapter}", EvidenceLocator(page=chapter + 1)
+                ),
+                StructuredContentUnit("paragraph", "B" * 1_900, EvidenceLocator(page=chapter + 1)),
+            )
+        )
+    proposal = derive_markdown_proposal(
+        item_id=7,
+        vault_id="vault-1",
+        source_id="source-1",
+        processing_task_id="task-1",
+        source_sha256="e" * 64,
+        managed_root="platform",
+        source_suffix=".pdf",
+        source_label="Book",
+        evidence=_evidence(*units),
+    )
+
+    assert proposal.groups == (tuple(range(8)), tuple(range(8, 16)))
+    assert [note.title for note in proposal.notes] == ["Book", "Chapter 4"]
+    assert all(
+        4_000 <= sum(len(proposal.units[index].text) for index in group) <= 8_000
+        for group in proposal.groups
+    )
+
+
+def test_derivation_keeps_an_oversized_chapter_without_a_safe_subheading_together() -> None:
+    from domain.derived_notes import derive_markdown_proposal
+
+    proposal = derive_markdown_proposal(
+        item_id=7,
+        vault_id="vault-1",
+        source_id="source-1",
+        processing_task_id="task-1",
+        source_sha256="e" * 64,
+        managed_root="platform",
+        source_suffix=".pdf",
+        source_label="Book",
+        evidence=_evidence(
+            StructuredContentUnit("heading", "Book", EvidenceLocator(page=1)),
+            StructuredContentUnit("heading-2", "Chapter", EvidenceLocator(page=1)),
+            StructuredContentUnit("paragraph", "A" * 8_100, EvidenceLocator(page=1)),
+        ),
+    )
+
+    assert proposal.groups == ((0, 1, 2),)
+    assert len(proposal.notes) == 1
 
 
 def test_private_retrieval_candidates_remain_in_app_data_for_derived_and_native_notes() -> None:
@@ -197,9 +287,9 @@ def test_merge_and_split_only_change_private_proposal_boundaries() -> None:
         source_label="Book",
         evidence=_evidence(
             StructuredContentUnit("heading", "One", EvidenceLocator(page=1)),
-            StructuredContentUnit("paragraph", "First " * 250, EvidenceLocator(page=1)),
+            StructuredContentUnit("paragraph", "First " * 700, EvidenceLocator(page=1)),
             StructuredContentUnit("heading", "Two", EvidenceLocator(page=2)),
-            StructuredContentUnit("paragraph", "Second " * 250, EvidenceLocator(page=2)),
+            StructuredContentUnit("paragraph", "Second " * 700, EvidenceLocator(page=2)),
         ),
     )
 
@@ -226,9 +316,9 @@ def test_relocating_a_derived_proposal_only_changes_private_planned_paths() -> N
         source_label="Algebra",
         evidence=_evidence(
             StructuredContentUnit("heading", "One", EvidenceLocator(page=1)),
-            StructuredContentUnit("paragraph", "First " * 250, EvidenceLocator(page=1)),
+            StructuredContentUnit("paragraph", "First " * 700, EvidenceLocator(page=1)),
             StructuredContentUnit("heading", "Two", EvidenceLocator(page=2)),
-            StructuredContentUnit("paragraph", "Second " * 250, EvidenceLocator(page=2)),
+            StructuredContentUnit("paragraph", "Second " * 700, EvidenceLocator(page=2)),
         ),
     )
 

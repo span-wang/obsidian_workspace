@@ -438,38 +438,20 @@ def test_manual_import_scan_persists_progress_without_writing_the_vault(
         "duplicate": 0,
         "possible_version": 0,
         "identity_failed": 0,
-            "parsed": 1,
-            "parse_failed": 0,
-            "ocr_completed": 0,
+        "parsed": 0,
+        "parse_failed": 0,
+        "ocr_completed": 0,
         "ocr_failed": 0,
         "confirmed_gaps": 0,
         "required_check": 1,
-        "derived_notes": 1,
+        "derived_notes": 0,
     }
-    assert detail["classification_suggestions"] == [
-        {
-            "item_id": detail["items"][0]["item_id"],
-            "revision": 1,
-            "proposal_revision": 1,
-            "domain": "unclassified",
-            "target_vault_id": vault_id,
-            "target_vault_label": created["vault"]["path"].split("\\")[-1],
-            "target_folder": "platform/notes/unclassified",
-            "filename": "selected-import.pdf",
-            "confidence": 0.4,
-            "status": "required-check",
-            "decision": None,
-            "decision_reason": None,
-            "origin": "generated",
-            "reason": "No supported domain terms were found in the private proposal.",
-            "created_at": detail["classification_suggestions"][0]["created_at"],
-            "decided_at": None,
-        }
-    ]
+    assert detail["classification_suggestions"] == []
     assert detail["items"][0]["label"] == "selected-import.pdf"
     assert detail["items"][0]["document_kind"] == "pdf"
-    assert detail["items"][0]["parse_status"] == "parsed"
-    assert detail["items"][0]["parse_locator_summary"] == "page 1"
+    assert detail["items"][0]["parse_status"] == "not-applicable"
+    assert detail["items"][0]["conversion_status"] == "rejected"
+    assert "converter profile" in detail["items"][0]["conversion_fallback_reason"].lower()
     assert "source_path" not in detail["items"][0]
     detail_json = json.dumps(detail)
     assert str(source_file) not in detail_json
@@ -484,17 +466,10 @@ def test_manual_import_scan_persists_progress_without_writing_the_vault(
         event_name = stream.readline().decode()
         event_payload = json.loads(stream.readline().decode().removeprefix("data: "))
         assert event_payload["event_type"] in {
-            "parse-completed",
-            "ocr-started",
-            "ocr-completed",
-            "derivation-started",
-            "derivation-item-completed",
-            "derivation-completed",
-            "derivation-failed",
-            "classification-generated",
-            "classification-revised",
-            "classification-accepted",
-            "classification-excluded",
+            "conversion-started",
+            "conversion-item-rejected",
+            "conversion-profile-rejected",
+            "review-snapshot-created",
         }
         assert event_name == f"event: {event_payload['event_type']}\n"
 

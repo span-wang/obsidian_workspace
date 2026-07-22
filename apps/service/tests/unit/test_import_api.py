@@ -8,7 +8,7 @@ from adapters.filesystem_vault_adapter import LocalVaultFilesystem
 from adapters.sqlite_source_repository import SqliteSourceRepository
 from adapters.sqlite_task_repository import SqliteImportTaskRepository
 from adapters.sqlite_vault_repository import SqliteVaultRepository
-from application.ingest import ImportTaskService
+from application.ingest import ImportTaskError, ImportTaskService
 from application.vaults import VaultService
 from workers.markdown_deriver import derive_items
 from api.main import create_app, import_task_sse_event_name
@@ -109,6 +109,21 @@ class StartParsingTaskService(SnapshotTaskService):
         return self.task
 
 
+class DeleteTaskService:
+    def __init__(self, tasks) -> None:
+        self.tasks = {task.task_id: task for task in tasks}
+        self.deleted_task_id = None
+
+    def delete(self, task_id: str) -> None:
+        task = self.tasks.get(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        if task.lifecycle == "running":
+            raise ImportTaskError("A running import task must be cancelled before it can be deleted.")
+        self.deleted_task_id = task_id
+        del self.tasks[task_id]
+
+
 class CandidateLinkTaskService(SnapshotTaskService):
     def __init__(self, task, candidate: CandidateLinkProposal) -> None:
         super().__init__(task)
@@ -121,6 +136,38 @@ class CandidateLinkTaskService(SnapshotTaskService):
 
     def decide_candidate_link_proposal(self, task_id: str, review_item_id: str, decision: str, reason: str):
         self.decision = (task_id, review_item_id, decision, reason)
+        return self.task
+
+
+class ConversionReviewTaskService(SnapshotTaskService):
+    def __init__(self, task) -> None:
+        super().__init__(task)
+        self.correction = None
+        self.retry_error: Exception | None = ImportTaskError("No approved converter profile is available.")
+        self.retried_item_id = None
+
+    def correct_conversion_block_payload(
+        self, task_id, item_id, block_id, kind, payload, retrieval_projection, reason
+    ):
+        if task_id != self.task.task_id:
+            raise KeyError(task_id)
+        if item_id != 1:
+            raise ImportTaskError("The conversion item does not belong to this import task.")
+        if block_id != "block-1":
+            raise ImportTaskError("The conversion block is not in the selected graph.")
+        if payload != {"inline_runs": [{"kind": "text", "text": "Corrected"}]}:
+            raise ImportTaskError("The typed conversion payload is invalid.")
+        self.correction = (item_id, block_id, kind, payload, retrieval_projection, reason)
+        return self.task
+
+    def retry_conversion_item(self, task_id: str, item_id: int):
+        if task_id != self.task.task_id:
+            raise KeyError(task_id)
+        if item_id != 1:
+            raise ImportTaskError("The conversion item does not belong to this import task.")
+        if self.retry_error is not None:
+            raise self.retry_error
+        self.retried_item_id = item_id
         return self.task
 
 
@@ -394,6 +441,136 @@ def test_import_task_detail_uses_an_atomic_snapshot(tmp_path: Path) -> None:
     assert task_service.requested_task_id == task.task_id
     assert detail["event_cursor"] == 7
     assert detail["items"] == []
+
+
+def test_delete_import_task_requires_local_session_and_maps_task_errors(tmp_path: Path) -> None:
+    completed = new_import_task(
+        vault_id="vault-1", vault_label="Vault", source_paths=(tmp_path / "book.pdf",), scope_label="book.pdf"
+    )
+    running = replace(completed, task_id="running-task", lifecycle="running", phase="scanning")
+    task_service = DeleteTaskService((completed, running))
+    runtime = RuntimeState(data_directory=tmp_path / "app-data", sqlite_version="3.45.1")
+    app = create_app(
+        runtime=runtime,
+        directory_picker=FakeDirectoryPicker(tmp_path),
+        import_picker=FakeImportPicker(tmp_path / "book.pdf"),
+        import_task_service=task_service,
+    )
+
+    denied_status, _, _ = asgi_request(app, "DELETE", f"/api/import-tasks/{completed.task_id}")
+    _, headers, _ = asgi_request(app, "GET", "/")
+    cookie = headers["set-cookie"].split(";", maxsplit=1)[0]
+    deleted_status, _, deleted = asgi_request(
+        app, "DELETE", f"/api/import-tasks/{completed.task_id}", cookie=cookie
+    )
+    missing_status, _, missing = asgi_request(
+        app, "DELETE", "/api/import-tasks/missing-task", cookie=cookie
+    )
+    running_status, _, running_error = asgi_request(
+        app, "DELETE", f"/api/import-tasks/{running.task_id}", cookie=cookie
+    )
+
+    assert denied_status == 403
+    assert deleted_status == 204
+    assert deleted == {}
+    assert task_service.deleted_task_id == completed.task_id
+    assert missing_status == 404
+    assert missing["code"] == "import_task_not_found"
+    assert running_status == 400
+    assert running_error["code"] == "import_task_validation_failed"
+    assert "must be cancelled" in running_error["message"]
+
+
+def test_conversion_remediation_endpoints_require_session_validate_payload_and_hide_private_paths(
+    tmp_path: Path,
+) -> None:
+    task = replace(
+        new_import_task(
+            vault_id="vault-1",
+            vault_label="Vault",
+            source_paths=(tmp_path / "book.pdf",),
+            scope_label="book.pdf",
+        ),
+        lifecycle="waiting-for-review",
+        phase="waiting-for-review",
+    )
+    task_service = ConversionReviewTaskService(task)
+    runtime = RuntimeState(data_directory=tmp_path / "app-data", sqlite_version="3.45.1")
+    app = create_app(
+        runtime=runtime,
+        directory_picker=FakeDirectoryPicker(tmp_path),
+        import_picker=FakeImportPicker(tmp_path / "book.pdf"),
+        import_task_service=task_service,
+    )
+    correct_path = (
+        f"/api/import-tasks/{task.task_id}/conversion-items/1/blocks/block-1/correct"
+    )
+    retry_path = f"/api/import-tasks/{task.task_id}/conversion-items/1/retry"
+    denied_status, _, _ = asgi_request(
+        app,
+        "POST",
+        correct_path,
+        body={"kind": "paragraph", "payload": {}, "retrieval_projection": "Corrected", "reason": "Reviewed."},
+    )
+    _, headers, _ = asgi_request(app, "GET", "/")
+    cookie = headers["set-cookie"].split(";", maxsplit=1)[0]
+    invalid_status, _, _ = asgi_request(
+        app,
+        "POST",
+        correct_path,
+        body={"kind": "paragraph", "payload": [], "retrieval_projection": "Corrected", "reason": "Reviewed."},
+        cookie=cookie,
+    )
+    wrong_task_status, _, _ = asgi_request(
+        app,
+        "POST",
+        correct_path.replace(task.task_id, "missing-task"),
+        body={"kind": "paragraph", "payload": {}, "retrieval_projection": "Corrected", "reason": "Reviewed."},
+        cookie=cookie,
+    )
+    wrong_item_status, _, _ = asgi_request(
+        app,
+        "POST",
+        correct_path.replace("conversion-items/1", "conversion-items/2"),
+        body={"kind": "paragraph", "payload": {}, "retrieval_projection": "Corrected", "reason": "Reviewed."},
+        cookie=cookie,
+    )
+    wrong_block_status, _, _ = asgi_request(
+        app,
+        "POST",
+        correct_path.replace("block-1", "missing-block"),
+        body={"kind": "paragraph", "payload": {}, "retrieval_projection": "Corrected", "reason": "Reviewed."},
+        cookie=cookie,
+    )
+    correct_status, _, corrected = asgi_request(
+        app,
+        "POST",
+        correct_path,
+        body={
+            "kind": "paragraph",
+            "payload": {"inline_runs": [{"kind": "text", "text": "Corrected"}]},
+            "retrieval_projection": "Corrected",
+            "reason": "Reviewed against the source."
+        },
+        cookie=cookie,
+    )
+    retry_status, _, retry_error = asgi_request(app, "POST", retry_path, cookie=cookie)
+    task_service.retry_error = None
+    retried_status, _, retried = asgi_request(app, "POST", retry_path, cookie=cookie)
+
+    assert denied_status == 403
+    assert invalid_status == 422
+    assert wrong_task_status == 404
+    assert wrong_item_status == 400
+    assert wrong_block_status == 400
+    assert correct_status == 200
+    assert task_service.correction is not None
+    assert "private" not in json.dumps(corrected)
+    assert retry_status == 400
+    assert retry_error["code"] == "import_task_validation_failed"
+    assert retried_status == 200
+    assert retried["task"]["task_id"] == task.task_id
+    assert task_service.retried_item_id == 1
 
 
 def test_candidate_link_api_uses_safe_payloads_and_local_session(tmp_path: Path) -> None:

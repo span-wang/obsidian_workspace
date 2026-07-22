@@ -8,7 +8,15 @@ from pathlib import Path
 from domain.derived_notes import NoteProposal, private_index_candidates, proposal_from_dict
 from domain.candidate_links import CandidateLinkProposal, LEGACY_CANDIDATE_LINK_ISOLATION_REASON
 from domain.classification import ClassificationSuggestion
-from domain.evidence import EvidenceLocator, OcrEvidence, OcrTarget, ParseEvidence, ParseIssue
+from domain.evidence import (
+    ConversionAttempt,
+    ConversionEvidence,
+    EvidenceLocator,
+    OcrEvidence,
+    OcrTarget,
+    ParseEvidence,
+    ParseIssue,
+)
 from domain.metadata_tags import MetadataTagProposal, TagChangePreview, TagDefinition
 from domain.review_commits import CommitJournal, ReviewDecision, ReviewSnapshot
 from domain.sources import VersionSuggestion
@@ -23,6 +31,7 @@ from domain.tasks import (
 
 
 _LEGACY_CANDIDATE_LINK_ISOLATION_MIGRATION = "legacy-candidate-link-isolation-2026-07-22"
+_DOCUMENT_CONVERSION_V2_MIGRATION = "document-conversion-v2-2026-07-22"
 
 
 class SqliteImportTaskRepository:
@@ -144,6 +153,13 @@ class SqliteImportTaskRepository:
             self._ensure_column(connection, "import_task_items", "parse_locator_summary TEXT")
             self._ensure_column(connection, "import_task_items", "parse_issue_summary TEXT")
             self._ensure_column(connection, "import_task_items", "parse_evidence_id INTEGER")
+            self._ensure_column(
+                connection, "import_task_items", "conversion_status TEXT NOT NULL DEFAULT 'not-applicable'"
+            )
+            self._ensure_column(connection, "import_task_items", "conversion_attempt_id TEXT")
+            self._ensure_column(connection, "import_task_items", "conversion_graph_id TEXT")
+            self._ensure_column(connection, "import_task_items", "conversion_engine TEXT")
+            self._ensure_column(connection, "import_task_items", "conversion_fallback_reason TEXT")
             self._ensure_column(
                 connection, "import_task_items", "ocr_status TEXT NOT NULL DEFAULT 'not-applicable'"
             )
@@ -391,6 +407,7 @@ class SqliteImportTaskRepository:
                 )
                 """
             )
+            self._initialize_document_conversion_v2(connection)
             self._isolate_legacy_candidate_links(connection)
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS vault_tag_definitions_latest "
@@ -444,6 +461,91 @@ class SqliteImportTaskRepository:
                 "ON import_commit_journals(task_id, journal_id DESC)"
             )
 
+    def _initialize_document_conversion_v2(self, connection: sqlite3.Connection) -> None:
+        """Forward-only V2 tables; `import_parse_evidence` stays immutable legacy state."""
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS import_conversion_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                item_id INTEGER NOT NULL,
+                idempotency_key TEXT,
+                engine TEXT NOT NULL,
+                status TEXT NOT NULL,
+                input_snapshot_hash TEXT NOT NULL,
+                attempt_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(task_id, item_id, idempotency_key)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS import_conversion_artifacts (
+                artifact_id TEXT PRIMARY KEY,
+                attempt_id TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                role TEXT NOT NULL,
+                private_relative_path TEXT NOT NULL,
+                artifact_json TEXT NOT NULL,
+                UNIQUE(attempt_id, sha256, role)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS import_conversion_quality_gate_decisions (
+                decision_id TEXT PRIMARY KEY,
+                attempt_id TEXT NOT NULL,
+                graph_id TEXT NOT NULL,
+                decision_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS import_conversion_graph_revisions (
+                graph_id TEXT PRIMARY KEY,
+                item_id INTEGER NOT NULL,
+                attempt_id TEXT NOT NULL,
+                graph_revision INTEGER NOT NULL,
+                source_sha256 TEXT NOT NULL,
+                graph_json TEXT NOT NULL,
+                selected INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS import_conversion_review_links (
+                task_id TEXT NOT NULL,
+                item_id INTEGER NOT NULL,
+                review_item_id TEXT NOT NULL,
+                graph_id TEXT NOT NULL,
+                block_id TEXT,
+                locator_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(task_id, review_item_id)
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS import_conversion_attempts_item "
+            "ON import_conversion_attempts(item_id, created_at DESC)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS import_conversion_graphs_item "
+            "ON import_conversion_graph_revisions(item_id, selected DESC, graph_revision DESC)"
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO import_repository_migrations(migration_id, applied_at) VALUES (?, ?)",
+            (_DOCUMENT_CONVERSION_V2_MIGRATION, utc_now()),
+        )
+
     @staticmethod
     def _isolate_legacy_candidate_links(connection: sqlite3.Connection) -> None:
         timestamp = utc_now()
@@ -484,6 +586,61 @@ class SqliteImportTaskRepository:
         with self._connect() as connection:
             self._write_task(connection, task)
             self._append_event(connection, task.task_id, event_type, task.updated_at)
+
+    def delete(self, task_id: str) -> None:
+        """Delete records owned solely by an import task in one SQLite transaction."""
+
+        with self._connect() as connection:
+            task = self._task_from_connection(connection, task_id)
+            item_ids = [
+                row["item_id"]
+                for row in connection.execute(
+                    "SELECT item_id FROM import_task_items WHERE task_id = ?", (task_id,)
+                )
+            ]
+            if item_ids:
+                item_placeholders = ", ".join("?" for _ in item_ids)
+                item_parameters = tuple(item_ids)
+                for table in (
+                    "import_ocr_decisions",
+                    "import_ocr_attempts",
+                    "import_ocr_targets",
+                    "import_conversion_graph_revisions",
+                ):
+                    connection.execute(
+                        f"DELETE FROM {table} WHERE item_id IN ({item_placeholders})", item_parameters
+                    )
+
+            connection.execute(
+                "DELETE FROM import_conversion_artifacts WHERE attempt_id IN "
+                "(SELECT attempt_id FROM import_conversion_attempts WHERE task_id = ?)",
+                (task_id,),
+            )
+            connection.execute(
+                "DELETE FROM import_conversion_quality_gate_decisions WHERE attempt_id IN "
+                "(SELECT attempt_id FROM import_conversion_attempts WHERE task_id = ?)",
+                (task_id,),
+            )
+            connection.execute("DELETE FROM import_conversion_review_links WHERE task_id = ?", (task_id,))
+            connection.execute("DELETE FROM import_conversion_attempts WHERE task_id = ?", (task_id,))
+            connection.execute("DELETE FROM import_private_index_candidates WHERE task_id = ?", (task_id,))
+            connection.execute("DELETE FROM import_note_proposals WHERE task_id = ?", (task_id,))
+            connection.execute("DELETE FROM import_classification_suggestions WHERE task_id = ?", (task_id,))
+            if task.lifecycle in {"complete", "completed-with-confirmed-gaps"}:
+                connection.execute(
+                    "DELETE FROM import_metadata_tag_proposals "
+                    "WHERE task_id = ? AND decision IS NOT 'accepted'",
+                    (task_id,),
+                )
+            else:
+                connection.execute("DELETE FROM import_metadata_tag_proposals WHERE task_id = ?", (task_id,))
+            connection.execute("DELETE FROM import_candidate_link_proposals WHERE task_id = ?", (task_id,))
+            connection.execute("DELETE FROM import_review_decisions WHERE task_id = ?", (task_id,))
+            connection.execute("DELETE FROM import_review_snapshots WHERE task_id = ?", (task_id,))
+            connection.execute("DELETE FROM import_commit_journals WHERE task_id = ?", (task_id,))
+            connection.execute("DELETE FROM import_task_events WHERE task_id = ?", (task_id,))
+            connection.execute("DELETE FROM import_task_items WHERE task_id = ?", (task_id,))
+            connection.execute("DELETE FROM import_tasks WHERE task_id = ?", (task_id,))
 
     def append_item(self, task_id: str, item: ImportTaskItem) -> ImportTask:
         with self._connect() as connection:
@@ -633,6 +790,269 @@ class SqliteImportTaskRepository:
                 (item_id,),
             ).fetchone()
         return ParseEvidence.from_dict(json.loads(row["evidence_json"])) if row is not None else None
+
+    def record_conversion_attempt(self, attempt: ConversionAttempt) -> ConversionAttempt:
+        with self._connect() as connection:
+            existing = None
+            if attempt.idempotency_key:
+                existing = connection.execute(
+                    """
+                    SELECT attempt_json FROM import_conversion_attempts
+                    WHERE task_id = ? AND item_id = ? AND idempotency_key = ?
+                    """,
+                    (attempt.task_id, attempt.item_id, attempt.idempotency_key),
+                ).fetchone()
+            if existing is not None:
+                return ConversionAttempt.from_dict(json.loads(existing["attempt_json"]))
+            connection.execute(
+                """
+                INSERT INTO import_conversion_attempts(
+                    attempt_id, task_id, item_id, idempotency_key, engine, status,
+                    input_snapshot_hash, attempt_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    attempt.attempt_id,
+                    attempt.task_id,
+                    attempt.item_id,
+                    attempt.idempotency_key,
+                    attempt.engine,
+                    attempt.status,
+                    attempt.input_snapshot_hash,
+                    json.dumps(attempt.to_dict()),
+                    utc_now(),
+                ),
+            )
+        return attempt
+
+    def record_conversion_quality_gate_decision(
+        self, attempt: ConversionAttempt, graph_id: str, decision: dict[str, object]
+    ) -> None:
+        decision_id = decision.get("decision_id")
+        if (
+            not isinstance(decision_id, str)
+            or decision_id != attempt.quality_gate_decision_id
+            or decision.get("action") != "accepted"
+            or not graph_id
+        ):
+            raise ValueError("Selected conversion attempts need their accepted quality gate decision.")
+        decision_json = json.dumps(decision, sort_keys=True)
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT attempt_id, graph_id, decision_json FROM import_conversion_quality_gate_decisions "
+                "WHERE decision_id = ?",
+                (decision_id,),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO import_conversion_quality_gate_decisions(
+                        decision_id, attempt_id, graph_id, decision_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (decision_id, attempt.attempt_id, graph_id, decision_json, utc_now()),
+                )
+            elif (
+                existing["attempt_id"] != attempt.attempt_id
+                or existing["graph_id"] != graph_id
+                or existing["decision_json"] != decision_json
+            ):
+                raise ValueError("Quality gate decisions are immutable.")
+
+    def list_conversion_attempts(self, item_id: int) -> tuple[ConversionAttempt, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT attempt_json FROM import_conversion_attempts
+                WHERE item_id = ? ORDER BY created_at, attempt_id
+                """,
+                (item_id,),
+            ).fetchall()
+        return tuple(
+            ConversionAttempt.from_dict(json.loads(row["attempt_json"])) for row in rows
+        )
+
+    def record_conversion_evidence(self, item_id: int, evidence: ConversionEvidence) -> ImportTask:
+        """Promote a selected V2 envelope without mutating any V1 evidence row."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM import_task_items WHERE item_id = ?", (item_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(item_id)
+            if row["content_sha256"] != evidence.graph.source_sha256:
+                raise ValueError("The conversion graph does not match the scanned source hash.")
+            gate = connection.execute(
+                """
+                SELECT 1 FROM import_conversion_quality_gate_decisions
+                WHERE decision_id = ? AND attempt_id = ?
+                """,
+                (
+                    evidence.attempt.quality_gate_decision_id,
+                    evidence.attempt.attempt_id,
+                ),
+            ).fetchone()
+            if gate is None:
+                raise ValueError("The selected conversion graph has no persisted quality gate decision.")
+            existing = connection.execute(
+                "SELECT attempt_json FROM import_conversion_attempts WHERE attempt_id = ?",
+                (evidence.attempt.attempt_id,),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO import_conversion_attempts(
+                        attempt_id, task_id, item_id, idempotency_key, engine, status,
+                        input_snapshot_hash, attempt_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        evidence.attempt.attempt_id,
+                        evidence.attempt.task_id,
+                        item_id,
+                        evidence.attempt.idempotency_key,
+                        evidence.attempt.engine,
+                        evidence.attempt.status,
+                        evidence.attempt.input_snapshot_hash,
+                        json.dumps(evidence.attempt.to_dict()),
+                        utc_now(),
+                    ),
+                )
+            elif json.loads(existing["attempt_json"]) != evidence.attempt.to_dict():
+                raise ValueError("Immutable conversion attempts cannot be rewritten.")
+            for artifact in evidence.attempt.output_artifact_refs:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO import_conversion_artifacts(
+                        artifact_id, attempt_id, sha256, media_type, role, private_relative_path, artifact_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        artifact.artifact_id,
+                        artifact.attempt_id,
+                        artifact.sha256,
+                        artifact.media_type,
+                        artifact.role,
+                        artifact.private_relative_path,
+                        json.dumps(artifact.to_dict()),
+                    ),
+                )
+            connection.execute(
+                "UPDATE import_conversion_graph_revisions SET selected = 0 WHERE item_id = ?", (item_id,)
+            )
+            graph_json = json.dumps(evidence.graph.to_dict())
+            existing_graph = connection.execute(
+                "SELECT graph_json FROM import_conversion_graph_revisions WHERE graph_id = ?",
+                (evidence.graph.graph_id,),
+            ).fetchone()
+            if existing_graph is None:
+                connection.execute(
+                    """
+                    INSERT INTO import_conversion_graph_revisions(
+                        graph_id, item_id, attempt_id, graph_revision, source_sha256, graph_json, selected, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+                    """,
+                    (
+                        evidence.graph.graph_id,
+                        item_id,
+                        evidence.attempt.attempt_id,
+                        evidence.graph.graph_revision,
+                        evidence.graph.source_sha256,
+                        graph_json,
+                        utc_now(),
+                    ),
+                )
+            elif existing_graph["graph_json"] != graph_json:
+                raise ValueError("Immutable graph revisions cannot reuse a graph ID.")
+            connection.execute(
+                "UPDATE import_conversion_graph_revisions SET selected = 1 WHERE graph_id = ?",
+                (evidence.graph.graph_id,),
+            )
+            for index, issue in enumerate(evidence.graph.issues, start=1):
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO import_conversion_review_links(
+                        task_id, item_id, review_item_id, graph_id, block_id, locator_json, created_at
+                    ) VALUES (?, ?, ?, ?, NULL, ?, ?)
+                    """,
+                    (
+                        evidence.attempt.task_id,
+                        item_id,
+                        f"conversion-{item_id}-{evidence.graph.graph_id}-{index}",
+                        evidence.graph.graph_id,
+                        json.dumps(issue.locator.to_dict()),
+                        utc_now(),
+                    ),
+                )
+            connection.execute(
+                """
+                UPDATE import_task_items
+                SET conversion_status = 'selected', conversion_attempt_id = ?, conversion_graph_id = ?,
+                    conversion_engine = ?, conversion_fallback_reason = NULL
+                WHERE item_id = ?
+                """,
+                (evidence.attempt.attempt_id, evidence.graph.graph_id, evidence.attempt.engine, item_id),
+            )
+            task = self._task_from_connection(connection, row["task_id"])
+            updated = replace(
+                task,
+                current_item_label=row["label"],
+                counts=self._counts_from_connection(connection, row["task_id"]),
+                updated_at=utc_now(),
+            )
+            self._write_task(connection, updated)
+            self._append_event(connection, row["task_id"], "conversion-item-selected", updated.updated_at)
+        return updated
+
+    def get_conversion_evidence(self, item_id: int) -> ConversionEvidence | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT graph.graph_json, attempt.attempt_json, item.document_kind
+                FROM import_task_items AS item
+                JOIN import_conversion_graph_revisions AS graph ON graph.graph_id = item.conversion_graph_id
+                JOIN import_conversion_attempts AS attempt ON attempt.attempt_id = item.conversion_attempt_id
+                WHERE item.item_id = ? AND graph.selected = 1
+                """,
+                (item_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return ConversionEvidence.from_dict(
+            {
+                "schema_version": 2,
+                "document_kind": row["document_kind"],
+                "graph": json.loads(row["graph_json"]),
+                "attempt": json.loads(row["attempt_json"]),
+            }
+        )
+
+    def record_conversion_rejection(self, item_id: int, reason: str) -> ImportTask:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM import_task_items WHERE item_id = ?", (item_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(item_id)
+            connection.execute(
+                """
+                UPDATE import_task_items
+                SET conversion_status = 'rejected', conversion_fallback_reason = ?
+                WHERE item_id = ?
+                """,
+                (reason, item_id),
+            )
+            task = self._task_from_connection(connection, row["task_id"])
+            updated = replace(
+                task,
+                current_item_label=row["label"],
+                counts=self._counts_from_connection(connection, row["task_id"]),
+                updated_at=utc_now(),
+            )
+            self._write_task(connection, updated)
+            self._append_event(connection, row["task_id"], "conversion-item-rejected", updated.updated_at)
+        return updated
 
     def record_parse_failure(
         self, item_id: int, reason: str, locator_summary: str | None = None
@@ -1116,6 +1536,40 @@ class SqliteImportTaskRepository:
             self._write_task(connection, updated)
             self._append_event(connection, row["task_id"], event_type, updated.updated_at)
         return updated
+
+    def record_vault_metadata_tag_proposal(self, proposal: MetadataTagProposal) -> None:
+        """Persist a completed task's accepted tag reference after its task row is deleted."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT proposal_json FROM import_metadata_tag_proposals
+                WHERE task_id = ? AND item_id = ? AND invalidated_at IS NULL
+                ORDER BY revision DESC LIMIT 1
+                """,
+                (proposal.task_id, proposal.item_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(proposal.item_id)
+            existing = MetadataTagProposal.from_dict(json.loads(row["proposal_json"]))
+            if existing.vault_id != proposal.vault_id or proposal.revision <= existing.revision:
+                raise ValueError("Vault tag reference is not a valid revision.")
+            connection.execute(
+                """
+                INSERT INTO import_metadata_tag_proposals (
+                    task_id, item_id, revision, proposal_json, requires_review, decision, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    proposal.task_id,
+                    proposal.item_id,
+                    proposal.revision,
+                    json.dumps(proposal.to_dict(), ensure_ascii=True, sort_keys=True),
+                    int(proposal.requires_review),
+                    proposal.decision,
+                    proposal.created_at,
+                ),
+            )
 
     def get_metadata_tag_proposal(self, item_id: int) -> MetadataTagProposal | None:
         with self._connect() as connection:
@@ -1862,6 +2316,7 @@ class SqliteImportTaskRepository:
                 , COALESCE(SUM(parse_status = 'parsed'), 0) AS parsed_count
                 , COALESCE(SUM(parse_status = 'parse-failed'), 0) AS parse_failed_count
                 , COALESCE(SUM(parse_issue_count > 0), 0)
+                  + COALESCE(SUM(conversion_status = 'rejected'), 0)
                   + COALESCE((
                       SELECT SUM(target.issue_count > 0 AND target.decision IS NULL)
                       FROM import_ocr_targets AS target
@@ -2004,6 +2459,11 @@ class SqliteImportTaskRepository:
             parse_issue_count=row["parse_issue_count"],
             parse_locator_summary=row["parse_locator_summary"],
             parse_issue_summary=row["parse_issue_summary"],
+            conversion_status=row["conversion_status"],
+            conversion_attempt_id=row["conversion_attempt_id"],
+            conversion_graph_id=row["conversion_graph_id"],
+            conversion_engine=row["conversion_engine"],
+            conversion_fallback_reason=row["conversion_fallback_reason"],
             ocr_status=row["ocr_status"],
             ocr_confidence=row["ocr_confidence"],
             ocr_issue_count=row["ocr_issue_count"],

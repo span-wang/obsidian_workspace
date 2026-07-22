@@ -11,7 +11,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field
 from fastapi.responses import FileResponse, StreamingResponse
@@ -23,6 +23,7 @@ from adapters.filesystem_vault_committer import LocalVaultCommitter
 from adapters.local_import_task_runner import LocalImportTaskRunner
 from adapters.openai_compatible_provider import OpenAiCompatibleProviderClient
 from adapters.sqlite_provider_repository import SqliteProviderRepository
+from adapters.sqlite_session_repository import SqliteSessionRepository
 from adapters.sqlite_index_repository import SqliteIndexRepository
 from adapters.sqlite_source_repository import SqliteSourceRepository
 from adapters.sqlite_task_repository import SqliteImportTaskRepository
@@ -46,6 +47,7 @@ from application.providers import (
     ProviderUnavailableError,
     ProviderValidationError,
 )
+from application.sessions import SessionNotFoundError, SessionService, SessionValidationError
 from application.vaults import VaultConflictError, VaultService, VaultValidationError
 from api.errors import error_response
 from api.runtime import RuntimeState, initialize_runtime
@@ -65,9 +67,19 @@ from domain.derived_notes import (
 from domain.classification import ClassificationSuggestion
 from domain.candidate_links import CandidateLinkProposal
 from domain.metadata_tags import MetadataTagProposal, TagChangePreview, TagDefinition
+from domain.evidence import EvidenceLocator
 from domain.indexing import IndexHealth
 from domain.review_commits import CommitJournal, ReviewSnapshot
 from domain.tasks import ImportTask, ImportTaskEvent, ImportTaskItem
+from domain.sessions import (
+    PersistentSession,
+    SessionCitation,
+    SessionDetail,
+    SessionGenerationResult,
+    SessionMessage,
+    SessionPage,
+    SessionTaskState,
+)
 from domain.vaults import Vault
 
 
@@ -89,6 +101,12 @@ IMPORT_TASK_SSE_EVENT_NAMES = frozenset(
         "parse-completed",
         "parse-failed",
         "parse-restarted",
+        "conversion-started",
+        "conversion-item-selected",
+        "conversion-item-rejected",
+        "conversion-completed",
+        "conversion-failed",
+        "conversion-profile-rejected",
         "source-changed",
         "ocr-started",
         "ocr-target-started",
@@ -146,6 +164,29 @@ class KnowledgeGraphQuery(BaseModel):
     tag: str | None = None
     source: Literal["native", "derived"] | None = None
     relationship_state: Literal["all", "confirmed", "candidate"] | None = None
+
+
+class SessionListQuery(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = ""
+    vault_id: str | None = None
+    sort: Literal["updated_at", "created_at", "title", "vault"] = "updated_at"
+    order: Literal["asc", "desc"] = "desc"
+    page: int = Field(default=1, ge=1)
+    page_size: int = Field(default=25, ge=1, le=100)
+
+
+class SessionCreateCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str | None = None
+
+
+class SessionRenameCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str
 
 
 class PendingAssociationResolutionCommand(BaseModel):
@@ -212,6 +253,17 @@ class ReviewItemDecisionCommand(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     decision: Literal["accepted", "revised", "excluded"]
+    reason: str = Field(pattern=r".*\S.*")
+
+
+class ConversionBlockCorrectionCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal[
+        "heading", "paragraph", "list", "table", "formula", "image", "caption", "code", "unresolved"
+    ]
+    payload: dict[str, object]
+    retrieval_projection: str = Field(min_length=1)
     reason: str = Field(pattern=r".*\S.*")
 
 
@@ -479,6 +531,88 @@ def provider_payload(provider: Provider) -> dict[str, object]:
     }
 
 
+def persistent_session_payload(session: PersistentSession) -> dict[str, object]:
+    return {
+        "session_id": session.session_id,
+        "title": session.title,
+        "selected_vault_id": session.selected_vault_id,
+        "selected_vault_label": session.selected_vault_label,
+        "selected_provider_id": session.selected_provider_id,
+        "selected_provider_label": session.selected_provider_label,
+        "selected_model_id": session.selected_model_id,
+        "selected_model_label": session.selected_model_label,
+        "message_count": session.message_count,
+        "created_at": session.created_at,
+        "updated_at": session.updated_at,
+        "last_activity_at": session.last_activity_at,
+    }
+
+
+def session_message_payload(message: SessionMessage) -> dict[str, object]:
+    return {
+        "message_id": message.message_id,
+        "role": message.role,
+        "content": message.content,
+        "provider_id": message.provider_id,
+        "model_id": message.model_id,
+        "created_at": message.created_at,
+    }
+
+
+def session_task_state_payload(task_state: SessionTaskState) -> dict[str, object]:
+    return {
+        "task_id": task_state.task_id,
+        "status": task_state.status,
+        "snapshot_id": task_state.snapshot_id,
+        "created_at": task_state.created_at,
+        "updated_at": task_state.updated_at,
+    }
+
+
+def session_citation_payload(citation: SessionCitation) -> dict[str, object]:
+    return {
+        "citation_id": citation.citation_id,
+        "vault_id": citation.vault_id,
+        "source_id": citation.source_id,
+        "source_content_hash": citation.source_content_hash,
+        "relative_path": citation.relative_path,
+        "location": citation.location,
+        "status": citation.status,
+        "created_at": citation.created_at,
+    }
+
+
+def session_generation_result_payload(result: SessionGenerationResult) -> dict[str, object]:
+    return {
+        "result_id": result.result_id,
+        "status": result.status,
+        "content": result.content,
+        "created_at": result.created_at,
+    }
+
+
+def session_detail_payload(detail: SessionDetail) -> dict[str, object]:
+    return {
+        "session": persistent_session_payload(detail.session),
+        "messages": [session_message_payload(message) for message in detail.messages],
+        "task_states": [session_task_state_payload(task) for task in detail.task_states],
+        "citations": [session_citation_payload(citation) for citation in detail.citations],
+        "generation_results": [
+            session_generation_result_payload(result) for result in detail.generation_results
+        ],
+    }
+
+
+def session_page_payload(page: SessionPage) -> dict[str, object]:
+    return {
+        "sessions": [persistent_session_payload(session) for session in page.sessions],
+        "page": page.page,
+        "page_size": page.page_size,
+        "total": page.total,
+        "total_pages": page.total_pages,
+    }
+
+
 def model_default_payload(provider_service: ProviderService, model_type: str) -> dict[str, object]:
     selection = provider_service.get_default(model_type)
     if selection is None:
@@ -640,6 +774,9 @@ def import_task_item_payload(item: ImportTaskItem) -> dict[str, object]:
         "parse_issue_count": item.parse_issue_count,
         "parse_locator_summary": item.parse_locator_summary,
         "parse_issue_summary": item.parse_issue_summary,
+        "conversion_status": item.conversion_status,
+        "conversion_engine": item.conversion_engine,
+        "conversion_fallback_reason": item.conversion_fallback_reason,
         "ocr_status": item.ocr_status,
         "ocr_confidence": item.ocr_confidence,
         "ocr_issue_count": item.ocr_issue_count,
@@ -672,6 +809,47 @@ def import_task_item_payload(item: ImportTaskItem) -> dict[str, object]:
     }
 
 
+def source_locator_payload(locator) -> dict[str, object]:
+    if locator.document_locator is None:
+        return {
+            key: value
+            for key, value in {
+                "page": locator.page,
+                "docx_location": locator.docx_location,
+                "region": locator.region,
+            }.items()
+            if value is not None
+        }
+    source = locator.document_locator
+    locator_type = source["type"]
+    allowed_keys = {
+        "pdf-region": ("type", "page", "bounds", "rotation", "segment_id"),
+        "docx-ooxml": ("type", "package_part_uri", "element_path"),
+        "source-scope": ("type", "scope", "reason"),
+    }[locator_type]
+    return {key: source[key] for key in allowed_keys if key in source}
+
+
+def conversion_review_graph_payload(item_id: int, graph) -> dict[str, object]:
+    return {
+        "item_id": item_id,
+        "graph_id": graph.graph_id,
+        "graph_revision": graph.graph_revision,
+        "selected_attempt_id": graph.selected_attempt_id,
+        "blocks": [
+            {
+                "block_id": block.block_id,
+                "kind": block.kind,
+                "locators": [
+                    source_locator_payload(EvidenceLocator(document_locator=locator.to_dict()))
+                    for locator in block.locators
+                ],
+            }
+            for block in graph.blocks
+        ],
+    }
+
+
 def note_proposal_payload(proposal) -> dict[str, object]:
     if isinstance(proposal, NativeMarkdownProposal):
         return {
@@ -685,11 +863,15 @@ def note_proposal_payload(proposal) -> dict[str, object]:
         }
     if not isinstance(proposal, DerivedMarkdownProposal):
         raise TypeError("Unsupported note proposal.")
+
     return {
         "kind": "derived",
         "item_id": proposal.item_id,
         "revision": proposal.revision,
         "source_relative_path": proposal.source_relative_path,
+        "graph_id": proposal.graph_id,
+        "graph_revision": proposal.graph_revision,
+        "selected_attempt_id": proposal.graph_selected_attempt_id,
         "risks": list(proposal.risks),
         "index_note": {
             "relative_path": proposal.index_note.relative_path,
@@ -701,18 +883,7 @@ def note_proposal_payload(proposal) -> dict[str, object]:
                 "title": note.title,
                 "sequence": note.sequence,
                 "relative_path": note.relative_path,
-                "source_locators": [
-                    {
-                        key: value
-                        for key, value in {
-                            "page": locator.page,
-                            "docx_location": locator.docx_location,
-                            "region": locator.region,
-                        }.items()
-                        if value is not None
-                    }
-                    for locator in note.source_locators
-                ],
+                "source_locators": [source_locator_payload(locator) for locator in note.source_locators],
                 "unit_indexes": list(note.unit_indexes),
                 "safe_split_after_unit_indexes": list(
                     safe_split_after_unit_indexes(proposal, note.sequence)
@@ -980,6 +1151,38 @@ def import_task_error(error: Exception) -> HTTPException:
     )
 
 
+def session_error(error: Exception) -> HTTPException:
+    if isinstance(error, SessionNotFoundError):
+        return HTTPException(
+            status_code=404,
+            detail={
+                "code": "session_not_found",
+                "message": "Session was not found.",
+                "details": {},
+                "retryable": False,
+            },
+        )
+    if isinstance(error, SessionValidationError):
+        return HTTPException(
+            status_code=400,
+            detail={
+                "code": "session_validation_failed",
+                "message": str(error),
+                "details": {},
+                "retryable": True,
+            },
+        )
+    return HTTPException(
+        status_code=500,
+        detail={
+            "code": "session_operation_failed",
+            "message": "The session operation could not be completed.",
+            "details": {},
+            "retryable": True,
+        },
+    )
+
+
 def provider_error(error: Exception) -> HTTPException:
     if isinstance(error, KeyError):
         return HTTPException(
@@ -1060,6 +1263,7 @@ def create_app(
     vault_service: VaultService | None = None,
     policy_service: PolicyService | None = None,
     provider_service: ProviderService | None = None,
+    session_service: SessionService | None = None,
     directory_picker: WindowsDirectoryPicker | None = None,
     directory_selections: DirectorySelectionStore | None = None,
     import_task_service: ImportTaskService | None = None,
@@ -1097,6 +1301,9 @@ def create_app(
         credentials=WindowsCredentialManager(),
         client=OpenAiCompatibleProviderClient(),
         authorization_invalidator=app.state.vault_service.repository,
+    )
+    app.state.session_service = session_service or SessionService(
+        SqliteSessionRepository(runtime.data_directory / "sessions.sqlite3")
     )
     app.state.directory_picker = directory_picker or WindowsDirectoryPicker()
     app.state.directory_selections = directory_selections or DirectorySelectionStore()
@@ -1184,6 +1391,77 @@ def create_app(
             app.state.local_session,
             request.cookies.get(LOCAL_SESSION_COOKIE_NAME),
         )
+
+    @app.post("/api/sessions")
+    def create_persistent_session(
+        request: Request, command: SessionCreateCommand
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            return {"session": persistent_session_payload(app.state.session_service.create(command.title))}
+        except Exception as error:
+            raise session_error(error) from error
+
+    @app.get("/api/sessions")
+    def list_persistent_sessions(
+        request: Request, filters: Annotated[SessionListQuery, Query()]
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            return session_page_payload(
+                app.state.session_service.list(
+                    query=filters.query,
+                    vault_id=filters.vault_id,
+                    sort=filters.sort,
+                    order=filters.order,
+                    page=filters.page,
+                    page_size=filters.page_size,
+                )
+            )
+        except Exception as error:
+            raise session_error(error) from error
+
+    @app.get("/api/sessions/{session_id}/export")
+    def export_persistent_session(request: Request, session_id: str) -> Response:
+        require_local_session(app, request)
+        try:
+            payload = session_detail_payload(app.state.session_service.export(session_id))
+        except Exception as error:
+            raise session_error(error) from error
+        return Response(
+            content=json.dumps(payload, ensure_ascii=False),
+            media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="session-{session_id}.json"'},
+        )
+
+    @app.get("/api/sessions/{session_id}")
+    def get_persistent_session(request: Request, session_id: str) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            return session_detail_payload(app.state.session_service.detail(session_id))
+        except Exception as error:
+            raise session_error(error) from error
+
+    @app.patch("/api/sessions/{session_id}")
+    def rename_persistent_session(
+        request: Request, session_id: str, command: SessionRenameCommand
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            return {"session": persistent_session_payload(
+                app.state.session_service.rename(session_id, command.title)
+            )}
+        except Exception as error:
+            raise session_error(error) from error
+
+    @app.delete("/api/sessions/{session_id}")
+    def delete_persistent_session(request: Request, session_id: str) -> dict[str, str]:
+        require_local_session(app, request)
+        try:
+            app.state.session_service.delete(session_id)
+        except Exception as error:
+            raise session_error(error) from error
+        return {"status": "removed"}
 
     @app.get("/api/providers/defaults")
     def get_model_defaults(request: Request) -> dict[str, object]:
@@ -1386,6 +1664,12 @@ def create_app(
             task, items, event_cursor = app.state.import_task_service.detail_snapshot(task_id)
             list_note_proposals = getattr(app.state.import_task_service, "list_note_proposals", None)
             note_proposals = list_note_proposals(task_id) if list_note_proposals is not None else []
+            list_conversion_graphs = getattr(
+                app.state.import_task_service, "list_conversion_review_graphs", None
+            )
+            conversion_graphs = (
+                list_conversion_graphs(task_id) if list_conversion_graphs is not None else ()
+            )
             list_classifications = getattr(
                 app.state.import_task_service, "list_classification_suggestions", None
             )
@@ -1410,6 +1694,10 @@ def create_app(
                 "task": import_task_payload(task),
                 "items": [import_task_item_payload(item) for item in items],
                 "note_proposals": [note_proposal_payload(proposal) for proposal in note_proposals],
+                "conversion_graphs": [
+                    conversion_review_graph_payload(item_id, graph)
+                    for item_id, graph in conversion_graphs
+                ],
                 "classification_suggestions": [
                     classification_suggestion_payload(suggestion) for suggestion in classifications
                 ],
@@ -1424,6 +1712,15 @@ def create_app(
                 "index": index_health,
                 "event_cursor": event_cursor,
             }
+        except Exception as error:
+            raise import_task_error(error) from error
+
+    @app.delete("/api/import-tasks/{task_id}", status_code=204)
+    def delete_import_task(request: Request, task_id: str) -> Response:
+        require_local_session(app, request)
+        try:
+            app.state.import_task_service.delete(task_id)
+            return Response(status_code=204)
         except Exception as error:
             raise import_task_error(error) from error
 
@@ -1448,6 +1745,14 @@ def create_app(
         require_local_session(app, request)
         try:
             return {"task": import_task_payload(app.state.import_task_service.start_parsing(task_id))}
+        except Exception as error:
+            raise import_task_error(error) from error
+
+    @app.post("/api/import-tasks/{task_id}/convert")
+    def start_import_task_conversion(request: Request, task_id: str) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            return {"task": import_task_payload(app.state.import_task_service.start_conversion(task_id))}
         except Exception as error:
             raise import_task_error(error) from error
 
@@ -1573,6 +1878,40 @@ def create_app(
                     )
                 )
             }
+        except Exception as error:
+            raise import_task_error(error) from error
+
+    @app.post("/api/import-tasks/{task_id}/conversion-items/{item_id}/blocks/{block_id}/correct")
+    def correct_import_conversion_block(
+        request: Request,
+        task_id: str,
+        item_id: int,
+        block_id: str,
+        command: ConversionBlockCorrectionCommand,
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            task = app.state.import_task_service.correct_conversion_block_payload(
+                task_id,
+                item_id,
+                block_id,
+                command.kind,
+                command.payload,
+                command.retrieval_projection,
+                command.reason,
+            )
+            return {"task": import_task_payload(task)}
+        except Exception as error:
+            raise import_task_error(error) from error
+
+    @app.post("/api/import-tasks/{task_id}/conversion-items/{item_id}/retry")
+    def retry_import_conversion_item(
+        request: Request, task_id: str, item_id: int
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            task = app.state.import_task_service.retry_conversion_item(task_id, item_id)
+            return {"task": import_task_payload(task)}
         except Exception as error:
             raise import_task_error(error) from error
 

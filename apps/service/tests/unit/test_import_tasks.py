@@ -1,13 +1,33 @@
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
+import sqlite3
+
+import pytest
 
 from adapters.sqlite_task_repository import SqliteImportTaskRepository
+from application.ingest import ImportTaskError, ImportTaskService
 from domain.classification import ClassificationSuggestion
 from domain.evidence import EvidenceLocator, ParseEvidence, ParseIssue, StructuredContentUnit
+from domain.metadata_tags import MetadataTagProposal, TagSuggestion
 from domain.review_commits import CommitFile, CommitJournal, CommitUnit, build_review_snapshot
 from domain.sources import VersionSuggestion
 from domain.tasks import ImportTask, ImportTaskCounts, ImportTaskItem, new_import_task
+from workers.converters.artifact_store import PrivateArtifactStore
+
+
+class DeleteTaskRepository:
+    def __init__(self, task: ImportTask) -> None:
+        self.task = task
+        self.deleted_task_id: str | None = None
+
+    def get(self, task_id: str) -> ImportTask:
+        if task_id != self.task.task_id:
+            raise KeyError(task_id)
+        return self.task
+
+    def delete(self, task_id: str) -> None:
+        self.deleted_task_id = task_id
 
 
 def test_import_task_persists_scope_counts_and_recovers_interrupted_scans(tmp_path: Path) -> None:
@@ -407,3 +427,218 @@ def test_import_task_persists_classification_history_and_counts_unresolved_low_c
         "classification-generated",
         "classification-accepted",
     ]
+
+
+def test_delete_import_task_removes_only_task_scoped_records(tmp_path: Path) -> None:
+    database = tmp_path / "tasks.sqlite3"
+    repository = SqliteImportTaskRepository(database)
+    deleted_task = new_import_task(
+        vault_id="vault-1", vault_label="Vault", source_paths=(tmp_path / "delete.pdf",), scope_label="delete.pdf"
+    )
+    retained_task = new_import_task(
+        vault_id="vault-1", vault_label="Vault", source_paths=(tmp_path / "keep.pdf",), scope_label="keep.pdf"
+    )
+    repository.create(deleted_task, "created")
+    repository.create(retained_task, "created")
+    for task, label in ((deleted_task, "delete.pdf"), (retained_task, "keep.pdf")):
+        repository.append_item(
+            task.task_id,
+            ImportTaskItem(
+                item_id=0,
+                task_id=task.task_id,
+                source_path=tmp_path / label,
+                label=label,
+                category="supported",
+                document_kind="pdf",
+                reason=None,
+                content_sha256="a" * 64,
+                source_id="shared-source",
+                identity_status="new",
+            ),
+        )
+    deleted_item = repository.list_items(deleted_task.task_id)[0]
+    retained_item = repository.list_items(retained_task.task_id)[0]
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO import_parse_evidence(vault_id, source_id, content_sha256, document_kind, evidence_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            ("vault-1", "shared-source", "a" * 64, "pdf", "{}", "2026-07-22T00:00:00+00:00"),
+        )
+        connection.execute(
+            "INSERT INTO vault_tag_definitions(vault_id, name, revision, tag_json, updated_at) VALUES (?, ?, ?, ?, ?)",
+            ("vault-1", "shared", 1, "{}", "2026-07-22T00:00:00+00:00"),
+        )
+        connection.execute(
+            "INSERT INTO import_ocr_targets(item_id, target_id, locator_json, label, status, locator_summary, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (deleted_item.item_id, "target-1", "{}", "Page 1", "completed", "page 1", "now", "now"),
+        )
+        connection.execute(
+            "INSERT INTO import_ocr_attempts(item_id, target_id, evidence_json, created_at) VALUES (?, ?, ?, ?)",
+            (deleted_item.item_id, "target-1", "{}", "now"),
+        )
+        connection.execute(
+            "INSERT INTO import_ocr_decisions(item_id, target_id, decision, reason, created_at) VALUES (?, ?, ?, ?, ?)",
+            (deleted_item.item_id, "target-1", "accepted", "reviewed", "now"),
+        )
+        connection.execute(
+            "INSERT INTO import_conversion_attempts(attempt_id, task_id, item_id, engine, status, input_snapshot_hash, attempt_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("attempt-1", deleted_task.task_id, deleted_item.item_id, "local", "completed", "a" * 64, "{}", "now"),
+        )
+        connection.execute(
+            "INSERT INTO import_conversion_artifacts(artifact_id, attempt_id, sha256, media_type, role, private_relative_path, artifact_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("artifact-1", "attempt-1", "b" * 64, "text/plain", "output", "private/output.txt", "{}"),
+        )
+        connection.execute(
+            "INSERT INTO import_conversion_graph_revisions(graph_id, item_id, attempt_id, graph_revision, source_sha256, graph_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("graph-1", deleted_item.item_id, "attempt-1", 1, "a" * 64, "{}", "now"),
+        )
+        connection.execute(
+            "INSERT INTO import_conversion_review_links(task_id, item_id, review_item_id, graph_id, locator_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (deleted_task.task_id, deleted_item.item_id, "review-1", "graph-1", "{}", "now"),
+        )
+        connection.execute(
+            "INSERT INTO import_note_proposals(task_id, item_id, proposal_kind, proposal_json, created_at) VALUES (?, ?, ?, ?, ?)",
+            (deleted_task.task_id, deleted_item.item_id, "derived", "{}", "now"),
+        )
+        proposal_id = connection.execute("SELECT proposal_id FROM import_note_proposals").fetchone()[0]
+        connection.execute(
+            "INSERT INTO import_private_index_candidates(proposal_id, task_id, item_id, proposal_kind, note_relative_path, block_sequence, text, source_locators_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (proposal_id, deleted_task.task_id, deleted_item.item_id, "derived", "notes/a.md", 1, "text", "[]", "now"),
+        )
+        connection.execute(
+            "INSERT INTO import_classification_suggestions(task_id, item_id, revision, suggestion_json, confidence, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (deleted_task.task_id, deleted_item.item_id, 1, "{}", 0.5, "now"),
+        )
+        connection.execute(
+            "INSERT INTO import_metadata_tag_proposals(task_id, item_id, revision, proposal_json, requires_review, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (deleted_task.task_id, deleted_item.item_id, 1, "{}", 1, "now"),
+        )
+        connection.execute(
+            "INSERT INTO import_candidate_link_proposals(task_id, review_item_id, revision, vault_id, source_item_id, target_item_id, proposal_json, requires_review, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (deleted_task.task_id, "link-1", 1, "vault-1", deleted_item.item_id, deleted_item.item_id, "{}", 1, "now"),
+        )
+        connection.execute(
+            "INSERT INTO import_review_snapshots(task_id, vault_id, digest, snapshot_json, created_at) VALUES (?, ?, ?, ?, ?)",
+            (deleted_task.task_id, "vault-1", "digest", "{}", "now"),
+        )
+        connection.execute(
+            "INSERT INTO import_review_decisions(task_id, review_item_id, decision_json, created_at) VALUES (?, ?, ?, ?)",
+            (deleted_task.task_id, "review-1", "{}", "now"),
+        )
+        connection.execute(
+            "INSERT INTO import_commit_journals(task_id, vault_id, unit_id, snapshot_digest, status, journal_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (deleted_task.task_id, "vault-1", "unit-1", "digest", "committed", "{}", "now"),
+        )
+
+    repository.delete(deleted_task.task_id)
+
+    with sqlite3.connect(database) as connection:
+        for table in (
+            "import_tasks", "import_task_items", "import_task_events", "import_ocr_targets",
+            "import_ocr_attempts", "import_ocr_decisions", "import_conversion_attempts",
+            "import_conversion_artifacts", "import_conversion_graph_revisions",
+            "import_conversion_review_links", "import_note_proposals",
+            "import_private_index_candidates", "import_classification_suggestions",
+            "import_metadata_tag_proposals", "import_candidate_link_proposals",
+            "import_review_snapshots", "import_review_decisions", "import_commit_journals",
+        ):
+            if table in {"import_tasks", "import_task_items", "import_task_events"}:
+                continue
+            assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM import_tasks WHERE task_id = ?", (deleted_task.task_id,)).fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM import_task_items WHERE task_id = ?", (deleted_task.task_id,)).fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM import_task_events WHERE task_id = ?", (deleted_task.task_id,)).fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM import_tasks WHERE task_id = ?", (retained_task.task_id,)).fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM import_task_items WHERE item_id = ?", (retained_item.item_id,)).fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM import_parse_evidence").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM vault_tag_definitions").fetchone()[0] == 1
+
+
+def test_import_task_service_rejects_running_task_deletion() -> None:
+    task = new_import_task(
+        vault_id="vault-1", vault_label="Vault", source_paths=(Path("book.pdf"),), scope_label="book.pdf"
+    )
+    repository = DeleteTaskRepository(task)
+    service = ImportTaskService(None, repository, object())
+
+    service.delete(task.task_id)
+
+    assert repository.deleted_task_id == task.task_id
+    running_repository = DeleteTaskRepository(replace(task, lifecycle="running", phase="scanning"))
+    with pytest.raises(ImportTaskError, match="must be cancelled"):
+        ImportTaskService(None, running_repository, object()).delete(task.task_id)
+    assert running_repository.deleted_task_id is None
+
+
+def test_delete_import_task_removes_its_private_artifact_namespace(tmp_path: Path) -> None:
+    task = new_import_task(
+        vault_id="vault-1", vault_label="Vault", source_paths=(tmp_path / "book.pdf",), scope_label="book.pdf"
+    )
+    repository = DeleteTaskRepository(task)
+    store = PrivateArtifactStore(tmp_path / "private")
+    deleted_file = store.root / task.task_id / "1" / "input" / "snapshot"
+    retained_file = store.root / "other-task" / "1" / "input" / "snapshot"
+    deleted_file.parent.mkdir(parents=True)
+    retained_file.parent.mkdir(parents=True)
+    deleted_file.write_bytes(b"private source")
+    retained_file.write_bytes(b"other private source")
+
+    ImportTaskService(None, repository, object(), artifact_store=store).delete(task.task_id)
+
+    assert not (store.root / task.task_id).exists()
+    assert retained_file.read_bytes() == b"other private source"
+    assert repository.deleted_task_id == task.task_id
+
+
+def test_delete_completed_task_keeps_accepted_tag_reference_for_vault_governance(tmp_path: Path) -> None:
+    repository = SqliteImportTaskRepository(tmp_path / "tasks.sqlite3")
+    task = replace(
+        new_import_task(
+            vault_id="vault-1", vault_label="Vault", source_paths=(tmp_path / "book.pdf",), scope_label="book.pdf"
+        ),
+        lifecycle="complete",
+        phase="complete",
+    )
+    repository.create(task, "completed")
+    repository.append_item(
+        task.task_id,
+        ImportTaskItem(
+            item_id=0,
+            task_id=task.task_id,
+            source_path=tmp_path / "book.pdf",
+            label="book.pdf",
+            category="supported",
+            document_kind="pdf",
+            reason=None,
+            content_sha256="a" * 64,
+            source_id="source-1",
+            identity_status="new",
+        ),
+    )
+    item = repository.list_items(task.task_id)[0]
+    proposal = MetadataTagProposal(
+        task_id=task.task_id,
+        item_id=item.item_id,
+        revision=1,
+        vault_id="vault-1",
+        proposal_revision=1,
+        content_sha256="a" * 64,
+        source_type="pdf",
+        source_file="book.pdf",
+        ingested_at="2026-07-22T00:00:00+00:00",
+        processing_status="complete",
+        domain="mathematics",
+        domain_confidence=0.9,
+        tags=(TagSuggestion("mathematics", 0.9, "accepted", False, (), ("platform/notes/book.md",), "Reviewed."),),
+        created_at="2026-07-22T00:00:00+00:00",
+        decision="accepted",
+        decision_reason="Reviewed.",
+    )
+    repository.record_metadata_tag_proposal(item.item_id, proposal, "metadata-tags-accepted")
+
+    repository.delete(task.task_id)
+
+    assert repository.list_metadata_tag_proposals_for_vault("vault-1") == [proposal]
+    updated = replace(proposal, revision=2)
+    repository.record_vault_metadata_tag_proposal(updated)
+    assert repository.list_metadata_tag_proposals_for_vault("vault-1") == [updated]

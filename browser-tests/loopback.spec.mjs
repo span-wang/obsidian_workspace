@@ -1157,3 +1157,131 @@ test("configures a chat-only Provider without requiring an Embedding model", asy
   await expect(page.getByRole("dialog", { name: "删除 Provider" })).toBeHidden();
   await expect(deleteButton).toBeFocused();
 });
+
+test("manages bounded private sessions without inheriting a vault or closing deletion on Escape", async ({ page }) => {
+  let nextSessionId = 27;
+  let sessions = Array.from({ length: 26 }, (_, index) => ({
+    session_id: `session-${index + 1}`,
+    title: `会话 ${index + 1}`,
+    selected_vault_id: index === 0 ? "vault-math" : null,
+    selected_vault_label: index === 0 ? "数学资料" : null,
+    selected_provider_id: null,
+    selected_provider_label: null,
+    selected_model_id: null,
+    selected_model_label: null,
+    message_count: 0,
+    created_at: `2026-07-22T00:${String(index).padStart(2, "0")}:00+00:00`,
+    updated_at: `2026-07-22T00:${String(index).padStart(2, "0")}:00+00:00`,
+    last_activity_at: `2026-07-22T00:${String(index).padStart(2, "0")}:00+00:00`
+  }));
+
+  function listPayload(url) {
+    const query = url.searchParams.get("query") || "";
+    const page = Number(url.searchParams.get("page") || "1");
+    const pageSize = Number(url.searchParams.get("page_size") || "25");
+    const matching = sessions.filter((session) => (
+      `${session.title} ${session.selected_vault_label || ""}`.includes(query)
+    ));
+    return {
+      sessions: matching.slice((page - 1) * pageSize, page * pageSize),
+      page,
+      page_size: pageSize,
+      total: matching.length,
+      total_pages: Math.max(1, Math.ceil(matching.length / pageSize))
+    };
+  }
+
+  await page.route("**/api/sessions**", async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const method = request.method();
+    const parts = url.pathname.split("/").filter(Boolean);
+    const sessionId = parts[2];
+    if (method === "GET" && !sessionId) {
+      await route.fulfill({ json: listPayload(url) });
+      return;
+    }
+    if (method === "POST") {
+      const session = {
+        session_id: `session-${nextSessionId++}`,
+        title: "未命名会话",
+        selected_vault_id: null,
+        selected_vault_label: null,
+        selected_provider_id: null,
+        selected_provider_label: null,
+        selected_model_id: null,
+        selected_model_label: null,
+        message_count: 0,
+        created_at: "2026-07-22T01:00:00+00:00",
+        updated_at: "2026-07-22T01:00:00+00:00",
+        last_activity_at: "2026-07-22T01:00:00+00:00"
+      };
+      sessions = [session, ...sessions];
+      await route.fulfill({ json: { session } });
+      return;
+    }
+    const session = sessions.find((item) => item.session_id === sessionId);
+    if (method === "PATCH") {
+      const { title } = request.postDataJSON();
+      session.title = title;
+      session.updated_at = "2026-07-22T01:01:00+00:00";
+      await route.fulfill({ json: { session } });
+      return;
+    }
+    if (method === "GET" && parts.at(-1) === "export") {
+      await route.fulfill({
+        contentType: "application/json",
+        headers: { "Content-Disposition": `attachment; filename=\"${sessionId}.json\"` },
+        body: JSON.stringify({ session })
+      });
+      return;
+    }
+    if (method === "DELETE") {
+      sessions = sessions.filter((item) => item.session_id !== sessionId);
+      await route.fulfill({ json: { status: "removed" } });
+      return;
+    }
+    await route.fallback();
+  });
+
+  await page.goto("/");
+  await page.getByRole("link", { name: "会话", exact: true }).click();
+
+  await expect(page.getByText("会话 1", { exact: true })).toBeVisible();
+  await expect(page.getByText("所用 vault：数学资料", { exact: true })).toBeVisible();
+  await expect(page.getByText("第 1 / 2 页", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "下一页" }).click();
+  await expect(page.getByText("会话 26", { exact: true })).toBeVisible();
+
+  await page.getByLabel("搜索会话").fill("会话 26");
+  await page.getByRole("button", { name: "搜索", exact: true }).click();
+  await expect(page.getByText("会话 26", { exact: true })).toBeVisible();
+  await expect(page.getByText("会话 1", { exact: true })).toHaveCount(0);
+
+  await page.getByLabel("搜索会话").fill("");
+  await page.getByRole("button", { name: "搜索", exact: true }).click();
+  await page.getByRole("button", { name: "新建会话", exact: true }).click();
+  const titleInput = page.getByLabel("未命名会话 的会话标题");
+  await expect(titleInput).toBeFocused();
+  await titleInput.fill("代数复习");
+  await page.getByRole("button", { name: "保存", exact: true }).click();
+  const sessionRow = page.locator(".session-row", { hasText: "代数复习" });
+  await expect(sessionRow).toContainText("所用 vault：未设置");
+
+  const download = page.waitForEvent("download");
+  await sessionRow.getByRole("button", { name: "导出", exact: true }).click();
+  await (await download).cancel();
+
+  const deleteButton = sessionRow.getByRole("button", { name: "删除", exact: true });
+  await deleteButton.focus();
+  await deleteButton.click();
+  const dialog = page.getByRole("dialog", { name: "删除会话“代数复习”？" });
+  await expect(dialog).toContainText("不会删除、移动或改写已审核写入 vault 的资料、笔记或标签。", { exact: true });
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "取消", exact: true }).click();
+  await expect(deleteButton).toBeFocused();
+  await deleteButton.click();
+  await dialog.getByRole("button", { name: "删除会话", exact: true }).click();
+  await expect(page.getByText("代数复习", { exact: true })).toHaveCount(0);
+});
