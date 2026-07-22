@@ -655,6 +655,203 @@ test("creates an import task from the workbench and shows its persistent scan sn
   await expect(classificationFolder).toBeFocused();
 });
 
+test("filters commit review units and submits only the explicitly selectable units", async ({ page }) => {
+  const vault = {
+    vault_id: "vault-review",
+    path: "C:\\fixture\\Review Vault",
+    managed_root_relative_path: "platform",
+    managed_root: "C:\\fixture\\Review Vault\\platform",
+    source_directory: "C:\\fixture\\Review Vault\\platform\\sources",
+    note_directory: "C:\\fixture\\Review Vault\\platform\\notes",
+    authorization_status: "active",
+    access_status: "available",
+    index_status: "not-initialized",
+    created_at: "2026-07-22T00:00:00+00:00",
+    updated_at: "2026-07-22T00:00:00+00:00",
+    is_current: true,
+    recovery_actions: []
+  };
+  const task = {
+    task_id: "task-review",
+    vault_id: vault.vault_id,
+    vault_label: "Review Vault",
+    scope_label: "review.pdf",
+    lifecycle: "waiting-for-review",
+    phase: "waiting-for-review",
+    current_item_label: null,
+    counts: {
+      discovered: 3,
+      supported: 3,
+      skipped: 0,
+      unsupported: 0,
+      failed: 0,
+      new: 3,
+      duplicate: 0,
+      possible_version: 0,
+      identity_failed: 0,
+      parsed: 3,
+      parse_failed: 0,
+      ocr_completed: 3,
+      ocr_failed: 0,
+      confirmed_gaps: 1,
+      required_check: 2,
+      derived_notes: 3
+    },
+    recovery_actions: [],
+    failure_reason: null,
+    parent_task_id: null,
+    created_at: "2026-07-22T00:00:00+00:00",
+    updated_at: "2026-07-22T00:00:00+00:00"
+  };
+  const reviewSnapshot = {
+    task_id: task.task_id,
+    vault_id: vault.vault_id,
+    digest: "a".repeat(64),
+    source_hashes: [[1, "b".repeat(64)]],
+    existing_file_hashes: [],
+    review_items: [
+      {
+        review_item_id: "parse-blocked",
+        unit_id: "source-blocked",
+        object_type: "parse",
+        risk: "blocking",
+        status: "blocking",
+        reason: "解析失败，不能提交。"
+      },
+      {
+        review_item_id: "metadata-required",
+        unit_id: "existing-note-required",
+        object_type: "metadata",
+        risk: "required-check",
+        status: "pending",
+        reason: "既有笔记修改需要明确确认。"
+      }
+    ],
+    units: [
+      {
+        unit_id: "source-ready",
+        source_item_id: 1,
+        source_label: "review.pdf",
+        kind: "source",
+        eligibility_reason: null,
+        confirmed_gaps: true,
+        files: [
+          { relative_path: "platform/sources/review.pdf", kind: "source", modifies_existing: false },
+          { relative_path: "platform/notes/review.md", kind: "markdown", modifies_existing: false }
+        ]
+      },
+      {
+        unit_id: "source-retry",
+        source_item_id: 2,
+        source_label: "retry.pdf",
+        kind: "source",
+        eligibility_reason: null,
+        confirmed_gaps: false,
+        files: [{ relative_path: "platform/notes/retry.md", kind: "markdown", modifies_existing: false }]
+      },
+      {
+        unit_id: "source-blocked",
+        source_item_id: 3,
+        source_label: "blocked.pdf",
+        kind: "source",
+        eligibility_reason: "解析失败，不能提交。",
+        confirmed_gaps: false,
+        files: [{ relative_path: "platform/notes/blocked.md", kind: "markdown", modifies_existing: false }]
+      },
+      {
+        unit_id: "existing-note-required",
+        source_item_id: 4,
+        source_label: "existing.md",
+        kind: "existing-note",
+        eligibility_reason: "既有笔记修改需要明确确认。",
+        confirmed_gaps: false,
+        files: [{ relative_path: "existing.md", kind: "markdown", modifies_existing: true }]
+      }
+    ],
+    created_at: "2026-07-22T00:00:00+00:00",
+    stale_reasons: [],
+    remaining_review_count: 2
+  };
+  let journals = [{ unit_id: "source-retry", status: "failed", reason: "模拟写入失败" }];
+  let commitUnitIds = null;
+  let refreshed = false;
+  const detailPayload = () => ({
+    task,
+    items: [],
+    note_proposals: [],
+    classification_suggestions: [],
+    metadata_tag_proposals: [],
+    candidate_link_proposals: [],
+    review_snapshot: reviewSnapshot,
+    commit_journals: journals,
+    event_cursor: 9
+  });
+
+  await page.route("**/api/import-tasks", async (route) => {
+    if (route.request().method() === "GET") {
+      await route.fulfill({ json: { tasks: [task] } });
+      return;
+    }
+    await route.fallback();
+  });
+  await page.route("**/api/import-tasks/task-review**", async (route) => {
+    const url = route.request().url();
+    if (url.includes("/events")) {
+      await route.fulfill({ contentType: "text/event-stream", body: ": keep-alive\n\n" });
+      return;
+    }
+    if (url.endsWith("/review-snapshot") && route.request().method() === "POST") {
+      refreshed = true;
+      await route.fulfill({ json: { review_snapshot: reviewSnapshot } });
+      return;
+    }
+    if (url.endsWith("/commit") && route.request().method() === "POST") {
+      commitUnitIds = route.request().postDataJSON().unit_ids;
+      journals = reviewSnapshot.units
+        .filter((unit) => commitUnitIds.includes(unit.unit_id))
+        .map((unit) => ({ unit_id: unit.unit_id, status: "committed", reason: null }));
+      task.lifecycle = "complete";
+      task.phase = "complete";
+      await route.fulfill({ json: { task, commit_journals: journals } });
+      return;
+    }
+    await route.fulfill({ json: detailPayload() });
+  });
+  await page.route("**/api/vaults", async (route) => {
+    await route.fulfill({ json: { vaults: [vault] } });
+  });
+
+  await page.goto("/");
+  await page.getByRole("link", { name: "任务", exact: true }).click();
+  await page.getByRole("button", { name: "review.pdf" }).click();
+
+  const review = page.getByLabel("提交审核");
+  await expect(review).toHaveAttribute("aria-live", "polite");
+  await expect(page.getByText("仍有 2 个阻断或必须检查项。", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "提交所选" })).toBeDisabled();
+  await expect(page.getByLabel("选择提交单元 blocked.pdf")).toBeDisabled();
+  await expect(page.getByLabel("选择提交单元 existing.md")).toBeDisabled();
+  await expect(page.getByText("失败，可重试", { exact: true })).toBeVisible();
+  await expect(page.getByText("恢复原因：模拟写入失败", { exact: true })).toBeVisible();
+
+  await page.getByLabel("提交单元筛选").selectOption("existing-note");
+  await expect(page.getByText("existing.md", { exact: true })).toBeVisible();
+  await expect(page.getByText("review.pdf", { exact: true })).toHaveCount(0);
+  await page.getByLabel("提交单元筛选").selectOption("all");
+  await page.getByRole("button", { name: "全选可提交" }).click();
+  await expect(page.getByLabel("选择提交单元 review.pdf")).toBeChecked();
+  await expect(page.getByLabel("选择提交单元 retry.pdf")).toBeChecked();
+  await expect(page.getByRole("button", { name: "提交所选" })).toBeEnabled();
+
+  await page.getByRole("button", { name: "刷新快照" }).click();
+  await expect.poll(() => refreshed).toBe(true);
+  await expect(page.getByText("审核快照已刷新。", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "提交所选" }).click();
+  await expect.poll(() => commitUnitIds).toEqual(["source-ready", "source-retry"]);
+  await expect(page.getByText("提交结果已记录。", { exact: true })).toBeVisible();
+  await expect(page.getByText("已提交", { exact: true })).toHaveCount(2);
+});
+
 test("shows a task loading failure instead of an empty task list", async ({ page }) => {
   await page.route("**/api/import-tasks", async (route) => {
     await route.fulfill({

@@ -9,6 +9,7 @@ from application.import_selections import ImportSelection
 from application.vaults import VaultService
 from domain.derived_notes import (
     DerivedMarkdownProposal,
+    NativeMarkdownProposal,
     merge_adjacent_notes,
     native_markdown_proposal,
     proposal_from_dict,
@@ -40,11 +41,23 @@ from domain.metadata_tags import (
     suggest_metadata_tags,
 )
 from domain.evidence import EvidenceLocator, OcrEvidence, OcrTarget, ParseEvidence, StructuredContentUnit
+from domain.review_commits import (
+    CommitBackup,
+    CommitFile,
+    CommitJournal,
+    ReviewDecision,
+    CommitUnit,
+    ReviewItem,
+    ReviewSnapshot,
+    build_review_snapshot,
+    snapshot_stale_reasons,
+)
 from domain.sources import VersionSuggestion
 from domain.tasks import ImportTask, ImportTaskCounts, ImportTaskItem, new_import_task, utc_now
 from ports.source_repository import SourceRepository
 from ports.task_repository import TaskRepository
 from ports.task_worker import TaskWorker
+from ports.vault_committer import VaultCommitError, VaultCommitter, VaultWrite
 
 
 class ImportTaskError(ValueError):
@@ -59,12 +72,14 @@ class ImportTaskService:
         worker: TaskWorker,
         policy_service=None,
         source_repository: SourceRepository | None = None,
+        vault_committer: VaultCommitter | None = None,
     ) -> None:
         self.vault_service = vault_service
         self.repository = repository
         self.worker = worker
         self.policy_service = policy_service
         self.source_repository = source_repository
+        self.vault_committer = vault_committer
         self._state_lock = threading.RLock()
 
     def create(self, vault_id: str, selection: ImportSelection) -> ImportTask:
@@ -810,6 +825,8 @@ class ImportTaskService:
             self._ensure_classification_suggestions(completed)
             self._ensure_metadata_tag_proposals(completed)
             self._ensure_candidate_link_proposals(completed)
+            initial_snapshot = self._build_review_snapshot(self.get(task.task_id))
+            self.repository.record_review_snapshot(initial_snapshot, "review-snapshot-created")
         return self.get(task.task_id)
 
     def _generate_native_proposals(self, task: ImportTask) -> bool:
@@ -953,6 +970,7 @@ class ImportTaskService:
         existing = {
             proposal.review_item_id: proposal
             for proposal in self.repository.list_candidate_link_proposals(task.task_id)
+            if not proposal.is_legacy_isolated
         }
         for generated in discover_candidate_links(task.task_id, proposals, utc_now()):
             current = existing.get(generated.review_item_id)
@@ -969,6 +987,14 @@ class ImportTaskService:
     def _require_classification_review_task(self, task: ImportTask) -> None:
         if task.lifecycle != "waiting-for-review":
             raise ImportTaskError("Classification decisions need a task waiting for review.")
+
+    @staticmethod
+    def _require_commit_review_task(task: ImportTask) -> None:
+        if task.lifecycle == "waiting-for-review":
+            return
+        if task.lifecycle == "recoverable" and "retry-commit" in task.recovery_actions:
+            return
+        raise ImportTaskError("Commit review needs a task waiting for review or retrying a failed commit.")
 
     def _classification_context(
         self, task_id: str, item_id: int
@@ -1009,6 +1035,645 @@ class ImportTaskService:
     def list_candidate_link_proposals(self, task_id: str) -> list[CandidateLinkProposal]:
         self.get(task_id)
         return self.repository.list_candidate_link_proposals(task_id)
+
+    def get_review_snapshot(self, task_id: str) -> ReviewSnapshot | None:
+        self.get(task_id)
+        return self.repository.get_review_snapshot(task_id)
+
+    def list_commit_journals(self, task_id: str) -> list[CommitJournal]:
+        self.get(task_id)
+        return self.repository.list_commit_journals(task_id)
+
+    def recover_interrupted_commits(self, tasks: list[ImportTask]) -> None:
+        if self.vault_committer is None:
+            return
+        restore = getattr(self.vault_committer, "restore", None)
+        if restore is None:
+            return
+        with self._state_lock:
+            for task in tasks:
+                if "retry-commit" not in task.recovery_actions:
+                    continue
+                vault = self._available_vault(task.vault_id)
+                interrupted = [
+                    journal
+                    for journal in self.repository.list_commit_journals(task.task_id)
+                    if journal.status == "failed"
+                    and journal.reason == "The vault commit was interrupted before its result was recorded."
+                ]
+                try:
+                    for journal in interrupted:
+                        restore(
+                            vault.path,
+                            journal.backups,
+                            None
+                            if journal.unit.kind == "existing-note"
+                            else vault.managed_root_relative_path,
+                        )
+                except (VaultCommitError, OSError) as error:
+                    self.repository.save(
+                        replace(
+                            task,
+                            recovery_actions=(),
+                            failure_reason=f"Interrupted vault commit could not be restored: {error}",
+                            updated_at=utc_now(),
+                        ),
+                        "commit-recovery-failed",
+                    )
+                    continue
+                if interrupted:
+                    self.repository.save(
+                        replace(
+                            task,
+                            updated_at=utc_now(),
+                        ),
+                        "commit-rolled-back-after-interruption",
+                    )
+
+    def refresh_review_snapshot(self, task_id: str) -> ReviewSnapshot:
+        with self._state_lock:
+            task = self.get(task_id)
+            self._require_commit_review_task(task)
+            snapshot = self._build_review_snapshot(task)
+            self.repository.record_review_snapshot(snapshot, "review-snapshot-created")
+            return snapshot
+
+    def decide_review_item(
+        self, task_id: str, review_item_id: str, decision: str, reason: str
+    ) -> ImportTask:
+        with self._state_lock:
+            task = self.get(task_id)
+            self._require_classification_review_task(task)
+            snapshot = self._build_review_snapshot(task)
+            review_item = next(
+                (item for item in snapshot.review_items if item.review_item_id == review_item_id), None
+            )
+            if review_item is None or review_item.risk != "required-check":
+                raise ImportTaskError("This review item does not need an explicit decision.")
+            if review_item.object_type not in {"parse", "existing-note"}:
+                raise ImportTaskError("This review item must be handled by its dedicated review action.")
+            if not review_item.context_sha256:
+                raise ImportTaskError("This review item cannot be decided safely.")
+            try:
+                review_decision = ReviewDecision(
+                    task_id=task_id,
+                    review_item_id=review_item_id,
+                    decision=decision,
+                    reason=reason,
+                    context_sha256=review_item.context_sha256,
+                    decided_at=utc_now(),
+                )
+            except ValueError as error:
+                raise ImportTaskError(str(error)) from error
+            self.repository.record_review_decision(review_decision, "review-item-decided")
+            refreshed = self._build_review_snapshot(task)
+            self.repository.record_review_snapshot(refreshed, "review-snapshot-created")
+            return self.get(task_id)
+
+    def commit_review(self, task_id: str, unit_ids: tuple[str, ...] | None = None) -> ImportTask:
+        with self._state_lock:
+            task = self.get(task_id)
+            self._require_commit_review_task(task)
+            vault = self._available_vault(task.vault_id)
+            if self.vault_committer is None:
+                raise ImportTaskError("Vault commit service is unavailable.")
+            snapshot = self.repository.get_review_snapshot(task_id)
+            if snapshot is None:
+                raise ImportTaskError("Create an audit snapshot before committing.")
+            current_snapshot = self._build_review_snapshot(task)
+            stale_reasons = snapshot_stale_reasons(snapshot, current_snapshot)
+            if stale_reasons:
+                stale_snapshot = replace(current_snapshot, stale_reasons=stale_reasons)
+                self.repository.record_review_snapshot(stale_snapshot, "review-snapshot-stale")
+                raise ImportTaskError("; ".join(stale_reasons))
+            if snapshot.stale_reasons:
+                raise ImportTaskError("Refresh the stale review snapshot before committing.")
+            journals = self.repository.list_commit_journals(task_id)
+            committed_unit_ids = {
+                journal.unit_id for journal in journals if journal.status == "committed"
+            }
+            requested = set(unit_ids or ())
+            unknown = requested - {unit.unit_id for unit in snapshot.units}
+            if unknown:
+                raise ImportTaskError("A selected commit unit does not belong to this review snapshot.")
+            selected = tuple(
+                unit
+                for unit in snapshot.units
+                if unit.unit_id not in committed_unit_ids
+                and (unit.unit_id in requested if unit_ids is not None else snapshot.commit_eligibility(unit.unit_id) is None)
+            )
+            if not selected:
+                raise ImportTaskError("No fully reviewed commit units are available to submit.")
+            for unit in selected:
+                eligibility = snapshot.commit_eligibility(unit.unit_id)
+                if eligibility:
+                    raise ImportTaskError(f"{unit.source_label}: {eligibility}")
+            prepared_work: list[tuple[CommitUnit, tuple[VaultWrite, ...], tuple[CommitBackup, ...]]] = []
+            for unit in selected:
+                try:
+                    writes = self._writes_for_unit(task, unit)
+                    backups = self._capture_commit_backups(
+                        vault.path,
+                        writes,
+                        None if unit.kind == "existing-note" else vault.managed_root_relative_path,
+                    )
+                except (ImportTaskError, VaultCommitError, OSError) as error:
+                    self._record_stale_snapshot(task, snapshot, str(error))
+                    raise ImportTaskError(str(error)) from error
+                prepared_work.append((unit, writes, backups))
+            committing_task = replace(
+                task,
+                lifecycle="running",
+                phase="committing",
+                current_item_label=None,
+                recovery_actions=(),
+                failure_reason=None,
+                updated_at=utc_now(),
+            )
+            self.repository.save(committing_task, "commit-started")
+            failures: list[str] = []
+            committed = 0
+            stale_failure_reason: str | None = None
+            for unit, writes, backups in prepared_work:
+                prepared = CommitJournal(
+                    task_id=task.task_id,
+                    vault_id=task.vault_id,
+                    unit_id=unit.unit_id,
+                    snapshot_digest=snapshot.digest,
+                    unit=unit,
+                    status="prepared",
+                    created_at=utc_now(),
+                    backups=backups,
+                )
+                self.repository.record_commit_journal(prepared, "commit-prepared")
+                try:
+                    if writes:
+                        self.vault_committer.commit(
+                            vault.path,
+                            writes,
+                            None if unit.kind == "existing-note" else vault.managed_root_relative_path,
+                        )
+                except (ImportTaskError, VaultCommitError, OSError) as error:
+                    recovery_error = self._restore_commit_backups(
+                        vault.path,
+                        backups,
+                        None if unit.kind == "existing-note" else vault.managed_root_relative_path,
+                    )
+                    reason = str(error) if recovery_error is None else f"{error}; recovery failed: {recovery_error}"
+                    failed = replace(prepared, status="failed", created_at=utc_now(), reason=reason)
+                    self.repository.record_commit_journal(failed, "commit-unit-failed")
+                    failures.append(f"{unit.source_label}: {reason}")
+                    if isinstance(error, (ImportTaskError, VaultCommitError)):
+                        stale_failure_reason = str(error)
+                        break
+                    continue
+                committed += 1
+                completed = replace(prepared, status="committed", created_at=utc_now())
+                self.repository.record_commit_journal(completed, "commit-unit-committed")
+            current = self.get(task_id)
+            if stale_failure_reason:
+                refreshed = self._record_stale_snapshot(current, snapshot, stale_failure_reason)
+            else:
+                refreshed = snapshot
+                self.repository.record_review_snapshot(refreshed, "review-snapshot-created")
+            if failures:
+                failed_task = replace(
+                    current,
+                    lifecycle="recoverable",
+                    phase="failed",
+                    current_item_label=None,
+                    recovery_actions=("retry-commit",),
+                    failure_reason="; ".join(failures),
+                    updated_at=utc_now(),
+                )
+                self.repository.save(failed_task, "commit-partial-failed")
+                return self.get(task_id)
+            final_journals = self.repository.list_commit_journals(task_id)
+            final_committed = {journal.unit_id for journal in final_journals if journal.status == "committed"}
+            if any(unit.unit_id not in final_committed for unit in refreshed.units):
+                waiting = replace(
+                    current,
+                    lifecycle="waiting-for-review",
+                    phase="waiting-for-review",
+                    current_item_label=None,
+                    recovery_actions=(),
+                    failure_reason=None,
+                    updated_at=utc_now(),
+                )
+                self.repository.save(waiting, "commit-partial-completed")
+                return self.get(task_id)
+            lifecycle = (
+                "completed-with-confirmed-gaps"
+                if any(unit.confirmed_gaps for unit in refreshed.units)
+                else "complete"
+            )
+            phase = lifecycle
+            completed_task = replace(
+                current,
+                lifecycle=lifecycle,
+                phase=phase,
+                current_item_label=None,
+                recovery_actions=(),
+                failure_reason=None,
+                updated_at=utc_now(),
+            )
+            self.repository.save(completed_task, "commit-completed")
+            return self.get(task_id)
+
+    def _capture_commit_backups(
+        self,
+        vault_path: Path,
+        writes: tuple[VaultWrite, ...],
+        managed_root_relative_path: str | None,
+    ) -> tuple[CommitBackup, ...]:
+        capture = getattr(self.vault_committer, "capture_backups", None)
+        if capture is None or not writes:
+            return ()
+        return tuple(capture(vault_path, writes, managed_root_relative_path))
+
+    def _restore_commit_backups(
+        self,
+        vault_path: Path,
+        backups: tuple[CommitBackup, ...],
+        managed_root_relative_path: str | None,
+    ) -> str | None:
+        restore = getattr(self.vault_committer, "restore", None)
+        if restore is None or not backups:
+            return None
+        try:
+            restore(vault_path, backups, managed_root_relative_path)
+        except (VaultCommitError, OSError) as error:
+            return str(error)
+        return None
+
+    def _record_stale_snapshot(
+        self, task: ImportTask, previous: ReviewSnapshot, fallback_reason: str
+    ) -> ReviewSnapshot:
+        current = self._build_review_snapshot(task)
+        reasons = snapshot_stale_reasons(previous, current) or (fallback_reason,)
+        stale = replace(current, stale_reasons=reasons)
+        self.repository.record_review_snapshot(stale, "review-snapshot-stale")
+        return stale
+
+    def _build_review_snapshot(self, task: ImportTask) -> ReviewSnapshot:
+        vault = self._available_vault(task.vault_id)
+        items = {item.item_id: item for item in self.repository.list_items(task.task_id)}
+        proposals = {proposal.item_id: proposal for proposal in self.repository.list_note_proposals(task.task_id)}
+        classifications = {
+            suggestion.item_id: suggestion
+            for suggestion in self.repository.list_classification_suggestions(task.task_id)
+        }
+        metadata = {
+            proposal.item_id: proposal
+            for proposal in self.repository.list_metadata_tag_proposals(task.task_id)
+        }
+        candidates = self.repository.list_candidate_link_proposals(task.task_id)
+        source_hashes: list[tuple[int, str]] = []
+        existing_hashes: dict[str, str] = {}
+        units: list[CommitUnit] = []
+        review_items: list[ReviewItem] = []
+        unit_ids: dict[int, str] = {}
+        proposal_item_ids: set[int] = set()
+        for item_id, proposal in sorted(proposals.items()):
+            item = items.get(item_id)
+            if item is None or not item.content_sha256:
+                continue
+            proposal_item_ids.add(item_id)
+            if not self._source_matches_scanned_content(item):
+                self._record_source_change(task, item_id)
+                raise ImportTaskError("A source changed after review; restart the scan before committing.")
+            source_hashes.append((item_id, item.content_sha256))
+            inside_vault = self._source_is_inside_vault(item.source_path, vault.path)
+            files = self._commit_files_for_proposal(
+                proposal,
+                item,
+                vault.path,
+                metadata.get(item_id),
+                candidates,
+                existing_hashes,
+                inside_vault,
+            )
+            primary_files = tuple(
+                file
+                for file in files
+                if not (file.kind == "markdown" and file.expected_existing_sha256 is not None)
+            )
+            existing_files = tuple(
+                file
+                for file in files
+                if file.kind == "markdown" and file.expected_existing_sha256 is not None
+            )
+            review_unit_id: str | None = None
+            if primary_files:
+                review_unit_id = f"source-{item_id}"
+                units.append(
+                    CommitUnit(
+                        unit_id=review_unit_id,
+                        source_item_id=item_id,
+                        source_label=item.label,
+                        kind="source",
+                        files=primary_files,
+                        confirmed_gaps=any(target.decision == "excluded" for target in item.ocr_targets),
+                    )
+                )
+            for index, file in enumerate(existing_files, start=1):
+                existing_unit_id = f"existing-note-{item_id}-{index}"
+                context_sha256 = sha256(
+                    f"{item.content_sha256}:{file.relative_path}:{file.expected_existing_sha256}".encode("utf-8")
+                ).hexdigest()
+                existing_review = self._review_item(
+                    task.task_id,
+                    f"existing-{existing_unit_id}",
+                    existing_unit_id,
+                    "existing-note",
+                    "required-check",
+                    "Existing Markdown needs an explicit confirmation before it can be changed.",
+                    context_sha256,
+                )
+                review_items.append(existing_review)
+                units.append(
+                    CommitUnit(
+                        unit_id=existing_unit_id,
+                        source_item_id=item_id,
+                        source_label=item.label,
+                        kind="existing-note",
+                        files=() if existing_review.status == "excluded" else (file,),
+                        confirmed_gaps=existing_review.status == "excluded",
+                    )
+                )
+                review_unit_id = review_unit_id or existing_unit_id
+            if review_unit_id is None:
+                continue
+            unit_ids[item_id] = review_unit_id
+            if item.parse_status == "parse-failed":
+                review_items.append(
+                    ReviewItem(
+                        f"parse-{item_id}", review_unit_id, "parse", "blocking", "blocking",
+                        item.parse_issue_summary or "Parsing failed for this source.",
+                    )
+                )
+            elif item.parse_issue_count:
+                review_items.append(
+                    self._review_item(
+                        task.task_id,
+                        f"parse-{item_id}",
+                        review_unit_id,
+                        "parse",
+                        "required-check",
+                        item.parse_issue_summary or "Parsing issues need an explicit decision.",
+                        sha256(
+                            f"{item.content_sha256}:{item.parse_issue_count}:{item.parse_issue_summary or ''}".encode(
+                                "utf-8"
+                            )
+                        ).hexdigest(),
+                    )
+                )
+            for target in item.ocr_targets:
+                if target.status == "failed":
+                    review_items.append(
+                        ReviewItem(
+                            f"ocr-{item_id}-{target.target_id}", review_unit_id, "ocr", "blocking", "blocking",
+                            target.issue_summary or f"{target.label} failed.",
+                        )
+                    )
+                elif target.issue_count and target.decision is None:
+                    review_items.append(
+                        ReviewItem(
+                            f"ocr-{item_id}-{target.target_id}", review_unit_id, "ocr", "required-check", "pending",
+                            target.issue_summary or f"{target.label} needs review.",
+                        )
+                    )
+            classification = classifications.get(item_id)
+            if classification is not None and classification.requires_review:
+                review_items.append(
+                    ReviewItem(
+                        f"classification-{item_id}", review_unit_id, "classification", "required-check", "pending",
+                        "Low-confidence classification needs an explicit decision.",
+                    )
+                )
+            governance = metadata.get(item_id)
+            if governance is not None and governance.requires_review:
+                review_items.append(
+                    ReviewItem(
+                        f"metadata-{item_id}", review_unit_id, "metadata", "required-check", "pending",
+                        "Metadata and tags need an explicit decision.",
+                    )
+                )
+        for item_id, item in items.items():
+            if item_id in proposal_item_ids:
+                continue
+            if item.parse_status == "parse-failed":
+                unit_id = f"unresolved-{item_id}"
+                unit_ids[item_id] = unit_id
+                units.append(
+                    CommitUnit(
+                        unit_id=unit_id,
+                        source_item_id=item_id,
+                        source_label=item.label,
+                        kind="unresolved",
+                        files=(),
+                    )
+                )
+                review_items.append(
+                    ReviewItem(
+                        f"parse-{item_id}", unit_id, "parse", "blocking", "blocking",
+                        item.parse_issue_summary or "Parsing failed for this source.",
+                    )
+                )
+                continue
+            if item.category not in {"skipped", "unsupported"}:
+                continue
+            unit_id = f"skipped-{item_id}"
+            unit_ids[item_id] = unit_id
+            units.append(
+                CommitUnit(
+                    unit_id=unit_id,
+                    source_item_id=item_id,
+                    source_label=item.label,
+                    kind="skipped",
+                    files=(),
+                )
+            )
+        for candidate in candidates:
+            if candidate.is_legacy_isolated:
+                continue
+            unit_id = unit_ids.get(candidate.source_item_id)
+            if unit_id is None:
+                continue
+            if candidate.status == "stale":
+                review_items.append(
+                    ReviewItem(
+                        f"candidate-{candidate.review_item_id}", unit_id, "candidate-link", "blocking", "blocking",
+                        candidate.stale_reason or "A candidate link is stale.",
+                    )
+                )
+            elif candidate.requires_review:
+                review_items.append(
+                    ReviewItem(
+                        f"candidate-{candidate.review_item_id}", unit_id, "candidate-link", "required-check", "pending",
+                        "Candidate link needs an explicit decision.",
+                    )
+                )
+        return build_review_snapshot(
+            task_id=task.task_id,
+            vault_id=task.vault_id,
+            source_hashes=tuple(source_hashes),
+            existing_file_hashes=tuple(existing_hashes.items()),
+            review_items=tuple(review_items),
+            units=tuple(units),
+            created_at=utc_now(),
+        )
+
+    def _review_item(
+        self,
+        task_id: str,
+        review_item_id: str,
+        unit_id: str,
+        object_type: str,
+        risk: str,
+        reason: str,
+        context_sha256: str,
+    ) -> ReviewItem:
+        decision = self.repository.get_review_decision(task_id, review_item_id)
+        status = (
+            decision.decision
+            if decision is not None and decision.context_sha256 == context_sha256
+            else "pending"
+        )
+        return ReviewItem(
+            review_item_id,
+            unit_id,
+            object_type,
+            risk,
+            status,
+            reason,
+            context_sha256,
+        )
+
+    def _commit_files_for_proposal(
+        self,
+        proposal,
+        item: ImportTaskItem,
+        vault_path: Path,
+        governance: MetadataTagProposal | None,
+        candidates: list[CandidateLinkProposal],
+        existing_hashes: dict[str, str],
+        inside_vault: bool,
+    ) -> tuple[CommitFile, ...]:
+        files: list[CommitFile] = []
+        if isinstance(proposal, DerivedMarkdownProposal):
+            source_expected = self._existing_file_hash(vault_path, proposal.source_relative_path)
+            if source_expected is not None:
+                existing_hashes[proposal.source_relative_path] = source_expected
+            files.append(
+                CommitFile(
+                    relative_path=proposal.source_relative_path,
+                    kind="source",
+                    content=None,
+                    content_sha256=proposal.source_sha256,
+                    expected_existing_sha256=source_expected,
+                )
+            )
+            note_contents = [(proposal.index_note.relative_path, proposal.index_note.markdown)] + [
+                (note.relative_path, note.markdown) for note in proposal.notes
+            ]
+        else:
+            note_contents = [(proposal.relative_path, proposal.markdown)]
+        accepted_tags = ()
+        if governance is not None and governance.decision == "accepted":
+            accepted_tags = tuple(tag.name for tag in governance.tags if tag.status != "excluded")
+        accepted_links = [
+            candidate for candidate in candidates
+            if candidate.source_item_id == proposal.item_id and candidate.decision == "accepted"
+        ]
+        for relative_path, markdown in note_contents:
+            rendered = self._render_accepted_governance(
+                markdown,
+                relative_path,
+                accepted_tags,
+                accepted_links,
+            )
+            expected = None
+            target = vault_path / relative_path
+            if inside_vault and isinstance(proposal, NativeMarkdownProposal):
+                expected = proposal.content_sha256
+                existing_hashes[relative_path] = expected
+            elif target.exists():
+                expected = sha256(target.read_bytes()).hexdigest()
+                existing_hashes[relative_path] = expected
+            files.append(
+                CommitFile(
+                    relative_path=relative_path,
+                    kind="markdown",
+                    content=rendered,
+                    content_sha256=sha256(rendered.encode("utf-8")).hexdigest(),
+                    expected_existing_sha256=expected,
+                )
+            )
+        return tuple(files)
+
+    @staticmethod
+    def _render_accepted_governance(
+        markdown: str,
+        relative_path: str,
+        tags: tuple[str, ...],
+        candidates: list[CandidateLinkProposal],
+    ) -> str:
+        rendered = markdown
+        if tags and rendered.startswith("---\n"):
+            closing = rendered.find("\n---", 4)
+            if closing >= 0 and "\ntags:" not in rendered[:closing]:
+                tag_lines = "\ntags:\n" + "".join(f"  - {tag}\n" for tag in sorted(set(tags)))
+                rendered = rendered[:closing] + tag_lines + rendered[closing:]
+        for candidate in candidates:
+            if candidate.source_path != relative_path:
+                continue
+            link = f"[[{candidate.target_path}]]"
+            if link not in rendered:
+                rendered = rendered.rstrip() + f"\n\n{link}\n"
+        return rendered
+
+    def _writes_for_unit(self, task: ImportTask, unit: CommitUnit) -> tuple[VaultWrite, ...]:
+        items = {item.item_id: item for item in self.repository.list_items(task.task_id)}
+        item = items.get(unit.source_item_id)
+        if item is None or not item.content_sha256:
+            raise ImportTaskError("The source item for this commit unit is unavailable.")
+        writes: list[VaultWrite] = []
+        for file in unit.files:
+            if file.kind == "source":
+                try:
+                    content = item.source_path.read_bytes()
+                except OSError as error:
+                    raise ImportTaskError("The reviewed source file is no longer available.") from error
+                if sha256(content).hexdigest() != file.content_sha256:
+                    raise ImportTaskError("The source content changed after the review snapshot.")
+            else:
+                content = (file.content or "").encode("utf-8")
+            writes.append(
+                VaultWrite(
+                    relative_path=file.relative_path,
+                    content=content,
+                    expected_existing_sha256=file.expected_existing_sha256,
+                    content_sha256=file.content_sha256,
+                )
+            )
+        return tuple(writes)
+
+    @staticmethod
+    def _source_is_inside_vault(source_path: Path, vault_path: Path) -> bool:
+        try:
+            source_path.resolve().relative_to(vault_path.resolve())
+        except (ValueError, OSError):
+            return False
+        return True
+
+    @staticmethod
+    def _existing_file_hash(vault_path: Path, relative_path: str) -> str | None:
+        target = vault_path / relative_path
+        try:
+            return sha256(target.read_bytes()).hexdigest() if target.exists() else None
+        except OSError as error:
+            raise ImportTaskError("An affected vault file cannot be read for review.") from error
 
     def decide_candidate_link_proposal(
         self, task_id: str, review_item_id: str, decision: str, reason: str
@@ -1210,6 +1875,16 @@ class ImportTaskService:
     ) -> ImportTask:
         with self._state_lock:
             _, vault, suggestion, proposal = self._classification_context(task_id, item_id)
+            item = next(
+                (candidate for candidate in self.repository.list_items(task_id) if candidate.item_id == item_id),
+                None,
+            )
+            if (
+                isinstance(proposal, NativeMarkdownProposal)
+                and item is not None
+                and self._source_is_inside_vault(item.source_path, vault.path)
+            ):
+                raise ImportTaskError("Existing Markdown cannot be moved by revising its classification.")
             validate_filename_for_proposal(proposal, filename)
             revised = revise_classification(
                 suggestion,

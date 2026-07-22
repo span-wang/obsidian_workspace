@@ -44,7 +44,17 @@ export const IMPORT_TASK_EVENT_NAMES = [
   "metadata-tags-excluded",
   "candidate-links-generated",
   "candidate-links-accepted",
-  "candidate-links-excluded"
+  "candidate-links-excluded",
+  "review-snapshot-created",
+  "review-snapshot-stale",
+  "review-item-decided",
+  "commit-started",
+  "commit-prepared",
+  "commit-unit-committed",
+  "commit-unit-failed",
+  "commit-partial-completed",
+  "commit-partial-failed",
+  "commit-completed"
 ];
 export const NAVIGATION_DESTINATIONS = [
   { id: "workbench", label: "工作台", emptyState: "尚未选择 vault。" },
@@ -64,7 +74,8 @@ function importLifecycleText(lifecycle) {
     recoverable: "可恢复",
     failed: "失败",
     cancelled: "已取消",
-    complete: "已完成"
+    complete: "已完成",
+    "completed-with-confirmed-gaps": "带已确认缺口完成"
   }[lifecycle] || lifecycle;
 }
 
@@ -82,7 +93,8 @@ function importPhaseText(phase) {
     indexing: "索引",
     failed: "失败",
     cancelled: "已取消",
-    complete: "完成"
+    complete: "完成",
+    "completed-with-confirmed-gaps": "带已确认缺口完成"
   }[phase] || phase;
 }
 
@@ -108,6 +120,7 @@ function importRecoveryActionText(action) {
     cancel: "取消",
     "restart-scan": "重新扫描",
     "restart-ocr": "重新 OCR",
+    "retry-commit": "重试提交",
     "create-new-task": "创建新任务"
   }[action] || action;
 }
@@ -1313,7 +1326,10 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
   const [classificationDrafts, setClassificationDrafts] = React.useState({});
   const [metadataTagDrafts, setMetadataTagDrafts] = React.useState({});
   const [candidateLinkDrafts, setCandidateLinkDrafts] = React.useState({});
+  const [reviewItemDrafts, setReviewItemDrafts] = React.useState({});
   const [splitSelections, setSplitSelections] = React.useState({});
+  const [selectedCommitUnits, setSelectedCommitUnits] = React.useState({});
+  const [commitFilter, setCommitFilter] = React.useState("all");
   const refreshTimerRef = React.useRef(null);
 
   const loadDetail = React.useCallback(async () => {
@@ -1399,6 +1415,10 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
 
   function updateCandidateLinkDraft(reviewItemId, value) {
     setCandidateLinkDrafts((current) => ({ ...current, [reviewItemId]: value }));
+  }
+
+  function updateReviewItemDraft(reviewItemId, value) {
+    setReviewItemDrafts((current) => ({ ...current, [reviewItemId]: value }));
   }
 
   function updateSplitSelection(itemId, sequence, value) {
@@ -1579,6 +1599,63 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
     }
   }
 
+  async function refreshReviewSnapshot() {
+    if (isActing) return;
+    setStatus("");
+    setIsActing(true);
+    try {
+      await requestJson(`${IMPORT_TASKS_ENDPOINT}/${taskId}/review-snapshot`, { method: "POST" });
+      await loadDetail();
+      setStatus("审核快照已刷新。");
+    } catch (error) {
+      setStatus(error.message);
+    } finally {
+      setIsActing(false);
+    }
+  }
+
+  async function runReviewItemAction(reviewItem, decision) {
+    if (isActing) return;
+    const reason = reviewItemDrafts[reviewItem.review_item_id]?.trim();
+    if (!reason) {
+      setStatus("请说明本次审核决定的理由。");
+      return;
+    }
+    setStatus("");
+    setIsActing(true);
+    try {
+      const response = await requestJson(
+        `${IMPORT_TASKS_ENDPOINT}/${taskId}/review-items/${encodeURIComponent(reviewItem.review_item_id)}/decision`,
+        { method: "POST", body: JSON.stringify({ decision, reason }) }
+      );
+      onTaskChanged(response.task);
+      await loadDetail();
+    } catch (error) {
+      setStatus(error.message);
+    } finally {
+      setIsActing(false);
+    }
+  }
+
+  async function runCommitReview(unitIds) {
+    if (isActing || unitIds.length === 0) return;
+    setStatus("");
+    setIsActing(true);
+    try {
+      const response = await requestJson(`${IMPORT_TASKS_ENDPOINT}/${taskId}/commit`, {
+        method: "POST",
+        body: JSON.stringify({ unit_ids: unitIds })
+      });
+      onTaskChanged(response.task);
+      await loadDetail();
+      setStatus("提交结果已记录。");
+    } catch (error) {
+      setStatus(error.message);
+    } finally {
+      setIsActing(false);
+    }
+  }
+
   if (!detail) {
     return React.createElement(
       "section",
@@ -1594,7 +1671,9 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
     note_proposals: noteProposals = [],
     classification_suggestions: classifications = [],
     metadata_tag_proposals: metadataTagProposals = [],
-    candidate_link_proposals: candidateLinkProposals = []
+    candidate_link_proposals: candidateLinkProposals = [],
+    review_snapshot: reviewSnapshot = null,
+    commit_journals: commitJournals = []
   } = detail;
   const canCancel = task.lifecycle === "running";
   const canResume = task.recovery_actions.includes("restart-scan") || task.recovery_actions.includes("restart-parse") || task.recovery_actions.includes("restart-ocr") || task.recovery_actions.includes("restart-derivation") || task.recovery_actions.includes("create-new-task");
@@ -1626,6 +1705,36 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
     : task.lifecycle !== "waiting-for-review"
       ? "候选链接只能在等待审核时处理。"
       : "";
+  const reviewItemsByUnit = new Map();
+  for (const reviewItem of reviewSnapshot?.review_items || []) {
+    const current = reviewItemsByUnit.get(reviewItem.unit_id) || [];
+    current.push(reviewItem);
+    reviewItemsByUnit.set(reviewItem.unit_id, current);
+  }
+  const unitRisk = (unit) => {
+    const itemsForUnit = reviewItemsByUnit.get(unit.unit_id) || [];
+    if (itemsForUnit.some((item) => item.risk === "blocking")) return "blocking";
+    if (itemsForUnit.some((item) => item.risk === "required-check" && !["accepted", "revised", "excluded"].includes(item.status))) return "required-check";
+    return "ordinary";
+  };
+  const filteredCommitUnits = (reviewSnapshot?.units || []).filter((unit) => (
+    commitFilter === "all" || unitRisk(unit) === commitFilter || unit.kind === commitFilter
+  ));
+  const eligibleCommitUnits = (reviewSnapshot?.units || []).filter((unit) => !unit.eligibility_reason);
+  const selectedCommitUnitIds = eligibleCommitUnits
+    .filter((unit) => selectedCommitUnits[unit.unit_id])
+    .map((unit) => unit.unit_id);
+  const commitControlReason = !reviewSnapshot
+    ? "正在等待审核快照。"
+    : reviewSnapshot.stale_reasons?.length
+      ? reviewSnapshot.stale_reasons.join("；")
+      : isActing
+        ? "正在更新审核或提交状态。"
+        : selectedCommitUnitIds.length === 0
+          ? reviewSnapshot.remaining_review_count
+            ? `仍有 ${reviewSnapshot.remaining_review_count} 个阻断或必须检查项。`
+            : "请先选择可提交单元。"
+          : "";
   return React.createElement(
     "section",
     { className: "import-task-detail", "aria-label": "导入任务详情" },
@@ -1676,6 +1785,139 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
         : null
     ),
     status ? React.createElement("p", { className: "status-line", role: "status" }, status) : null,
+    React.createElement(
+      "section",
+      { className: "commit-review-list", "aria-label": "提交审核", "aria-live": "polite" },
+      React.createElement("h3", null, "提交审核"),
+      reviewSnapshot
+        ? React.createElement(
+            React.Fragment,
+            null,
+            React.createElement(
+              "p",
+              { className: "scope-summary" },
+              `快照 ${reviewSnapshot.digest.slice(0, 12)}；目标 vault：${task.vault_label}；来源 ${reviewSnapshot.source_hashes.length}；受影响既有文件 ${reviewSnapshot.existing_file_hashes.length}`
+            ),
+            React.createElement(
+              "div",
+              { className: "review-summary" },
+              React.createElement("span", { className: "status-marker" }, `剩余审核 ${reviewSnapshot.remaining_review_count}`),
+              React.createElement("span", null, `新增 ${reviewSnapshot.units.filter((unit) => unit.kind === "source").length}`),
+              React.createElement("span", null, `既有笔记变更 ${reviewSnapshot.units.filter((unit) => unit.kind === "existing-note").length}`),
+              React.createElement("span", null, `异常 ${reviewSnapshot.units.filter((unit) => unit.kind === "unresolved").length}`),
+              React.createElement("span", null, `跳过 ${reviewSnapshot.units.filter((unit) => unit.kind === "skipped").length}`),
+              React.createElement("span", null, `确认缺口 ${reviewSnapshot.units.filter((unit) => unit.confirmed_gaps).length}`),
+              React.createElement("span", null, `已提交 ${commitJournals.filter((journal) => journal.status === "committed").length}`),
+              React.createElement("span", null, `失败 ${commitJournals.filter((journal) => journal.status === "failed").length}`)
+            ),
+            reviewSnapshot.stale_reasons?.length
+              ? React.createElement("p", { className: "status-line status-danger", role: "status" }, `陈旧原因：${reviewSnapshot.stale_reasons.join("；")}`)
+              : null,
+            React.createElement(
+              "div",
+              { className: "detail-actions" },
+              React.createElement("select", {
+                value: commitFilter,
+                onChange: (event) => setCommitFilter(event.target.value),
+                "aria-label": "提交单元筛选"
+              },
+              React.createElement("option", { value: "all" }, "全部单元"),
+              React.createElement("option", { value: "ordinary" }, "普通项"),
+              React.createElement("option", { value: "required-check" }, "必须检查"),
+              React.createElement("option", { value: "blocking" }, "阻断项"),
+              React.createElement("option", { value: "source" }, "新资料"),
+              React.createElement("option", { value: "existing-note" }, "既有笔记"),
+              React.createElement("option", { value: "unresolved" }, "异常/未处理"),
+              React.createElement("option", { value: "skipped" }, "跳过项")),
+              React.createElement("button", {
+                className: "secondary-button",
+                type: "button",
+                disabled: isActing || eligibleCommitUnits.length === 0,
+                title: eligibleCommitUnits.length ? "选择所有当前可提交单元。" : "没有可提交单元。",
+                onClick: () => setSelectedCommitUnits(Object.fromEntries(eligibleCommitUnits.map((unit) => [unit.unit_id, true])))
+              }, "全选可提交"),
+              React.createElement("button", {
+                className: "secondary-button",
+                type: "button",
+                disabled: isActing,
+                onClick: refreshReviewSnapshot
+              }, "刷新快照"),
+              React.createElement("button", {
+                className: "primary-button",
+                type: "button",
+                disabled: Boolean(commitControlReason),
+                title: commitControlReason || "提交已选择的原子单元。",
+                "aria-describedby": commitControlReason ? "commit-control-reason" : undefined,
+                onClick: () => runCommitReview(selectedCommitUnitIds)
+              }, "提交所选")
+            ),
+            commitControlReason
+              ? React.createElement("p", { id: "commit-control-reason", className: "status-line", role: "status" }, commitControlReason)
+              : null,
+            filteredCommitUnits.map((unit) => {
+              const journal = [...commitJournals].reverse().find((item) => item.unit_id === unit.unit_id);
+              const reason = unit.eligibility_reason;
+              const unitStatus = journal?.status === "committed"
+                ? "已提交"
+                : journal?.status === "failed"
+                  ? "失败，可重试"
+                  : reason
+                    ? `不可提交：${reason}`
+                    : unit.kind === "unresolved"
+                      ? "异常，需处理"
+                    : unit.kind === "skipped"
+                      ? "已跳过"
+                    : unit.confirmed_gaps
+                      ? "带已确认缺口完成"
+                      : "可提交";
+              return React.createElement(
+                "div",
+                { className: "section-row review-diff-row commit-unit-row", key: unit.unit_id },
+                React.createElement("input", {
+                  type: "checkbox",
+                  checked: Boolean(selectedCommitUnits[unit.unit_id]),
+                  disabled: Boolean(reason) || journal?.status === "committed" || isActing,
+                  onChange: (event) => setSelectedCommitUnits((current) => ({ ...current, [unit.unit_id]: event.target.checked })),
+                  "aria-label": `选择提交单元 ${unit.source_label}`
+                }),
+                React.createElement("span", { className: "row-title" }, unit.source_label),
+                React.createElement("span", { className: "row-meta" }, unit.kind === "existing-note" ? "既有笔记独立单元" : unit.kind === "unresolved" ? "异常资料" : unit.kind === "skipped" ? "跳过资料" : "源文件原子单元"),
+                React.createElement("span", { className: `row-status${reason ? " status-danger" : ""}` }, unitStatus),
+                unit.confirmed_gaps ? React.createElement("span", { className: "row-note" }, "带已确认缺口完成") : null,
+                journal?.reason ? React.createElement("span", { className: "row-note" }, `恢复原因：${journal.reason}`) : null,
+                ...unit.files.map((file) => React.createElement(
+                  "span",
+                  { className: "row-note", key: `${unit.unit_id}:${file.relative_path}` },
+                  `${file.kind === "source" ? "来源" : file.modifies_existing ? "修改" : "新增"}：${file.relative_path}`
+                )),
+                ...(reviewItemsByUnit.get(unit.unit_id) || [])
+                  .filter((item) => ["parse", "existing-note"].includes(item.object_type) && item.risk === "required-check")
+                  .map((item) => React.createElement(
+                    "div",
+                    { className: "detail-actions", key: item.review_item_id },
+                    React.createElement("span", { className: "row-note" }, `${item.object_type === "parse" ? "解析" : "既有笔记"}：${item.reason}`),
+                    item.status === "pending"
+                      ? React.createElement(
+                          React.Fragment,
+                          null,
+                          React.createElement("input", {
+                            type: "text",
+                            value: reviewItemDrafts[item.review_item_id] || "",
+                            disabled: isActing,
+                            onChange: (event) => updateReviewItemDraft(item.review_item_id, event.target.value),
+                            "aria-label": `${unit.source_label} 的审核决定理由`
+                          }),
+                          React.createElement("button", { type: "button", disabled: isActing, onClick: () => runReviewItemAction(item, "accepted") }, "接受"),
+                          React.createElement("button", { type: "button", disabled: isActing, onClick: () => runReviewItemAction(item, "revised") }, "确认修正"),
+                          React.createElement("button", { type: "button", disabled: isActing, onClick: () => runReviewItemAction(item, "excluded") }, "排除")
+                        )
+                      : React.createElement("span", { className: "row-status" }, `已${item.status === "accepted" ? "接受" : item.status === "revised" ? "修正" : "排除"}`)
+                  ))
+              );
+            })
+          )
+        : React.createElement("p", { className: "empty-state" }, "正在生成审核快照。")
+    ),
     React.createElement("h3", null, "资料项"),
     items.length === 0
       ? React.createElement("p", { className: "empty-state" }, "尚未发现文件。")

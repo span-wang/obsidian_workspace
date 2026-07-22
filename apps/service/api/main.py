@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from adapters.filesystem_vault_adapter import LocalVaultFilesystem
+from adapters.filesystem_vault_committer import LocalVaultCommitter
 from adapters.local_import_task_runner import LocalImportTaskRunner
 from adapters.openai_compatible_provider import OpenAiCompatibleProviderClient
 from adapters.sqlite_provider_repository import SqliteProviderRepository
@@ -61,6 +62,7 @@ from domain.derived_notes import (
 from domain.classification import ClassificationSuggestion
 from domain.candidate_links import CandidateLinkProposal
 from domain.metadata_tags import MetadataTagProposal, TagChangePreview, TagDefinition
+from domain.review_commits import CommitJournal, ReviewSnapshot
 from domain.tasks import ImportTask, ImportTaskEvent, ImportTaskItem
 from domain.vaults import Vault
 
@@ -109,6 +111,16 @@ IMPORT_TASK_SSE_EVENT_NAMES = frozenset(
         "candidate-links-generated",
         "candidate-links-accepted",
         "candidate-links-excluded",
+        "review-snapshot-created",
+        "review-snapshot-stale",
+        "review-item-decided",
+        "commit-started",
+        "commit-prepared",
+        "commit-unit-committed",
+        "commit-unit-failed",
+        "commit-partial-completed",
+        "commit-partial-failed",
+        "commit-completed",
     }
 )
 
@@ -164,6 +176,19 @@ class CandidateLinkDecisionCommand(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     decision: Literal["accepted", "excluded"]
+    reason: str = Field(pattern=r".*\S.*")
+
+
+class ReviewCommitCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    unit_ids: list[str] | None = None
+
+
+class ReviewItemDecisionCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: Literal["accepted", "revised", "excluded"]
     reason: str = Field(pattern=r".*\S.*")
 
 
@@ -681,6 +706,61 @@ def candidate_link_proposal_payload(proposal: CandidateLinkProposal) -> dict[str
     }
 
 
+def review_snapshot_payload(snapshot: ReviewSnapshot) -> dict[str, object]:
+    return {
+        "vault_id": snapshot.vault_id,
+        "digest": snapshot.digest,
+        "created_at": snapshot.created_at,
+        "source_hashes": [
+            {"item_id": item_id, "content_sha256": content_sha256}
+            for item_id, content_sha256 in snapshot.source_hashes
+        ],
+        "existing_file_hashes": [
+            {"relative_path": relative_path, "content_sha256": content_sha256}
+            for relative_path, content_sha256 in snapshot.existing_file_hashes
+        ],
+        "remaining_review_count": snapshot.remaining_review_count,
+        "stale_reasons": list(snapshot.stale_reasons),
+        "review_items": [item.to_dict() for item in snapshot.review_items],
+        "units": [
+            {
+                "unit_id": unit.unit_id,
+                "source_item_id": unit.source_item_id,
+                "source_label": unit.source_label,
+                "kind": unit.kind,
+                "confirmed_gaps": unit.confirmed_gaps,
+                "eligibility_reason": snapshot.commit_eligibility(unit.unit_id),
+                "files": [
+                    {
+                        "relative_path": file.relative_path,
+                        "kind": file.kind,
+                        "content_sha256": file.content_sha256,
+                        "modifies_existing": file.expected_existing_sha256 is not None,
+                    }
+                    for file in unit.files
+                ],
+            }
+            for unit in snapshot.units
+        ],
+    }
+
+
+def commit_journal_payload(journal: CommitJournal) -> dict[str, object]:
+    return {
+        "unit_id": journal.unit_id,
+        "status": journal.status,
+        "created_at": journal.created_at,
+        "reason": journal.reason,
+        "source_label": journal.unit.source_label,
+        "kind": journal.unit.kind,
+        "confirmed_gaps": journal.unit.confirmed_gaps,
+        "files": [
+            {"relative_path": file.relative_path, "kind": file.kind}
+            for file in journal.unit.files
+        ],
+    }
+
+
 def vault_tag_payload(tag: TagDefinition) -> dict[str, object]:
     return tag.to_dict()
 
@@ -922,14 +1002,16 @@ def create_app(
     app.state.import_selections = import_selections or ImportSelectionStore()
     if import_task_service is None:
         task_repository = SqliteImportTaskRepository(runtime.data_directory / "tasks.sqlite3")
+        recovered_tasks = task_repository.recover_interrupted_tasks()
         import_task_service = ImportTaskService(
             app.state.vault_service,
             task_repository,
             LocalImportTaskRunner(),
             app.state.policy_service,
             SqliteSourceRepository(runtime.data_directory / "tasks.sqlite3"),
+            LocalVaultCommitter(),
         )
-        task_repository.recover_interrupted_tasks()
+        import_task_service.recover_interrupted_commits(recovered_tasks)
     app.state.import_task_service = import_task_service
 
     @app.exception_handler(StarletteHTTPException)
@@ -1207,6 +1289,10 @@ def create_app(
                 app.state.import_task_service, "list_candidate_link_proposals", None
             )
             candidate_links = list_candidate_links(task_id) if list_candidate_links is not None else []
+            get_review_snapshot = getattr(app.state.import_task_service, "get_review_snapshot", None)
+            review_snapshot = get_review_snapshot(task_id) if get_review_snapshot is not None else None
+            list_commit_journals = getattr(app.state.import_task_service, "list_commit_journals", None)
+            commit_journals = list_commit_journals(task_id) if list_commit_journals is not None else []
             return {
                 "task": import_task_payload(task),
                 "items": [import_task_item_payload(item) for item in items],
@@ -1220,6 +1306,8 @@ def create_app(
                 "candidate_link_proposals": [
                     candidate_link_proposal_payload(proposal) for proposal in candidate_links
                 ],
+                "review_snapshot": review_snapshot_payload(review_snapshot) if review_snapshot else None,
+                "commit_journals": [commit_journal_payload(journal) for journal in commit_journals],
                 "event_cursor": event_cursor,
             }
         except Exception as error:
@@ -1335,6 +1423,60 @@ def create_app(
                         task_id, review_item_id, command.decision, command.reason
                     )
                 )
+            }
+        except Exception as error:
+            raise import_task_error(error) from error
+
+    @app.get("/api/import-tasks/{task_id}/review-snapshot")
+    def get_import_review_snapshot(request: Request, task_id: str) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            snapshot = app.state.import_task_service.get_review_snapshot(task_id)
+            return {"review_snapshot": review_snapshot_payload(snapshot) if snapshot else None}
+        except Exception as error:
+            raise import_task_error(error) from error
+
+    @app.post("/api/import-tasks/{task_id}/review-snapshot")
+    def refresh_import_review_snapshot(request: Request, task_id: str) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            snapshot = app.state.import_task_service.refresh_review_snapshot(task_id)
+            return {"review_snapshot": review_snapshot_payload(snapshot)}
+        except Exception as error:
+            raise import_task_error(error) from error
+
+    @app.post("/api/import-tasks/{task_id}/review-items/{review_item_id}/decision")
+    def decide_import_review_item(
+        request: Request,
+        task_id: str,
+        review_item_id: str,
+        command: ReviewItemDecisionCommand,
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            return {
+                "task": import_task_payload(
+                    app.state.import_task_service.decide_review_item(
+                        task_id, review_item_id, command.decision, command.reason
+                    )
+                )
+            }
+        except Exception as error:
+            raise import_task_error(error) from error
+
+    @app.post("/api/import-tasks/{task_id}/commit")
+    def commit_import_review(
+        request: Request, task_id: str, command: ReviewCommitCommand
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            task = app.state.import_task_service.commit_review(
+                task_id, tuple(command.unit_ids) if command.unit_ids is not None else None
+            )
+            journals = app.state.import_task_service.list_commit_journals(task_id)
+            return {
+                "task": import_task_payload(task),
+                "commit_journals": [commit_journal_payload(journal) for journal in journals],
             }
         except Exception as error:
             raise import_task_error(error) from error

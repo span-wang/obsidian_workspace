@@ -15,7 +15,7 @@ def _evidence(*units: StructuredContentUnit, document_kind: str = "pdf") -> Pars
     )
 
 
-def test_derivation_keeps_atomic_content_and_renders_navigable_notes() -> None:
+def test_derivation_keeps_atomic_content_without_same_source_navigation() -> None:
     from domain.derived_notes import derive_markdown_proposal
 
     proposal = derive_markdown_proposal(
@@ -42,10 +42,12 @@ def test_derivation_keeps_atomic_content_and_renders_navigable_notes() -> None:
     assert len(proposal.notes) == 2
     assert proposal.notes[0].source_locators == (EvidenceLocator(page=1), EvidenceLocator(page=2))
     assert "[[platform/sources/source-1-aaaaaaaaaaaaaaaa.pdf|原始资料]]" in proposal.notes[0].markdown
-    assert "[[platform/notes/source-1/02-unit-two|下一篇：Unit Two]]" in proposal.notes[0].markdown
+    assert "[[platform/notes/source-1/index|目录]]" not in proposal.notes[0].markdown
+    assert "[[platform/notes/source-1/02-unit-two|下一篇：Unit Two]]" not in proposal.notes[0].markdown
     assert "Question: Why?" in proposal.notes[1].markdown
     assert "Answer: Because." in proposal.notes[1].markdown
-    assert "[[platform/notes/source-1/01-unit-one|Unit One]]" in proposal.index_note.markdown
+    assert "[[platform/notes/source-1/01-unit-one|Unit One]]" not in proposal.index_note.markdown
+    assert "[[platform/sources/source-1-aaaaaaaaaaaaaaaa.pdf|原始资料]]" in proposal.index_note.markdown
 
 
 def test_derivation_uses_docx_locations_without_fabricating_pages() -> None:
@@ -241,7 +243,7 @@ def test_relocating_a_derived_proposal_only_changes_private_planned_paths() -> N
     assert relocated.index_note.relative_path == "platform/notes/mathematics/source-1/index.md"
     assert relocated.notes[0].relative_path == "platform/notes/mathematics/source-1/01-one.md"
     assert "[[platform/sources/mathematics/algebra-workbook.pdf|原始资料]]" in relocated.notes[0].markdown
-    assert "[[platform/notes/mathematics/source-1/02-two|下一篇：Two]]" in relocated.notes[0].markdown
+    assert "[[platform/notes/mathematics/source-1/02-two|下一篇：Two]]" not in relocated.notes[0].markdown
 
 
 def test_short_sections_merge_by_character_count_and_keep_lists_atomic() -> None:

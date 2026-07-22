@@ -11,6 +11,11 @@ from adapters.filesystem_vault_adapter import LocalVaultFilesystem
 from adapters.sqlite_source_repository import SqliteSourceRepository
 from adapters.sqlite_task_repository import SqliteImportTaskRepository
 from adapters.sqlite_vault_repository import SqliteVaultRepository
+from domain.candidate_links import (
+    CandidateLinkEvidence,
+    CandidateLinkProposal,
+    LEGACY_CANDIDATE_LINK_ISOLATION_REASON,
+)
 from domain.evidence import (
     EvidenceLocator,
     OcrEvidence,
@@ -909,7 +914,46 @@ def test_external_markdown_gets_a_private_native_candidate_without_a_source_id(t
     assert candidates == [("native", "platform/notes/external.md", "line:1")]
 
 
-def test_candidate_links_stay_private_and_reject_stale_sources(tmp_path: Path) -> None:
+def test_existing_markdown_needs_confirmation_and_cannot_be_relocated(tmp_path: Path) -> None:
+    vault_path = tmp_path / "vault"
+    source_file = vault_path / "platform" / "notes" / "existing.md"
+    source_file.parent.mkdir(parents=True)
+    source_file.write_text("# Existing\n\nNative body", encoding="utf-8")
+    vault_repository = SqliteVaultRepository(tmp_path / "vaults.sqlite3")
+    vault_service = VaultService(vault_repository, LocalVaultFilesystem())
+    vault = vault_service.authorize(vault_path, "platform")
+    service = ImportTaskService(
+        vault_service,
+        SqliteImportTaskRepository(tmp_path / "tasks.sqlite3"),
+        NativeMarkdownWorker(),
+    )
+
+    task = service.create(vault.vault_id, ImportSelection("session", "files", (source_file,), 999.0))
+    snapshot = service.refresh_review_snapshot(task.task_id)
+    existing_review = next(item for item in snapshot.review_items if item.object_type == "existing-note")
+    item = service.list_items(task.task_id)[0]
+
+    assert snapshot.commit_eligibility(existing_review.unit_id)
+    service.decide_review_item(
+        task.task_id, existing_review.review_item_id, "accepted", "Keep the existing note in place."
+    )
+    assert next(
+        item
+        for item in service.get_review_snapshot(task.task_id).review_items
+        if item.review_item_id == existing_review.review_item_id
+    ).status == "accepted"
+    with pytest.raises(ImportTaskError, match="cannot be moved"):
+        service.revise_classification_suggestion(
+            task.task_id,
+            item.item_id,
+            domain="language",
+            target_folder="platform/notes/language",
+            filename="existing.md",
+            reason="Attempted move.",
+        )
+
+
+def test_new_imports_generate_reviewable_candidate_links(tmp_path: Path) -> None:
     class MultiNativeMarkdownWorker:
         def start(self, task, on_event) -> None:
             for source_path in task.source_paths:
@@ -942,6 +986,7 @@ def test_candidate_links_stay_private_and_reject_stale_sources(tmp_path: Path) -
     database_path = tmp_path / "tasks.sqlite3"
     repository = SqliteImportTaskRepository(database_path)
     service = ImportTaskService(vault_service, repository, MultiNativeMarkdownWorker())
+    before = (first_source.read_bytes(), second_source.read_bytes())
 
     task = service.create(
         vault.vault_id, ImportSelection("session", "files", (first_source, second_source), 999.0)
@@ -952,35 +997,95 @@ def test_candidate_links_stay_private_and_reject_stale_sources(tmp_path: Path) -
     assert len(candidates) == 1
     assert candidates[0].is_existing_note_change
     assert candidates[0].decision is None
-    reopened = SqliteImportTaskRepository(database_path)
-    assert reopened.list_candidate_link_proposals(task.task_id) == candidates
-    before = (first_source.read_bytes(), second_source.read_bytes())
-
-    decided = service.decide_candidate_link_proposal(
+    assert SqliteImportTaskRepository(database_path).list_candidate_link_proposals(task.task_id) == candidates
+    service.decide_candidate_link_proposal(
         task.task_id, candidates[0].review_item_id, "accepted", "Evidence was reviewed."
     )
 
     assert service.list_candidate_link_proposals(task.task_id)[0].decision == "accepted"
     assert (first_source.read_bytes(), second_source.read_bytes()) == before
-    assert decided.phase == "waiting-for-review"
 
-    stale_task = service.create(
-        vault.vault_id, ImportSelection("session", "files", (first_source, second_source), 999.0)
+
+def test_legacy_candidate_links_are_preserved_as_stale_history(tmp_path: Path) -> None:
+    database_path = tmp_path / "tasks.sqlite3"
+    candidate = CandidateLinkProposal(
+        task_id="legacy-task",
+        review_item_id="legacy-candidate",
+        revision=1,
+        vault_id="vault-1",
+        source_item_id=1,
+        source_path="platform/notes/source.md",
+        source_proposal_revision=1,
+        source_proposal_sha256="a" * 64,
+        target_item_id=2,
+        target_path="platform/notes/target.md",
+        target_proposal_revision=1,
+        target_proposal_sha256="b" * 64,
+        reason="Legacy candidate link.",
+        confidence=0.9,
+        source_evidence=CandidateLinkEvidence("platform/notes/source.md", "line:1", "Source evidence."),
+        target_evidence=CandidateLinkEvidence("platform/notes/target.md", "line:1", "Target evidence."),
+        is_existing_note_change=True,
+        status="pending",
+        created_at="2026-07-22T00:00:00+00:00",
     )
-    stale_candidate = service.list_candidate_link_proposals(stale_task.task_id)[0]
-    second_source.write_text("# Practice\nUnrelated history note.", encoding="utf-8")
-    with pytest.raises(ImportTaskError, match="stale"):
-        service.decide_candidate_link_proposal(
-            stale_task.task_id, stale_candidate.review_item_id, "excluded", "Source changed."
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE import_candidate_link_proposals (
+                candidate_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                review_item_id TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                vault_id TEXT NOT NULL,
+                source_item_id INTEGER NOT NULL,
+                target_item_id INTEGER NOT NULL,
+                proposal_json TEXT NOT NULL,
+                requires_review INTEGER NOT NULL,
+                decision TEXT,
+                created_at TEXT NOT NULL,
+                invalidated_at TEXT,
+                invalidation_reason TEXT,
+                UNIQUE(task_id, review_item_id, revision)
+            )
+            """
         )
-    stale_proposals = service.list_candidate_link_proposals(stale_task.task_id)
-    assert len(stale_proposals) == 1
-    assert stale_proposals[0].status == "stale"
-    assert stale_proposals[0].stale_reason is not None
-    assert "Source content changed" in stale_proposals[0].stale_reason
-    stale_task_after_change = service.get(stale_task.task_id)
-    assert stale_task_after_change.phase == "failed"
-    assert stale_task_after_change.recovery_actions == ("restart-scan",)
+        connection.execute(
+            """
+            INSERT INTO import_candidate_link_proposals (
+                task_id, review_item_id, revision, vault_id, source_item_id, target_item_id,
+                proposal_json, requires_review, decision, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                candidate.task_id,
+                candidate.review_item_id,
+                candidate.revision,
+                candidate.vault_id,
+                candidate.source_item_id,
+                candidate.target_item_id,
+                json.dumps(candidate.to_dict()),
+                0,
+                None,
+                candidate.created_at,
+            ),
+        )
+
+    repository = SqliteImportTaskRepository(database_path)
+    proposals = repository.list_candidate_link_proposals(candidate.task_id)
+
+    assert len(proposals) == 1
+    assert proposals[0].status == "stale"
+    assert proposals[0].stale_reason == LEGACY_CANDIDATE_LINK_ISOLATION_REASON
+    assert proposals[0].is_legacy_isolated
+    with pytest.raises(ValueError, match="Stale"):
+        proposals[0].with_decision("accepted", "Reviewed.", "2026-07-22T00:01:00+00:00")
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT invalidated_at, invalidation_reason FROM import_candidate_link_proposals"
+        ).fetchone()
+    assert row[0] is not None
+    assert row[1] == LEGACY_CANDIDATE_LINK_ISOLATION_REASON
 
 
 def test_classification_is_private_and_relocates_only_the_derived_proposal_plan(tmp_path: Path) -> None:

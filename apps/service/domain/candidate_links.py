@@ -11,6 +11,7 @@ from domain.vaults import ensure_same_vault
 
 
 LOW_CONFIDENCE_THRESHOLD = 0.75
+LEGACY_CANDIDATE_LINK_ISOLATION_REASON = "Legacy bidirectional links are isolated."
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _TERM_PATTERN = re.compile(r"[a-z][a-z0-9_-]{2,}|[\u4e00-\u9fff]{2,}", re.IGNORECASE)
 _STOP_TERMS = frozenset(
@@ -124,6 +125,10 @@ class CandidateLinkProposal:
     @property
     def requires_review(self) -> bool:
         return self.status == "required-check" and self.decision is None
+
+    @property
+    def is_legacy_isolated(self) -> bool:
+        return self.status == "stale" and self.stale_reason == LEGACY_CANDIDATE_LINK_ISOLATION_REASON
 
     def with_decision(
         self, decision: str, reason: str, decided_at: str

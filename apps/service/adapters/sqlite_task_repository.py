@@ -6,10 +6,11 @@ from dataclasses import replace
 from pathlib import Path
 
 from domain.derived_notes import NoteProposal, private_index_candidates, proposal_from_dict
-from domain.candidate_links import CandidateLinkProposal
+from domain.candidate_links import CandidateLinkProposal, LEGACY_CANDIDATE_LINK_ISOLATION_REASON
 from domain.classification import ClassificationSuggestion
 from domain.evidence import EvidenceLocator, OcrEvidence, OcrTarget, ParseEvidence, ParseIssue
 from domain.metadata_tags import MetadataTagProposal, TagChangePreview, TagDefinition
+from domain.review_commits import CommitJournal, ReviewDecision, ReviewSnapshot
 from domain.sources import VersionSuggestion
 from domain.tasks import (
     ImportTask,
@@ -19,6 +20,9 @@ from domain.tasks import (
     OcrTargetSummary,
     utc_now,
 )
+
+
+_LEGACY_CANDIDATE_LINK_ISOLATION_MIGRATION = "legacy-candidate-link-isolation-2026-07-22"
 
 
 class SqliteImportTaskRepository:
@@ -380,9 +384,80 @@ class SqliteImportTaskRepository:
                 connection, "import_candidate_link_proposals", "invalidation_reason TEXT"
             )
             connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS import_repository_migrations (
+                    migration_id TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                )
+                """
+            )
+            self._isolate_legacy_candidate_links(connection)
+            connection.execute(
                 "CREATE INDEX IF NOT EXISTS vault_tag_definitions_latest "
                 "ON vault_tag_definitions(vault_id, name, revision DESC)"
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS import_review_snapshots (
+                    snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    vault_id TEXT NOT NULL,
+                    digest TEXT NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(task_id, digest)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS import_review_decisions (
+                    task_id TEXT NOT NULL,
+                    review_item_id TEXT NOT NULL,
+                    decision_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(task_id, review_item_id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS import_commit_journals (
+                    journal_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    vault_id TEXT NOT NULL,
+                    unit_id TEXT NOT NULL,
+                    snapshot_digest TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    journal_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(task_id, unit_id, snapshot_digest, status)
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS import_review_snapshots_latest "
+                "ON import_review_snapshots(task_id, snapshot_id DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS import_commit_journals_task "
+                "ON import_commit_journals(task_id, journal_id DESC)"
+            )
+
+    @staticmethod
+    def _isolate_legacy_candidate_links(connection: sqlite3.Connection) -> None:
+        timestamp = utc_now()
+        migration = connection.execute(
+            "INSERT OR IGNORE INTO import_repository_migrations (migration_id, applied_at) VALUES (?, ?)",
+            (_LEGACY_CANDIDATE_LINK_ISOLATION_MIGRATION, timestamp),
+        )
+        if migration.rowcount == 0:
+            return
+        connection.execute(
+            "UPDATE import_candidate_link_proposals "
+            "SET invalidated_at = ?, invalidation_reason = ? WHERE invalidated_at IS NULL",
+            (timestamp, LEGACY_CANDIDATE_LINK_ISOLATION_REASON),
+        )
 
     def create(self, task: ImportTask, event_type: str) -> None:
         with self._connect() as connection:
@@ -1263,6 +1338,108 @@ class SqliteImportTaskRepository:
             for row in rows
         )
 
+    def record_review_snapshot(self, snapshot: ReviewSnapshot, event_type: str) -> None:
+        with self._connect() as connection:
+            task = self._task_from_connection(connection, snapshot.task_id)
+            if task.vault_id != snapshot.vault_id:
+                raise ValueError("Review snapshot cannot cross vault boundaries.")
+            connection.execute(
+                """
+                INSERT INTO import_review_snapshots (
+                    task_id, vault_id, digest, snapshot_json, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(task_id, digest) DO UPDATE SET
+                    vault_id = excluded.vault_id,
+                    snapshot_json = excluded.snapshot_json,
+                    created_at = excluded.created_at
+                """,
+                (
+                    snapshot.task_id,
+                    snapshot.vault_id,
+                    snapshot.digest,
+                    json.dumps(snapshot.to_dict()),
+                    snapshot.created_at,
+                ),
+            )
+            self._append_event(connection, snapshot.task_id, event_type, snapshot.created_at)
+
+    def get_review_snapshot(self, task_id: str) -> ReviewSnapshot | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT snapshot_json FROM import_review_snapshots
+                WHERE task_id = ? ORDER BY snapshot_id DESC LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+        return ReviewSnapshot.from_dict(json.loads(row["snapshot_json"])) if row is not None else None
+
+    def record_review_decision(self, decision: ReviewDecision, event_type: str) -> None:
+        with self._connect() as connection:
+            self._task_from_connection(connection, decision.task_id)
+            connection.execute(
+                """
+                INSERT INTO import_review_decisions (
+                    task_id, review_item_id, decision_json, created_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(task_id, review_item_id) DO UPDATE SET
+                    decision_json = excluded.decision_json,
+                    created_at = excluded.created_at
+                """,
+                (
+                    decision.task_id,
+                    decision.review_item_id,
+                    json.dumps(decision.to_dict()),
+                    decision.decided_at,
+                ),
+            )
+            self._append_event(connection, decision.task_id, event_type, decision.decided_at)
+
+    def get_review_decision(self, task_id: str, review_item_id: str) -> ReviewDecision | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT decision_json FROM import_review_decisions
+                WHERE task_id = ? AND review_item_id = ?
+                """,
+                (task_id, review_item_id),
+            ).fetchone()
+        return ReviewDecision.from_dict(json.loads(row["decision_json"])) if row is not None else None
+
+    def record_commit_journal(self, journal: CommitJournal, event_type: str) -> None:
+        with self._connect() as connection:
+            task = self._task_from_connection(connection, journal.task_id)
+            if task.vault_id != journal.vault_id:
+                raise ValueError("Commit journal cannot cross vault boundaries.")
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO import_commit_journals (
+                    task_id, vault_id, unit_id, snapshot_digest, status, journal_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    journal.task_id,
+                    journal.vault_id,
+                    journal.unit_id,
+                    journal.snapshot_digest,
+                    journal.status,
+                    json.dumps(journal.to_dict()),
+                    journal.created_at,
+                ),
+            )
+            self._append_event(connection, journal.task_id, event_type, journal.created_at)
+
+    def list_commit_journals(self, task_id: str) -> list[CommitJournal]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT journal_json FROM import_commit_journals
+                WHERE task_id = ? ORDER BY journal_id
+                """,
+                (task_id,),
+            ).fetchall()
+        return [CommitJournal.from_dict(json.loads(row["journal_json"])) for row in rows]
+
     def find_parse_evidence(
         self, vault_id: str, source_id: str, content_sha256: str
     ) -> ParseEvidence | None:
@@ -1313,6 +1490,44 @@ class SqliteImportTaskRepository:
 
     def recover_interrupted_tasks(self) -> list[ImportTask]:
         with self._connect() as connection:
+            timestamp = utc_now()
+            prepared_journals = connection.execute(
+                """
+                SELECT prepared.journal_json FROM import_commit_journals AS prepared
+                WHERE prepared.status = 'prepared'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM import_commit_journals AS terminal
+                      WHERE terminal.task_id = prepared.task_id
+                        AND terminal.unit_id = prepared.unit_id
+                        AND terminal.snapshot_digest = prepared.snapshot_digest
+                        AND terminal.status IN ('committed', 'failed')
+                  )
+                """
+            ).fetchall()
+            for row in prepared_journals:
+                journal = CommitJournal.from_dict(json.loads(row["journal_json"]))
+                failed_journal = replace(
+                    journal,
+                    status="failed",
+                    created_at=timestamp,
+                    reason="The vault commit was interrupted before its result was recorded.",
+                )
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO import_commit_journals (
+                        task_id, vault_id, unit_id, snapshot_digest, status, journal_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        failed_journal.task_id,
+                        failed_journal.vault_id,
+                        failed_journal.unit_id,
+                        failed_journal.snapshot_digest,
+                        failed_journal.status,
+                        json.dumps(failed_journal.to_dict()),
+                        failed_journal.created_at,
+                    ),
+                )
             rows = connection.execute(
                 "SELECT * FROM import_tasks WHERE lifecycle = 'running'"
             ).fetchall()
@@ -1322,6 +1537,7 @@ class SqliteImportTaskRepository:
                 was_parsing = previous_task.phase == "parsing"
                 was_ocr = previous_task.phase == "ocr"
                 was_deriving = previous_task.phase == "deriving-markdown"
+                was_committing = previous_task.phase == "committing"
                 task = replace(
                     previous_task,
                     lifecycle="recoverable",
@@ -1334,6 +1550,8 @@ class SqliteImportTaskRepository:
                         if was_ocr
                         else ("restart-derivation",)
                         if was_deriving
+                        else ("retry-commit",)
+                        if was_committing
                         else ("restart-scan",)
                     ),
                     failure_reason=(
@@ -1343,6 +1561,8 @@ class SqliteImportTaskRepository:
                         if was_ocr
                         else "The private Markdown derivation was interrupted before completion."
                         if was_deriving
+                        else "A journaled vault commit was interrupted before completion."
+                        if was_committing
                         else "The local scan was interrupted before completion."
                     ),
                     updated_at=utc_now(),

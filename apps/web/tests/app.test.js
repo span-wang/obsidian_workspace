@@ -75,7 +75,17 @@ test("uses relative same-origin endpoints for health and local session checks", 
     "metadata-tags-excluded",
     "candidate-links-generated",
     "candidate-links-accepted",
-    "candidate-links-excluded"
+    "candidate-links-excluded",
+    "review-snapshot-created",
+    "review-snapshot-stale",
+    "review-item-decided",
+    "commit-started",
+    "commit-prepared",
+    "commit-unit-committed",
+    "commit-unit-failed",
+    "commit-partial-completed",
+    "commit-partial-failed",
+    "commit-completed"
   ]);
 });
 

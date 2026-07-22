@@ -488,17 +488,10 @@ def _render_proposal(
             source_relative_path=source_relative_path,
             locators=locators,
         )
-        previous_note = note_specs[sequence - 2] if sequence > 1 else None
-        next_note = note_specs[sequence] if sequence < len(note_specs) else None
-        links = [f"[[{source_relative_path}|原始资料]]", f"[[{notes_root}/index|目录]]"]
-        if previous_note:
-            links.append(f"[[{notes_root}/{previous_note[2]}|上一篇：{previous_note[1]}]]")
-        if next_note:
-            links.append(f"[[{notes_root}/{next_note[2]}|下一篇：{next_note[1]}]]")
         body = "\n\n".join(units[index].text for index in group)
         markdown = (
             f"{_frontmatter(provenance)}\n# {title}\n\n"
-            f"来源：{' · '.join(links)}\n\n{body}\n"
+            f"来源：[[{source_relative_path}|原始资料]]\n\n{body}\n"
         )
         notes.append(
             ProposedMarkdownNote(
@@ -511,12 +504,9 @@ def _render_proposal(
                 provenance=provenance,
                 markdown=markdown,
             )
-        )
+    )
     index_path = f"{notes_root}/index.md"
-    index_links = "\n".join(
-        f"- [[{PurePosixPath(note.relative_path).with_suffix('')}|{note.title}]]"
-        for note in notes
-    ) or "- 尚无可生成的内容单元"
+    empty_index_notice = "\n- 尚无可生成的内容单元" if not notes else ""
     index_locators = _unique_locators(unit.locator for unit in units) or fallback_locators
     index_provenance = _provenance(
         vault_id=vault_id,
@@ -536,7 +526,7 @@ def _render_proposal(
         provenance=index_provenance,
         markdown=(
             f"{_frontmatter(index_provenance)}\n"
-            f"# {source_label}\n\n来源：[[{source_relative_path}|原始资料]]\n\n{index_links}\n"
+            f"# {source_label}\n\n来源：[[{source_relative_path}|原始资料]]{empty_index_notice}\n"
         ),
     )
     return DerivedMarkdownProposal(
@@ -553,6 +543,32 @@ def _render_proposal(
         risks=risks,
         revision=revision,
     )
+
+
+def _legacy_same_source_navigation_links(
+    *,
+    source_relative_path: str,
+    notes_root: str,
+    note_specs: list[tuple[tuple[int, ...], str, str]],
+    sequence: int,
+) -> str:
+    """Retain the former same-source navigation algorithm while it is isolated."""
+    previous_note = note_specs[sequence - 2] if sequence > 1 else None
+    next_note = note_specs[sequence] if sequence < len(note_specs) else None
+    links = [f"[[{source_relative_path}|原始资料]]", f"[[{notes_root}/index|目录]]"]
+    if previous_note:
+        links.append(f"[[{notes_root}/{previous_note[2]}|上一篇：{previous_note[1]}]]")
+    if next_note:
+        links.append(f"[[{notes_root}/{next_note[2]}|下一篇：{next_note[1]}]]")
+    return " · ".join(links)
+
+
+def _legacy_same_source_index_links(notes: list[ProposedMarkdownNote]) -> str:
+    """Retain the former index-to-child links while they are isolated."""
+    return "\n".join(
+        f"- [[{PurePosixPath(note.relative_path).with_suffix('')}|{note.title}]]"
+        for note in notes
+    ) or "- 尚无可生成的内容单元"
 
 
 def _provenance(

@@ -821,6 +821,27 @@ button:disabled {
   line-height: 1.5;
 }
 
+.commit-review-list,
+.review-summary {
+  display: grid;
+  gap: 0.6rem;
+}
+
+.review-summary {
+  grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr));
+  padding-block: 0.55rem;
+  border-block: 1px solid var(--border-subtle);
+}
+
+.commit-unit-row {
+  grid-template-columns: auto minmax(10rem, 1.2fr) minmax(8rem, 1fr) minmax(10rem, 1fr);
+}
+
+.commit-unit-row input[type="checkbox"] {
+  align-self: start;
+  margin-top: 0.22rem;
+}
+
 .progress-sequence span:not(:last-child)::after {
   padding-left: 16px;
   color: #8a8a84;
