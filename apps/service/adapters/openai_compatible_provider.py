@@ -102,6 +102,37 @@ class OpenAiCompatibleProviderClient:
         if not isinstance(data, list) or not any(self._has_embedding(item) for item in data):
             raise ProviderClientError("Embedding probe returned no usable vectors.")
 
+    def generate_chat(
+        self,
+        endpoint: str,
+        secret: str,
+        model_id: str,
+        prompt: str,
+        cancel_event: Event | None = None,
+    ) -> str:
+        normalized_prompt = prompt.strip()
+        if not normalized_prompt or len(normalized_prompt) > 200_000:
+            raise ProviderClientError("Generation prompt is invalid.")
+        payload = self._json_request(
+            endpoint,
+            "/chat/completions",
+            secret,
+            {
+                "model": model_id,
+                "messages": [{"role": "user", "content": normalized_prompt}],
+                "stream": False,
+            },
+            cancel_event,
+        )
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            raise ProviderClientError("Generation returned no usable choices.")
+        message = choices[0].get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, str) or not content.strip() or len(content) > self._MAX_RESPONSE_BYTES:
+            raise ProviderClientError("Generation returned no usable content.")
+        return content.strip()
+
     def _json_request(
         self,
         endpoint: str,

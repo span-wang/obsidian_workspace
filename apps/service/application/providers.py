@@ -277,6 +277,23 @@ class ProviderService:
             raise ProviderUnavailableError(f"The selected {model_type} Model is unavailable. Choose another model.")
         return ResolvedProviderModel(provider, model)
 
+    def generate_chat(self, provider_id: str, model_id: str, prompt: str) -> str:
+        normalized_prompt = prompt.strip()
+        if not normalized_prompt or len(normalized_prompt) > 200_000:
+            raise ProviderUnavailableError("The generation request is invalid.")
+        with self._provider_lock(provider_id):
+            resolved = self.resolve_specific_model("chat", provider_id, model_id)
+            try:
+                secret = self.credentials.read(resolved.provider.credential_reference)
+            except Exception as error:
+                raise ProviderUnavailableError("The selected Provider credential is unavailable.") from error
+            try:
+                return self.client.generate_chat(
+                    resolved.provider.endpoint, secret, resolved.model.model_id, normalized_prompt
+                )
+            except Exception as error:
+                raise ProviderUnavailableError("The selected Provider could not generate this section.") from error
+
     @staticmethod
     def _validate_name(name: str) -> str:
         normalized = name.strip()

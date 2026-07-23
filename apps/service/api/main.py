@@ -83,6 +83,7 @@ from domain.sessions import (
     SessionCompletenessResult,
     SessionDetail,
     SessionGenerationResult,
+    SessionKnowledgeOrganizationResult,
     SessionMessage,
     SessionPage,
     SessionRetrievalResult,
@@ -664,6 +665,9 @@ def session_task_snapshot_payload(snapshot) -> dict[str, object]:
             "excluded_count": sum(item.disposition == "excluded" for item in snapshot.coverage_items),
             "uncovered_count": sum(item.disposition == "uncovered" for item in snapshot.coverage_items),
         } if snapshot.intent == "completeness" else None,
+        "knowledge_organization_plan": knowledge_organization_plan_payload(
+            snapshot.organization_sections
+        ) if snapshot.intent == "knowledge-organization" else None,
         "status": snapshot.status,
         "invalidation_reason": snapshot.invalidation_reason,
         "created_at": snapshot.created_at,
@@ -702,6 +706,11 @@ def session_task_preview_payload(preview) -> dict[str, object]:
         "source_digest": preview.source_digest,
         "source_sample": source_sample,
         "source_sample_truncated": preview.source_count > len(source_sample),
+        "knowledge_organization_plan": knowledge_organization_plan_payload(
+            preview.organization_sections,
+            evidence_count=preview.organization_evidence_count,
+            is_bounded_preview=preview.organization_budget_exceeded,
+        ) if preview.intent == "knowledge-organization" else None,
         "is_ready": preview.is_ready,
         "blocking_reason": preview.blocking_reason,
         "recovery_action": preview.recovery_action,
@@ -877,6 +886,122 @@ def session_completeness_result_payload(
     }
 
 
+def knowledge_organization_plan_payload(
+    sections, *, evidence_count: int | None = None, is_bounded_preview: bool = False
+) -> dict[str, object]:
+    return {
+        "section_count": len(sections),
+        "knowledge_base_evidence_only": True,
+        "evidence_count": evidence_count if evidence_count is not None else sum(
+            len(section.evidence) for section in sections
+        ),
+        "is_bounded_preview": is_bounded_preview,
+        "sections": [
+            {
+                "ordinal": section.ordinal,
+                "title": section.title,
+                "goal": section.goal,
+                "scope_path": section.scope_path,
+                "evidence_count": len(section.evidence),
+                "evidence": [
+                    {
+                        "ordinal": item.ordinal,
+                        "source_ordinal": item.source_ordinal,
+                        "identity_kind": item.identity_kind,
+                        "relative_path": item.relative_path,
+                        "content_sha256": item.content_sha256,
+                        "source_id": item.source_id,
+                        "source_content_hash": item.source_content_hash,
+                        "source_path": item.source_path,
+                        "heading": item.heading,
+                        "location": item.location,
+                        "page": item.page,
+                        "excerpt": item.excerpt,
+                    }
+                    for item in section.evidence
+                ],
+            }
+            for section in sections
+        ],
+    }
+
+
+def session_knowledge_organization_result_payload(
+    result: SessionKnowledgeOrganizationResult, snapshot=None
+) -> dict[str, object]:
+    sections = snapshot.organization_sections if snapshot is not None else ()
+    outcomes = {outcome.ordinal: outcome for outcome in result.outcomes}
+    stale = snapshot is not None and snapshot.status == "invalidated"
+    plan = knowledge_organization_plan_payload(sections)
+    rendered_sections = []
+    for section in plan["sections"]:
+        outcome = outcomes.get(section["ordinal"])
+        evidence_by_ordinal = {item["ordinal"]: item for item in section["evidence"]}
+        rendered_sections.append({
+            **section,
+            "status": outcome.status if outcome is not None else "planned",
+            "reason": outcome.reason if outcome is not None else None,
+            "prepared_evidence_count": outcome.evidence_count if outcome is not None else 0,
+            "conclusions": [
+                {
+                    "ordinal": conclusion.ordinal,
+                    "content": conclusion.content,
+                    "evidence": [
+                        evidence_by_ordinal[ordinal]
+                        for ordinal in conclusion.evidence_ordinals
+                        if ordinal in evidence_by_ordinal
+                    ],
+                }
+                for conclusion in outcome.conclusions
+            ] if outcome is not None else [],
+            "independent_source_count": len({
+                ("derived", item["source_id"]) if item["identity_kind"] == "derived" else (
+                    "native", item["content_sha256"]
+                )
+                for item in section["evidence"]
+            }),
+        })
+    return {
+        "result_id": result.result_id,
+        "task_id": result.task_id,
+        "snapshot_id": result.snapshot_id,
+        "status": "source-changed" if stale else result.status,
+        "summary": result.summary,
+        "recovery_action": result.recovery_action,
+        "duration_ms": result.duration_ms,
+        "created_at": result.created_at,
+        "structure_kind": result.structure_kind,
+        "authorization_id": result.authorization_id,
+        "authorization_status": result.authorization_status,
+        "vault_id": snapshot.vault_id if snapshot is not None else None,
+        "snapshot_status": snapshot.status if snapshot is not None else None,
+        "is_stale": stale,
+        "invalidation_reason": snapshot.invalidation_reason if snapshot is not None else None,
+        "frozen_context": {
+            "vault_id": snapshot.vault_id,
+            "scope_kind": snapshot.scope_kind,
+            "scope_path": snapshot.scope_path,
+            "source_count": snapshot.source_count,
+            "source_digest": snapshot.source_digest,
+            "index_status": snapshot.index_status,
+            "index_updated_at": snapshot.index_updated_at,
+            "index_digest": snapshot.index_digest,
+            "policy_revision": snapshot.policy_revision,
+            "exclusion_summary": snapshot.exclusion_summary,
+        } if snapshot is not None else None,
+        "local_evidence_only": True,
+        "section_counts": {
+            "planned": len(sections),
+            "prepared": sum(section["status"] == "prepared" for section in rendered_sections),
+            "running": sum(section["status"] == "running" for section in rendered_sections),
+            "completed": sum(section["status"] == "completed" for section in rendered_sections),
+            "failed": sum(section["status"] == "failed" for section in rendered_sections),
+            "recoverable": sum(section["status"] == "recoverable" for section in rendered_sections),
+        },
+        "sections": rendered_sections,
+    }
+
+
 def session_attachment_payload(attachment) -> dict[str, object]:
     return {
         "attachment_id": attachment.attachment_id,
@@ -911,6 +1036,12 @@ def session_detail_payload(
                 result, snapshots.get(result.snapshot_id), coverage_limit=coverage_limit
             )
             for result in detail.completeness_results
+        ],
+        "knowledge_organization_results": [
+            session_knowledge_organization_result_payload(
+                result, snapshots.get(result.snapshot_id)
+            )
+            for result in detail.knowledge_organization_results
         ],
     }
 
@@ -1930,6 +2061,8 @@ def create_app(
             payload = (
                 session_completeness_result_payload(result, snapshot)
                 if isinstance(result, SessionCompletenessResult)
+                else session_knowledge_organization_result_payload(result, snapshot)
+                if isinstance(result, SessionKnowledgeOrganizationResult)
                 else session_retrieval_result_payload(result, snapshot)
             )
             return {"result": payload}

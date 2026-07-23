@@ -652,6 +652,7 @@ export function SessionManagement({
   onPreviewTask,
   onCreateTask,
   onExecuteTask,
+  onConfirmKnowledgeOrganizationAuthorization,
   onLoadCompletenessCoverage,
   onEditGenerationResult,
   onReverifyGenerationResult
@@ -680,6 +681,7 @@ export function SessionManagement({
     || null;
   const retrievalResults = activeDetail?.retrieval_results || [];
   const completenessResults = activeDetail?.completeness_results || [];
+  const knowledgeOrganizationResults = activeDetail?.knowledge_organization_results || [];
   const generationResults = activeDetail?.generation_results || [];
   const snapshotsById = new Map((activeDetail?.task_snapshots || []).map((snapshot) => [snapshot.snapshot_id, snapshot]));
   const vaultsById = new Map(vaults.map((vault) => [vault.vault_id, vault]));
@@ -863,6 +865,7 @@ export function SessionManagement({
   function taskSnapshotStatusText(snapshot) {
     if (snapshot.status === "invalidated") return "已失效";
     if (snapshot.status === "completed") return "已完成";
+    if (snapshot.status === "preparing") return "正在准备";
     if (snapshot.status === "recoverable") return "待恢复";
     if (snapshot.status === "failed") return "失败";
     return "已准备";
@@ -1151,6 +1154,132 @@ export function SessionManagement({
     );
   }
 
+  function knowledgeOrganizationPlanView(plan, outcomeByOrdinal = new Map()) {
+    if (!plan?.sections?.length) {
+      return React.createElement("p", { className: "organization-plan-empty" }, "当前范围没有可准备的计划段。");
+    }
+    return React.createElement(
+      "section",
+      { className: "knowledge-organization-plan", "aria-label": "知识整理计划" },
+      React.createElement("h3", null, "知识整理计划"),
+      React.createElement("p", { className: "organization-plan-note" }, "仅使用本地知识库中已冻结的证据作为事实依据；生成前会显示实际发送范围并请求本次授权。"),
+      plan.is_bounded_preview
+        ? React.createElement("p", { className: "form-error" }, "该计划仅为有界诊断预览，缩小范围后才能固定快照。")
+        : null,
+      plan.sections.map((section) => {
+        const outcome = outcomeByOrdinal.get(section.ordinal);
+        const statusText = outcome?.status === "completed"
+          ? "已完成"
+          : outcome?.status === "running" || outcome?.status === "preparing"
+            ? "正在生成"
+            : outcome?.status === "prepared"
+              ? "已准备"
+          : outcome?.status === "failed"
+            ? "准备失败"
+            : outcome?.status === "recoverable"
+              ? "待恢复"
+              : "已计划";
+        return React.createElement(
+          "section",
+          { className: "organization-plan-section", key: `organization-section:${section.ordinal}` },
+          React.createElement("p", { className: "organization-plan-heading" }, `第 ${section.ordinal} 段：${section.title}`),
+          React.createElement("p", { className: "organization-plan-meta" }, `目标：${section.goal}`),
+          React.createElement("p", { className: "organization-plan-meta" }, `范围：${section.scope_path || "范围根目录"}；预期证据 ${section.evidence_count ?? section.evidence?.length ?? 0} 条；状态：${statusText}`),
+          outcome?.reason
+            ? React.createElement("p", { className: "form-error" }, `原因：${outcome.reason}`)
+            : null,
+          (section.evidence || []).map((evidence) => React.createElement(
+            "details",
+            { className: "evidence-row", key: `organization-evidence:${section.ordinal}:${evidence.ordinal}` },
+            React.createElement("summary", null, `${evidence.relative_path} · ${evidence.heading || evidence.location}`),
+            React.createElement("p", null, evidence.excerpt),
+            React.createElement("p", null, `定位：${evidence.location}${evidence.page ? `；第 ${evidence.page} 页` : ""}`),
+            evidence.identity_kind === "derived"
+              ? React.createElement("p", null, `Source ID ${evidence.source_id}；源内容哈希 ${evidence.source_content_hash}`)
+              : React.createElement("p", null, `原生 Markdown：${evidence.relative_path}；内容哈希 ${evidence.content_sha256}`)
+          ))
+        );
+      })
+    );
+  }
+
+  function knowledgeOrganizationResultView(result) {
+    const statusText = {
+      preparing: "正在生成整理",
+      planned: "计划已准备",
+      "waiting-authorization": "等待本次授权",
+      completed: "整理已完成",
+      failed: "整理失败",
+      recoverable: "计划待恢复",
+      "source-changed": "来源已变化"
+    }[result.status] || "计划状态未知";
+    const outcomes = new Map((result.sections || []).map((section) => [section.ordinal, section]));
+    const vault = result.vault_id ? vaultsById.get(result.vault_id) : null;
+    const canOpenInObsidian = vault
+      && vault.authorization_status === "active"
+      && vault.access_status === "available";
+    const structureText = {
+      summary: "归纳", classification: "分类", comparison: "比较", timeline: "时间线",
+      outline: "大纲", "chapter-summary": "章节汇总"
+    }[result.structure_kind] || "结构化整理";
+    return React.createElement(
+      "section",
+      { className: "session-retrieval-result knowledge-organization-result", key: result.result_id, "aria-label": statusText },
+      React.createElement("p", { className: "session-message-role" }, statusText),
+      React.createElement("p", { className: "session-retrieval-summary" }, result.summary),
+      React.createElement("p", { className: "organization-plan-meta" }, `结构：${structureText}；事实依据：冻结知识库证据`),
+      React.createElement(
+        "div",
+        { className: "progress-sequence", "aria-label": "知识整理计划进度" },
+        React.createElement("span", null, `计划 ${result.section_counts?.planned || 0} 段；已准备 ${result.section_counts?.prepared || 0} 段；已完成 ${result.section_counts?.completed || 0} 段；进行中 ${result.section_counts?.running || 0} 段`),
+        React.createElement("span", null, `失败 ${result.section_counts?.failed || 0} 段；待恢复 ${result.section_counts?.recoverable || 0} 段`)
+      ),
+      result.invalidation_reason
+        ? React.createElement("p", { className: "form-error" }, `需重新准备：${result.invalidation_reason}`)
+        : null,
+      result.recovery_action
+        ? React.createElement("p", { className: "form-error" }, `下一步：${result.recovery_action}`)
+        : null,
+      result.status === "waiting-authorization" && result.authorization_id && onConfirmKnowledgeOrganizationAuthorization
+        ? React.createElement("button", {
+          className: "primary-button",
+          type: "button",
+          disabled: isSubmitting,
+          onClick: () => confirmKnowledgeOrganizationAuthorization(result)
+        }, "授权并生成")
+        : null,
+      (result.sections || []).map((section) => React.createElement(
+        "section",
+        { className: "organization-result-section", key: `organization-result:${result.result_id}:${section.ordinal}` },
+        React.createElement("p", { className: "organization-plan-heading" }, `第 ${section.ordinal} 段：${section.title} · ${section.status}`),
+        React.createElement("p", { className: "organization-plan-meta" }, `独立来源：${section.independent_source_count || 0}；同一 Source 的派生笔记只计为一个来源。`),
+        (section.conclusions || []).map((conclusion) => React.createElement(
+          "div",
+          { className: "organization-conclusion", key: `organization-conclusion:${section.ordinal}:${conclusion.ordinal}` },
+          React.createElement("p", { className: "organization-conclusion-content" }, conclusion.content),
+          React.createElement("p", { className: "organization-plan-meta" }, "可展开核验依据："),
+          (conclusion.evidence || []).map((evidence) => React.createElement(
+            "details",
+            { className: "evidence-row", key: `organization-conclusion-evidence:${section.ordinal}:${conclusion.ordinal}:${evidence.ordinal}` },
+            React.createElement("summary", null, `${evidence.relative_path} · ${evidence.heading || evidence.location}`),
+            React.createElement("p", null, evidence.excerpt),
+            React.createElement("p", null, `定位：${evidence.location}${evidence.page ? `；第 ${evidence.page} 页` : ""}`),
+            evidence.identity_kind === "derived"
+              ? React.createElement("p", null, `Source ID ${evidence.source_id}；源内容哈希 ${evidence.source_content_hash}`)
+              : React.createElement("p", null, `原生 Markdown：${evidence.relative_path}；内容哈希 ${evidence.content_sha256}`),
+            canOpenInObsidian
+              ? React.createElement("a", {
+                href: `${VAULTS_ENDPOINT}/${encodeURIComponent(result.vault_id)}/open?file=${encodeURIComponent(evidence.relative_path)}`,
+                target: "_blank", rel: "noreferrer"
+              }, "在 Obsidian 中打开")
+              : null
+          ))
+        ))
+      )),
+      knowledgeOrganizationPlanView({ sections: result.sections || [] }, outcomes)
+    );
+  }
+
   async function prepareTask(event) {
     event?.preventDefault();
     if (!canPrepare || !selectedSession || contextIsDirty) return;
@@ -1193,6 +1322,23 @@ export function SessionManagement({
       if (execution?.isCurrent === false) return;
       const result = execution?.result || execution;
       setStatus(["completed", "complete"].includes(result.status) ? "任务已完成，证据已刷新。" : result.summary);
+    } catch (requestError) {
+      setStatus(requestError.message);
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  async function confirmKnowledgeOrganizationAuthorization(result) {
+    if (!selectedSession || !onConfirmKnowledgeOrganizationAuthorization) return;
+    setStatus("");
+    setIsSubmitting(true);
+    try {
+      const execution = await onConfirmKnowledgeOrganizationAuthorization(
+        selectedSession.session_id, result.task_id, result.vault_id, result.authorization_id
+      );
+      const generated = execution?.result || execution;
+      setStatus(["completed", "complete"].includes(generated.status) ? "任务已完成，证据已刷新。" : generated.summary);
     } catch (requestError) {
       setStatus(requestError.message);
     } finally {
@@ -1340,19 +1486,21 @@ export function SessionManagement({
           ? React.createElement("p", { className: "empty-state", role: "status" }, "正在加载会话内容。")
           : detailError
             ? React.createElement("p", { className: "form-error", role: "alert" }, detailError)
-          : activeDetail?.messages?.length || generationResults.length
+          : activeDetail?.messages?.length || generationResults.length || knowledgeOrganizationResults.length
               ? React.createElement(
                   React.Fragment,
                   null,
                   [...activeDetail.messages.map((message) => ({ kind: "message", value: message })),
                     ...generationResults.map((result) => ({ kind: "generation", value: result })),
                     ...retrievalResults.map((result) => ({ kind: "retrieval", value: result })),
-                    ...completenessResults.map((result) => ({ kind: "completeness", value: result }))]
+                    ...completenessResults.map((result) => ({ kind: "completeness", value: result })),
+                    ...knowledgeOrganizationResults.map((result) => ({ kind: "organization", value: result }))]
                     .sort((first, second) => (first.value.created_at || "").localeCompare(second.value.created_at || ""))
                     .map((entry) => {
                       if (entry.kind === "generation") return generationResultView(entry.value);
                       if (entry.kind === "retrieval") return retrievalResultView(entry.value);
                       if (entry.kind === "completeness") return completenessResultView(entry.value);
+                      if (entry.kind === "organization") return knowledgeOrganizationResultView(entry.value);
                       return React.createElement(
                         "article",
                         { className: `session-message session-message-${entry.value.role}`, key: entry.value.message_id },
@@ -1361,8 +1509,12 @@ export function SessionManagement({
                       );
                     })
                 )
-              : retrievalResults.length || completenessResults.length
-                ? [...retrievalResults.map(retrievalResultView), ...completenessResults.map(completenessResultView)]
+              : retrievalResults.length || completenessResults.length || knowledgeOrganizationResults.length
+                ? [
+                    ...retrievalResults.map(retrievalResultView),
+                    ...completenessResults.map(completenessResultView),
+                    ...knowledgeOrganizationResults.map(knowledgeOrganizationResultView)
+                  ]
               : selectedSession
                 ? React.createElement("p", { className: "empty-state" }, "该会话尚无已保存的消息。")
                 : React.createElement("p", { className: "empty-state" }, "从左侧选择一个会话以查看内容。")
@@ -1374,20 +1526,36 @@ export function SessionManagement({
             activeDetail.task_snapshots.map((snapshot) => {
               const canExecute = snapshot.status === "prepared"
                 && ["source-lookup", "knowledge-organization", "completeness"].includes(snapshot.intent);
+              const frozenVault = vaultsById.get(snapshot.vault_id);
               return React.createElement(
                 "section",
                 { className: "scope-summary session-task-snapshot", key: snapshot.snapshot_id },
                 React.createElement("strong", null, `任务 ${taskIntentText(snapshot.intent)}：${taskSnapshotStatusText(snapshot)}`),
                 React.createElement("span", null, `范围：${snapshot.scope_kind === "directory" ? snapshot.scope_path : "整个 vault"}；来源 ${snapshot.source_count} 项；摘要 ${snapshot.source_digest.slice(0, 12)}`),
                 React.createElement("span", null, `索引：${snapshot.index_status}；外发：${snapshot.outbound_scope_summary}`),
+                snapshot.intent === "knowledge-organization"
+                  ? React.createElement("span", null, `冻结 vault：${frozenVault?.display_name || snapshot.vault_id}`)
+                  : null,
+                snapshot.intent === "knowledge-organization"
+                  ? React.createElement("span", null, `来源：${snapshot.source_count} 项；来源摘要：${snapshot.source_digest.slice(0, 12)}`)
+                  : null,
+                snapshot.intent === "knowledge-organization"
+                  ? React.createElement("span", null, `索引：${snapshot.index_status}；版本：${snapshot.index_updated_at || "无"}；索引摘要：${snapshot.index_digest?.slice(0, 12) || "无"}`)
+                  : null,
+                snapshot.intent === "knowledge-organization"
+                  ? React.createElement("span", null, `策略修订：${snapshot.policy_revision ?? "无"}；排除项：${snapshot.exclusion_summary || "无"}`)
+                  : null,
                 snapshot.coverage
                   ? React.createElement("span", null, `覆盖：计划 ${snapshot.coverage.planned_count} 项；排除 ${snapshot.coverage.excluded_count} 项；未覆盖 ${snapshot.coverage.uncovered_count} 项`)
+                  : null,
+                snapshot.knowledge_organization_plan
+                  ? knowledgeOrganizationPlanView(snapshot.knowledge_organization_plan)
                   : null,
                 snapshot.invalidation_reason
                   ? React.createElement("span", { className: "form-error" }, `需重新准备：${snapshot.invalidation_reason}`)
                   : null,
                 canExecute
-                  ? React.createElement("button", { className: "secondary-button", type: "button", disabled: isSubmitting, onClick: () => executeTask(snapshot.task_id) }, snapshot.intent === "completeness" ? "执行完整性检索" : "执行检索")
+                  ? React.createElement("button", { className: "secondary-button", type: "button", disabled: isSubmitting, onClick: () => executeTask(snapshot.task_id) }, snapshot.intent === "completeness" ? "执行完整性检索" : snapshot.intent === "knowledge-organization" ? "生成知识整理" : "执行检索")
                   : null
               );
             })
@@ -1443,6 +1611,9 @@ export function SessionManagement({
                   React.createElement("span", null, `外发范围：${taskPreview.outbound_scope_summary}`),
                   taskPreview.source_sample?.length
                     ? React.createElement("span", null, `来源样例：${taskPreview.source_sample.map((source) => source.source_id ? `Source ID ${source.source_id} / ${source.source_content_hash?.slice(0, 12)}` : `${source.relative_path} / ${source.content_sha256.slice(0, 12)}`).join("；")}`)
+                    : null,
+                  taskPreview.knowledge_organization_plan
+                    ? knowledgeOrganizationPlanView(taskPreview.knowledge_organization_plan)
                     : null,
                   !taskPreview.is_ready
                     ? React.createElement("span", { className: "form-error" }, `${taskPreview.blocking_reason} ${taskPreview.recovery_action}`)
@@ -4328,6 +4499,16 @@ export function App() {
     return { result: response.result, isCurrent };
   }
 
+  async function confirmPersistentKnowledgeOrganizationAuthorization(
+    sessionId, taskId, vaultId, authorizationId
+  ) {
+    await requestJson(
+      `${VAULTS_ENDPOINT}/${encodeURIComponent(vaultId)}/outbound-authorizations/${encodeURIComponent(authorizationId)}/confirm`,
+      { method: "POST", body: JSON.stringify({ approved: true }) }
+    );
+    return executePersistentSessionTask(sessionId, taskId);
+  }
+
   async function editPersistentSessionGenerationResult(sessionId, resultId, content) {
     const response = await requestJson(`${SESSIONS_ENDPOINT}/${sessionId}/generation-results/${resultId}`, {
       method: "PATCH",
@@ -4509,6 +4690,7 @@ export function App() {
       onPreviewTask: previewPersistentSessionTask,
       onCreateTask: createPersistentSessionTask,
       onExecuteTask: executePersistentSessionTask,
+      onConfirmKnowledgeOrganizationAuthorization: confirmPersistentKnowledgeOrganizationAuthorization,
       onLoadCompletenessCoverage: loadPersistentCompletenessCoverage,
       onEditGenerationResult: editPersistentSessionGenerationResult,
       onReverifyGenerationResult: reverifyPersistentSessionGenerationResult

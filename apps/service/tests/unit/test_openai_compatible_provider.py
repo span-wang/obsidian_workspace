@@ -23,6 +23,9 @@ class FixtureProviderHandler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self._record(body)
         if self.path == "/v1/chat/completions":
+            if body.get("stream") is False:
+                self._json_response({"choices": [{"message": {"content": "结构化结论"}}]})
+                return
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
@@ -115,6 +118,23 @@ def test_empty_stream_or_embedding_response_does_not_verify_capability() -> None
             client.probe_embedding(endpoint, "test-secret", "model-alpha")
 
     with_fixture_provider(verify)
+
+
+def test_openai_compatible_adapter_generates_bounded_non_streaming_chat_content() -> None:
+    def verify(client, endpoint) -> None:
+        assert client.generate_chat(endpoint, "test-secret", "model-alpha", "仅使用此段证据。") == "结构化结论"
+
+    with_fixture_provider(verify)
+
+    assert FixtureProviderHandler.calls[-1] == (
+        "POST",
+        "/v1/chat/completions",
+        {
+            "model": "model-alpha",
+            "messages": [{"role": "user", "content": "仅使用此段证据。"}],
+            "stream": False,
+        },
+    )
 
 
 def test_redirects_are_rejected_before_credentials_reach_another_origin() -> None:

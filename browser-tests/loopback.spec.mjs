@@ -1855,6 +1855,339 @@ test("shows completeness coverage gaps and stale sources without claiming comple
   await expect(page.getByText("完整完成", { exact: true })).toHaveCount(0);
 });
 
+test("generates an evidence-bound knowledge organization result from the frozen plan", async ({ page }) => {
+  const session = {
+    session_id: "session-organization", title: "英语整理", selected_vault_id: "vault-a",
+    selected_vault_label: "Session Vault", selected_provider_id: "provider-1",
+    selected_provider_label: "Local", selected_model_id: "chat-1", selected_model_label: "chat-1",
+    scope_kind: "directory", scope_path: "notes/english", message_count: 1,
+    created_at: "2026-07-23T00:00:00+00:00", updated_at: "2026-07-23T00:00:00+00:00",
+    last_activity_at: "2026-07-23T00:00:00+00:00"
+  };
+  const plan = {
+    section_count: 1,
+    local_evidence_only: true,
+    sections: [{
+      ordinal: 1, title: "notes/english", goal: "整理英语知识点", scope_path: "notes/english",
+      evidence_count: 1,
+      evidence: [{
+        ordinal: 1, source_ordinal: 1, identity_kind: "native", relative_path: "notes/english/vocabulary.md",
+        content_sha256: "a".repeat(64), source_id: null, source_content_hash: null, source_path: null,
+        heading: "Vocabulary", location: "heading: Vocabulary", page: null, excerpt: "word evidence"
+      }]
+    }]
+  };
+  let generated = false;
+  const result = {
+    result_id: "result-organization", task_id: "task-organization", snapshot_id: "snapshot-organization",
+    vault_id: "vault-a", status: "completed", summary: "已按冻结证据生成 1 个知识整理计划段。",
+    recovery_action: null, duration_ms: 2, local_evidence_only: true,
+    structure_kind: "outline", section_counts: { planned: 1, prepared: 0, running: 0, completed: 1, failed: 0, recoverable: 0 },
+    sections: [{
+      ...plan.sections[0], status: "completed", reason: null, prepared_evidence_count: 1,
+      independent_source_count: 1,
+      conclusions: [{ ordinal: 1, content: "词汇整理结论。", evidence: plan.sections[0].evidence }]
+    }]
+  };
+  const detail = () => ({
+    session, messages: [{ message_id: "message-organization", role: "user", content: "整理英语知识点" }],
+    task_states: [], citations: [], generation_results: [], attachments: [], retrieval_results: [], completeness_results: [],
+    task_snapshots: [{
+      snapshot_id: "snapshot-organization", task_id: "task-organization", vault_id: "vault-a",
+      intent: "knowledge-organization", status: generated ? "completed" : "prepared", scope_kind: "directory",
+      scope_path: "notes/english", source_count: 1, source_digest: "a".repeat(64), index_status: "healthy",
+      exclusion_summary: "无排除项", outbound_scope_summary: "仅使用已冻结的本地知识库证据；不会调用 Provider、Model 或互联网。",
+      knowledge_organization_plan: plan, invalidation_reason: null
+    }],
+    knowledge_organization_results: generated ? [result] : []
+  });
+
+  await page.route("**/api/**", async (route) => {
+    const request = route.request();
+    const pathname = new URL(request.url()).pathname;
+    if (pathname === "/api/health") return route.fulfill({ json: { service: serviceName } });
+    if (pathname === "/api/session") return route.fulfill({ json: { status: "ok" } });
+    if (pathname === "/api/vaults") return route.fulfill({ json: { vaults: [{
+      vault_id: "vault-a", display_name: "Session Vault", managed_root_relative_path: "platform",
+      authorization_status: "active", access_status: "available"
+    }] } });
+    if (pathname === "/api/providers/defaults") return route.fulfill({ json: { chat: {}, embedding: {} } });
+    if (pathname === "/api/providers") return route.fulfill({ json: { providers: [] } });
+    if (pathname === "/api/import-tasks") return route.fulfill({ json: { tasks: [] } });
+    if (pathname === "/api/sessions" && request.method() === "GET") {
+      return route.fulfill({ json: { sessions: [session], page: 1, page_size: 25, total: 1, total_pages: 1 } });
+    }
+    if (pathname === "/api/sessions/session-organization" && request.method() === "GET") {
+      return route.fulfill({ json: detail() });
+    }
+    if (pathname === "/api/sessions/session-organization/tasks/task-organization/execute" && request.method() === "POST") {
+      generated = true;
+      return route.fulfill({ json: { result } });
+    }
+    return route.fallback();
+  });
+
+  await page.goto("/");
+  await page.getByRole("link", { name: "会话", exact: true }).click();
+  await expect(page.getByLabel("知识整理计划").first()).toContainText("第 1 段：notes/english");
+  await expect(page.getByText("仅使用本地知识库中已冻结的证据作为事实依据；生成前会显示实际发送范围并请求本次授权。", { exact: true })).toBeVisible();
+  const evidence = page.getByLabel("知识整理计划").first().locator(".evidence-row");
+  await evidence.locator("summary").focus();
+  await evidence.locator("summary").press("Enter");
+  await expect(evidence).toContainText("word evidence");
+  await expect(evidence).toContainText("原生 Markdown：notes/english/vocabulary.md");
+
+  await page.getByRole("button", { name: "生成知识整理", exact: true }).click();
+  const generatedResult = page.getByLabel("整理已完成");
+  await expect(generatedResult).toContainText("已按冻结证据生成 1 个知识整理计划段。");
+  await expect(generatedResult).toContainText("结构：大纲；事实依据：冻结知识库证据");
+  await expect(generatedResult).toContainText("词汇整理结论。");
+  await expect(generatedResult).toContainText("独立来源：1");
+  await expect(page.getByLabel("知识整理计划进度")).toHaveText("计划 1 段；已准备 0 段；已完成 1 段；进行中 0 段失败 0 段；待恢复 0 段");
+  const conclusionEvidence = generatedResult.locator(".organization-conclusion .evidence-row");
+  await conclusionEvidence.locator("summary").focus();
+  await conclusionEvidence.locator("summary").press("Enter");
+  await expect(conclusionEvidence).toContainText("word evidence");
+  await expect(conclusionEvidence.getByRole("link", { name: "在 Obsidian 中打开" })).toHaveAttribute(
+    "href", "/api/vaults/vault-a/open?file=notes%2Fenglish%2Fvocabulary.md"
+  );
+});
+
+test("confirms per-task knowledge-organization authorization before generating", async ({ page }) => {
+  const session = {
+    session_id: "session-authorization", title: "需授权整理", selected_vault_id: "vault-a",
+    selected_vault_label: "Session Vault", selected_provider_id: "provider-1",
+    selected_provider_label: "Local", selected_model_id: "chat-1", selected_model_label: "chat-1",
+    scope_kind: "directory", scope_path: "notes/english", message_count: 1,
+    created_at: "2026-07-23T00:00:00+00:00", updated_at: "2026-07-23T00:00:00+00:00",
+    last_activity_at: "2026-07-23T00:00:00+00:00"
+  };
+  const evidence = [{
+    ordinal: 1, source_ordinal: 1, identity_kind: "native", relative_path: "notes/english/vocabulary.md",
+    content_sha256: "a".repeat(64), source_id: null, source_content_hash: null, source_path: null,
+    heading: "Vocabulary", location: "heading: Vocabulary", page: null, excerpt: "word evidence"
+  }];
+  const completedResult = {
+    result_id: "result-authorization", task_id: "task-authorization", snapshot_id: "snapshot-authorization",
+    vault_id: "vault-a", status: "completed", summary: "已按冻结证据生成 1 个知识整理计划段。",
+    recovery_action: null, duration_ms: 2, local_evidence_only: true, structure_kind: "outline",
+    authorization_id: "authorization-organization", authorization_status: "approved",
+    section_counts: { planned: 1, prepared: 0, running: 0, completed: 1, failed: 0, recoverable: 0 },
+    sections: [{
+      ordinal: 1, title: "notes/english", goal: "整理英语知识点", scope_path: "notes/english", evidence_count: 1,
+      evidence, status: "completed", independent_source_count: 1,
+      conclusions: [{ ordinal: 1, content: "词汇整理结论。", evidence }]
+    }]
+  };
+  const waitingResult = {
+    ...completedResult, status: "waiting-authorization", summary: "知识整理将仅发送已冻结的计划段证据，等待本次授权。",
+    authorization_status: "pending", section_counts: { planned: 1, prepared: 0, running: 0, completed: 0, failed: 0, recoverable: 0 },
+    sections: []
+  };
+  let authorized = false;
+  let generated = false;
+  let authorizationRequests = 0;
+  let executionRequests = 0;
+  const detail = () => ({
+    session, messages: [{ message_id: "message-authorization", role: "user", content: "整理英语知识点" }],
+    task_states: [], citations: [], generation_results: [], attachments: [], retrieval_results: [], completeness_results: [],
+    task_snapshots: [{
+      snapshot_id: "snapshot-authorization", task_id: "task-authorization", vault_id: "vault-a",
+      intent: "knowledge-organization", status: generated ? "completed" : "waiting-authorization", scope_kind: "directory",
+      scope_path: "notes/english", source_count: 1, source_digest: "a".repeat(64), index_status: "healthy",
+      exclusion_summary: "无排除项", outbound_scope_summary: "仅使用已冻结的计划段证据，等待本次授权。",
+      knowledge_organization_plan: { section_count: 1, local_evidence_only: true, sections: [] }, invalidation_reason: null
+    }],
+    knowledge_organization_results: [generated ? completedResult : waitingResult]
+  });
+
+  await page.route("**/api/**", async (route) => {
+    const request = route.request();
+    const pathname = new URL(request.url()).pathname;
+    if (pathname === "/api/health") return route.fulfill({ json: { service: serviceName } });
+    if (pathname === "/api/session") return route.fulfill({ json: { status: "ok" } });
+    if (pathname === "/api/vaults") return route.fulfill({ json: { vaults: [{
+      vault_id: "vault-a", display_name: "Session Vault", managed_root_relative_path: "platform",
+      authorization_status: "active", access_status: "available"
+    }] } });
+    if (pathname === "/api/providers/defaults") return route.fulfill({ json: { chat: {}, embedding: {} } });
+    if (pathname === "/api/providers") return route.fulfill({ json: { providers: [] } });
+    if (pathname === "/api/import-tasks") return route.fulfill({ json: { tasks: [] } });
+    if (pathname === "/api/sessions" && request.method() === "GET") {
+      return route.fulfill({ json: { sessions: [session], page: 1, page_size: 25, total: 1, total_pages: 1 } });
+    }
+    if (pathname === "/api/sessions/session-authorization" && request.method() === "GET") {
+      return route.fulfill({ json: detail() });
+    }
+    if (pathname === "/api/vaults/vault-a/outbound-authorizations/authorization-organization/confirm" && request.method() === "POST") {
+      expect(request.postDataJSON()).toEqual({ approved: true });
+      authorizationRequests += 1;
+      authorized = true;
+      return route.fulfill({ json: { authorization: { authorization_id: "authorization-organization", status: "approved" } } });
+    }
+    if (pathname === "/api/sessions/session-authorization/tasks/task-authorization/execute" && request.method() === "POST") {
+      expect(authorized).toBe(true);
+      executionRequests += 1;
+      generated = true;
+      return route.fulfill({ json: { result: completedResult } });
+    }
+    return route.fallback();
+  });
+
+  await page.goto("/");
+  await page.getByRole("link", { name: "会话", exact: true }).click();
+  await expect(page.getByLabel("等待本次授权")).toContainText("等待本次授权");
+  await page.getByRole("button", { name: "授权并生成", exact: true }).click();
+  await expect(page.getByLabel("整理已完成")).toContainText("词汇整理结论。");
+  expect(authorizationRequests).toBe(1);
+  expect(executionRequests).toBe(1);
+});
+
+test("blocks an oversized knowledge-organization preview before it can create a snapshot", async ({ page }) => {
+  const session = {
+    session_id: "session-budget", title: "范围预算", selected_vault_id: "vault-a",
+    selected_vault_label: "Budget Vault", selected_provider_id: "provider-1",
+    selected_provider_label: "Local", selected_model_id: "chat-1", selected_model_label: "chat-1",
+    scope_kind: "directory", scope_path: "notes/large", message_count: 0,
+    created_at: "2026-07-23T00:00:00+00:00", updated_at: "2026-07-23T00:00:00+00:00",
+    last_activity_at: "2026-07-23T00:00:00+00:00"
+  };
+  let snapshotCreateRequests = 0;
+
+  await page.route("**/api/**", async (route) => {
+    const request = route.request();
+    const pathname = new URL(request.url()).pathname;
+    if (pathname === "/api/health") return route.fulfill({ json: { service: serviceName } });
+    if (pathname === "/api/session") return route.fulfill({ json: { status: "ok" } });
+    if (pathname === "/api/vaults") return route.fulfill({ json: { vaults: [{
+      vault_id: "vault-a", display_name: "Budget Vault", managed_root_relative_path: "platform",
+      authorization_status: "active", access_status: "available"
+    }] } });
+    if (pathname === "/api/providers/defaults") return route.fulfill({ json: { chat: {}, embedding: {} } });
+    if (pathname === "/api/providers") return route.fulfill({ json: { providers: [{
+      provider_id: "provider-1", name: "Local", credential_configured: true,
+      verification: { is_verified: true },
+      models: [{ model_id: "chat-1", model_type: "chat", is_discovered: true, verification: { ok: true } }]
+    }] } });
+    if (pathname === "/api/import-tasks") return route.fulfill({ json: { tasks: [] } });
+    if (pathname === "/api/sessions" && request.method() === "GET") {
+      return route.fulfill({ json: { sessions: [session], page: 1, page_size: 25, total: 1, total_pages: 1 } });
+    }
+    if (pathname === "/api/sessions/session-budget" && request.method() === "GET") {
+      return route.fulfill({ json: {
+        session, messages: [], task_states: [], citations: [], generation_results: [], attachments: [],
+        task_snapshots: [], retrieval_results: [], completeness_results: [], knowledge_organization_results: []
+      } });
+    }
+    if (pathname === "/api/sessions/session-budget/task-preview" && request.method() === "POST") {
+      return route.fulfill({ json: { preview: {
+        intent: "knowledge-organization", intent_source: "explicit", vault_id: "vault-a",
+        scope_kind: "directory", scope_path: "notes/large", provider_id: "provider-1", model_id: "chat-1",
+        index_status: "healthy", index_updated_at: "2026-07-23T00:00:00+00:00", index_digest: "i".repeat(64),
+        policy_revision: 4, exclusion_summary: "无排除项。", outbound_mode: "ask-each-task",
+        outbound_scope_summary: "仅使用已冻结的本地知识库证据；不会调用 Provider、Model 或互联网。",
+        source_count: 501, source_digest: "s".repeat(64), source_sample: [],
+        knowledge_organization_plan: { section_count: 1, local_evidence_only: true, sections: [{
+          ordinal: 1, title: "notes/large", goal: "整理大范围资料", scope_path: "notes/large", evidence_count: 129, evidence: []
+        }] },
+        is_ready: false,
+        blocking_reason: "计划证据超出 128 条预算；请缩小范围后重新准备任务。",
+        recovery_action: "缩小范围后重新准备任务。"
+      } } });
+    }
+    if (pathname === "/api/sessions/session-budget/tasks" && request.method() === "POST") {
+      snapshotCreateRequests += 1;
+      return route.fulfill({ status: 500, json: { detail: "不得创建部分计划。" } });
+    }
+    return route.fallback();
+  });
+
+  await page.goto("/");
+  await page.getByRole("link", { name: "会话", exact: true }).click();
+  await page.getByLabel("选择任务类型").selectOption("knowledge-organization");
+  await page.getByLabel("输入问题或继续创作").fill("整理大范围资料");
+  await page.getByRole("button", { name: "准备任务", exact: true }).click();
+
+  await expect(page.getByText("计划证据超出 128 条预算；请缩小范围后重新准备任务。", { exact: true })).toBeVisible();
+  await expect(page.getByText("第 1 段：notes/large", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "固定快照", exact: true })).toHaveCount(0);
+  expect(snapshotCreateRequests).toBe(0);
+});
+
+test("shows restored frozen bindings and never calls an interrupted plan prepared", async ({ page }) => {
+  const session = {
+    session_id: "session-restored-organization", title: "恢复整理", selected_vault_id: "vault-current",
+    selected_vault_label: "Current Vault", selected_provider_id: "provider-1",
+    selected_provider_label: "Local", selected_model_id: "chat-1", selected_model_label: "chat-1",
+    scope_kind: "vault", scope_path: null, message_count: 0,
+    created_at: "2026-07-23T00:00:00+00:00", updated_at: "2026-07-23T00:00:00+00:00",
+    last_activity_at: "2026-07-23T00:00:00+00:00"
+  };
+  const plan = {
+    section_count: 2, local_evidence_only: true,
+    sections: [
+      { ordinal: 1, title: "notes/unit", goal: "整理已完成主题", scope_path: "notes/unit", evidence_count: 1, evidence: [] },
+      { ordinal: 2, title: "notes/review", goal: "整理待恢复主题", scope_path: "notes/review", evidence_count: 1, evidence: [] }
+    ]
+  };
+  const result = {
+    result_id: "result-restored-organization", task_id: "task-restored-organization", snapshot_id: "snapshot-restored-organization",
+    vault_id: "vault-frozen", status: "recoverable", summary: "准备被中断，已知段落已保留。",
+    recovery_action: "恢复索引后重新准备任务。", duration_ms: 2, local_evidence_only: true,
+    section_counts: { planned: 2, prepared: 1, failed: 0, recoverable: 1 },
+    sections: [
+      { ...plan.sections[0], status: "prepared", prepared_evidence_count: 1, reason: null },
+      { ...plan.sections[1], status: "recoverable", prepared_evidence_count: 0, reason: "服务在准备此段前中断。" }
+    ]
+  };
+
+  await page.route("**/api/**", async (route) => {
+    const request = route.request();
+    const pathname = new URL(request.url()).pathname;
+    if (pathname === "/api/health") return route.fulfill({ json: { service: serviceName } });
+    if (pathname === "/api/session") return route.fulfill({ json: { status: "ok" } });
+    if (pathname === "/api/vaults") return route.fulfill({ json: { vaults: [
+      { vault_id: "vault-current", display_name: "Current Vault", managed_root_relative_path: "platform", authorization_status: "active", access_status: "available" },
+      { vault_id: "vault-frozen", display_name: "Frozen Vault", managed_root_relative_path: "platform", authorization_status: "active", access_status: "available" }
+    ] } });
+    if (pathname === "/api/providers/defaults") return route.fulfill({ json: { chat: {}, embedding: {} } });
+    if (pathname === "/api/providers") return route.fulfill({ json: { providers: [] } });
+    if (pathname === "/api/import-tasks") return route.fulfill({ json: { tasks: [] } });
+    if (pathname === "/api/sessions" && request.method() === "GET") {
+      return route.fulfill({ json: { sessions: [session], page: 1, page_size: 25, total: 1, total_pages: 1 } });
+    }
+    if (pathname === "/api/sessions/session-restored-organization" && request.method() === "GET") {
+      return route.fulfill({ json: {
+        session, messages: [], task_states: [], citations: [], generation_results: [], attachments: [], retrieval_results: [], completeness_results: [],
+        task_snapshots: [{
+          snapshot_id: "snapshot-restored-organization", task_id: "task-restored-organization", vault_id: "vault-frozen",
+          intent: "knowledge-organization", status: "recoverable", scope_kind: "directory", scope_path: "notes/unit",
+          source_count: 2, source_digest: "s".repeat(64), index_status: "healthy", index_updated_at: "2026-07-23T00:00:00+00:00", index_digest: "i".repeat(64),
+          policy_revision: 9, exclusion_summary: "排除规则 1 项：never-send-cloud: notes/private",
+          outbound_scope_summary: "仅使用已冻结的本地知识库证据；不会调用 Provider、Model 或互联网。",
+          knowledge_organization_plan: plan, invalidation_reason: null
+        }],
+        knowledge_organization_results: [result]
+      } });
+    }
+    return route.fallback();
+  });
+
+  await page.goto("/");
+  await page.getByRole("link", { name: "会话", exact: true }).click();
+
+  await expect(page.getByText("冻结 vault：Frozen Vault", { exact: true })).toBeVisible();
+  await expect(page.getByText("来源：2 项；来源摘要：ssssssssssss", { exact: true })).toBeVisible();
+  await expect(page.getByText("索引：healthy；版本：2026-07-23T00:00:00+00:00；索引摘要：iiiiiiiiiiii", { exact: true })).toBeVisible();
+  await expect(page.getByText("策略修订：9；排除项：排除规则 1 项：never-send-cloud: notes/private", { exact: true })).toBeVisible();
+  await expect(page.getByLabel("计划待恢复")).toContainText("准备被中断，已知段落已保留。");
+  await expect(page.getByLabel("知识整理计划进度")).toHaveText("计划 2 段；已准备 1 段；已完成 0 段；进行中 0 段失败 0 段；待恢复 1 段");
+  const interruptedSection = page.getByLabel("计划待恢复").locator(".organization-plan-section").nth(1);
+  await expect(interruptedSection).toContainText("状态：待恢复");
+  await expect(interruptedSection).toContainText("服务在准备此段前中断。");
+  await expect(page.getByRole("button", { name: "准备计划段", exact: true })).toHaveCount(0);
+});
+
 test("keeps the current session detail when an earlier selection resolves last", async ({ page }) => {
   const session = (sessionId, title, vault) => ({
     session_id: sessionId,

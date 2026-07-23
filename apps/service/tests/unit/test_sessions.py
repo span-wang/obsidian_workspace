@@ -1,14 +1,24 @@
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from threading import Barrier
+from threading import Barrier, Event, Thread
 import pytest
 
 from adapters.sqlite_session_repository import SqliteSessionRepository
-from application.sessions import SessionNotFoundError, SessionService, SessionValidationError
+from application.sessions import (
+    MAX_KNOWLEDGE_ORGANIZATION_EVIDENCES,
+    MAX_KNOWLEDGE_ORGANIZATION_SOURCES,
+    SessionNotFoundError,
+    SessionService,
+    SessionValidationError,
+)
 from domain.sessions import (
     MAX_SESSION_PAGE,
     SessionCitation,
     SessionGenerationResult,
+    SessionKnowledgeOrganizationConclusion,
+    SessionKnowledgeOrganizationEvidence,
+    SessionKnowledgeOrganizationPlanSection,
+    SessionKnowledgeOrganizationResult,
     SessionMessage,
     SessionRetrievalEvidence,
     SessionTaskState,
@@ -17,7 +27,7 @@ from domain.sessions import (
     new_session,
 )
 from domain.indexing import IndexBlock, IndexHealth, IndexedDocument
-from domain.policies import PolicyEvaluation
+from domain.policies import OutboundAuthorization, OutboundScope, PolicyEvaluation
 from domain.providers import Provider, ProviderModel, ProviderProbeResults, ProbeResult, ResolvedProviderModel
 from domain.vaults import Vault
 
@@ -41,15 +51,24 @@ def task_service_fixture(tmp_path, documents=()):
 
     class Providers:
         available = True
+        generated_prompts = []
 
         def resolve_specific_model(self, *_args):
             if not self.available:
                 raise ValueError("Model unavailable")
             return ResolvedProviderModel(provider, provider.models[0])
 
+        def generate_chat(self, provider_id, model_id, prompt):
+            if not self.available:
+                raise ValueError("Model unavailable")
+            assert (provider_id, model_id) == ("provider-1", "chat-1")
+            self.generated_prompts.append(prompt)
+            return "基于已冻结证据的结构化结论。"
+
     class Policies:
         policy_revision = 1
-        outbound_mode = "ask-each-task"
+        outbound_mode = "always-allow"
+        authorizations = {}
 
         def get(self, _vault_id):
             return type("Policy", (), {
@@ -61,6 +80,38 @@ def task_service_fixture(tmp_path, documents=()):
 
         def preview(self, _vault_id, _source_path, _derived_path, stage):
             return PolicyEvaluation(True, stage, (), (), "fixture")
+
+        def request_outbound_authorization(
+            self, vault_id, *, provider_id, model_id, operation, task_id, scopes
+        ):
+            authorization = OutboundAuthorization(
+                f"authorization-{len(self.authorizations) + 1}", vault_id, self.policy_revision,
+                provider_id, model_id, operation, task_id, "a" * 64,
+                f"{len(scopes)} scoped item(s)", None, None,
+                "approved" if self.outbound_mode == "always-allow" else "pending", "now", "now",
+            )
+            self.authorizations[authorization.authorization_id] = authorization
+            return authorization
+
+        def confirm_outbound_authorization(self, vault_id, authorization_id, *, approved):
+            authorization = self.authorizations[authorization_id]
+            assert authorization.vault_id == vault_id
+            confirmed = replace(authorization, status="approved" if approved else "rejected")
+            self.authorizations[authorization_id] = confirmed
+            return confirmed
+
+        def check_outbound_authorization(
+            self, vault_id, authorization_id, *, provider_id, model_id, operation, task_id, scopes
+        ):
+            authorization = self.authorizations[authorization_id]
+            assert authorization.vault_id == vault_id
+            assert authorization.status == "approved"
+            assert (provider_id, model_id, operation, task_id) == (
+                authorization.provider_id, authorization.model_id,
+                authorization.operation, authorization.task_id,
+            )
+            assert all(isinstance(scope, OutboundScope) for scope in scopes)
+            return replace(authorization, actual_scope_summary=f"{len(scopes)} scoped item(s)", actual_scope_digest="b" * 64)
 
     class Indexes:
         current = list(documents)
@@ -1030,3 +1081,450 @@ def test_completeness_unavailable_execution_remains_recoverable(tmp_path) -> Non
 
     assert result.status == "recoverable"
     assert repository.get_detail(session.session_id).task_snapshots[0].status == "recoverable"
+
+
+def test_knowledge_organization_plan_sections_are_bounded_to_frozen_evidence() -> None:
+    evidence = SessionKnowledgeOrganizationEvidence(
+        1, 2, "native", "notes/unit/lesson.md", "a" * 64, None, None, None,
+        "Unit 1", "heading: Unit 1", None, "Vocabulary evidence",
+    )
+    section = SessionKnowledgeOrganizationPlanSection(
+        1, "notes/unit", "按已确认资料整理：英语知识点", "notes/unit", (evidence,),
+    )
+
+    assert section.evidence[0].source_ordinal == 2
+    assert section.evidence[0].relative_path == "notes/unit/lesson.md"
+
+    with pytest.raises(ValueError, match="vault-relative"):
+        SessionKnowledgeOrganizationEvidence(
+            1, 1, "native", "C:\\outside.md", "a" * 64, None, None, None,
+            "Unit 1", "heading: Unit 1", None, "Evidence",
+        )
+
+
+def test_knowledge_organization_conclusions_require_frozen_evidence_references() -> None:
+    conclusion = SessionKnowledgeOrganizationConclusion(
+        1, "词汇要点：evidence。", (1, 2),
+    )
+    result = SessionKnowledgeOrganizationResult(
+        "result-1", "session-1", "task-1", "snapshot-1", "completed", "已生成 1 段。",
+        None, (), 1, "2026-07-23T00:00:00+00:00", (),
+        structure_kind="outline", completed_ordinals=(1,), authorization_id="authorization-1",
+    )
+
+    assert conclusion.evidence_ordinals == (1, 2)
+    assert result.completed_ordinals == (1,)
+    with pytest.raises(ValueError, match="evidence"):
+        SessionKnowledgeOrganizationConclusion(1, "结论", ())
+    with pytest.raises(ValueError, match="scope"):
+        SessionKnowledgeOrganizationPlanSection(
+            1, "notes/unit", "按已确认资料整理", "notes/unit", (
+                SessionKnowledgeOrganizationEvidence(
+                    1, 1, "native", "notes/other.md", "a" * 64, None, None, None,
+                    "Other", "heading: Other", None, "Evidence",
+                ),
+            ),
+        )
+
+
+def test_knowledge_organization_plan_is_directory_bounded_and_survives_reopen(tmp_path) -> None:
+    documents = (
+        IndexedDocument(
+            "native-1", "vault-1", "notes/unit-1/vocabulary.md", "a" * 64, "native", (), (), (),
+            (IndexBlock(1, "heading: Vocabulary", "word evidence"),), "now",
+        ),
+        IndexedDocument(
+            "native-2", "vault-1", "notes/unit-2/grammar.md", "b" * 64, "native", (), (), (),
+            (IndexBlock(1, "heading: Grammar", "grammar evidence"),), "now",
+        ),
+    )
+    service, repository, session, _, providers, _, _ = task_service_fixture(tmp_path, documents)
+
+    snapshot = service.create_task(
+        session.session_id, "整理英语知识点", intent="knowledge-organization"
+    )
+
+    assert [section.scope_path for section in snapshot.organization_sections] == [
+        "notes/unit-1", "notes/unit-2"
+    ]
+    assert [item.relative_path for item in snapshot.organization_sections[0].evidence] == [
+        "notes/unit-1/vocabulary.md"
+    ]
+    mismatched_evidence = replace(
+        snapshot.organization_sections[0].evidence[0], content_sha256="c" * 64
+    )
+    mismatched_section = replace(
+        snapshot.organization_sections[0], evidence=(mismatched_evidence,)
+    )
+    with pytest.raises(ValueError, match="source identity"):
+        replace(snapshot, organization_sections=(mismatched_section, snapshot.organization_sections[1]))
+
+    result = service.execute_task(session.session_id, snapshot.task_id)
+    refreshed = service.detail(session.session_id)
+    restarted = SqliteSessionRepository(repository.database_path).get_detail(session.session_id)
+
+    assert result.status == "completed"
+    assert result.completed_ordinals == (1, 2)
+    assert refreshed.task_snapshots[0].status == "completed"
+    assert refreshed.knowledge_organization_results[0].status == "completed"
+    assert restarted.knowledge_organization_results[0] == result
+    assert restarted.task_snapshots[0].organization_sections == snapshot.organization_sections
+
+
+def test_knowledge_organization_plan_uses_one_section_per_root_source(tmp_path) -> None:
+    documents = (
+        IndexedDocument(
+            "native-1", "vault-1", "vocabulary.md", "a" * 64, "native", (), (), (),
+            (IndexBlock(1, "heading: Vocabulary", "word evidence"),), "now",
+        ),
+        IndexedDocument(
+            "native-2", "vault-1", "grammar.md", "b" * 64, "native", (), (), (),
+            (IndexBlock(1, "heading: Grammar", "grammar evidence"),), "now",
+        ),
+    )
+    service, _, session, _, _, _, _ = task_service_fixture(tmp_path, documents)
+
+    snapshot = service.create_task(
+        session.session_id, "整理英语知识点", intent="knowledge-organization"
+    )
+
+    assert [section.scope_path for section in snapshot.organization_sections] == [
+        "grammar.md", "vocabulary.md"
+    ]
+    assert [section.evidence[0].relative_path for section in snapshot.organization_sections] == [
+        "grammar.md", "vocabulary.md"
+    ]
+
+
+def test_knowledge_organization_execution_uses_only_persisted_plan_evidence(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1", "vault-1", "notes/unit/vocabulary.md", "a" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Vocabulary", "word evidence"),), "now",
+    )
+    service, repository, session, _, providers, policies, indexes = task_service_fixture(tmp_path, (document,))
+    snapshot = service.create_task(
+        session.session_id, "整理英语知识点", intent="knowledge-organization"
+    )
+
+    indexes.current_documents = lambda _vault_id: (_ for _ in ()).throw(
+        AssertionError("frozen preparation must not enumerate current documents")
+    )
+    result = service.execute_task(session.session_id, snapshot.task_id)
+
+    assert result.status == "completed"
+    assert result.outcomes[0].status == "completed"
+    assert result.outcomes[0].conclusions[0].evidence_ordinals == (1,)
+    assert providers.generated_prompts[0].count("word evidence") == 1
+    assert repository.get_detail(session.session_id).task_snapshots[0].status == "completed"
+
+
+def test_knowledge_organization_waits_for_task_authorization_before_generating(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1", "vault-1", "notes/unit/vocabulary.md", "a" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Vocabulary", "word evidence"),), "now",
+    )
+    service, repository, session, _, providers, policies, _ = task_service_fixture(tmp_path, (document,))
+    policies.outbound_mode = "ask-each-task"
+    snapshot = service.create_task(
+        session.session_id, "整理英语知识点", intent="knowledge-organization"
+    )
+
+    waiting = service.execute_task(session.session_id, snapshot.task_id)
+
+    assert waiting.status == "waiting-authorization"
+    assert waiting.authorization_id == "authorization-1"
+    assert providers.generated_prompts == []
+    assert repository.get_detail(session.session_id).task_snapshots[0].status == "waiting-authorization"
+
+    completed = service.confirm_knowledge_organization_authorization(
+        session.session_id, snapshot.task_id, waiting.authorization_id, approved=True
+    )
+
+    assert completed.status == "completed"
+    assert len(providers.generated_prompts) == 1
+
+
+def test_knowledge_organization_direct_execution_invalidates_changed_policy_without_reading_documents(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1", "vault-1", "notes/unit/vocabulary.md", "a" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Vocabulary", "word evidence"),), "now",
+    )
+    service, repository, session, _, _, policies, indexes = task_service_fixture(tmp_path, (document,))
+    snapshot = service.create_task(
+        session.session_id, "整理英语知识点", intent="knowledge-organization"
+    )
+    policies.policy_revision += 1
+    indexes.current_documents = lambda _vault_id: (_ for _ in ()).throw(
+        AssertionError("frozen preparation must not enumerate current documents")
+    )
+
+    with pytest.raises(SessionValidationError, match="来源、索引或授权策略已改变"):
+        service.execute_task(session.session_id, snapshot.task_id)
+
+    assert repository.get_detail(session.session_id).task_snapshots[0].status == "invalidated"
+
+
+def test_knowledge_organization_direct_execution_invalidates_changed_index_version(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1", "vault-1", "notes/unit/vocabulary.md", "a" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Vocabulary", "word evidence"),), "now",
+    )
+    service, repository, session, _, _, _, indexes = task_service_fixture(tmp_path, (document,))
+    snapshot = service.create_task(
+        session.session_id, "整理英语知识点", intent="knowledge-organization"
+    )
+    indexes.health = lambda vault_id: IndexHealth(
+        vault_id, "healthy", "later", 1, 0, 0, "unavailable"
+    )
+    indexes.current_documents = lambda _vault_id: (_ for _ in ()).throw(
+        AssertionError("frozen preparation must not enumerate current documents")
+    )
+
+    with pytest.raises(SessionValidationError, match="来源、索引或授权策略已改变"):
+        service.execute_task(session.session_id, snapshot.task_id)
+
+    assert repository.get_detail(session.session_id).task_snapshots[0].status == "invalidated"
+
+
+def test_knowledge_organization_detail_keeps_an_active_preparation_in_progress(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1", "vault-1", "notes/unit/vocabulary.md", "a" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Vocabulary", "word evidence"),), "now",
+    )
+    service, repository, session, *_ = task_service_fixture(tmp_path, (document,))
+    snapshot = service.create_task(
+        session.session_id, "整理英语知识点", intent="knowledge-organization"
+    )
+    started = Event()
+    proceed = Event()
+    prepare_section = service._prepare_knowledge_organization_section
+
+    def block_preparation(section):
+        started.set()
+        assert proceed.wait(2)
+        return prepare_section(section)
+
+    service._prepare_knowledge_organization_section = block_preparation
+    execution: dict[str, object] = {}
+    worker = Thread(
+        target=lambda: execution.setdefault(
+            "result", service.execute_task(session.session_id, snapshot.task_id)
+        )
+    )
+    worker.start()
+    assert started.wait(2)
+
+    active = service.detail(session.session_id)
+
+    assert active.task_snapshots[0].status == "preparing"
+    assert active.knowledge_organization_results[0].status == "preparing"
+    proceed.set()
+    worker.join(2)
+    assert not worker.is_alive()
+    assert execution["result"].status == "completed"
+    assert repository.get_detail(session.session_id).task_snapshots[0].status == "completed"
+
+
+def test_knowledge_organization_preparation_persists_known_sections_before_interruption(tmp_path) -> None:
+    documents = (
+        IndexedDocument(
+            "native-1", "vault-1", "notes/unit-1/vocabulary.md", "a" * 64, "native", (), (), (),
+            (IndexBlock(1, "heading: Vocabulary", "word evidence"),), "now",
+        ),
+        IndexedDocument(
+            "native-2", "vault-1", "notes/unit-2/grammar.md", "b" * 64, "native", (), (), (),
+            (IndexBlock(1, "heading: Grammar", "grammar evidence"),), "now",
+        ),
+    )
+    service, repository, session, vaults, providers, policies, indexes = task_service_fixture(tmp_path, documents)
+    snapshot = service.create_task(
+        session.session_id, "整理英语知识点", intent="knowledge-organization"
+    )
+    prepare_section = service._prepare_knowledge_organization_section
+
+    def interrupt_second_section(section):
+        if section.ordinal == 2:
+            raise KeyboardInterrupt("fixture interruption")
+        return prepare_section(section)
+
+    service._prepare_knowledge_organization_section = interrupt_second_section
+    with pytest.raises(KeyboardInterrupt, match="fixture interruption"):
+        service.execute_task(session.session_id, snapshot.task_id)
+
+    interrupted = repository.get_detail(session.session_id)
+    assert interrupted.task_snapshots[0].status == "preparing"
+    assert interrupted.knowledge_organization_results[0].status == "preparing"
+    assert interrupted.knowledge_organization_results[0].completed_ordinals == (1,)
+    assert [outcome.ordinal for outcome in interrupted.knowledge_organization_results[0].outcomes] == [1]
+
+    restarted_service = SessionService(
+        SqliteSessionRepository(repository.database_path), vault_service=vaults, provider_service=providers,
+        policy_service=policies, index_repository=indexes,
+    )
+    resumed = restarted_service.execute_task(session.session_id, snapshot.task_id)
+    restarted = restarted_service.detail(session.session_id)
+
+    assert resumed.status == "recoverable"
+    assert restarted.task_snapshots[0].status == "recoverable"
+    assert restarted.task_states[0].status == "recoverable"
+    assert restarted.knowledge_organization_results[0].status == "recoverable"
+    assert restarted.knowledge_organization_results[0].completed_ordinals == (1,)
+    assert [outcome.ordinal for outcome in restarted.knowledge_organization_results[0].outcomes] == [1]
+
+
+def test_knowledge_organization_records_a_failed_section_without_completing_unknown_sections(tmp_path) -> None:
+    documents = tuple(
+        IndexedDocument(
+            f"native-{ordinal}", "vault-1", f"notes/unit-{ordinal}/lesson.md", f"{ordinal:x}" * 64,
+            "native", (), (), (), (IndexBlock(1, f"heading: Unit {ordinal}", "evidence"),), "now",
+        )
+        for ordinal in range(1, 4)
+    )
+    service, repository, session, *_ = task_service_fixture(tmp_path, documents)
+    snapshot = service.create_task(
+        session.session_id, "整理英语知识点", intent="knowledge-organization"
+    )
+    prepare_section = service._prepare_knowledge_organization_section
+
+    def fail_second_section(section):
+        if section.ordinal == 2:
+            raise ValueError("fixture failure")
+        return prepare_section(section)
+
+    service._prepare_knowledge_organization_section = fail_second_section
+    result = service.execute_task(session.session_id, snapshot.task_id)
+
+    assert result.status == "failed"
+    assert result.completed_ordinals == (1,)
+    assert [(outcome.ordinal, outcome.status) for outcome in result.outcomes] == [
+        (1, "completed"), (2, "failed")
+    ]
+    assert result.outcomes[1].evidence_count == 0
+    assert repository.get_detail(session.session_id).task_snapshots[0].status == "failed"
+
+
+def test_knowledge_organization_blocks_oversized_scope_without_persisting_partial_snapshot(tmp_path) -> None:
+    documents = tuple(
+        IndexedDocument(
+            f"native-{ordinal}", "vault-1", f"notes/unit-{ordinal}/lesson.md", f"{ordinal:064x}",
+            "native", (), (), (), tuple(
+                IndexBlock(block, f"heading: Unit {ordinal}", f"evidence {block}")
+                for block in range(1, 4)
+            ), "now",
+        )
+        for ordinal in range(1, MAX_KNOWLEDGE_ORGANIZATION_SOURCES + 2)
+    )
+    service, repository, session, *_ = task_service_fixture(tmp_path, documents)
+
+    preview = service.preview_task(
+        session.session_id, "整理英语知识点", intent="knowledge-organization"
+    )
+
+    assert preview.is_ready is False
+    assert preview.organization_budget_exceeded is True
+    assert preview.organization_evidence_count > MAX_KNOWLEDGE_ORGANIZATION_EVIDENCES
+    assert sum(len(section.evidence) for section in preview.organization_sections) <= MAX_KNOWLEDGE_ORGANIZATION_EVIDENCES
+    with pytest.raises(SessionValidationError, match="固定上限"):
+        service.create_task(session.session_id, "整理英语知识点", intent="knowledge-organization")
+    assert repository.get_detail(session.session_id).task_snapshots == ()
+
+
+def test_knowledge_organization_blocks_evidence_budget_within_the_source_budget(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1", "vault-1", "notes/unit/lesson.md", "a" * 64, "native", (), (), (), tuple(
+            IndexBlock(block, "heading: Unit", f"evidence {block}")
+            for block in range(1, MAX_KNOWLEDGE_ORGANIZATION_EVIDENCES + 2)
+        ), "now",
+    )
+    service, repository, session, *_ = task_service_fixture(tmp_path, (document,))
+
+    preview = service.preview_task(
+        session.session_id, "整理英语知识点", intent="knowledge-organization"
+    )
+
+    assert preview.source_count == 1
+    assert preview.organization_budget_exceeded is True
+    assert preview.organization_evidence_count == MAX_KNOWLEDGE_ORGANIZATION_EVIDENCES + 1
+    assert len(preview.organization_sections[0].evidence) == MAX_KNOWLEDGE_ORGANIZATION_EVIDENCES
+    with pytest.raises(SessionValidationError, match="固定上限"):
+        service.create_task(session.session_id, "整理英语知识点", intent="knowledge-organization")
+    assert repository.get_detail(session.session_id).task_snapshots == ()
+
+
+def test_knowledge_organization_sanitizes_non_positive_index_pages(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1", "vault-1", "notes/unit/vocabulary.md", "a" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Vocabulary; page: 0", "word evidence"),), "now",
+    )
+    service, _, session, *_ = task_service_fixture(tmp_path, (document,))
+
+    preview = service.preview_task(
+        session.session_id, "整理英语知识点", intent="knowledge-organization"
+    )
+
+    assert preview.is_ready is True
+    assert preview.organization_sections[0].evidence[0].page is None
+
+
+def test_knowledge_organization_persists_a_recoverable_result_when_index_is_unavailable(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1", "vault-1", "notes/unit/vocabulary.md", "a" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Vocabulary", "word evidence"),), "now",
+    )
+    service, repository, session, _, _, _, indexes = task_service_fixture(tmp_path, (document,))
+    snapshot = service.create_task(
+        session.session_id, "整理英语知识点", intent="knowledge-organization"
+    )
+    indexes.health = lambda vault_id: IndexHealth(vault_id, "failed", "now", 1, 0, 1, "repair-index")
+
+    result = service.execute_task(session.session_id, snapshot.task_id)
+    detail = repository.get_detail(session.session_id)
+
+    assert result.status == "recoverable"
+    assert result.outcomes[0].status == "recoverable"
+    assert result.outcomes[0].evidence_count == 0
+    assert detail.task_snapshots[0].status == "recoverable"
+    assert detail.knowledge_organization_results[0].recovery_action == "重试索引。"
+
+
+def test_knowledge_organization_refresh_keeps_an_unavailable_plan_recoverable(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1", "vault-1", "notes/unit/vocabulary.md", "a" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Vocabulary", "word evidence"),), "now",
+    )
+    service, _, session, _, _, _, indexes = task_service_fixture(tmp_path, (document,))
+    service.create_task(
+        session.session_id, "整理英语知识点", intent="knowledge-organization"
+    )
+    indexes.health = lambda vault_id: IndexHealth(vault_id, "stale", "now", 1, 1, 0, "reindex")
+
+    refreshed = service.detail(session.session_id)
+
+    assert refreshed.task_snapshots[0].status == "recoverable"
+    assert refreshed.task_states[0].status == "recoverable"
+    assert refreshed.knowledge_organization_results[0].status == "recoverable"
+    assert refreshed.knowledge_organization_results[0].outcomes[0].evidence_count == 0
+
+
+def test_knowledge_organization_invalidates_when_frozen_index_blocks_change(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1", "vault-1", "notes/unit/vocabulary.md", "a" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Vocabulary", "original evidence"),), "now",
+    )
+    service, repository, session, _, _, _, indexes = task_service_fixture(tmp_path, (document,))
+    snapshot = service.create_task(
+        session.session_id, "整理英语知识点", intent="knowledge-organization"
+    )
+    indexes.current = [
+        IndexedDocument(
+            "native-1", "vault-1", "notes/unit/vocabulary.md", "a" * 64, "native", (), (), (),
+            (IndexBlock(1, "heading: Vocabulary", "changed evidence"),), "now",
+        )
+    ]
+
+    refreshed = service.detail(session.session_id)
+
+    assert refreshed.task_snapshots[0].status == "invalidated"
+    with pytest.raises(SessionValidationError, match="no longer ready"):
+        service.execute_task(session.session_id, snapshot.task_id)
+    assert repository.get_detail(session.session_id).task_snapshots[0].status == "invalidated"

@@ -14,6 +14,11 @@ from domain.sessions import (
     SessionCompletenessResult,
     SessionDetail,
     SessionGenerationResult,
+    SessionKnowledgeOrganizationEvidence,
+    SessionKnowledgeOrganizationConclusion,
+    SessionKnowledgeOrganizationPlanSection,
+    SessionKnowledgeOrganizationResult,
+    SessionKnowledgeOrganizationSectionOutcome,
     SessionMessage,
     SessionPage,
     SessionRetrievalEvidence,
@@ -187,6 +192,38 @@ class SqliteSessionRepository:
                 "CREATE INDEX IF NOT EXISTS session_task_snapshot_session_idx ON session_task_snapshots(session_id, created_at)"
             )
             connection.execute(
+                """CREATE TABLE IF NOT EXISTS session_task_snapshot_organization_sections (
+                    snapshot_id TEXT NOT NULL REFERENCES session_task_snapshots(snapshot_id) ON DELETE CASCADE,
+                    ordinal INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    goal TEXT NOT NULL,
+                    scope_path TEXT,
+                    PRIMARY KEY (snapshot_id, ordinal)
+                )"""
+            )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS session_task_snapshot_organization_evidence (
+                    snapshot_id TEXT NOT NULL REFERENCES session_task_snapshots(snapshot_id) ON DELETE CASCADE,
+                    section_ordinal INTEGER NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    source_ordinal INTEGER NOT NULL,
+                    identity_kind TEXT NOT NULL,
+                    relative_path TEXT NOT NULL,
+                    content_sha256 TEXT NOT NULL,
+                    source_id TEXT,
+                    source_content_hash TEXT,
+                    source_path TEXT,
+                    heading TEXT,
+                    location TEXT NOT NULL,
+                    page INTEGER,
+                    excerpt TEXT NOT NULL,
+                    PRIMARY KEY (snapshot_id, section_ordinal, ordinal),
+                    FOREIGN KEY (snapshot_id, section_ordinal)
+                        REFERENCES session_task_snapshot_organization_sections(snapshot_id, ordinal)
+                        ON DELETE CASCADE
+                )"""
+            )
+            connection.execute(
                 """CREATE TABLE IF NOT EXISTS session_task_snapshot_coverage_items (
                     snapshot_id TEXT NOT NULL REFERENCES session_task_snapshots(snapshot_id) ON DELETE CASCADE,
                     ordinal INTEGER NOT NULL,
@@ -263,6 +300,40 @@ class SqliteSessionRepository:
             )
             self._ensure_completeness_result_column(
                 connection, "outcomes_json", "TEXT NOT NULL DEFAULT '[]'"
+            )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS session_knowledge_organization_results (
+                    result_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                    task_id TEXT NOT NULL,
+                    snapshot_id TEXT NOT NULL REFERENCES session_task_snapshots(snapshot_id) ON DELETE CASCADE,
+                    status TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    recovery_action TEXT,
+                    prepared_ordinals_json TEXT NOT NULL,
+                    outcomes_json TEXT NOT NULL DEFAULT '[]',
+                    duration_ms INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(session_id, task_id)
+                )"""
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS session_organization_result_session_idx "
+                "ON session_knowledge_organization_results(session_id, created_at)"
+            )
+            self._ensure_table_column(
+                connection, "session_knowledge_organization_results", "structure_kind",
+                "TEXT NOT NULL DEFAULT 'outline'",
+            )
+            self._ensure_table_column(
+                connection, "session_knowledge_organization_results", "completed_ordinals_json",
+                "TEXT NOT NULL DEFAULT '[]'",
+            )
+            self._ensure_table_column(
+                connection, "session_knowledge_organization_results", "authorization_id", "TEXT",
+            )
+            self._ensure_table_column(
+                connection, "session_knowledge_organization_results", "authorization_status", "TEXT",
             )
 
     @staticmethod
@@ -356,6 +427,22 @@ class SqliteSessionRepository:
                 ).fetchall()
                 for row in snapshots
             }
+            organization_sections = {
+                row["snapshot_id"]: connection.execute(
+                    "SELECT * FROM session_task_snapshot_organization_sections "
+                    "WHERE snapshot_id = ? ORDER BY ordinal",
+                    (row["snapshot_id"],),
+                ).fetchall()
+                for row in snapshots
+            }
+            organization_evidence = {
+                row["snapshot_id"]: connection.execute(
+                    "SELECT * FROM session_task_snapshot_organization_evidence "
+                    "WHERE snapshot_id = ? ORDER BY section_ordinal, ordinal",
+                    (row["snapshot_id"],),
+                ).fetchall()
+                for row in snapshots
+            }
             retrieval_results = connection.execute(
                 "SELECT * FROM session_retrieval_results WHERE session_id = ? ORDER BY created_at, result_id",
                 (session_id,),
@@ -371,6 +458,11 @@ class SqliteSessionRepository:
                 "SELECT * FROM session_completeness_results WHERE session_id = ? ORDER BY created_at, result_id",
                 (session_id,),
             ).fetchall()
+            organization_results = connection.execute(
+                "SELECT * FROM session_knowledge_organization_results "
+                "WHERE session_id = ? ORDER BY created_at, result_id",
+                (session_id,),
+            ).fetchall()
         return SessionDetail(
             self._session_from_row(session_row),
             tuple(self._message_from_row(row) for row in messages),
@@ -380,7 +472,11 @@ class SqliteSessionRepository:
             tuple(self._attachment_from_row(row) for row in attachments),
             tuple(
                 self._snapshot_from_row(
-                    row, snapshot_sources[row["snapshot_id"]], coverage_items[row["snapshot_id"]]
+                    row,
+                    snapshot_sources[row["snapshot_id"]],
+                    coverage_items[row["snapshot_id"]],
+                    organization_sections[row["snapshot_id"]],
+                    organization_evidence[row["snapshot_id"]],
                 )
                 for row in snapshots
             ),
@@ -389,6 +485,7 @@ class SqliteSessionRepository:
                 for row in retrieval_results
             ),
             tuple(self._completeness_result_from_row(row) for row in completeness_results),
+            tuple(self._knowledge_organization_result_from_row(row) for row in organization_results),
         )
 
     def list_page(
@@ -713,6 +810,69 @@ class SqliteSessionRepository:
             self._touch_session(connection, snapshot.session_id, task_state.updated_at)
         return True
 
+    def persist_knowledge_organization_execution(
+        self,
+        snapshot: SessionTaskSnapshot,
+        task_state: SessionTaskState,
+        result: SessionKnowledgeOrganizationResult,
+        *,
+        expected_status: str = "prepared",
+    ) -> bool:
+        with self._connect() as connection:
+            if self._update_task_snapshot(
+                connection, snapshot, expected_status=expected_status
+            ).rowcount != 1:
+                return False
+            self._upsert_task_state(connection, task_state)
+            connection.execute(
+                """INSERT INTO session_knowledge_organization_results (
+                    result_id, session_id, task_id, snapshot_id, status, summary, recovery_action,
+                    prepared_ordinals_json, outcomes_json, duration_ms, created_at,
+                    structure_kind, completed_ordinals_json, authorization_id, authorization_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id, task_id) DO UPDATE SET
+                    result_id = excluded.result_id,
+                    snapshot_id = excluded.snapshot_id,
+                    status = excluded.status,
+                    summary = excluded.summary,
+                    recovery_action = excluded.recovery_action,
+                    prepared_ordinals_json = excluded.prepared_ordinals_json,
+                    outcomes_json = excluded.outcomes_json,
+                    duration_ms = excluded.duration_ms,
+                    created_at = excluded.created_at,
+                    structure_kind = excluded.structure_kind,
+                    completed_ordinals_json = excluded.completed_ordinals_json,
+                    authorization_id = excluded.authorization_id,
+                    authorization_status = excluded.authorization_status""",
+                (
+                    result.result_id, result.session_id, result.task_id, result.snapshot_id,
+                    result.status, result.summary, result.recovery_action,
+                    json.dumps(result.prepared_ordinals),
+                    json.dumps([
+                        {
+                            "ordinal": outcome.ordinal,
+                            "status": outcome.status,
+                            "evidence_count": outcome.evidence_count,
+                            "reason": outcome.reason,
+                            "conclusions": [
+                                {
+                                    "ordinal": conclusion.ordinal,
+                                    "content": conclusion.content,
+                                    "evidence_ordinals": conclusion.evidence_ordinals,
+                                }
+                                for conclusion in outcome.conclusions
+                            ],
+                        }
+                        for outcome in result.outcomes
+                    ]),
+                    result.duration_ms, result.created_at, result.structure_kind,
+                    json.dumps(result.completed_ordinals), result.authorization_id,
+                    result.authorization_status,
+                ),
+            )
+            self._touch_session(connection, snapshot.session_id, task_state.updated_at)
+        return True
+
     @staticmethod
     def _session_select(where: str) -> str:
         return """SELECT sessions.*, (
@@ -834,6 +994,48 @@ class SqliteSessionRepository:
                     item.heading, item.location, item.page, item.excerpt, item.disposition, item.reason,
                 )
                 for item in snapshot.coverage_items
+            ],
+        )
+        connection.executemany(
+            """INSERT INTO session_task_snapshot_organization_sections (
+                snapshot_id, ordinal, title, goal, scope_path
+            ) VALUES (?, ?, ?, ?, ?)""",
+            [
+                (
+                    snapshot.snapshot_id,
+                    section.ordinal,
+                    section.title,
+                    section.goal,
+                    section.scope_path,
+                )
+                for section in snapshot.organization_sections
+            ],
+        )
+        connection.executemany(
+            """INSERT INTO session_task_snapshot_organization_evidence (
+                snapshot_id, section_ordinal, ordinal, source_ordinal, identity_kind,
+                relative_path, content_sha256, source_id, source_content_hash, source_path,
+                heading, location, page, excerpt
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    snapshot.snapshot_id,
+                    section.ordinal,
+                    item.ordinal,
+                    item.source_ordinal,
+                    item.identity_kind,
+                    item.relative_path,
+                    item.content_sha256,
+                    item.source_id,
+                    item.source_content_hash,
+                    item.source_path,
+                    item.heading,
+                    item.location,
+                    item.page,
+                    item.excerpt,
+                )
+                for section in snapshot.organization_sections
+                for item in section.evidence
             ],
         )
 
@@ -1003,7 +1205,11 @@ class SqliteSessionRepository:
 
     @staticmethod
     def _snapshot_from_row(
-        row: sqlite3.Row, source_rows: list[sqlite3.Row], coverage_rows: list[sqlite3.Row]
+        row: sqlite3.Row,
+        source_rows: list[sqlite3.Row],
+        coverage_rows: list[sqlite3.Row],
+        organization_section_rows: list[sqlite3.Row],
+        organization_evidence_rows: list[sqlite3.Row],
     ) -> SessionTaskSnapshot:
         return SessionTaskSnapshot(
             row["snapshot_id"],
@@ -1050,6 +1256,33 @@ class SqliteSessionRepository:
                     item["excerpt"], item["disposition"], item["reason"],
                 )
                 for item in coverage_rows
+            ),
+            tuple(
+                SessionKnowledgeOrganizationPlanSection(
+                    section["ordinal"],
+                    section["title"],
+                    section["goal"],
+                    section["scope_path"],
+                    tuple(
+                        SessionKnowledgeOrganizationEvidence(
+                            evidence["ordinal"],
+                            evidence["source_ordinal"],
+                            evidence["identity_kind"],
+                            evidence["relative_path"],
+                            evidence["content_sha256"],
+                            evidence["source_id"],
+                            evidence["source_content_hash"],
+                            evidence["source_path"],
+                            evidence["heading"],
+                            evidence["location"],
+                            evidence["page"],
+                            evidence["excerpt"],
+                        )
+                        for evidence in organization_evidence_rows
+                        if evidence["section_ordinal"] == section["ordinal"]
+                    ),
+                )
+                for section in organization_section_rows
             ),
         )
 
@@ -1119,6 +1352,31 @@ class SqliteSessionRepository:
                 )
                 for outcome in json.loads(row["outcomes_json"])
             ),
+        )
+
+    @staticmethod
+    def _knowledge_organization_result_from_row(
+        row: sqlite3.Row,
+    ) -> SessionKnowledgeOrganizationResult:
+        return SessionKnowledgeOrganizationResult(
+            row["result_id"], row["session_id"], row["task_id"], row["snapshot_id"],
+            row["status"], row["summary"], row["recovery_action"],
+            tuple(json.loads(row["prepared_ordinals_json"])), int(row["duration_ms"]), row["created_at"],
+            tuple(
+                SessionKnowledgeOrganizationSectionOutcome(
+                    outcome["ordinal"], outcome["status"], outcome["evidence_count"], outcome.get("reason"),
+                    tuple(
+                        SessionKnowledgeOrganizationConclusion(
+                            conclusion["ordinal"], conclusion["content"],
+                            tuple(conclusion["evidence_ordinals"]),
+                        )
+                        for conclusion in outcome.get("conclusions", ())
+                    ),
+                )
+                for outcome in json.loads(row["outcomes_json"])
+            ),
+            row["structure_kind"], tuple(json.loads(row["completed_ordinals_json"])),
+            row["authorization_id"], row["authorization_status"],
         )
 
     @staticmethod

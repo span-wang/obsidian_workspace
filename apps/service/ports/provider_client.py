@@ -16,3 +16,12 @@ class ProviderClient(Protocol):
     def probe_embedding(
         self, endpoint: str, secret: str, model_id: str, cancel_event: Event | None = None
     ) -> None: ...
+
+    def generate_chat(
+        self,
+        endpoint: str,
+        secret: str,
+        model_id: str,
+        prompt: str,
+        cancel_event: Event | None = None,
+    ) -> str: ...

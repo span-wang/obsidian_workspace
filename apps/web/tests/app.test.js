@@ -310,6 +310,76 @@ test("renders completeness coverage with explicit gaps and stale source status",
   assert.match(markup, /加载更多覆盖项/);
 });
 
+test("renders an evidence-bound knowledge organization conclusion with expandable evidence", () => {
+  const markup = renderToStaticMarkup(React.createElement(SessionManagement, {
+    sessionPage: { sessions: [{ session_id: "session-1", title: "英语", message_count: 0 }], page: 1, page_size: 25, total: 1, total_pages: 1 },
+    filters: { query: "", sort: "updated_at", order: "desc" }, isLoading: false, error: "", selectedSessionId: "session-1",
+    selectedDetail: {
+      session: { session_id: "session-1", title: "英语" }, messages: [], citations: [], retrieval_results: [], completeness_results: [],
+      task_snapshots: [{
+        snapshot_id: "snapshot-1", task_id: "task-1", vault_id: "vault-1", intent: "knowledge-organization", status: "completed", scope_kind: "directory", scope_path: "notes/unit", source_count: 1, source_digest: "a".repeat(64), index_status: "healthy", outbound_scope_summary: "仅使用已冻结的本地知识库证据；不会调用 Provider、Model 或互联网。",
+        knowledge_organization_plan: { section_count: 1, local_evidence_only: true, sections: [{ ordinal: 1, title: "notes/unit", goal: "整理英语知识点", scope_path: "notes/unit", evidence_count: 1, evidence: [{ ordinal: 1, relative_path: "notes/unit/vocabulary.md", heading: "Vocabulary", location: "heading: Vocabulary", excerpt: "word evidence", identity_kind: "native", content_sha256: "a".repeat(64) }] }] }
+      }],
+      knowledge_organization_results: [{ result_id: "result-1", snapshot_id: "snapshot-1", vault_id: "vault-1", status: "completed", summary: "已按冻结证据生成 1 个知识整理计划段。", structure_kind: "outline", section_counts: { planned: 1, prepared: 0, running: 0, completed: 1, failed: 0, recoverable: 0 }, sections: [{ ordinal: 1, title: "notes/unit", goal: "整理英语知识点", scope_path: "notes/unit", status: "completed", independent_source_count: 1, evidence: [{ ordinal: 1, relative_path: "notes/unit/vocabulary.md", heading: "Vocabulary", location: "heading: Vocabulary", excerpt: "word evidence", identity_kind: "native", content_sha256: "a".repeat(64) }], conclusions: [{ ordinal: 1, content: "词汇要点。", evidence: [{ ordinal: 1, relative_path: "notes/unit/vocabulary.md", heading: "Vocabulary", location: "heading: Vocabulary", excerpt: "word evidence", identity_kind: "native", content_sha256: "a".repeat(64) }] }] }] }]
+    },
+    vaults: [{ vault_id: "vault-1", display_name: "英语资料", authorization_status: "active", access_status: "available" }]
+  }));
+
+  assert.match(markup, /知识整理计划/);
+  assert.match(markup, /仅使用本地知识库中已冻结的证据/);
+  assert.match(markup, /已按冻结证据生成 1 个知识整理计划段。/);
+  assert.match(markup, /词汇要点。/);
+  assert.match(markup, /独立来源：1/);
+  assert.match(markup, /在 Obsidian 中打开/);
+  assert.match(markup, /notes\/unit\/vocabulary\.md/);
+  assert.match(markup, /word evidence/);
+  assert.match(markup, /计划 1 段；已准备 0 段；已完成 1 段；进行中 0 段/);
+});
+
+test("renders restored knowledge-organization bindings and recoverable progress truthfully", () => {
+  const markup = renderToStaticMarkup(React.createElement(SessionManagement, {
+    sessionPage: { sessions: [{ session_id: "session-restore", title: "恢复整理", selected_vault_id: "vault-current", message_count: 0 }], page: 1, page_size: 25, total: 1, total_pages: 1 },
+    filters: { query: "", sort: "updated_at", order: "desc" }, isLoading: false, error: "", selectedSessionId: "session-restore",
+    selectedDetail: {
+      session: { session_id: "session-restore", title: "恢复整理", selected_vault_id: "vault-current", scope_kind: "vault", selected_model_label: "chat-1" },
+      messages: [], citations: [], retrieval_results: [], completeness_results: [],
+      task_snapshots: [{
+        snapshot_id: "snapshot-restore", task_id: "task-restore", vault_id: "vault-frozen", intent: "knowledge-organization", status: "recoverable", scope_kind: "directory", scope_path: "notes/unit", source_count: 2, source_digest: "s".repeat(64),
+        index_status: "healthy", index_updated_at: "2026-07-23T00:00:00+00:00", index_digest: "i".repeat(64), policy_revision: 9, exclusion_summary: "排除规则 1 项：never-send-cloud: notes/private", outbound_scope_summary: "仅使用已冻结的本地知识库证据；不会调用 Provider、Model 或互联网。",
+        knowledge_organization_plan: { section_count: 2, local_evidence_only: true, sections: [
+          { ordinal: 1, title: "notes/unit", goal: "整理已完成主题", scope_path: "notes/unit", evidence_count: 1, evidence: [] },
+          { ordinal: 2, title: "notes/review", goal: "整理待恢复主题", scope_path: "notes/review", evidence_count: 1, evidence: [] }
+        ] },
+        invalidation_reason: null
+      }],
+      knowledge_organization_results: [{
+        result_id: "result-restore", snapshot_id: "snapshot-restore", status: "recoverable", summary: "准备被中断，已知段落已保留。", recovery_action: "恢复索引后重新准备任务。", local_evidence_only: true,
+        section_counts: { planned: 2, prepared: 1, failed: 0, recoverable: 1 },
+        sections: [
+          { ordinal: 1, title: "notes/unit", goal: "整理已完成主题", scope_path: "notes/unit", status: "prepared", prepared_evidence_count: 1, evidence: [] },
+          { ordinal: 2, title: "notes/review", goal: "整理待恢复主题", scope_path: "notes/review", status: "recoverable", prepared_evidence_count: 0, reason: "服务在准备此段前中断。", evidence: [] }
+        ]
+      }]
+    },
+    vaults: [
+      { vault_id: "vault-current", display_name: "当前资料", authorization_status: "active", access_status: "available" },
+      { vault_id: "vault-frozen", display_name: "冻结资料", authorization_status: "active", access_status: "available" }
+    ]
+  }));
+
+  assert.match(markup, /任务 知识整理：待恢复/);
+  assert.match(markup, /冻结 vault：冻结资料/);
+  assert.match(markup, /来源：2 项；来源摘要：ssssssssssss/);
+  assert.match(markup, /索引：healthy；版本：2026-07-23T00:00:00\+00:00；索引摘要：iiiiiiiiiiii/);
+  assert.match(markup, /策略修订：9；排除项：排除规则 1 项：never-send-cloud: notes\/private/);
+  assert.match(markup, /计划待恢复/);
+  assert.match(markup, /计划 2 段；已准备 1 段；已完成 0 段；进行中 0 段/);
+  assert.match(markup, /失败 0 段；待恢复 1 段/);
+  assert.match(markup, /第 2 段：notes\/review/);
+  assert.match(markup, /状态：待恢复/);
+  assert.match(markup, /服务在准备此段前中断。/);
+});
+
 test("renders a pending citation paragraph with its historical scope and verification action", () => {
   const session = { session_id: "session-1", title: "英语", message_count: 1 };
   const markup = renderToStaticMarkup(React.createElement(SessionManagement, {

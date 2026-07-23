@@ -14,6 +14,7 @@ from api.main import (
     session_citation_payload,
     session_completeness_result_payload,
     session_generation_result_payload,
+    session_knowledge_organization_result_payload,
     session_retrieval_result_payload,
 )
 from api.runtime import RuntimeState
@@ -26,6 +27,11 @@ from domain.sessions import (
     SessionRetrievalResult,
     SessionCitation,
     SessionGenerationResult,
+    SessionKnowledgeOrganizationConclusion,
+    SessionKnowledgeOrganizationEvidence,
+    SessionKnowledgeOrganizationPlanSection,
+    SessionKnowledgeOrganizationResult,
+    SessionKnowledgeOrganizationSectionOutcome,
 )
 
 
@@ -143,6 +149,86 @@ def test_completeness_payload_marks_invalidated_snapshot_as_source_changed() -> 
     assert payload["coverage_total"] == 2
     assert payload["coverage_has_more"] is True
     assert payload["coverage_counts"]["planned"] == 2
+
+
+def test_knowledge_organization_payload_exposes_frozen_plan_and_stale_state() -> None:
+    evidence = SessionKnowledgeOrganizationEvidence(
+        1, 1, "native", "notes/unit/vocabulary.md", "a" * 64, None, None, None,
+        "Vocabulary", "heading: Vocabulary", None, "word evidence",
+    )
+    section = SessionKnowledgeOrganizationPlanSection(
+        1, "notes/unit", "整理英语知识点", "notes/unit", (evidence,)
+    )
+    result = SessionKnowledgeOrganizationResult(
+        "result-1", "session-1", "task-1", "snapshot-1", "planned", "计划已准备。",
+        None, (1,), 1, "2026-07-23T00:00:00+00:00",
+        (SessionKnowledgeOrganizationSectionOutcome(1, "prepared", 1),),
+    )
+    snapshot = type("Snapshot", (), {
+        "vault_id": "vault-1", "scope_kind": "directory", "scope_path": "notes/unit",
+        "source_count": 1, "source_digest": "a" * 64, "index_status": "healthy",
+        "index_updated_at": "2026-07-23T00:00:00+00:00", "index_digest": "b" * 64,
+        "policy_revision": 3, "exclusion_summary": "排除规则 1 项：directory: notes/private",
+        "status": "invalidated", "invalidation_reason": "索引已变化。",
+        "organization_sections": (section,),
+    })()
+
+    payload = session_knowledge_organization_result_payload(result, snapshot)
+
+    assert payload["status"] == "source-changed"
+    assert payload["section_counts"] == {
+        "planned": 1, "prepared": 1, "running": 0, "completed": 0, "failed": 0, "recoverable": 0
+    }
+    assert payload["sections"][0]["scope_path"] == "notes/unit"
+    assert payload["sections"][0]["evidence"][0]["relative_path"] == "notes/unit/vocabulary.md"
+    assert payload["invalidation_reason"] == "索引已变化。"
+    assert payload["frozen_context"] == {
+        "vault_id": "vault-1",
+        "scope_kind": "directory",
+        "scope_path": "notes/unit",
+        "source_count": 1,
+        "source_digest": "a" * 64,
+        "index_status": "healthy",
+        "index_updated_at": "2026-07-23T00:00:00+00:00",
+        "index_digest": "b" * 64,
+        "policy_revision": 3,
+        "exclusion_summary": "排除规则 1 项：directory: notes/private",
+    }
+
+
+def test_knowledge_organization_payload_binds_every_conclusion_to_section_evidence() -> None:
+    evidence = SessionKnowledgeOrganizationEvidence(
+        1, 1, "native", "notes/unit/vocabulary.md", "a" * 64, None, None, None,
+        "Vocabulary", "heading: Vocabulary", None, "word evidence",
+    )
+    section = SessionKnowledgeOrganizationPlanSection(
+        1, "notes/unit", "整理英语知识点", "notes/unit", (evidence,)
+    )
+    result = SessionKnowledgeOrganizationResult(
+        "result-1", "session-1", "task-1", "snapshot-1", "completed", "已生成 1 段。",
+        None, (), 1, "2026-07-23T00:00:00+00:00",
+        (SessionKnowledgeOrganizationSectionOutcome(
+            1, "completed", 1, conclusions=(
+                SessionKnowledgeOrganizationConclusion(1, "词汇要点。", (1,)),
+            ),
+        ),),
+        structure_kind="outline", completed_ordinals=(1,), authorization_id="authorization-1",
+        authorization_status="approved",
+    )
+    snapshot = type("Snapshot", (), {
+        "vault_id": "vault-1", "scope_kind": "directory", "scope_path": "notes/unit",
+        "source_count": 1, "source_digest": "a" * 64, "index_status": "healthy",
+        "index_updated_at": "2026-07-23T00:00:00+00:00", "index_digest": "b" * 64,
+        "policy_revision": 3, "exclusion_summary": "无排除项", "status": "completed",
+        "invalidation_reason": None, "organization_sections": (section,),
+    })()
+
+    payload = session_knowledge_organization_result_payload(result, snapshot)
+
+    assert payload["structure_kind"] == "outline"
+    assert payload["section_counts"]["completed"] == 1
+    assert payload["sections"][0]["conclusions"][0]["evidence"][0]["excerpt"] == "word evidence"
+    assert payload["sections"][0]["independent_source_count"] == 1
 
 
 def test_answer_and_citation_payload_preserve_turn_identity_and_verification_state() -> None:

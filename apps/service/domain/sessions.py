@@ -152,6 +152,65 @@ class SessionCompletenessCoverageItem:
 
 
 @dataclass(frozen=True)
+class SessionKnowledgeOrganizationEvidence:
+    ordinal: int
+    source_ordinal: int
+    identity_kind: str
+    relative_path: str
+    content_sha256: str
+    source_id: str | None
+    source_content_hash: str | None
+    source_path: str | None
+    heading: str | None
+    location: str
+    page: int | None
+    excerpt: str
+
+    def __post_init__(self) -> None:
+        if self.ordinal < 1 or self.source_ordinal < 1 or self.identity_kind not in {"derived", "native"}:
+            raise ValueError("Knowledge organization evidence identity is invalid.")
+        _validate_relative_path(self.relative_path)
+        _validate_sha256(self.content_sha256, "Knowledge organization evidence content hash")
+        if self.identity_kind == "native":
+            if any(value is not None for value in (self.source_id, self.source_content_hash, self.source_path)):
+                raise ValueError("Native knowledge organization evidence cannot fabricate source identity.")
+        else:
+            if not all((self.source_id, self.source_content_hash, self.source_path)):
+                raise ValueError("Derived knowledge organization evidence needs source identity.")
+            _validate_sha256(self.source_content_hash, "Knowledge organization evidence source hash")
+            _validate_relative_path(self.source_path)
+        if not self.location.strip() or not self.excerpt.strip() or len(self.excerpt) > 1000:
+            raise ValueError("Knowledge organization evidence location or excerpt is invalid.")
+        if self.page is not None and self.page < 1:
+            raise ValueError("Knowledge organization evidence page is invalid.")
+
+
+@dataclass(frozen=True)
+class SessionKnowledgeOrganizationPlanSection:
+    ordinal: int
+    title: str
+    goal: str
+    scope_path: str | None
+    evidence: tuple[SessionKnowledgeOrganizationEvidence, ...]
+
+    def __post_init__(self) -> None:
+        if self.ordinal < 1 or not self.title.strip() or not self.goal.strip():
+            raise ValueError("Knowledge organization plan section is invalid.")
+        if self.scope_path is not None:
+            _validate_relative_path(self.scope_path)
+            if not self.scope_path.strip():
+                raise ValueError("Knowledge organization plan section scope is invalid.")
+        if tuple(item.ordinal for item in self.evidence) != tuple(
+            range(1, len(self.evidence) + 1)
+        ):
+            raise ValueError("Knowledge organization plan evidence ordering is invalid.")
+        if self.scope_path is not None and any(
+            item.relative_path != self.scope_path
+            and not item.relative_path.startswith(f"{self.scope_path}/")
+            for item in self.evidence
+        ):
+            raise ValueError("Knowledge organization plan evidence falls outside its scope.")
+@dataclass(frozen=True)
 class SessionTaskSnapshot:
     snapshot_id: str
     session_id: str
@@ -179,6 +238,7 @@ class SessionTaskSnapshot:
     invalidation_reason: str | None = None
     sources: tuple[SessionTaskSnapshotSource, ...] = ()
     coverage_items: tuple[SessionCompletenessCoverageItem, ...] = ()
+    organization_sections: tuple[SessionKnowledgeOrganizationPlanSection, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -194,7 +254,7 @@ class SessionTaskSnapshot:
             or not self.model_id
             or self.policy_revision < 1
             or self.source_count != len(self.sources)
-            or self.status not in {"prepared", "waiting-authorization", "completed", "recoverable", "failed", "invalidated"}
+            or self.status not in {"prepared", "preparing", "waiting-authorization", "completed", "recoverable", "failed", "invalidated"}
         ):
             raise ValueError("Task snapshot is invalid.")
         normalize_session_scope(self.scope_kind, self.scope_path)
@@ -213,6 +273,35 @@ class SessionTaskSnapshot:
                 raise ValueError("Completeness task snapshots need ordered coverage items.")
         elif self.coverage_items:
             raise ValueError("Only completeness task snapshots can have coverage items.")
+        if self.intent == "knowledge-organization":
+            if tuple(section.ordinal for section in self.organization_sections) != tuple(
+                range(1, len(self.organization_sections) + 1)
+            ):
+                raise ValueError("Knowledge organization task snapshots need ordered plan sections.")
+            sources_by_ordinal = {source.ordinal: source for source in self.sources}
+            for section in self.organization_sections:
+                for item in section.evidence:
+                    source = sources_by_ordinal.get(item.source_ordinal)
+                    if source is None:
+                        raise ValueError("Knowledge organization evidence must belong to the task snapshot.")
+                    if (
+                        item.identity_kind,
+                        item.relative_path,
+                        item.content_sha256,
+                        item.source_id,
+                        item.source_content_hash,
+                        item.source_path,
+                    ) != (
+                        source.identity_kind,
+                        source.relative_path,
+                        source.content_sha256,
+                        source.source_id,
+                        source.source_content_hash,
+                        source.source_path,
+                    ):
+                        raise ValueError("Knowledge organization evidence source identity is invalid.")
+        elif self.organization_sections:
+            raise ValueError("Only knowledge organization task snapshots can have plan sections.")
 
 
 @dataclass(frozen=True)
@@ -572,6 +661,138 @@ class SessionCompletenessResult:
                 raise ValueError("Completeness processed coverage must match item outcomes.")
 
 
+KNOWLEDGE_ORGANIZATION_RESULT_STATUSES = frozenset(
+    {"preparing", "planned", "waiting-authorization", "completed", "failed", "recoverable"}
+)
+KNOWLEDGE_ORGANIZATION_STRUCTURE_KINDS = frozenset(
+    {"summary", "classification", "comparison", "timeline", "outline", "chapter-summary"}
+)
+
+
+@dataclass(frozen=True)
+class SessionKnowledgeOrganizationConclusion:
+    ordinal: int
+    content: str
+    evidence_ordinals: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            self.ordinal < 1
+            or not self.content.strip()
+            or len(self.content) > 8_000
+            or not self.evidence_ordinals
+            or tuple(sorted(set(self.evidence_ordinals))) != self.evidence_ordinals
+            or any(ordinal < 1 for ordinal in self.evidence_ordinals)
+        ):
+            raise ValueError("Knowledge organization conclusion evidence is invalid.")
+
+
+@dataclass(frozen=True)
+class SessionKnowledgeOrganizationSectionOutcome:
+    ordinal: int
+    status: str
+    evidence_count: int
+    reason: str | None = None
+    conclusions: tuple[SessionKnowledgeOrganizationConclusion, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.ordinal < 1 or self.status not in {
+            "prepared", "running", "completed", "failed", "recoverable"
+        }:
+            raise ValueError("Knowledge organization section outcome is invalid.")
+        if self.evidence_count < 0:
+            raise ValueError("Knowledge organization section evidence count is invalid.")
+        if self.status in {"prepared", "completed"}:
+            if self.evidence_count < 1 or self.reason is not None:
+                raise ValueError("Completed knowledge organization sections need evidence and no failure reason.")
+        elif self.status == "running":
+            if self.evidence_count != 0 or self.reason is not None or self.conclusions:
+                raise ValueError("Running knowledge organization sections cannot retain results.")
+        elif self.evidence_count != 0 or not self.reason:
+            raise ValueError("Incomplete knowledge organization sections need a reason.")
+        if self.status == "completed":
+            if not self.conclusions or tuple(item.ordinal for item in self.conclusions) != tuple(
+                range(1, len(self.conclusions) + 1)
+            ):
+                raise ValueError("Completed knowledge organization sections need ordered conclusions.")
+            if any(max(item.evidence_ordinals) > self.evidence_count for item in self.conclusions):
+                raise ValueError("Knowledge organization conclusions reference unknown evidence.")
+        elif self.conclusions:
+            raise ValueError("Only completed knowledge organization sections can retain conclusions.")
+
+
+@dataclass(frozen=True)
+class SessionKnowledgeOrganizationResult:
+    result_id: str
+    session_id: str
+    task_id: str
+    snapshot_id: str
+    status: str
+    summary: str
+    recovery_action: str | None
+    prepared_ordinals: tuple[int, ...]
+    duration_ms: int
+    created_at: str
+    outcomes: tuple[SessionKnowledgeOrganizationSectionOutcome, ...] = ()
+    structure_kind: str = "outline"
+    completed_ordinals: tuple[int, ...] = ()
+    authorization_id: str | None = None
+    authorization_status: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not self.result_id
+            or not self.session_id
+            or not self.task_id
+            or not self.snapshot_id
+            or self.status not in KNOWLEDGE_ORGANIZATION_RESULT_STATUSES
+            or not self.summary.strip()
+            or self.duration_ms < 0
+            or self.structure_kind not in KNOWLEDGE_ORGANIZATION_STRUCTURE_KINDS
+            or tuple(sorted(set(self.prepared_ordinals))) != self.prepared_ordinals
+            or any(ordinal < 1 for ordinal in self.prepared_ordinals)
+            or tuple(sorted(set(self.completed_ordinals))) != self.completed_ordinals
+            or any(ordinal < 1 for ordinal in self.completed_ordinals)
+        ):
+            raise ValueError("Knowledge organization result is invalid.")
+        if self.status == "planned":
+            if not self.prepared_ordinals or self.recovery_action is not None:
+                raise ValueError("Planned knowledge organization results need prepared sections and no recovery action.")
+        elif self.status == "completed":
+            if not self.completed_ordinals or self.recovery_action is not None:
+                raise ValueError("Completed knowledge organization results need completed sections and no recovery action.")
+        elif self.status == "waiting-authorization":
+            if not self.authorization_id or self.authorization_status != "pending" or self.recovery_action is not None:
+                raise ValueError("Waiting knowledge organization results need pending authorization.")
+        elif self.recovery_action is None:
+            raise ValueError("Incomplete knowledge organization results need a recovery action.")
+        if self.authorization_id is None and self.authorization_status is not None:
+            raise ValueError("Knowledge organization authorization status needs an identifier.")
+        if self.outcomes:
+            if tuple(outcome.ordinal for outcome in self.outcomes) != tuple(
+                sorted(outcome.ordinal for outcome in self.outcomes)
+            ) or len({outcome.ordinal for outcome in self.outcomes}) != len(self.outcomes):
+                raise ValueError("Knowledge organization section outcomes must be ordered and unique.")
+            prepared = tuple(
+                outcome.ordinal for outcome in self.outcomes if outcome.status == "prepared"
+            )
+            if prepared != self.prepared_ordinals:
+                raise ValueError("Prepared knowledge organization sections must match outcomes.")
+            completed = tuple(
+                outcome.ordinal for outcome in self.outcomes if outcome.status == "completed"
+            )
+            if completed != self.completed_ordinals:
+                raise ValueError("Completed knowledge organization sections must match outcomes.")
+            if self.status == "planned" and any(
+                outcome.status != "prepared" for outcome in self.outcomes
+            ):
+                raise ValueError("Planned knowledge organization results cannot retain incomplete sections.")
+            if self.status == "completed" and any(
+                outcome.status != "completed" for outcome in self.outcomes
+            ):
+                raise ValueError("Completed knowledge organization results cannot retain incomplete sections.")
+
+
 @dataclass(frozen=True)
 class SessionAttachment:
     attachment_id: str
@@ -612,6 +833,7 @@ class SessionDetail:
     task_snapshots: tuple[SessionTaskSnapshot, ...] = ()
     retrieval_results: tuple[SessionRetrievalResult, ...] = ()
     completeness_results: tuple[SessionCompletenessResult, ...] = ()
+    knowledge_organization_results: tuple[SessionKnowledgeOrganizationResult, ...] = ()
 
 
 @dataclass(frozen=True)

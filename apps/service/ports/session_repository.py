@@ -9,6 +9,7 @@ from domain.sessions import (
     SessionAttachment,
     SessionDetail,
     SessionGenerationResult,
+    SessionKnowledgeOrganizationResult,
     SessionMessage,
     SessionPage,
     SessionRetrievalResult,
@@ -104,4 +105,13 @@ class SessionRepository(Protocol):
         snapshot: SessionTaskSnapshot,
         task_state: SessionTaskState,
         result: SessionCompletenessResult,
+    ) -> bool: ...
+
+    def persist_knowledge_organization_execution(
+        self,
+        snapshot: SessionTaskSnapshot,
+        task_state: SessionTaskState,
+        result: SessionKnowledgeOrganizationResult,
+        *,
+        expected_status: str = "prepared",
     ) -> bool: ...

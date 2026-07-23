@@ -1201,6 +1201,61 @@ button:disabled {
   font-size: 13px;
 }
 
+.knowledge-organization-plan {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #d7d7d2;
+}
+
+.knowledge-organization-plan h3,
+.organization-plan-heading,
+.organization-plan-meta,
+.organization-plan-note,
+.organization-plan-empty {
+  margin: 0;
+}
+
+.knowledge-organization-plan h3,
+.organization-plan-heading {
+  color: #111111;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.45;
+}
+
+.organization-plan-meta,
+.organization-plan-note,
+.organization-plan-empty {
+  color: #545454;
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.organization-plan-section {
+  display: grid;
+  gap: 6px;
+  padding: 10px 0;
+  border-top: 1px solid #e9e9e4;
+}
+
+.organization-result-section,
+.organization-conclusion {
+  display: grid;
+  gap: 8px;
+  border-top: 1px solid #d7d7d2;
+  padding: 12px 0;
+}
+
+.organization-conclusion-content {
+  margin: 0;
+  color: #111111;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+
 .session-task-snapshot-list {
   display: grid;
   gap: 8px;

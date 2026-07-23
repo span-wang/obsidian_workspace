@@ -5,6 +5,7 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import re
+from threading import RLock
 from time import perf_counter
 from uuid import uuid4
 
@@ -18,6 +19,11 @@ from domain.sessions import (
     SessionCitation,
     SessionDetail,
     SessionGenerationResult,
+    SessionKnowledgeOrganizationConclusion,
+    SessionKnowledgeOrganizationEvidence,
+    SessionKnowledgeOrganizationPlanSection,
+    SessionKnowledgeOrganizationResult,
+    SessionKnowledgeOrganizationSectionOutcome,
     SessionMessage,
     SessionPage,
     SessionRetrievalEvidence,
@@ -30,6 +36,7 @@ from domain.sessions import (
     new_session,
     utc_now,
 )
+from domain.policies import OutboundScope
 from ports.session_repository import SessionRepository
 
 
@@ -45,6 +52,8 @@ MAX_RETRIEVAL_EVIDENCES = 8
 MAX_RETRIEVAL_BLOCK_CHARS = 800
 COMPLETENESS_BATCH_SIZE = 32
 MAX_RETRIEVAL_CONTEXT_CHARS = 4_000
+MAX_KNOWLEDGE_ORGANIZATION_SOURCES = 128
+MAX_KNOWLEDGE_ORGANIZATION_EVIDENCES = 256
 
 
 @dataclass(frozen=True)
@@ -71,6 +80,9 @@ class TaskPreview:
     is_ready: bool
     blocking_reason: str | None
     recovery_action: str | None
+    organization_sections: tuple[SessionKnowledgeOrganizationPlanSection, ...] = ()
+    organization_evidence_count: int = 0
+    organization_budget_exceeded: bool = False
 
 
 class SessionService:
@@ -83,6 +95,8 @@ class SessionService:
         self.provider_service = provider_service
         self.policy_service = policy_service
         self.index_repository = index_repository
+        self._preparing_snapshot_counts: dict[str, int] = {}
+        self._preparing_snapshot_guard = RLock()
 
     def create(self, title: str | None = None) -> PersistentSession:
         session = new_session(self._normalize_title(title, default="未命名会话"))
@@ -286,6 +300,7 @@ class SessionService:
             preview.exclusion_summary, preview.outbound_mode, preview.outbound_scope_summary,
             preview.source_count, preview.source_digest, "prepared", timestamp, timestamp,
             sources=preview.sources, coverage_items=preview.coverage_items,
+            organization_sections=preview.organization_sections,
         )
         self.repository.persist_task(
             message,
@@ -304,10 +319,134 @@ class SessionService:
         snapshot = next((item for item in detail.task_snapshots if item.task_id == task_id), None)
         if task_state is None or snapshot is None or task_state.snapshot_id != snapshot.snapshot_id:
             raise SessionValidationError("The selected task is unavailable. Prepare a new task.")
-        if task_state.status != "prepared" or snapshot.status != "prepared":
-            raise SessionValidationError("The selected task is no longer ready. Prepare a new task.")
         if snapshot.intent not in {"source-lookup", "knowledge-organization", "completeness"}:
             raise SessionValidationError("The selected task type is handled by a later workflow.")
+
+        if snapshot.intent == "knowledge-organization":
+            existing = next(
+                (
+                    item
+                    for item in detail.knowledge_organization_results
+                    if item.task_id == snapshot.task_id and item.snapshot_id == snapshot.snapshot_id
+                ),
+                None,
+            )
+            if snapshot.status == "preparing":
+                if self._knowledge_organization_preparation_is_active(snapshot.snapshot_id):
+                    return existing
+                return self._recover_interrupted_knowledge_organization_preparation(
+                    detail, snapshot, task_state
+                )
+            if existing is not None and snapshot.status in {"completed", "recoverable", "failed"}:
+                return existing
+            if task_state.status not in {"prepared", "waiting-authorization"} or snapshot.status not in {
+                "prepared", "waiting-authorization"
+            }:
+                raise SessionValidationError("The selected task is no longer ready. Prepare a new task.")
+            if self._context_changed(
+                detail.session,
+                vault_id=snapshot.vault_id,
+                scope_kind=snapshot.scope_kind,
+                scope_path=snapshot.scope_path,
+                provider_id=snapshot.provider_id,
+                model_id=snapshot.model_id,
+            ):
+                reason = "会话语境已改变。"
+                self._invalidate_active_snapshots(session_id, reason, snapshot_ids={snapshot.snapshot_id})
+                raise SessionValidationError(f"{reason} 请重新准备任务。")
+            try:
+                health = self.index_repository.health(snapshot.vault_id)
+            except Exception:
+                health = None
+            if health is None:
+                return self._persist_unavailable_knowledge_organization_execution(
+                    snapshot,
+                    task_state,
+                    started,
+                    "索引不可用：unavailable。",
+                    self._index_recovery_action("unavailable"),
+                )
+            if health.status != "healthy":
+                return self._persist_unavailable_knowledge_organization_execution(
+                    snapshot,
+                    task_state,
+                    started,
+                    f"索引不可用：{health.status}。",
+                    self._index_recovery_action(health.status),
+                )
+            policy = self.policy_service.get(snapshot.vault_id)
+            if (
+                health.updated_at != snapshot.index_updated_at
+                or policy.policy_revision != snapshot.policy_revision
+                or policy.outbound_mode != snapshot.outbound_mode
+            ):
+                reason = "来源、索引或授权策略已改变。"
+                self._invalidate_active_snapshots(session_id, reason, snapshot_ids={snapshot.snapshot_id})
+                raise SessionValidationError(f"{reason} 请重新准备任务。")
+            content = next(
+                (message.content for message in detail.messages if message.message_id == snapshot.message_id),
+                "整理已确认资料。",
+            )
+            scopes = self._knowledge_organization_outbound_scopes(snapshot)
+            authorization_id: str
+            if snapshot.status == "waiting-authorization":
+                if existing is None or not existing.authorization_id:
+                    raise SessionValidationError("The selected task authorization is unavailable. Prepare a new task.")
+                authorization_id = existing.authorization_id
+            else:
+                try:
+                    authorization = self.policy_service.request_outbound_authorization(
+                        snapshot.vault_id,
+                        provider_id=snapshot.provider_id,
+                        model_id=snapshot.model_id,
+                        operation="knowledge-organization",
+                        task_id=snapshot.task_id,
+                        scopes=scopes,
+                    )
+                except Exception as error:
+                    return self._persist_unavailable_knowledge_organization_execution(
+                        snapshot, task_state, started, str(error) or "无法请求知识整理授权。",
+                        "检查外发授权和排除规则后重新准备任务。",
+                    )
+                authorization_id = authorization.authorization_id
+                if authorization.status == "pending":
+                    waiting = SessionKnowledgeOrganizationResult(
+                        str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id,
+                        "waiting-authorization", "知识整理将仅发送已冻结的计划段证据，等待本次授权。",
+                        None, (), int((perf_counter() - started) * 1000), utc_now(), (),
+                        self._knowledge_organization_structure_kind(content), (), authorization_id, "pending",
+                    )
+                    return self._persist_knowledge_organization_execution(
+                        replace(snapshot, status="waiting-authorization", updated_at=utc_now()),
+                        replace(task_state, status="waiting-authorization", updated_at=utc_now()),
+                        waiting,
+                        expected_status="prepared",
+                    )
+            try:
+                self.policy_service.check_outbound_authorization(
+                    snapshot.vault_id,
+                    authorization_id,
+                    provider_id=snapshot.provider_id,
+                    model_id=snapshot.model_id,
+                    operation="knowledge-organization",
+                    task_id=snapshot.task_id,
+                    scopes=scopes,
+                )
+            except Exception as error:
+                return self._persist_unavailable_knowledge_organization_execution(
+                    snapshot, task_state, started, str(error) or "知识整理授权不可用。",
+                    "确认本次授权后重试。",
+                )
+            self._begin_knowledge_organization_preparation(snapshot.snapshot_id)
+            try:
+                return self._execute_knowledge_organization(
+                    snapshot, task_state, started, content, authorization_id
+                )
+            finally:
+                self._end_knowledge_organization_preparation(snapshot.snapshot_id)
+
+        if task_state.status != "prepared" or snapshot.status != "prepared":
+            raise SessionValidationError("The selected task is no longer ready. Prepare a new task.")
 
         content = next(
             (message.content for message in detail.messages if message.message_id == snapshot.message_id),
@@ -365,6 +504,7 @@ class SessionService:
             or preview.policy_revision != snapshot.policy_revision
             or preview.outbound_mode != snapshot.outbound_mode
             or preview.coverage_items != snapshot.coverage_items
+            or preview.organization_sections != snapshot.organization_sections
         ):
             reason = preview.blocking_reason or "来源、索引或授权策略已改变。"
             self._invalidate_active_snapshots(session_id, reason, include_completed=True)
@@ -380,6 +520,52 @@ class SessionService:
         return self._persist_retrieval_execution(
             completed_snapshot, completed_state, result, generation_results, citations
         )
+
+    def confirm_knowledge_organization_authorization(
+        self, session_id: str, task_id: str, authorization_id: str, *, approved: bool
+    ) -> SessionKnowledgeOrganizationResult:
+        try:
+            detail = self.repository.get_detail(session_id)
+        except KeyError as error:
+            raise SessionNotFoundError(session_id) from error
+        snapshot = next((item for item in detail.task_snapshots if item.task_id == task_id), None)
+        task_state = next((item for item in detail.task_states if item.task_id == task_id), None)
+        result = next(
+            (
+                item
+                for item in detail.knowledge_organization_results
+                if item.task_id == task_id and item.snapshot_id == (snapshot.snapshot_id if snapshot else None)
+            ),
+            None,
+        )
+        if (
+            snapshot is None
+            or task_state is None
+            or result is None
+            or snapshot.status != "waiting-authorization"
+            or result.status != "waiting-authorization"
+            or result.authorization_id != authorization_id
+        ):
+            raise SessionValidationError("The selected task authorization is unavailable. Prepare a new task.")
+        authorization = self.policy_service.confirm_outbound_authorization(
+            snapshot.vault_id, authorization_id, approved=approved
+        )
+        if authorization.status != "approved":
+            failed = replace(
+                result,
+                status="failed",
+                summary="本次知识整理授权被拒绝，未发送任何资料。",
+                recovery_action="重新准备任务并确认外发授权。",
+                authorization_status=authorization.status,
+            )
+            timestamp = utc_now()
+            return self._persist_knowledge_organization_execution(
+                replace(snapshot, status="failed", updated_at=timestamp),
+                replace(task_state, status="failed", updated_at=timestamp),
+                failed,
+                expected_status="waiting-authorization",
+            )
+        return self.execute_task(session_id, task_id)
 
     def edit_generation_result(
         self, session_id: str, result_id: str, content: str, content_origin: str = "user-content"
@@ -590,6 +776,11 @@ class SessionService:
             if resolved_intent == "completeness"
             else ()
         )
+        organization_sections, organization_evidence_count, organization_budget_exceeded = (
+            self._knowledge_organization_sections(session, vault.vault_id, normalized_content, sources)
+            if resolved_intent == "knowledge-organization"
+            else ((), 0, False)
+        )
         source_digest = self._digest([
             {
                 "kind": source.identity_kind,
@@ -611,9 +802,22 @@ class SessionService:
             "source_digest": source_digest,
         })
         exclusion_summary = self._exclusion_summary(rules, session.scope_kind, session.scope_path)
-        is_ready = health.status == "healthy"
-        blocking_reason = None if is_ready else f"索引不可用：{health.status}。"
-        recovery_action = None if is_ready else self._index_recovery_action(health.status)
+        is_ready = health.status == "healthy" and not organization_budget_exceeded
+        blocking_reason = (
+            f"索引不可用：{health.status}。"
+            if health.status != "healthy"
+            else (
+                f"知识整理范围超出固定上限（{MAX_KNOWLEDGE_ORGANIZATION_SOURCES} 项来源或 "
+                f"{MAX_KNOWLEDGE_ORGANIZATION_EVIDENCES} 条证据）。"
+                if organization_budget_exceeded
+                else None
+            )
+        )
+        recovery_action = (
+            self._index_recovery_action(health.status)
+            if health.status != "healthy"
+            else "缩小资料范围后重新准备任务。" if organization_budget_exceeded else None
+        )
         return TaskPreview(
             normalized_content, resolved_intent, intent_source, vault.vault_id,
             session.scope_kind, session.scope_path, session.selected_provider_id,
@@ -621,7 +825,265 @@ class SessionService:
             policy.policy_revision, exclusion_summary, policy.outbound_mode,
             "尚未发送；实际检索块将在执行前按任务快照申请或核验授权。",
             len(sources), source_digest, sources, coverage_items, is_ready, blocking_reason, recovery_action,
+            organization_sections, organization_evidence_count, organization_budget_exceeded,
         )
+
+    def _execute_knowledge_organization(
+        self,
+        snapshot: SessionTaskSnapshot,
+        task_state: SessionTaskState,
+        started: float,
+        content: str,
+        authorization_id: str,
+    ) -> SessionKnowledgeOrganizationResult:
+        timestamp = utc_now()
+        expected_status = snapshot.status
+        executing_snapshot = replace(snapshot, status="preparing", updated_at=timestamp)
+        executing_state = replace(task_state, status="preparing", updated_at=timestamp)
+        structure_kind = self._knowledge_organization_structure_kind(content)
+        result = SessionKnowledgeOrganizationResult(
+            str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id, "preparing",
+            "正在按冻结计划段生成可追溯的知识整理。", "若生成中断，请恢复任务以保留已完成段。",
+            (), 0, timestamp, (), structure_kind, (), authorization_id, "approved",
+        )
+        persisted = self._persist_knowledge_organization_execution(
+            executing_snapshot, executing_state, result, expected_status=expected_status
+        )
+        if persisted is not result:
+            return persisted
+
+        outcomes: list[SessionKnowledgeOrganizationSectionOutcome] = []
+        for section in snapshot.organization_sections:
+            if not section.evidence:
+                outcomes.append(
+                    SessionKnowledgeOrganizationSectionOutcome(
+                        section.ordinal, "recoverable", 0, "计划范围内没有可用的结构化索引块。"
+                    )
+                )
+                break
+            try:
+                self._prepare_knowledge_organization_section(section)
+                generated = self.provider_service.generate_chat(
+                    snapshot.provider_id,
+                    snapshot.model_id,
+                    self._knowledge_organization_prompt(snapshot, section, content, structure_kind),
+                )
+                outcome = SessionKnowledgeOrganizationSectionOutcome(
+                    section.ordinal,
+                    "completed",
+                    len(section.evidence),
+                    conclusions=(
+                        SessionKnowledgeOrganizationConclusion(
+                            1, generated, tuple(item.ordinal for item in section.evidence)
+                        ),
+                    ),
+                )
+            except Exception as error:
+                outcomes.append(
+                    SessionKnowledgeOrganizationSectionOutcome(
+                        section.ordinal, "failed", 0, str(error) or "整理计划段生成失败。"
+                    )
+                )
+                break
+            outcomes.append(outcome)
+            progress = replace(
+                result,
+                duration_ms=int((perf_counter() - started) * 1000),
+                outcomes=tuple(outcomes),
+                completed_ordinals=tuple(item.ordinal for item in outcomes if item.status == "completed"),
+            )
+            persisted = self._persist_knowledge_organization_execution(
+                replace(executing_snapshot, updated_at=utc_now()),
+                replace(executing_state, updated_at=utc_now()),
+                progress,
+                expected_status="preparing",
+            )
+            if persisted is not progress:
+                return persisted
+            result = progress
+
+        completed = tuple(item.ordinal for item in outcomes if item.status == "completed")
+        failed = [item for item in outcomes if item.status == "failed"]
+        recoverable = [item for item in outcomes if item.status == "recoverable"]
+        duration = int((perf_counter() - started) * 1000)
+        if failed:
+            final_status = "failed"
+            summary = f"已生成 {len(completed)} 段；{len(failed)} 个整理计划段生成失败。"
+            recovery_action = "修复 Provider 或失败段后重新准备任务。"
+        elif recoverable or not outcomes:
+            final_status = "recoverable"
+            summary = "计划范围内缺少可用的结构化证据，未生成完整整理结果。"
+            recovery_action = "确认范围并修复索引后重新准备任务。"
+        else:
+            final_status = "completed"
+            summary = f"已按冻结证据生成 {len(completed)} 个知识整理计划段。"
+            recovery_action = None
+        final_result = replace(
+            result,
+            status=final_status,
+            summary=summary,
+            recovery_action=recovery_action,
+            duration_ms=duration,
+            outcomes=tuple(outcomes),
+            completed_ordinals=completed,
+        )
+        timestamp = utc_now()
+        return self._persist_knowledge_organization_execution(
+            replace(executing_snapshot, status=final_status, updated_at=timestamp),
+            replace(executing_state, status=final_status, updated_at=timestamp),
+            final_result,
+            expected_status="preparing",
+        )
+
+    @staticmethod
+    def _knowledge_organization_structure_kind(content: str) -> str:
+        lowered = content.lower()
+        if any(marker in lowered for marker in ("时间线", "时间轴", "timeline")):
+            return "timeline"
+        if any(marker in lowered for marker in ("分类", "归类", "classif")):
+            return "classification"
+        if any(marker in lowered for marker in ("比较", "对比", "compare")):
+            return "comparison"
+        if any(marker in lowered for marker in ("章节", "chapter")):
+            return "chapter-summary"
+        if any(marker in lowered for marker in ("归纳", "总结", "summary")):
+            return "summary"
+        return "outline"
+
+    @staticmethod
+    def _knowledge_organization_outbound_scopes(
+        snapshot: SessionTaskSnapshot,
+    ) -> list[OutboundScope]:
+        scopes: list[OutboundScope] = []
+        for section in snapshot.organization_sections:
+            for evidence in section.evidence:
+                candidate = OutboundScope(evidence.source_path or evidence.relative_path, evidence.relative_path)
+                if candidate not in scopes:
+                    scopes.append(candidate)
+        return scopes
+
+    @staticmethod
+    def _knowledge_organization_prompt(
+        snapshot: SessionTaskSnapshot,
+        section: SessionKnowledgeOrganizationPlanSection,
+        request: str,
+        structure_kind: str,
+    ) -> str:
+        evidence = "\n\n".join(
+            f"[证据 {item.ordinal}] 文件：{item.relative_path}；位置：{item.location}\n{item.excerpt}"
+            for item in section.evidence
+        )
+        return (
+            "仅依据以下冻结知识库证据生成一个中文知识整理段。不得使用外部资料、先前对话或模型常识；"
+            "证据不足时明确说明，冲突说法必须并列保留。不要添加引用编号以外无法由证据支撑的事实。\n"
+            f"用户请求：{request[:2_000]}\n结构类型：{structure_kind}\n段目标：{section.goal}\n"
+            f"快照：{snapshot.snapshot_id}\n\n{evidence}"
+        )
+
+    @staticmethod
+    def _prepare_knowledge_organization_section(
+        section: SessionKnowledgeOrganizationPlanSection,
+    ) -> int:
+        return len(section.evidence)
+
+    def _persist_unavailable_knowledge_organization_execution(
+        self,
+        snapshot: SessionTaskSnapshot,
+        task_state: SessionTaskState,
+        started: float,
+        reason: str | None,
+        recovery_action: str | None,
+    ) -> SessionKnowledgeOrganizationResult:
+        normalized_reason = reason or "索引不可用，未准备知识整理计划。"
+        result = SessionKnowledgeOrganizationResult(
+            str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id, "recoverable",
+            normalized_reason,
+            recovery_action or "恢复索引后重新准备任务。",
+            (),
+            int((perf_counter() - started) * 1000),
+            utc_now(),
+            tuple(
+                SessionKnowledgeOrganizationSectionOutcome(
+                    section.ordinal, "recoverable", 0, normalized_reason
+                )
+                for section in snapshot.organization_sections
+            ),
+        )
+        timestamp = utc_now()
+        return self._persist_knowledge_organization_execution(
+            replace(snapshot, status="recoverable", updated_at=timestamp),
+            replace(task_state, status="recoverable", updated_at=timestamp),
+            result,
+            expected_status=snapshot.status,
+        )
+
+    def _recover_interrupted_knowledge_organization_preparation(
+        self,
+        detail: SessionDetail,
+        snapshot: SessionTaskSnapshot,
+        task_state: SessionTaskState | None,
+    ) -> SessionKnowledgeOrganizationResult:
+        previous = next(
+            (
+                item
+                for item in detail.knowledge_organization_results
+                if item.task_id == snapshot.task_id and item.snapshot_id == snapshot.snapshot_id
+            ),
+            None,
+        )
+        timestamp = utc_now()
+        known_outcomes = previous.outcomes if previous is not None else ()
+        prepared = tuple(
+            outcome.ordinal for outcome in known_outcomes if outcome.status == "prepared"
+        )
+        completed = tuple(
+            outcome.ordinal for outcome in known_outcomes if outcome.status == "completed"
+        )
+        result = SessionKnowledgeOrganizationResult(
+            previous.result_id if previous is not None else str(uuid4()),
+            snapshot.session_id,
+            snapshot.task_id,
+            snapshot.snapshot_id,
+            "recoverable",
+            "知识整理计划准备在完成前中断，已保留已知段进度。",
+            "确认索引和范围后重新准备任务。",
+            prepared,
+            previous.duration_ms if previous is not None else 0,
+            previous.created_at if previous is not None else timestamp,
+            known_outcomes,
+            previous.structure_kind if previous is not None else "outline",
+            completed,
+            previous.authorization_id if previous is not None else None,
+            previous.authorization_status if previous is not None else None,
+        )
+        return self._persist_knowledge_organization_execution(
+            replace(snapshot, status="recoverable", updated_at=timestamp),
+            replace(
+                task_state or SessionTaskState.new(snapshot.session_id, snapshot.task_id, "preparing", snapshot.snapshot_id),
+                status="recoverable",
+                updated_at=timestamp,
+            ),
+            result,
+            expected_status="preparing",
+        )
+
+    def _begin_knowledge_organization_preparation(self, snapshot_id: str) -> None:
+        with self._preparing_snapshot_guard:
+            self._preparing_snapshot_counts[snapshot_id] = (
+                self._preparing_snapshot_counts.get(snapshot_id, 0) + 1
+            )
+
+    def _end_knowledge_organization_preparation(self, snapshot_id: str) -> None:
+        with self._preparing_snapshot_guard:
+            remaining = self._preparing_snapshot_counts.get(snapshot_id, 0) - 1
+            if remaining > 0:
+                self._preparing_snapshot_counts[snapshot_id] = remaining
+            else:
+                self._preparing_snapshot_counts.pop(snapshot_id, None)
+
+    def _knowledge_organization_preparation_is_active(self, snapshot_id: str) -> bool:
+        with self._preparing_snapshot_guard:
+            return self._preparing_snapshot_counts.get(snapshot_id, 0) > 0
 
     def _execute_completeness(
         self, snapshot: SessionTaskSnapshot, task_state: SessionTaskState, started: float
@@ -838,6 +1300,34 @@ class SessionService:
             return existing
         raise SessionValidationError("The selected task is no longer ready. Prepare a new task.")
 
+    def _persist_knowledge_organization_execution(
+        self,
+        snapshot: SessionTaskSnapshot,
+        task_state: SessionTaskState,
+        result: SessionKnowledgeOrganizationResult,
+        *,
+        expected_status: str,
+    ) -> SessionKnowledgeOrganizationResult:
+        if self.repository.persist_knowledge_organization_execution(
+            snapshot, task_state, result, expected_status=expected_status
+        ):
+            return result
+        try:
+            detail = self.repository.get_detail(snapshot.session_id)
+        except KeyError as error:
+            raise SessionNotFoundError(snapshot.session_id) from error
+        existing = next(
+            (
+                item
+                for item in detail.knowledge_organization_results
+                if item.task_id == snapshot.task_id and item.snapshot_id == snapshot.snapshot_id
+            ),
+            None,
+        )
+        if existing is not None:
+            return existing
+        raise SessionValidationError("The selected task is no longer ready. Prepare a new task.")
+
     def _evidence_turn_records(
         self,
         snapshot: SessionTaskSnapshot,
@@ -1022,7 +1512,8 @@ class SessionService:
             document.heading_locations[0] if document.heading_locations else None
         )
         page_match = re.search(r"page:\s*(\d+)", location, flags=re.IGNORECASE)
-        return heading, int(page_match.group(1)) if page_match else None
+        page = int(page_match.group(1)) if page_match else None
+        return heading, page if page is not None and page > 0 else None
 
     def _unavailable_task_preview(
         self,
@@ -1117,6 +1608,103 @@ class SessionService:
                     )
                 )
         return tuple(items)
+
+    def _knowledge_organization_sections(
+        self,
+        session: PersistentSession,
+        vault_id: str,
+        content: str,
+        sources: tuple[SessionTaskSnapshotSource, ...],
+    ) -> tuple[tuple[SessionKnowledgeOrganizationPlanSection, ...], int, bool]:
+        source_ordinals = {
+            (
+                source.identity_kind,
+                source.relative_path,
+                source.content_sha256,
+                source.source_id,
+                source.source_content_hash,
+                source.source_path,
+            ): source.ordinal
+            for source in sources
+        }
+        grouped: dict[str, list[SessionKnowledgeOrganizationEvidence]] = {}
+        bounded_source_ordinals = {
+            source.ordinal for source in sources[:MAX_KNOWLEDGE_ORGANIZATION_SOURCES]
+        }
+        planned_evidence_count = 0
+        evidence_count = 0
+        evidence_budget_exceeded = False
+        documents = sorted(
+            self.index_repository.current_documents(vault_id), key=lambda document: document.relative_path
+        )
+        for document in documents:
+            identity = (
+                document.document_kind,
+                document.relative_path,
+                document.content_sha256,
+                document.source_id,
+                document.source_sha256,
+                document.source_path,
+            )
+            source_ordinal = source_ordinals.get(identity)
+            if source_ordinal is None:
+                continue
+            for block in document.blocks:
+                excerpt = self._bounded_excerpt(block.text, MAX_RETRIEVAL_BLOCK_CHARS)
+                if not excerpt:
+                    continue
+                evidence_count += 1
+                if evidence_count > MAX_KNOWLEDGE_ORGANIZATION_EVIDENCES:
+                    evidence_budget_exceeded = True
+                    break
+                if (
+                    source_ordinal not in bounded_source_ordinals
+                    or planned_evidence_count >= MAX_KNOWLEDGE_ORGANIZATION_EVIDENCES
+                ):
+                    continue
+                scope_path = document.relative_path.rpartition("/")[0] or document.relative_path
+                bucket = grouped.setdefault(scope_path, [])
+                heading, page = self._evidence_location(document, block.location)
+                bucket.append(
+                    SessionKnowledgeOrganizationEvidence(
+                        len(bucket) + 1,
+                        source_ordinal,
+                        document.document_kind,
+                        document.relative_path,
+                        document.content_sha256,
+                        document.source_id,
+                        document.source_sha256,
+                        document.source_path,
+                        heading,
+                        block.location,
+                        page,
+                        excerpt,
+                    )
+                )
+                planned_evidence_count += 1
+            if evidence_budget_exceeded:
+                break
+        source_scopes = {
+            source.relative_path.rpartition("/")[0] or source.relative_path
+            for source in sources[:MAX_KNOWLEDGE_ORGANIZATION_SOURCES]
+        }
+        sections: list[SessionKnowledgeOrganizationPlanSection] = []
+        for scope_path in sorted(source_scopes):
+            evidence = tuple(grouped.get(scope_path, ()))
+            sections.append(
+                SessionKnowledgeOrganizationPlanSection(
+                    len(sections) + 1,
+                    scope_path,
+                    f"按已确认资料整理：{content[:200]}",
+                    scope_path,
+                    evidence,
+                )
+            )
+        return (
+            tuple(sections),
+            evidence_count,
+            len(sources) > MAX_KNOWLEDGE_ORGANIZATION_SOURCES or evidence_budget_exceeded,
+        )
 
     @staticmethod
     def _is_snapshot_source_eligible(document) -> bool:
@@ -1221,8 +1809,16 @@ class SessionService:
     def _refresh_task_snapshots(self, detail: SessionDetail) -> None:
         if not detail.task_snapshots or self.index_repository is None:
             return
+        task_states = {state.snapshot_id: state for state in detail.task_states if state.snapshot_id}
         for snapshot in detail.task_snapshots:
-            if snapshot.status not in {"prepared", "waiting-authorization", "completed"}:
+            if snapshot.status not in {"prepared", "preparing", "waiting-authorization", "completed"}:
+                continue
+            if snapshot.intent == "knowledge-organization" and snapshot.status == "preparing":
+                if self._knowledge_organization_preparation_is_active(snapshot.snapshot_id):
+                    continue
+                self._recover_interrupted_knowledge_organization_preparation(
+                    detail, snapshot, task_states.get(snapshot.snapshot_id)
+                )
                 continue
             if snapshot.status != "completed" and self._context_changed(
                 detail.session, vault_id=snapshot.vault_id, scope_kind=snapshot.scope_kind,
@@ -1232,6 +1828,22 @@ class SessionService:
                     detail.session.session_id, "会话语境已改变。", snapshot_ids={snapshot.snapshot_id}
                 )
                 continue
+            if snapshot.intent == "knowledge-organization" and snapshot.status == "prepared":
+                try:
+                    health = self.index_repository.health(snapshot.vault_id)
+                except Exception:
+                    health = None
+                if health is None or health.status != "healthy":
+                    status = health.status if health is not None else "unavailable"
+                    self._persist_unavailable_knowledge_organization_execution(
+                        snapshot,
+                        task_states.get(snapshot.snapshot_id)
+                        or SessionTaskState.new(snapshot.session_id, snapshot.task_id, "prepared", snapshot.snapshot_id),
+                        perf_counter(),
+                        f"索引不可用：{status}。",
+                        self._index_recovery_action(status),
+                    )
+                    continue
             snapshot_context = replace(
                 detail.session,
                 selected_vault_id=snapshot.vault_id,
@@ -1240,12 +1852,27 @@ class SessionService:
                 scope_kind=snapshot.scope_kind,
                 scope_path=snapshot.scope_path,
             )
+            original_content = next(
+                (message.content for message in detail.messages if message.message_id == snapshot.message_id),
+                "快照复核",
+            )
             try:
-                preview = self._task_preview(snapshot_context, "快照复核", intent=snapshot.intent)
+                preview = self._task_preview(snapshot_context, original_content, intent=snapshot.intent)
             except SessionValidationError as error:
                 if snapshot.status != "completed":
                     self._invalidate_active_snapshots(
                         detail.session.session_id, str(error), snapshot_ids={snapshot.snapshot_id}
+                    )
+                continue
+            if snapshot.intent == "knowledge-organization" and not preview.is_ready:
+                if snapshot.status == "prepared":
+                    self._persist_unavailable_knowledge_organization_execution(
+                        snapshot,
+                        task_states.get(snapshot.snapshot_id)
+                        or SessionTaskState.new(snapshot.session_id, snapshot.task_id, "prepared", snapshot.snapshot_id),
+                        perf_counter(),
+                        preview.blocking_reason,
+                        preview.recovery_action,
                     )
                 continue
             if (
@@ -1255,6 +1882,7 @@ class SessionService:
                 or preview.policy_revision != snapshot.policy_revision
                 or preview.outbound_mode != snapshot.outbound_mode
                 or preview.coverage_items != snapshot.coverage_items
+                or preview.organization_sections != snapshot.organization_sections
             ):
                 reason = preview.blocking_reason or "来源、索引或授权策略已改变。"
                 self._invalidate_active_snapshots(
