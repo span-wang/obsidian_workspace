@@ -10,6 +10,7 @@ from domain.sessions import (
     SessionGenerationResult,
     SessionMessage,
     SessionPage,
+    SessionTaskSnapshot,
     SessionTaskState,
 )
 
@@ -38,6 +39,10 @@ class SessionRepository(Protocol):
 
     def append_message(self, message: SessionMessage) -> None: ...
 
+    def persist_task(
+        self, message: SessionMessage, snapshot: SessionTaskSnapshot, task_state: SessionTaskState
+    ) -> None: ...
+
     def append_attachment(self, attachment: SessionAttachment) -> None: ...
 
     def delete_attachment(self, session_id: str, attachment_id: str) -> None: ...
@@ -45,6 +50,16 @@ class SessionRepository(Protocol):
     def clear_attachments(self, session_id: str) -> None: ...
 
     def record_task_state(self, task_state: SessionTaskState) -> None: ...
+
+    def record_task_snapshot(self, snapshot: SessionTaskSnapshot) -> None: ...
+
+    def save_task_snapshot(self, snapshot: SessionTaskSnapshot) -> None: ...
+
+    def invalidate_task_snapshots(
+        self,
+        snapshots: tuple[SessionTaskSnapshot, ...],
+        task_states: tuple[SessionTaskState, ...],
+    ) -> None: ...
 
     def record_citation(self, citation: SessionCitation) -> None: ...
 

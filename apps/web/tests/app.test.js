@@ -148,7 +148,9 @@ test("renders a bounded three-pane session workspace with a context composer", (
       onUpdateContext: async () => {},
       onPickAttachments: async () => {},
       onRemoveAttachment: async () => {},
-      onSendMessage: async () => {}
+      onSendMessage: async () => {},
+      onPreviewTask: async () => ({}),
+      onCreateTask: async () => ({})
     })
   );
 
@@ -167,8 +169,9 @@ test("renders a bounded three-pane session workspace with a context composer", (
   assert.match(markup, /aria-label="会话输入"/);
   assert.match(markup, /aria-label="选择 vault"/);
   assert.match(markup, /aria-label="选择 Model"/);
+  assert.match(markup, /aria-label="选择任务类型"/);
+  assert.match(markup, /自动识别/);
   assert.match(markup, /aria-label="输入问题或继续创作"/);
-  assert.match(markup, /发送/);
   assert.match(markup, /session-composer/);
 });
 
@@ -364,6 +367,21 @@ test("renders index health and explicit recovery controls without exposing conte
   assert.match(markup, /确认重新关联/);
   assert.match(markup, /核对变更/);
   assert.match(markup, /重建索引/);
+});
+
+test("renders a partial index summary without unmounting the workspace", () => {
+  const markup = renderToStaticMarkup(
+    React.createElement(VaultIndexStatus, {
+      vault: {
+        vault_id: "vault-1",
+        index: { status: "not-initialized" }
+      },
+      onUpdate: () => {}
+    })
+  );
+
+  assert.match(markup, /状态：未初始化/);
+  assert.match(markup, /已索引 0 项；失效 0 项；待关联 0 项；失败 0 项。/);
 });
 
 test("renders the current-vault graph controls with non-color relationship states", () => {

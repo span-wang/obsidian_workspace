@@ -49,6 +49,9 @@ from application.providers import (
 )
 from application.sessions import SessionNotFoundError, SessionService, SessionValidationError
 from application.vaults import VaultConflictError, VaultService, VaultValidationError
+from workers.converters.artifact_store import PrivateArtifactStore
+from workers.converters.launcher import ProvisionedConversionLauncher
+from workers.converters.provisioning import ProvisionedProfiles, load_provisioned_profiles
 from api.errors import error_response
 from api.runtime import RuntimeState, initialize_runtime
 from domain.policies import (
@@ -210,6 +213,13 @@ class SessionMessageCommand(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     content: str
+
+
+class SessionTaskCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    content: str
+    intent: Literal["auto", "source-lookup", "completeness", "knowledge-organization", "deep-creation"] = "auto"
 
 
 class PendingAssociationResolutionCommand(BaseModel):
@@ -564,9 +574,9 @@ def persistent_session_payload(session: PersistentSession) -> dict[str, object]:
         "selected_provider_label": session.selected_provider_label,
         "selected_model_id": session.selected_model_id,
         "selected_model_label": session.selected_model_label,
-        "message_count": session.message_count,
         "scope_kind": session.scope_kind,
         "scope_path": session.scope_path,
+        "message_count": session.message_count,
         "created_at": session.created_at,
         "updated_at": session.updated_at,
         "last_activity_at": session.last_activity_at,
@@ -591,6 +601,84 @@ def session_task_state_payload(task_state: SessionTaskState) -> dict[str, object
         "snapshot_id": task_state.snapshot_id,
         "created_at": task_state.created_at,
         "updated_at": task_state.updated_at,
+    }
+
+
+def session_task_snapshot_payload(snapshot) -> dict[str, object]:
+    source_sample = [
+        {
+            "identity_kind": source.identity_kind,
+            "relative_path": source.relative_path,
+            "content_sha256": source.content_sha256,
+            "source_id": source.source_id,
+            "source_content_hash": source.source_content_hash,
+            "source_path": source.source_path,
+        }
+        for source in snapshot.sources[:10]
+    ]
+    return {
+        "snapshot_id": snapshot.snapshot_id,
+        "task_id": snapshot.task_id,
+        "message_id": snapshot.message_id,
+        "intent": snapshot.intent,
+        "intent_source": snapshot.intent_source,
+        "vault_id": snapshot.vault_id,
+        "scope_kind": snapshot.scope_kind,
+        "scope_path": snapshot.scope_path,
+        "provider_id": snapshot.provider_id,
+        "model_id": snapshot.model_id,
+        "index_status": snapshot.index_status,
+        "index_updated_at": snapshot.index_updated_at,
+        "index_digest": snapshot.index_digest,
+        "policy_revision": snapshot.policy_revision,
+        "exclusion_summary": snapshot.exclusion_summary,
+        "outbound_mode": snapshot.outbound_mode,
+        "outbound_scope_summary": snapshot.outbound_scope_summary,
+        "source_count": snapshot.source_count,
+        "source_digest": snapshot.source_digest,
+        "source_sample": source_sample,
+        "source_sample_truncated": snapshot.source_count > len(source_sample),
+        "status": snapshot.status,
+        "invalidation_reason": snapshot.invalidation_reason,
+        "created_at": snapshot.created_at,
+        "updated_at": snapshot.updated_at,
+    }
+
+
+def session_task_preview_payload(preview) -> dict[str, object]:
+    source_sample = [
+        {
+            "identity_kind": source.identity_kind,
+            "relative_path": source.relative_path,
+            "content_sha256": source.content_sha256,
+            "source_id": source.source_id,
+            "source_content_hash": source.source_content_hash,
+            "source_path": source.source_path,
+        }
+        for source in preview.sources[:10]
+    ]
+    return {
+        "intent": preview.intent,
+        "intent_source": preview.intent_source,
+        "vault_id": preview.vault_id,
+        "scope_kind": preview.scope_kind,
+        "scope_path": preview.scope_path,
+        "provider_id": preview.provider_id,
+        "model_id": preview.model_id,
+        "index_status": preview.index_status,
+        "index_updated_at": preview.index_updated_at,
+        "index_digest": preview.index_digest,
+        "policy_revision": preview.policy_revision,
+        "exclusion_summary": preview.exclusion_summary,
+        "outbound_mode": preview.outbound_mode,
+        "outbound_scope_summary": preview.outbound_scope_summary,
+        "source_count": preview.source_count,
+        "source_digest": preview.source_digest,
+        "source_sample": source_sample,
+        "source_sample_truncated": preview.source_count > len(source_sample),
+        "is_ready": preview.is_ready,
+        "blocking_reason": preview.blocking_reason,
+        "recovery_action": preview.recovery_action,
     }
 
 
@@ -637,6 +725,7 @@ def session_detail_payload(detail: SessionDetail) -> dict[str, object]:
             session_generation_result_payload(result) for result in detail.generation_results
         ],
         "attachments": [session_attachment_payload(attachment) for attachment in detail.attachments],
+        "task_snapshots": [session_task_snapshot_payload(snapshot) for snapshot in detail.task_snapshots],
     }
 
 
@@ -1308,6 +1397,7 @@ def create_app(
     knowledge_graph_service: KnowledgeGraphService | None = None,
     import_picker: WindowsImportPicker | None = None,
     import_selections: ImportSelectionStore | None = None,
+    converter_profiles: ProvisionedProfiles | None = None,
 ) -> FastAPI:
     web_build_directory = require_web_build()
     runtime = runtime or initialize_runtime()
@@ -1348,6 +1438,7 @@ def create_app(
         vault_service=app.state.vault_service,
         provider_service=app.state.provider_service,
         policy_service=app.state.policy_service,
+        index_repository=app.state.indexing_service.repository,
     )
     app.state.directory_picker = directory_picker or WindowsDirectoryPicker()
     app.state.directory_selections = directory_selections or DirectorySelectionStore()
@@ -1356,14 +1447,24 @@ def create_app(
     if import_task_service is None:
         task_repository = SqliteImportTaskRepository(runtime.data_directory / "tasks.sqlite3")
         recovered_tasks = task_repository.recover_interrupted_tasks()
+        provisioned_converters = converter_profiles or load_provisioned_profiles()
+        artifact_store = PrivateArtifactStore(runtime.data_directory / "conversion-artifacts")
+        conversion_launcher = ProvisionedConversionLauncher(
+            provisioned_converters.profiles, artifact_store
+        )
         import_task_service = ImportTaskService(
             app.state.vault_service,
             task_repository,
-            LocalImportTaskRunner(),
+            LocalImportTaskRunner(
+                conversion_launcher=conversion_launcher,
+                artifact_store=artifact_store,
+            ),
             app.state.policy_service,
             SqliteSourceRepository(runtime.data_directory / "tasks.sqlite3"),
             LocalVaultCommitter(),
             app.state.indexing_service,
+            converter_profile=dict(provisioned_converters.profiles),
+            artifact_store=artifact_store,
         )
         import_task_service.recover_interrupted_commits(recovered_tasks)
     app.state.import_task_service = import_task_service
@@ -1566,6 +1667,30 @@ def create_app(
         try:
             message = app.state.session_service.send_user_message(session_id, command.content)
             return {"message": session_message_payload(message)}
+        except Exception as error:
+            raise session_error(error) from error
+
+    @app.post("/api/sessions/{session_id}/task-preview", dependencies=[Depends(require_current_local_session)])
+    def preview_persistent_session_task(
+        request: Request, session_id: str, command: SessionTaskCommand
+    ) -> dict[str, object]:
+        try:
+            preview = app.state.session_service.preview_task(
+                session_id, command.content, intent=command.intent
+            )
+            return {"preview": session_task_preview_payload(preview)}
+        except Exception as error:
+            raise session_error(error) from error
+
+    @app.post("/api/sessions/{session_id}/tasks", dependencies=[Depends(require_current_local_session)])
+    def create_persistent_session_task(
+        request: Request, session_id: str, command: SessionTaskCommand
+    ) -> dict[str, object]:
+        try:
+            snapshot = app.state.session_service.create_task(
+                session_id, command.content, intent=command.intent
+            )
+            return {"snapshot": session_task_snapshot_payload(snapshot)}
         except Exception as error:
             raise session_error(error) from error
 

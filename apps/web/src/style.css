@@ -1093,6 +1093,21 @@ button:disabled {
   overflow-wrap: anywhere;
 }
 
+.session-task-preview,
+.session-task-snapshot {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  font-size: 13px;
+}
+
+.session-task-snapshot-list {
+  display: grid;
+  gap: 8px;
+  padding: 12px 20px;
+  border-top: 1px solid #e9e9e4;
+}
+
 .import-task-row,
 .import-item-row {
   display: grid;

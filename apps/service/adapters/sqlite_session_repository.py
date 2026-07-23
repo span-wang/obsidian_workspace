@@ -12,6 +12,8 @@ from domain.sessions import (
     SessionGenerationResult,
     SessionMessage,
     SessionPage,
+    SessionTaskSnapshot,
+    SessionTaskSnapshotSource,
     SessionTaskState,
     utc_now,
 )
@@ -114,6 +116,50 @@ class SqliteSessionRepository:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS session_attachment_session_idx ON session_attachments(session_id, created_at)"
             )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS session_task_snapshots (
+                    snapshot_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                    task_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    intent TEXT NOT NULL,
+                    intent_source TEXT NOT NULL,
+                    vault_id TEXT NOT NULL,
+                    scope_kind TEXT NOT NULL,
+                    scope_path TEXT,
+                    provider_id TEXT NOT NULL,
+                    model_id TEXT NOT NULL,
+                    index_status TEXT NOT NULL,
+                    index_updated_at TEXT,
+                    index_digest TEXT NOT NULL,
+                    policy_revision INTEGER NOT NULL,
+                    exclusion_summary TEXT NOT NULL,
+                    outbound_mode TEXT NOT NULL,
+                    outbound_scope_summary TEXT NOT NULL,
+                    source_count INTEGER NOT NULL,
+                    source_digest TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    invalidation_reason TEXT
+                )"""
+            )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS session_task_snapshot_sources (
+                    snapshot_id TEXT NOT NULL REFERENCES session_task_snapshots(snapshot_id) ON DELETE CASCADE,
+                    ordinal INTEGER NOT NULL,
+                    identity_kind TEXT NOT NULL,
+                    relative_path TEXT NOT NULL,
+                    content_sha256 TEXT NOT NULL,
+                    source_id TEXT,
+                    source_content_hash TEXT,
+                    source_path TEXT,
+                    PRIMARY KEY (snapshot_id, ordinal)
+                )"""
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS session_task_snapshot_session_idx ON session_task_snapshots(session_id, created_at)"
+            )
 
     @staticmethod
     def _ensure_session_column(connection: sqlite3.Connection, name: str, declaration: str) -> None:
@@ -168,6 +214,17 @@ class SqliteSessionRepository:
                 "SELECT * FROM session_attachments WHERE session_id = ? ORDER BY created_at, attachment_id",
                 (session_id,),
             ).fetchall()
+            snapshots = connection.execute(
+                "SELECT * FROM session_task_snapshots WHERE session_id = ? ORDER BY created_at, snapshot_id",
+                (session_id,),
+            ).fetchall()
+            snapshot_sources = {
+                row["snapshot_id"]: connection.execute(
+                    "SELECT * FROM session_task_snapshot_sources WHERE snapshot_id = ? ORDER BY ordinal",
+                    (row["snapshot_id"],),
+                ).fetchall()
+                for row in snapshots
+            }
         return SessionDetail(
             self._session_from_row(session_row),
             tuple(self._message_from_row(row) for row in messages),
@@ -175,6 +232,10 @@ class SqliteSessionRepository:
             tuple(self._citation_from_row(row) for row in citations),
             tuple(self._result_from_row(row) for row in results),
             tuple(self._attachment_from_row(row) for row in attachments),
+            tuple(
+                self._snapshot_from_row(row, snapshot_sources[row["snapshot_id"]])
+                for row in snapshots
+            ),
         )
 
     def list_page(
@@ -255,21 +316,17 @@ class SqliteSessionRepository:
 
     def append_message(self, message: SessionMessage) -> None:
         with self._connect() as connection:
-            connection.execute(
-                """INSERT INTO session_messages (
-                    message_id, session_id, role, content, provider_id, model_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    message.message_id,
-                    message.session_id,
-                    message.role,
-                    message.content,
-                    message.provider_id,
-                    message.model_id,
-                    message.created_at,
-                ),
-            )
+            self._insert_message(connection, message)
             self._touch_session(connection, message.session_id, message.created_at)
+
+    def persist_task(
+        self, message: SessionMessage, snapshot: SessionTaskSnapshot, task_state: SessionTaskState
+    ) -> None:
+        with self._connect() as connection:
+            self._insert_message(connection, message)
+            self._insert_task_snapshot(connection, snapshot)
+            self._upsert_task_state(connection, task_state)
+            self._touch_session(connection, message.session_id, task_state.updated_at)
 
     def append_attachment(self, attachment: SessionAttachment) -> None:
         with self._connect() as connection:
@@ -305,22 +362,35 @@ class SqliteSessionRepository:
 
     def record_task_state(self, task_state: SessionTaskState) -> None:
         with self._connect() as connection:
-            connection.execute(
-                """INSERT INTO session_task_states (
-                    session_id, task_id, status, snapshot_id, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(session_id, task_id) DO UPDATE SET status = excluded.status,
-                    snapshot_id = excluded.snapshot_id, updated_at = excluded.updated_at""",
-                (
-                    task_state.session_id,
-                    task_state.task_id,
-                    task_state.status,
-                    task_state.snapshot_id,
-                    task_state.created_at,
-                    task_state.updated_at,
-                ),
-            )
+            self._upsert_task_state(connection, task_state)
             self._touch_session(connection, task_state.session_id, task_state.updated_at)
+
+    def record_task_snapshot(self, snapshot: SessionTaskSnapshot) -> None:
+        with self._connect() as connection:
+            self._insert_task_snapshot(connection, snapshot)
+            self._touch_session(connection, snapshot.session_id, snapshot.updated_at)
+
+    def save_task_snapshot(self, snapshot: SessionTaskSnapshot) -> None:
+        with self._connect() as connection:
+            result = self._update_task_snapshot(connection, snapshot)
+            self._touch_session(connection, snapshot.session_id, snapshot.updated_at)
+        if result.rowcount != 1:
+            raise KeyError(snapshot.snapshot_id)
+
+    def invalidate_task_snapshots(
+        self,
+        snapshots: tuple[SessionTaskSnapshot, ...],
+        task_states: tuple[SessionTaskState, ...],
+    ) -> None:
+        if not snapshots:
+            return
+        with self._connect() as connection:
+            for snapshot in snapshots:
+                if self._update_task_snapshot(connection, snapshot).rowcount != 1:
+                    raise KeyError(snapshot.snapshot_id)
+            for task_state in task_states:
+                self._upsert_task_state(connection, task_state)
+            self._touch_session(connection, snapshots[0].session_id, snapshots[0].updated_at)
 
     def record_citation(self, citation: SessionCitation) -> None:
         with self._connect() as connection:
@@ -378,6 +448,119 @@ class SqliteSessionRepository:
         )
 
     @staticmethod
+    def _insert_message(connection: sqlite3.Connection, message: SessionMessage) -> None:
+        connection.execute(
+            """INSERT INTO session_messages (
+                message_id, session_id, role, content, provider_id, model_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                message.message_id,
+                message.session_id,
+                message.role,
+                message.content,
+                message.provider_id,
+                message.model_id,
+                message.created_at,
+            ),
+        )
+
+    def _insert_task_snapshot(
+        self, connection: sqlite3.Connection, snapshot: SessionTaskSnapshot
+    ) -> None:
+        connection.execute(
+            """INSERT INTO session_task_snapshots (
+                snapshot_id, session_id, task_id, message_id, intent, intent_source, vault_id,
+                scope_kind, scope_path, provider_id, model_id, index_status, index_updated_at,
+                index_digest, policy_revision, exclusion_summary, outbound_mode,
+                outbound_scope_summary, source_count, source_digest, status, created_at,
+                updated_at, invalidation_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            self._snapshot_values(snapshot),
+        )
+        connection.executemany(
+            """INSERT INTO session_task_snapshot_sources (
+                snapshot_id, ordinal, identity_kind, relative_path, content_sha256, source_id,
+                source_content_hash, source_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    snapshot.snapshot_id,
+                    source.ordinal,
+                    source.identity_kind,
+                    source.relative_path,
+                    source.content_sha256,
+                    source.source_id,
+                    source.source_content_hash,
+                    source.source_path,
+                )
+                for source in snapshot.sources
+            ],
+        )
+
+    @staticmethod
+    def _upsert_task_state(connection: sqlite3.Connection, task_state: SessionTaskState) -> None:
+        connection.execute(
+            """INSERT INTO session_task_states (
+                session_id, task_id, status, snapshot_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id, task_id) DO UPDATE SET status = excluded.status,
+                snapshot_id = excluded.snapshot_id, updated_at = excluded.updated_at""",
+            (
+                task_state.session_id,
+                task_state.task_id,
+                task_state.status,
+                task_state.snapshot_id,
+                task_state.created_at,
+                task_state.updated_at,
+            ),
+        )
+
+    @staticmethod
+    def _update_task_snapshot(
+        connection: sqlite3.Connection, snapshot: SessionTaskSnapshot
+    ) -> sqlite3.Cursor:
+        return connection.execute(
+            """UPDATE session_task_snapshots SET status = ?, updated_at = ?, invalidation_reason = ?
+                WHERE snapshot_id = ? AND session_id = ?""",
+            (
+                snapshot.status,
+                snapshot.updated_at,
+                snapshot.invalidation_reason,
+                snapshot.snapshot_id,
+                snapshot.session_id,
+            ),
+        )
+
+    @staticmethod
+    def _snapshot_values(snapshot: SessionTaskSnapshot) -> tuple[object, ...]:
+        return (
+            snapshot.snapshot_id,
+            snapshot.session_id,
+            snapshot.task_id,
+            snapshot.message_id,
+            snapshot.intent,
+            snapshot.intent_source,
+            snapshot.vault_id,
+            snapshot.scope_kind,
+            snapshot.scope_path,
+            snapshot.provider_id,
+            snapshot.model_id,
+            snapshot.index_status,
+            snapshot.index_updated_at,
+            snapshot.index_digest,
+            snapshot.policy_revision,
+            snapshot.exclusion_summary,
+            snapshot.outbound_mode,
+            snapshot.outbound_scope_summary,
+            snapshot.source_count,
+            snapshot.source_digest,
+            snapshot.status,
+            snapshot.created_at,
+            snapshot.updated_at,
+            snapshot.invalidation_reason,
+        )
+
+    @staticmethod
     def _escape_like(value: str) -> str:
         return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
@@ -419,6 +602,49 @@ class SqliteSessionRepository:
         return SessionTaskState(
             row["session_id"], row["task_id"], row["status"], row["snapshot_id"],
             row["created_at"], row["updated_at"],
+        )
+
+    @staticmethod
+    def _snapshot_from_row(
+        row: sqlite3.Row, source_rows: list[sqlite3.Row]
+    ) -> SessionTaskSnapshot:
+        return SessionTaskSnapshot(
+            row["snapshot_id"],
+            row["session_id"],
+            row["task_id"],
+            row["message_id"],
+            row["intent"],
+            row["intent_source"],
+            row["vault_id"],
+            row["scope_kind"],
+            row["scope_path"],
+            row["provider_id"],
+            row["model_id"],
+            row["index_status"],
+            row["index_updated_at"],
+            row["index_digest"],
+            int(row["policy_revision"]),
+            row["exclusion_summary"],
+            row["outbound_mode"],
+            row["outbound_scope_summary"],
+            int(row["source_count"]),
+            row["source_digest"],
+            row["status"],
+            row["created_at"],
+            row["updated_at"],
+            row["invalidation_reason"],
+            tuple(
+                SessionTaskSnapshotSource(
+                    source["ordinal"],
+                    source["identity_kind"],
+                    source["relative_path"],
+                    source["content_sha256"],
+                    source["source_id"],
+                    source["source_content_hash"],
+                    source["source_path"],
+                )
+                for source in source_rows
+            ),
         )
 
     @staticmethod

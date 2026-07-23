@@ -12,6 +12,7 @@ from application.vaults import VaultService
 from api.main import create_app
 from api.runtime import RuntimeState
 from domain.providers import Provider, ProviderModel, ProviderProbeResults, ProbeResult, ResolvedProviderModel
+from domain.indexing import IndexHealth
 
 
 def asgi_request(app, method: str, path: str, *, body: dict[str, object] | None = None, cookie: str = ""):
@@ -174,8 +175,12 @@ def test_session_context_attachment_and_message_api_keep_private_metadata(tmp_pa
     )
 
     class Providers:
+        available = True
+
         def resolve_specific_model(self, model_type: str, provider_id: str, model_id: str) -> ResolvedProviderModel:
             assert (model_type, provider_id, model_id) == ("chat", "provider-1", "chat-1")
+            if not self.available:
+                raise ValueError("Provider/Model unavailable")
             return ResolvedProviderModel(provider, provider.models[0])
 
     class Picker:
@@ -249,3 +254,113 @@ def test_session_context_attachment_and_message_api_keep_private_metadata(tmp_pa
     assert attachment_path.read_text(encoding="utf-8") == "# Local fixture"
     assert detail_status == 200
     assert json.loads(detail_body)["attachments"] == []
+
+
+def test_session_task_preview_and_confirmation_use_strict_private_snapshot_contract(tmp_path: Path) -> None:
+    runtime = RuntimeState(data_directory=tmp_path / "app-data", sqlite_version="3.45.1")
+    vault_path = tmp_path / "vault"
+    vault_path.mkdir()
+    vault_repository = SqliteVaultRepository(runtime.data_directory / "vaults.sqlite3")
+    vault_service = VaultService(vault_repository, LocalVaultFilesystem(), vault_repository)
+    vault = vault_service.authorize(vault_path, "platform")
+    policy_service = PolicyService(vault_service, vault_repository)
+    provider = Provider(
+        "provider-1", "Local", "http://localhost:9000", "opaque", True,
+        ProviderProbeResults(ProbeResult.success(), ProbeResult.success()),
+        (ProviderModel("provider-1", "chat-1", "chat", ProbeResult.success(), True, "now"),),
+        "now", "now", "now",
+    )
+
+    class Providers:
+        available = True
+
+        def resolve_specific_model(self, model_type: str, provider_id: str, model_id: str) -> ResolvedProviderModel:
+            assert (model_type, provider_id, model_id) == ("chat", "provider-1", "chat-1")
+            if not self.available:
+                raise ValueError("Provider/Model unavailable")
+            return ResolvedProviderModel(provider, provider.models[0])
+
+    class Indexes:
+        def health(self, vault_id: str) -> IndexHealth:
+            return IndexHealth(vault_id, "healthy", "2026-07-23T00:00:00+00:00", 0, 0, 0, "unavailable")
+
+        def current_documents(self, vault_id: str) -> list:
+            assert vault_id == vault.vault_id
+            return []
+
+    session_service = SessionService(
+        SqliteSessionRepository(runtime.data_directory / "sessions.sqlite3"),
+        vault_service=vault_service,
+        provider_service=Providers(),
+        policy_service=policy_service,
+        index_repository=Indexes(),
+    )
+    app = create_app(
+        runtime=runtime,
+        vault_service=vault_service,
+        policy_service=policy_service,
+        provider_service=Providers(),
+        session_service=session_service,
+    )
+    _, root_headers, _ = asgi_request(app, "GET", "/")
+    cookie = root_headers["set-cookie"].split(";", maxsplit=1)[0]
+    _, _, created_body = asgi_request(app, "POST", "/api/sessions", body={"title": "英语"}, cookie=cookie)
+    session_id = json.loads(created_body)["session"]["session_id"]
+    context_status, _, _ = asgi_request(
+        app,
+        "PATCH",
+        f"/api/sessions/{session_id}/context",
+        body={"vault_id": vault.vault_id, "scope_kind": "vault", "provider_id": "provider-1", "model_id": "chat-1"},
+        cookie=cookie,
+    )
+    denied_status, _, _ = asgi_request(
+        app, "POST", f"/api/sessions/{session_id}/task-preview", body={"content": "列出全部单词"}
+    )
+    invalid_status, _, _ = asgi_request(
+        app,
+        "POST",
+        f"/api/sessions/{session_id}/task-preview",
+        body={"content": "列出全部单词", "intent": "auto", "extra": True},
+        cookie=cookie,
+    )
+    preview_status, _, preview_body = asgi_request(
+        app,
+        "POST",
+        f"/api/sessions/{session_id}/task-preview",
+        body={"content": "列出全部单词", "intent": "auto"},
+        cookie=cookie,
+    )
+    task_status, _, task_body = asgi_request(
+        app,
+        "POST",
+        f"/api/sessions/{session_id}/tasks",
+        body={"content": "列出全部单词", "intent": "completeness"},
+        cookie=cookie,
+    )
+    Providers.available = False
+    unavailable_preview_status, _, unavailable_preview_body = asgi_request(
+        app,
+        "POST",
+        f"/api/sessions/{session_id}/task-preview",
+        body={"content": "定位第一单元", "intent": "auto"},
+        cookie=cookie,
+    )
+
+    assert context_status == 200
+    assert denied_status == 403
+    assert invalid_status == 422
+    assert preview_status == 200
+    preview = json.loads(preview_body)["preview"]
+    assert preview["intent"] == "completeness"
+    assert preview["intent_source"] == "auto"
+    assert preview["outbound_scope_summary"].startswith("尚未发送")
+    assert task_status == 200
+    snapshot = json.loads(task_body)["snapshot"]
+    assert snapshot["status"] == "prepared"
+    assert snapshot["source_count"] == 0
+    assert "content" not in snapshot
+    assert unavailable_preview_status == 200
+    unavailable_preview = json.loads(unavailable_preview_body)["preview"]
+    assert unavailable_preview["is_ready"] is False
+    assert unavailable_preview["index_status"] == "provider-model-unavailable"
+    assert unavailable_preview["recovery_action"] == "选择已验证的 chat Model 后重试。"

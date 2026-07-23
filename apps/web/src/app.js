@@ -634,7 +634,8 @@ export function SessionManagement({
   onUpdateContext,
   onPickAttachments,
   onRemoveAttachment,
-  onSendMessage
+  onPreviewTask,
+  onCreateTask
 }) {
   const [query, setQuery] = React.useState(filters.query || "");
   const [editingSessionId, setEditingSessionId] = React.useState(null);
@@ -643,6 +644,8 @@ export function SessionManagement({
   const [isSubmitting, setIsSubmitting] = React.useState(false);
   const [context, setContext] = React.useState({ vault_id: "", scope_kind: "vault", scope_path: "", provider_id: "", model_id: "" });
   const [message, setMessage] = React.useState("");
+  const [taskIntent, setTaskIntent] = React.useState("auto");
+  const [taskPreview, setTaskPreview] = React.useState(null);
   const renameInputRef = React.useRef(null);
   const page = sessionPage?.page || 1;
   const totalPages = sessionPage?.total_pages || 1;
@@ -666,6 +669,8 @@ export function SessionManagement({
     if (!selectedSession) return;
     setContext(sessionComposerContext(selectedSession));
     setMessage("");
+    setTaskIntent("auto");
+    setTaskPreview(null);
   }, [selectedSession?.session_id]);
 
   function load(nextFilters) {
@@ -752,7 +757,7 @@ export function SessionManagement({
   const authorizationText = selectedVault
     ? (policyFor(selectedVault).outbound_mode === "always-allow" ? "外部访问：已设为始终允许" : "外部访问：每次任务询问")
     : "外部访问：先选择 vault";
-  const canSend = Boolean(
+  const canPrepare = Boolean(
     selectedSession && !contextIsDirty && selectedSession.selected_vault_id && selectedSession.scope_kind
       && selectedSession.selected_provider_id && selectedSession.selected_model_id && message.trim()
   );
@@ -766,6 +771,7 @@ export function SessionManagement({
         ...context,
         scope_path: context.scope_kind === "directory" ? context.scope_path : null
       });
+      setTaskPreview(null);
       setStatus("会话语境已保存。");
     } catch (requestError) {
       setContext(sessionComposerContext(selectedSession));
@@ -781,6 +787,7 @@ export function SessionManagement({
     setIsSubmitting(true);
     try {
       await onPickAttachments(selectedSession.session_id);
+      setTaskPreview(null);
       setStatus("附件已添加。");
     } catch (requestError) {
       setStatus(requestError.message);
@@ -795,6 +802,7 @@ export function SessionManagement({
     setIsSubmitting(true);
     try {
       await onRemoveAttachment(selectedSession.session_id, attachmentId);
+      setTaskPreview(null);
       setStatus("附件已移除。");
     } catch (requestError) {
       setStatus(requestError.message);
@@ -803,15 +811,41 @@ export function SessionManagement({
     }
   }
 
-  async function sendMessage(event) {
+  function taskIntentText(intent) {
+    return {
+      "source-lookup": "原文定位",
+      completeness: "完整列举",
+      "knowledge-organization": "知识整理",
+      "deep-creation": "深度创作"
+    }[intent] || "自动识别";
+  }
+
+  async function prepareTask(event) {
     event?.preventDefault();
-    if (!canSend || !selectedSession || contextIsDirty) return;
+    if (!canPrepare || !selectedSession || contextIsDirty) return;
     setStatus("");
     setIsSubmitting(true);
     try {
-      await onSendMessage(selectedSession.session_id, message);
+      const preview = await onPreviewTask(selectedSession.session_id, message, taskIntent);
+      setTaskPreview(preview);
+      setStatus(preview.is_ready ? "范围已准备，请确认固定任务快照。" : preview.blocking_reason || "当前范围不可执行。 ");
+    } catch (requestError) {
+      setTaskPreview(null);
+      setStatus(requestError.message);
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  async function createTask() {
+    if (!taskPreview?.is_ready || !selectedSession || contextIsDirty) return;
+    setStatus("");
+    setIsSubmitting(true);
+    try {
+      await onCreateTask(selectedSession.session_id, message, taskIntent);
       setMessage("");
-      setStatus("消息已发送。");
+      setTaskPreview(null);
+      setStatus("任务快照已固定，等待后续检索执行。");
     } catch (requestError) {
       setStatus(requestError.message);
     } finally {
@@ -970,10 +1004,26 @@ export function SessionManagement({
                 ? React.createElement("p", { className: "empty-state" }, "该会话尚无已保存的消息。")
                 : React.createElement("p", { className: "empty-state" }, "从左侧选择一个会话以查看内容。")
       ),
+      activeDetail?.task_snapshots?.length
+        ? React.createElement(
+            "div",
+            { className: "session-task-snapshot-list", "aria-label": "任务快照状态", "aria-live": "polite" },
+            activeDetail.task_snapshots.map((snapshot) => React.createElement(
+              "section",
+              { className: "scope-summary session-task-snapshot", key: snapshot.snapshot_id },
+              React.createElement("strong", null, `任务 ${taskIntentText(snapshot.intent)}：${snapshot.status === "invalidated" ? "已失效" : "已准备"}`),
+              React.createElement("span", null, `范围：${snapshot.scope_kind === "directory" ? snapshot.scope_path : "整个 vault"}；来源 ${snapshot.source_count} 项；摘要 ${snapshot.source_digest.slice(0, 12)}`),
+              React.createElement("span", null, `索引：${snapshot.index_status}；外发：${snapshot.outbound_scope_summary}`),
+              snapshot.invalidation_reason
+                ? React.createElement("span", { className: "form-error" }, `需重新准备：${snapshot.invalidation_reason}`)
+                : null
+            ))
+          )
+        : null,
       selectedSession
         ? React.createElement(
             "form",
-            { className: "session-composer", "aria-label": "会话输入", onSubmit: sendMessage },
+            { className: "session-composer", "aria-label": "会话输入", onSubmit: prepareTask },
             React.createElement(
               "div",
               { className: "session-attachment-list", "aria-live": "polite", "aria-relevant": "additions removals text" },
@@ -996,14 +1046,36 @@ export function SessionManagement({
               disabled: isSubmitting,
               "aria-label": "输入问题或继续创作",
               placeholder: "输入问题，或继续创作...",
-              onChange: (event) => setMessage(event.target.value),
+              onChange: (event) => {
+                setMessage(event.target.value);
+                setTaskPreview(null);
+              },
               onKeyDown: (event) => {
                 if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
                   event.preventDefault();
-                  sendMessage();
+                  prepareTask();
                 }
               }
             }),
+            taskPreview
+              ? React.createElement(
+                  "section",
+                  { className: "scope-summary session-task-preview", role: "status", "aria-live": "polite" },
+                  React.createElement("strong", null, `执行前范围：${taskIntentText(taskPreview.intent)}${taskPreview.intent_source === "auto" ? "（自动识别）" : "（已明确选择）"}`),
+                  React.createElement("span", null, `vault：${taskPreview.vault_id}；范围：${taskPreview.scope_kind === "directory" ? taskPreview.scope_path : "整个 vault"}`),
+                  React.createElement("span", null, `来源：${taskPreview.source_count} 项；来源摘要：${taskPreview.source_digest.slice(0, 12)}`),
+                  React.createElement("span", null, `索引：${taskPreview.index_status}${taskPreview.index_updated_at ? `（${taskPreview.index_updated_at}）` : ""}`),
+                  React.createElement("span", null, `排除项：${taskPreview.exclusion_summary}`),
+                  React.createElement("span", null, `Model：${taskPreview.provider_id} · ${taskPreview.model_id}`),
+                  React.createElement("span", null, `外发范围：${taskPreview.outbound_scope_summary}`),
+                  taskPreview.source_sample?.length
+                    ? React.createElement("span", null, `来源样例：${taskPreview.source_sample.map((source) => source.source_id ? `Source ID ${source.source_id} / ${source.source_content_hash?.slice(0, 12)}` : `${source.relative_path} / ${source.content_sha256.slice(0, 12)}`).join("；")}`)
+                    : null,
+                  !taskPreview.is_ready
+                    ? React.createElement("span", { className: "form-error" }, `${taskPreview.blocking_reason} ${taskPreview.recovery_action}`)
+                    : null
+                )
+              : null,
             React.createElement(
               "div", { className: "session-composer-controls" },
               React.createElement("button", { className: "secondary-button", type: "button", disabled: isSubmitting || contextIsDirty || !selectedSession?.selected_vault_id, onClick: pickAttachments }, "添加附件"),
@@ -1011,6 +1083,7 @@ export function SessionManagement({
                 React.createElement("select", {
                   value: context.vault_id, disabled: isSubmitting, "aria-label": "选择 vault",
                   onChange: (event) => {
+                    setTaskPreview(null);
                     setContext({ vault_id: event.target.value, scope_kind: "vault", scope_path: "", provider_id: "", model_id: "" });
                   }
                 }, React.createElement("option", { value: "" }, "选择 vault"), availableVaults.map((vault) => React.createElement("option", { key: vault.vault_id, value: vault.vault_id }, vault.managed_root_relative_path)))
@@ -1019,12 +1092,14 @@ export function SessionManagement({
                 React.createElement("select", {
                   value: context.scope_kind, disabled: isSubmitting || !context.vault_id, "aria-label": "选择资料范围",
                   onChange: (event) => {
+                    setTaskPreview(null);
                     setContext({ ...context, scope_kind: event.target.value, scope_path: "" });
                   }
                 }, React.createElement("option", { value: "vault" }, "整个 vault"), React.createElement("option", { value: "directory" }, "指定目录"))
               ),
               context.scope_kind === "directory"
                 ? React.createElement("input", { value: context.scope_path, disabled: isSubmitting, "aria-label": "资料范围目录", placeholder: "vault 相对目录", onChange: (event) => {
+                  setTaskPreview(null);
                   setContext({ ...context, scope_path: event.target.value });
                 } })
                 : null,
@@ -1033,13 +1108,31 @@ export function SessionManagement({
                   value: JSON.stringify([context.provider_id, context.model_id]), disabled: isSubmitting || !context.vault_id, "aria-label": "选择 Model",
                   onChange: (event) => {
                     const [providerId, modelId] = JSON.parse(event.target.value);
+                    setTaskPreview(null);
                     setContext({ ...context, provider_id: providerId || "", model_id: modelId || "" });
                   }
                 }, React.createElement("option", { value: JSON.stringify(["", ""]) }, "选择已验证的 chat Model"), chatModels.map(({ provider, model }) => React.createElement("option", { key: `${provider.provider_id}:${model.model_id}`, value: JSON.stringify([provider.provider_id, model.model_id]) }, `${provider.name} · ${model.model_id}`)))
               ),
+              React.createElement("label", null, "任务类型",
+                React.createElement("select", {
+                  value: taskIntent, disabled: isSubmitting || contextIsDirty, "aria-label": "选择任务类型",
+                  onChange: (event) => {
+                    setTaskIntent(event.target.value);
+                    setTaskPreview(null);
+                  }
+                },
+                React.createElement("option", { value: "auto" }, "自动识别"),
+                React.createElement("option", { value: "source-lookup" }, "原文定位"),
+                React.createElement("option", { value: "completeness" }, "完整列举"),
+                React.createElement("option", { value: "knowledge-organization" }, "知识整理"),
+                React.createElement("option", { value: "deep-creation" }, "深度创作"))
+              ),
               React.createElement("span", { className: "session-authorization", role: "status" }, authorizationText),
               React.createElement("button", { className: "secondary-button", type: "button", disabled: isSubmitting || !context.vault_id || !context.provider_id || !context.model_id || (context.scope_kind === "directory" && !context.scope_path.trim()), onClick: saveContext }, "保存语境"),
-              React.createElement("button", { className: "primary-button", type: "submit", disabled: isSubmitting || !canSend }, "发送")
+              React.createElement("button", { className: "primary-button", type: "submit", disabled: isSubmitting || !canPrepare }, "准备任务"),
+              taskPreview?.is_ready
+                ? React.createElement("button", { className: "secondary-button", type: "button", disabled: isSubmitting || contextIsDirty, onClick: createTask }, "固定快照")
+                : null
             )
           )
         : null
@@ -1487,18 +1580,19 @@ export function TagManagement({ vault }) {
 export function VaultIndexStatus({ vault, onUpdate }) {
   const [status, setStatus] = React.useState("");
   const [isActing, setIsActing] = React.useState(false);
-  const index = vault.index || {
-    status: vault.index_status || "not-initialized",
-    updated_at: null,
-    current_count: 0,
-    stale_count: 0,
-    failure_count: 0,
-    semantic_status: "unavailable",
-    failed_paths: [],
-    stale_paths: [],
-    stale_details: [],
-    pending_count: 0,
-    pending_paths: []
+  const suppliedIndex = vault.index || {};
+  const index = {
+    status: suppliedIndex.status || vault.index_status || "not-initialized",
+    updated_at: suppliedIndex.updated_at || null,
+    current_count: suppliedIndex.current_count || 0,
+    stale_count: suppliedIndex.stale_count || 0,
+    failure_count: suppliedIndex.failure_count || 0,
+    semantic_status: suppliedIndex.semantic_status || "unavailable",
+    failed_paths: suppliedIndex.failed_paths || [],
+    stale_paths: suppliedIndex.stale_paths || [],
+    stale_details: suppliedIndex.stale_details || [],
+    pending_count: suppliedIndex.pending_count || 0,
+    pending_paths: suppliedIndex.pending_paths || []
   };
   const staleDetails = index.stale_details || [];
   const healthText = index.status === "not-initialized" ? "未初始化" : index.status;
@@ -3827,19 +3921,22 @@ export function App() {
     await loadSessionDetail(sessionId);
   }
 
-  async function sendPersistentSessionMessage(sessionId, content) {
-    const response = await requestJson(`${SESSIONS_ENDPOINT}/${sessionId}/messages`, {
+  async function previewPersistentSessionTask(sessionId, content, intent) {
+    const response = await requestJson(`${SESSIONS_ENDPOINT}/${sessionId}/task-preview`, {
       method: "POST",
-      body: JSON.stringify({ content })
+      body: JSON.stringify({ content, intent })
     });
-    setSelectedSessionDetail((current) => (
-      current?.session.session_id === sessionId
-        ? { ...current, messages: [...(current.messages || []), response.message] }
-        : current
-    ));
+    return response.preview;
+  }
+
+  async function createPersistentSessionTask(sessionId, content, intent) {
+    const response = await requestJson(`${SESSIONS_ENDPOINT}/${sessionId}/tasks`, {
+      method: "POST",
+      body: JSON.stringify({ content, intent })
+    });
     await loadSessionDetail(sessionId);
     await loadSessions(sessionFilters);
-    return response.message;
+    return response.snapshot;
   }
 
   async function exportPersistentSession(session) {
@@ -3990,7 +4087,8 @@ export function App() {
       onUpdateContext: updatePersistentSessionContext,
       onPickAttachments: pickPersistentSessionAttachments,
       onRemoveAttachment: removePersistentSessionAttachment,
-      onSendMessage: sendPersistentSessionMessage
+      onPreviewTask: previewPersistentSessionTask,
+      onCreateTask: createPersistentSessionTask
     });
   } else if (activeDestination === "workbench") {
     workspaceContent = React.createElement(KnowledgeGraphWorkbench, {

@@ -975,7 +975,7 @@ test("filters commit review units and submits only the explicitly selectable uni
 
   await page.goto("/");
   await page.getByRole("link", { name: "任务", exact: true }).click();
-  await page.getByRole("button", { name: "review.pdf" }).click();
+  await page.getByRole("button", { name: /^review\.pdf/ }).click();
 
   const review = page.getByLabel("提交审核");
   await expect(review).toHaveAttribute("aria-live", "polite");
@@ -1414,7 +1414,8 @@ test("requires a saved session context before composer actions and announces att
     last_activity_at: "2026-07-23T00:00:00+00:00"
   };
   const attachments = [];
-  const sentMessages = [];
+  const taskSnapshots = [];
+  let previewRequests = 0;
   const vaults = [
     { vault_id: "vault-a", managed_root_relative_path: "Vault A", authorization_status: "active", access_status: "available" },
     { vault_id: "vault-b", managed_root_relative_path: "Vault B", authorization_status: "active", access_status: "available" }
@@ -1441,7 +1442,7 @@ test("requires a saved session context before composer actions and announces att
       return route.fulfill({ json: { sessions: [session], page: 1, page_size: 25, total: 1, total_pages: 1 } });
     }
     if (url.pathname === "/api/sessions/session-1" && request.method() === "GET") {
-      return route.fulfill({ json: { session, messages: [], task_states: [], citations: [], generation_results: [], attachments } });
+      return route.fulfill({ json: { session, messages: [], task_states: [], citations: [], generation_results: [], attachments, task_snapshots: taskSnapshots } });
     }
     if (url.pathname === "/api/sessions/session-1/context" && request.method() === "PATCH") {
       const context = request.postDataJSON();
@@ -1470,10 +1471,38 @@ test("requires a saved session context before composer actions and announces att
       attachments.splice(0, attachments.length);
       return route.fulfill({ json: { status: "removed" } });
     }
-    if (url.pathname === "/api/sessions/session-1/messages" && request.method() === "POST") {
+    if (url.pathname === "/api/sessions/session-1/task-preview" && request.method() === "POST") {
+      previewRequests += 1;
+      if (previewRequests === 2) {
+        return route.fulfill({ json: { preview: {
+          intent: "source-lookup", intent_source: "auto", vault_id: session.selected_vault_id,
+          scope_kind: session.scope_kind, scope_path: session.scope_path,
+          provider_id: session.selected_provider_id, model_id: session.selected_model_id,
+          index_status: "provider-model-unavailable", index_updated_at: null,
+          exclusion_summary: "无法读取排除项。", outbound_scope_summary: "尚未发送；恢复不可用对象后重新准备任务。",
+          source_count: 0, source_digest: "a".repeat(64), source_sample: [], is_ready: false,
+          blocking_reason: "所选 Provider/Model 不可用。", recovery_action: "选择已验证的 chat Model 后重试。"
+        } } });
+      }
+      return route.fulfill({ json: { preview: {
+        intent: "source-lookup", intent_source: "auto", vault_id: session.selected_vault_id,
+        scope_kind: session.scope_kind, scope_path: session.scope_path,
+        provider_id: session.selected_provider_id, model_id: session.selected_model_id,
+        index_status: "healthy", index_updated_at: "2026-07-23T00:00:00+00:00",
+        exclusion_summary: "无排除项。", outbound_scope_summary: "尚未发送；实际检索块将在执行前按任务快照申请或核验授权。",
+        source_count: 0, source_digest: "a".repeat(64), source_sample: [], is_ready: true,
+        blocking_reason: null, recovery_action: null
+      } } });
+    }
+    if (url.pathname === "/api/sessions/session-1/tasks" && request.method() === "POST") {
       const { content } = request.postDataJSON();
-      sentMessages.push(content);
-      return route.fulfill({ json: { message: { message_id: "message-1", role: "user", content } } });
+      const snapshot = {
+        snapshot_id: "snapshot-1", task_id: "task-1", intent: "source-lookup", status: "prepared",
+        scope_kind: "vault", scope_path: null, source_count: 0, source_digest: "a".repeat(64),
+        index_status: "healthy", outbound_scope_summary: "尚未发送", content
+      };
+      taskSnapshots.push(snapshot);
+      return route.fulfill({ json: { snapshot } });
     }
     return route.fallback();
   });
@@ -1489,12 +1518,12 @@ test("requires a saved session context before composer actions and announces att
   await composer.press("Shift+Enter");
   await composer.pressSequentially("第二行");
   await expect(composer).toHaveValue("第一行\n第二行");
-  await expect(page.getByRole("button", { name: "发送", exact: true })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "准备任务", exact: true })).toBeDisabled();
   await expect(page.getByRole("button", { name: "添加附件", exact: true })).toBeDisabled();
 
   await page.getByRole("button", { name: "保存语境", exact: true }).click();
   await expect(page.getByText("会话语境已保存。", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "发送", exact: true })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "准备任务", exact: true })).toBeEnabled();
   await page.getByRole("button", { name: "添加附件", exact: true }).click();
   await expect(page.getByText("附件已添加。", { exact: true })).toBeVisible();
   const removeAttachment = page.getByRole("button", { name: "移除附件 handout.md" });
@@ -1503,8 +1532,16 @@ test("requires a saved session context before composer actions and announces att
   await expect(page.getByText("附件已移除。", { exact: true })).toBeVisible();
   await expect(removeAttachment).toHaveCount(0);
 
-  await page.getByRole("button", { name: "发送", exact: true }).click();
-  await expect.poll(() => sentMessages).toEqual(["第一行\n第二行"]);
+  await page.getByRole("button", { name: "准备任务", exact: true }).click();
+  await expect(page.getByText("执行前范围：原文定位（自动识别）", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "固定快照", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "准备任务", exact: true }).click();
+  await expect(page.getByText("所选 Provider/Model 不可用。", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "固定快照", exact: true })).toHaveCount(0);
+  await page.getByRole("button", { name: "准备任务", exact: true }).click();
+  await page.getByRole("button", { name: "固定快照", exact: true }).click();
+  await expect(page.getByText("任务快照已固定，等待后续检索执行。", { exact: true })).toBeVisible();
+  await expect(page.getByText("任务 原文定位：已准备", { exact: true })).toBeVisible();
 });
 
 test("keeps the current session detail when an earlier selection resolves last", async ({ page }) => {
