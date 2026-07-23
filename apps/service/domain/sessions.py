@@ -105,6 +105,48 @@ class SessionTaskSnapshotSource:
 
 
 @dataclass(frozen=True)
+class SessionCompletenessCoverageItem:
+    ordinal: int
+    identity_kind: str
+    relative_path: str
+    content_sha256: str
+    source_id: str | None
+    source_content_hash: str | None
+    source_path: str | None
+    heading: str | None
+    location: str
+    page: int | None
+    excerpt: str | None
+    disposition: str
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.ordinal < 1 or self.identity_kind not in {"derived", "native"}:
+            raise ValueError("Completeness coverage identity is invalid.")
+        _validate_relative_path(self.relative_path)
+        _validate_sha256(self.content_sha256, "Completeness coverage content hash")
+        if self.identity_kind == "native":
+            if any(value is not None for value in (self.source_id, self.source_content_hash, self.source_path)):
+                raise ValueError("Native completeness coverage cannot fabricate source identity.")
+        else:
+            source_identity = (self.source_id, self.source_content_hash, self.source_path)
+            if all(source_identity):
+                _validate_sha256(self.source_content_hash, "Completeness coverage source hash")
+                _validate_relative_path(self.source_path)
+            elif self.disposition == "planned" or any(value is not None for value in source_identity):
+                raise ValueError("Planned derived completeness coverage needs source identity.")
+        if not self.location.strip() or (self.page is not None and self.page < 1):
+            raise ValueError("Completeness coverage location is invalid.")
+        if self.disposition not in {"planned", "excluded", "uncovered"}:
+            raise ValueError("Completeness coverage disposition is invalid.")
+        if self.disposition == "planned":
+            if not self.excerpt or len(self.excerpt) > 1000 or self.reason is not None:
+                raise ValueError("Planned completeness coverage needs an excerpt and no gap reason.")
+        elif not self.reason or self.excerpt is not None:
+            raise ValueError("Completeness gaps need a reason and no excerpt.")
+
+
+@dataclass(frozen=True)
 class SessionTaskSnapshot:
     snapshot_id: str
     session_id: str
@@ -131,6 +173,7 @@ class SessionTaskSnapshot:
     updated_at: str
     invalidation_reason: str | None = None
     sources: tuple[SessionTaskSnapshotSource, ...] = ()
+    coverage_items: tuple[SessionCompletenessCoverageItem, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -146,7 +189,7 @@ class SessionTaskSnapshot:
             or not self.model_id
             or self.policy_revision < 1
             or self.source_count != len(self.sources)
-            or self.status not in {"prepared", "waiting-authorization", "completed", "invalidated"}
+            or self.status not in {"prepared", "waiting-authorization", "completed", "recoverable", "failed", "invalidated"}
         ):
             raise ValueError("Task snapshot is invalid.")
         normalize_session_scope(self.scope_kind, self.scope_path)
@@ -158,6 +201,13 @@ class SessionTaskSnapshot:
             raise ValueError("Only invalidated task snapshots can have a reason.")
         if tuple(source.ordinal for source in self.sources) != tuple(range(1, self.source_count + 1)):
             raise ValueError("Task snapshot source ordering is invalid.")
+        if self.intent == "completeness":
+            if tuple(item.ordinal for item in self.coverage_items) != tuple(
+                range(1, len(self.coverage_items) + 1)
+            ):
+                raise ValueError("Completeness task snapshots need ordered coverage items.")
+        elif self.coverage_items:
+            raise ValueError("Only completeness task snapshots can have coverage items.")
 
 
 @dataclass(frozen=True)
@@ -361,6 +411,76 @@ class SessionRetrievalResult:
             raise ValueError("Retrieval evidence ordering is invalid.")
 
 
+COMPLETENESS_RESULT_STATUSES = frozenset(
+    {"complete", "completed-with-confirmed-gaps", "failed", "recoverable"}
+)
+
+
+@dataclass(frozen=True)
+class SessionCompletenessItemOutcome:
+    ordinal: int
+    status: str
+    evidence_ordinal: int | None = None
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.ordinal < 1 or self.status not in {"processed", "duplicate", "failed"}:
+            raise ValueError("Completeness item outcome is invalid.")
+        if self.status == "processed":
+            if self.evidence_ordinal != self.ordinal or self.reason is not None:
+                raise ValueError("Processed completeness items need their own evidence.")
+        elif self.status == "duplicate":
+            if self.evidence_ordinal is None or self.evidence_ordinal < 1 or self.reason is not None:
+                raise ValueError("Duplicate completeness items need retained evidence.")
+        elif self.evidence_ordinal is not None or not self.reason:
+            raise ValueError("Failed completeness items need a reason.")
+
+
+@dataclass(frozen=True)
+class SessionCompletenessResult:
+    result_id: str
+    session_id: str
+    task_id: str
+    snapshot_id: str
+    status: str
+    summary: str
+    recovery_action: str | None
+    processed_ordinals: tuple[int, ...]
+    duration_ms: int
+    created_at: str
+    outcomes: tuple[SessionCompletenessItemOutcome, ...] = ()
+
+    def __post_init__(self) -> None:
+        if (
+            not self.result_id
+            or not self.session_id
+            or not self.task_id
+            or not self.snapshot_id
+            or self.status not in COMPLETENESS_RESULT_STATUSES
+            or not self.summary.strip()
+            or self.duration_ms < 0
+            or tuple(sorted(set(self.processed_ordinals))) != self.processed_ordinals
+            or any(ordinal < 1 for ordinal in self.processed_ordinals)
+        ):
+            raise ValueError("Completeness result is invalid.")
+        if self.status == "complete" and (not self.processed_ordinals or self.recovery_action is not None):
+            raise ValueError("Complete completeness results need processed coverage and no recovery action.")
+        if self.status != "complete" and self.recovery_action is None:
+            raise ValueError("Incomplete completeness results need a recovery action.")
+        if self.outcomes:
+            if tuple(outcome.ordinal for outcome in self.outcomes) != tuple(
+                sorted(outcome.ordinal for outcome in self.outcomes)
+            ) or len({outcome.ordinal for outcome in self.outcomes}) != len(self.outcomes):
+                raise ValueError("Completeness item outcomes must be ordered and unique.")
+            successful = tuple(
+                outcome.ordinal
+                for outcome in self.outcomes
+                if outcome.status in {"processed", "duplicate"}
+            )
+            if successful != self.processed_ordinals:
+                raise ValueError("Completeness processed coverage must match item outcomes.")
+
+
 @dataclass(frozen=True)
 class SessionAttachment:
     attachment_id: str
@@ -400,6 +520,7 @@ class SessionDetail:
     attachments: tuple[SessionAttachment, ...] = ()
     task_snapshots: tuple[SessionTaskSnapshot, ...] = ()
     retrieval_results: tuple[SessionRetrievalResult, ...] = ()
+    completeness_results: tuple[SessionCompletenessResult, ...] = ()
 
 
 @dataclass(frozen=True)

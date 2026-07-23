@@ -377,6 +377,11 @@ h1 {
   border-top: 1px solid #d7d7d2;
 }
 
+.completeness-result .progress-sequence {
+  margin: 12px 0;
+  font-size: 13px;
+}
+
 .session-retrieval-summary,
 .session-retrieval-timing,
 .evidence-row p {

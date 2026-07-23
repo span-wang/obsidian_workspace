@@ -5,6 +5,7 @@ from typing import Protocol
 from domain.sessions import (
     PersistentSession,
     SessionCitation,
+    SessionCompletenessResult,
     SessionAttachment,
     SessionDetail,
     SessionGenerationResult,
@@ -71,4 +72,11 @@ class SessionRepository(Protocol):
         snapshot: SessionTaskSnapshot,
         task_state: SessionTaskState,
         result: SessionRetrievalResult,
+    ) -> bool: ...
+
+    def persist_completeness_execution(
+        self,
+        snapshot: SessionTaskSnapshot,
+        task_state: SessionTaskState,
+        result: SessionCompletenessResult,
     ) -> bool: ...

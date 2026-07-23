@@ -80,6 +80,7 @@ from domain.sessions import (
     MAX_SESSION_PAGE,
     PersistentSession,
     SessionCitation,
+    SessionCompletenessResult,
     SessionDetail,
     SessionGenerationResult,
     SessionMessage,
@@ -92,6 +93,7 @@ from domain.vaults import Vault
 
 
 DEFAULT_HOST = "127.0.0.1"
+COMPLETENESS_COVERAGE_PAGE_SIZE = 100
 DEFAULT_PORT = 6240
 SERVICE_NAME = "obsidian-personal-knowledge-platform"
 WEB_BUILD_DIRECTORY = Path(__file__).resolve().parents[2] / "web" / "dist"
@@ -646,6 +648,11 @@ def session_task_snapshot_payload(snapshot) -> dict[str, object]:
         "source_digest": snapshot.source_digest,
         "source_sample": source_sample,
         "source_sample_truncated": snapshot.source_count > len(source_sample),
+        "coverage": {
+            "planned_count": sum(item.disposition == "planned" for item in snapshot.coverage_items),
+            "excluded_count": sum(item.disposition == "excluded" for item in snapshot.coverage_items),
+            "uncovered_count": sum(item.disposition == "uncovered" for item in snapshot.coverage_items),
+        } if snapshot.intent == "completeness" else None,
         "status": snapshot.status,
         "invalidation_reason": snapshot.invalidation_reason,
         "created_at": snapshot.created_at,
@@ -766,6 +773,79 @@ def session_retrieval_result_payload(
     }
 
 
+def session_completeness_result_payload(
+    result: SessionCompletenessResult,
+    snapshot=None,
+    *,
+    coverage_offset: int = 0,
+    coverage_limit: int | None = COMPLETENESS_COVERAGE_PAGE_SIZE,
+) -> dict[str, object]:
+    items = snapshot.coverage_items if snapshot is not None else ()
+    if coverage_offset < 0 or (coverage_limit is not None and coverage_limit < 1):
+        raise ValueError("Completeness coverage page is invalid.")
+    selected_items = (
+        items[coverage_offset:]
+        if coverage_limit is None
+        else items[coverage_offset:coverage_offset + coverage_limit]
+    )
+    processed = set(result.processed_ordinals)
+    outcomes = {outcome.ordinal: outcome for outcome in result.outcomes}
+
+    def coverage_status(item) -> str:
+        if item.ordinal in outcomes:
+            return outcomes[item.ordinal].status
+        return "processed" if item.ordinal in processed else item.disposition
+
+    coverage_counts = {
+        "planned": sum(item.disposition == "planned" for item in items),
+        "processed": sum(coverage_status(item) == "processed" for item in items),
+        "duplicate": sum(coverage_status(item) == "duplicate" for item in items),
+        "failed": sum(coverage_status(item) == "failed" for item in items),
+        "excluded": sum(coverage_status(item) == "excluded" for item in items),
+        "uncovered": sum(coverage_status(item) == "uncovered" for item in items),
+    }
+    stale = snapshot is not None and snapshot.status == "invalidated"
+    return {
+        "result_id": result.result_id,
+        "task_id": result.task_id,
+        "snapshot_id": result.snapshot_id,
+        "status": "source-changed" if stale else result.status,
+        "summary": result.summary,
+        "recovery_action": result.recovery_action,
+        "duration_ms": result.duration_ms,
+        "created_at": result.created_at,
+        "vault_id": snapshot.vault_id if snapshot is not None else None,
+        "snapshot_status": snapshot.status if snapshot is not None else None,
+        "is_stale": stale,
+        "invalidation_reason": snapshot.invalidation_reason if snapshot is not None else None,
+        "coverage_total": len(items),
+        "coverage_offset": coverage_offset,
+        "coverage_has_more": coverage_offset + len(selected_items) < len(items),
+        "coverage_counts": coverage_counts,
+        "coverage": [
+            {
+                "ordinal": item.ordinal,
+                "status": coverage_status(item),
+                "reason": outcomes[item.ordinal].reason if item.ordinal in outcomes else item.reason,
+                "evidence_ordinal": (
+                    outcomes[item.ordinal].evidence_ordinal if item.ordinal in outcomes else None
+                ),
+                "identity_kind": item.identity_kind,
+                "relative_path": item.relative_path,
+                "content_sha256": item.content_sha256,
+                "source_id": item.source_id,
+                "source_content_hash": item.source_content_hash,
+                "source_path": item.source_path,
+                "heading": item.heading,
+                "location": item.location,
+                "page": item.page,
+                "excerpt": item.excerpt,
+            }
+            for item in selected_items
+        ],
+    }
+
+
 def session_attachment_payload(attachment) -> dict[str, object]:
     return {
         "attachment_id": attachment.attachment_id,
@@ -777,7 +857,9 @@ def session_attachment_payload(attachment) -> dict[str, object]:
     }
 
 
-def session_detail_payload(detail: SessionDetail) -> dict[str, object]:
+def session_detail_payload(
+    detail: SessionDetail, *, coverage_limit: int | None = COMPLETENESS_COVERAGE_PAGE_SIZE
+) -> dict[str, object]:
     snapshots = {snapshot.snapshot_id: snapshot for snapshot in detail.task_snapshots}
     return {
         "session": persistent_session_payload(detail.session),
@@ -792,6 +874,12 @@ def session_detail_payload(detail: SessionDetail) -> dict[str, object]:
         "retrieval_results": [
             session_retrieval_result_payload(result, snapshots.get(result.snapshot_id))
             for result in detail.retrieval_results
+        ],
+        "completeness_results": [
+            session_completeness_result_payload(
+                result, snapshots.get(result.snapshot_id), coverage_limit=coverage_limit
+            )
+            for result in detail.completeness_results
         ],
     }
 
@@ -1635,7 +1723,9 @@ def create_app(
     @app.get("/api/sessions/{session_id}/export", dependencies=[Depends(require_current_local_session)])
     def export_persistent_session(request: Request, session_id: str) -> Response:
         try:
-            payload = session_detail_payload(app.state.session_service.export(session_id))
+            payload = session_detail_payload(
+                app.state.session_service.export(session_id), coverage_limit=None
+            )
         except Exception as error:
             raise session_error(error) from error
         return Response(
@@ -1643,6 +1733,33 @@ def create_app(
             media_type="application/json",
             headers={"Content-Disposition": f'attachment; filename="session-{session_id}.json"'},
         )
+
+    @app.get(
+        "/api/sessions/{session_id}/completeness-results/{result_id}/coverage",
+        dependencies=[Depends(require_current_local_session)],
+    )
+    def get_completeness_coverage_page(
+        request: Request,
+        session_id: str,
+        result_id: str,
+        offset: int = Query(0, ge=0),
+        limit: int = Query(COMPLETENESS_COVERAGE_PAGE_SIZE, ge=1, le=COMPLETENESS_COVERAGE_PAGE_SIZE),
+    ) -> dict[str, object]:
+        try:
+            detail = app.state.session_service.detail(session_id)
+            result = next(
+                (item for item in detail.completeness_results if item.result_id == result_id), None
+            )
+            if result is None:
+                raise SessionValidationError("The selected completeness result is unavailable.")
+            snapshot = next(
+                (item for item in detail.task_snapshots if item.snapshot_id == result.snapshot_id), None
+            )
+            return session_completeness_result_payload(
+                result, snapshot, coverage_offset=offset, coverage_limit=limit
+            )
+        except Exception as error:
+            raise session_error(error) from error
 
     @app.get("/api/sessions/{session_id}", dependencies=[Depends(require_current_local_session)])
     def get_persistent_session(request: Request, session_id: str) -> dict[str, object]:
@@ -1779,7 +1896,12 @@ def create_app(
                 (item for item in detail.task_snapshots if item.snapshot_id == result.snapshot_id),
                 None,
             )
-            return {"result": session_retrieval_result_payload(result, snapshot)}
+            payload = (
+                session_completeness_result_payload(result, snapshot)
+                if isinstance(result, SessionCompletenessResult)
+                else session_retrieval_result_payload(result, snapshot)
+            )
+            return {"result": payload}
         except Exception as error:
             raise session_error(error) from error
 

@@ -1700,6 +1700,63 @@ test("presents independent retrieval sources side by side without a preferred an
   await expect(evidenceRows.first()).toContainText("Source ID source-lesson");
 });
 
+test("shows completeness coverage gaps and stale sources without claiming completion", async ({ page }) => {
+  const session = {
+    session_id: "session-completeness", title: "完整性", selected_vault_id: "vault-a",
+    selected_vault_label: "Session Vault", selected_provider_id: "provider-1",
+    selected_provider_label: "Local", selected_model_id: "chat-1", selected_model_label: "chat-1",
+    scope_kind: "vault", scope_path: null, message_count: 1,
+    created_at: "2026-07-23T00:00:00+00:00", updated_at: "2026-07-23T00:00:00+00:00",
+    last_activity_at: "2026-07-23T00:00:00+00:00"
+  };
+  await page.route("**/api/**", async (route) => {
+    const request = route.request();
+    const pathname = new URL(request.url()).pathname;
+    if (pathname === "/api/health") return route.fulfill({ json: { service: serviceName } });
+    if (pathname === "/api/session") return route.fulfill({ json: { status: "ok" } });
+    if (pathname === "/api/vaults") return route.fulfill({ json: { vaults: [{
+      vault_id: "vault-a", display_name: "Session Vault", managed_root_relative_path: "platform",
+      authorization_status: "active", access_status: "available"
+    }] } });
+    if (pathname === "/api/providers/defaults") return route.fulfill({ json: { chat: {}, embedding: {} } });
+    if (pathname === "/api/providers") return route.fulfill({ json: { providers: [] } });
+    if (pathname === "/api/import-tasks") return route.fulfill({ json: { tasks: [] } });
+    if (pathname === "/api/sessions" && request.method() === "GET") {
+      return route.fulfill({ json: { sessions: [session], page: 1, page_size: 25, total: 1, total_pages: 1 } });
+    }
+    if (pathname === "/api/sessions/session-completeness" && request.method() === "GET") {
+      return route.fulfill({ json: {
+        session, messages: [], task_states: [], citations: [], generation_results: [], attachments: [], retrieval_results: [],
+        task_snapshots: [{
+          snapshot_id: "snapshot-completeness", task_id: "task-completeness", vault_id: "vault-a",
+          intent: "completeness", status: "invalidated", scope_kind: "vault", source_count: 1,
+          source_digest: "a".repeat(64), index_status: "healthy", outbound_scope_summary: "尚未发送",
+          coverage: { planned_count: 1, excluded_count: 1, uncovered_count: 0 }, invalidation_reason: "来源内容已变化。"
+        }],
+        completeness_results: [{
+          result_id: "result-completeness", task_id: "task-completeness", snapshot_id: "snapshot-completeness",
+          vault_id: "vault-a", status: "source-changed", summary: "来源已变化，不能继续作为当前完整结果。",
+          recovery_action: "重新准备任务。", invalidation_reason: "来源内容已变化。",
+          coverage: [
+            { ordinal: 1, status: "processed", identity_kind: "native", relative_path: "notes/unit.md", content_sha256: "a".repeat(64), location: "heading: Unit; page: 1", page: 1, excerpt: "first word" },
+            { ordinal: 2, status: "excluded", identity_kind: "native", relative_path: "notes/excluded.md", content_sha256: "b".repeat(64), location: "heading: Excluded", page: null, excerpt: null, reason: "内容被当前排除规则确认排除。" }
+          ]
+        }]
+      } });
+    }
+    return route.fallback();
+  });
+
+  await page.goto("/");
+  await page.getByRole("link", { name: "会话", exact: true }).click();
+  await expect(page.getByLabel("来源已变化")).toContainText("不能继续作为当前完整结果");
+  await expect(page.getByText("排除 1 项", { exact: true })).toBeVisible();
+  const excluded = page.locator(".completeness-result .evidence-row").nth(1);
+  await excluded.locator("summary").click();
+  await expect(excluded).toContainText("内容被当前排除规则确认排除。");
+  await expect(page.getByText("完整完成", { exact: true })).toHaveCount(0);
+});
+
 test("keeps the current session detail when an earlier selection resolves last", async ({ page }) => {
   const session = (sessionId, title, vault) => ({
     session_id: sessionId,

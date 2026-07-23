@@ -9,6 +9,9 @@ from domain.sessions import (
     PersistentSession,
     SessionAttachment,
     SessionCitation,
+    SessionCompletenessCoverageItem,
+    SessionCompletenessItemOutcome,
+    SessionCompletenessResult,
     SessionDetail,
     SessionGenerationResult,
     SessionMessage,
@@ -164,6 +167,25 @@ class SqliteSessionRepository:
                 "CREATE INDEX IF NOT EXISTS session_task_snapshot_session_idx ON session_task_snapshots(session_id, created_at)"
             )
             connection.execute(
+                """CREATE TABLE IF NOT EXISTS session_task_snapshot_coverage_items (
+                    snapshot_id TEXT NOT NULL REFERENCES session_task_snapshots(snapshot_id) ON DELETE CASCADE,
+                    ordinal INTEGER NOT NULL,
+                    identity_kind TEXT NOT NULL,
+                    relative_path TEXT NOT NULL,
+                    content_sha256 TEXT NOT NULL,
+                    source_id TEXT,
+                    source_content_hash TEXT,
+                    source_path TEXT,
+                    heading TEXT,
+                    location TEXT NOT NULL,
+                    page INTEGER,
+                    excerpt TEXT,
+                    disposition TEXT NOT NULL,
+                    reason TEXT,
+                    PRIMARY KEY (snapshot_id, ordinal)
+                )"""
+            )
+            connection.execute(
                 """CREATE TABLE IF NOT EXISTS session_retrieval_results (
                     result_id TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
@@ -200,12 +222,46 @@ class SqliteSessionRepository:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS session_retrieval_result_session_idx ON session_retrieval_results(session_id, created_at)"
             )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS session_completeness_results (
+                    result_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                    task_id TEXT NOT NULL,
+                    snapshot_id TEXT NOT NULL REFERENCES session_task_snapshots(snapshot_id) ON DELETE CASCADE,
+                    status TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    recovery_action TEXT,
+                    processed_ordinals_json TEXT NOT NULL,
+                    outcomes_json TEXT NOT NULL DEFAULT '[]',
+                    duration_ms INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(session_id, task_id)
+                )"""
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS session_completeness_result_session_idx ON session_completeness_results(session_id, created_at)"
+            )
+            self._ensure_completeness_result_column(
+                connection, "outcomes_json", "TEXT NOT NULL DEFAULT '[]'"
+            )
 
     @staticmethod
     def _ensure_session_column(connection: sqlite3.Connection, name: str, declaration: str) -> None:
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(sessions)")}
         if name not in columns:
             connection.execute(f"ALTER TABLE sessions ADD COLUMN {name} {declaration}")
+
+    @staticmethod
+    def _ensure_completeness_result_column(
+        connection: sqlite3.Connection, name: str, declaration: str
+    ) -> None:
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(session_completeness_results)")
+        }
+        if name not in columns:
+            connection.execute(
+                f"ALTER TABLE session_completeness_results ADD COLUMN {name} {declaration}"
+            )
 
     def create(self, session: PersistentSession) -> None:
         with self._connect() as connection:
@@ -265,6 +321,13 @@ class SqliteSessionRepository:
                 ).fetchall()
                 for row in snapshots
             }
+            coverage_items = {
+                row["snapshot_id"]: connection.execute(
+                    "SELECT * FROM session_task_snapshot_coverage_items WHERE snapshot_id = ? ORDER BY ordinal",
+                    (row["snapshot_id"],),
+                ).fetchall()
+                for row in snapshots
+            }
             retrieval_results = connection.execute(
                 "SELECT * FROM session_retrieval_results WHERE session_id = ? ORDER BY created_at, result_id",
                 (session_id,),
@@ -276,6 +339,10 @@ class SqliteSessionRepository:
                 ).fetchall()
                 for row in retrieval_results
             }
+            completeness_results = connection.execute(
+                "SELECT * FROM session_completeness_results WHERE session_id = ? ORDER BY created_at, result_id",
+                (session_id,),
+            ).fetchall()
         return SessionDetail(
             self._session_from_row(session_row),
             tuple(self._message_from_row(row) for row in messages),
@@ -284,13 +351,16 @@ class SqliteSessionRepository:
             tuple(self._result_from_row(row) for row in results),
             tuple(self._attachment_from_row(row) for row in attachments),
             tuple(
-                self._snapshot_from_row(row, snapshot_sources[row["snapshot_id"]])
+                self._snapshot_from_row(
+                    row, snapshot_sources[row["snapshot_id"]], coverage_items[row["snapshot_id"]]
+                )
                 for row in snapshots
             ),
             tuple(
                 self._retrieval_result_from_row(row, retrieval_evidences[row["result_id"]])
                 for row in retrieval_results
             ),
+            tuple(self._completeness_result_from_row(row) for row in completeness_results),
         )
 
     def list_page(
@@ -494,6 +564,40 @@ class SqliteSessionRepository:
             self._touch_session(connection, snapshot.session_id, task_state.updated_at)
         return True
 
+    def persist_completeness_execution(
+        self,
+        snapshot: SessionTaskSnapshot,
+        task_state: SessionTaskState,
+        result: SessionCompletenessResult,
+    ) -> bool:
+        with self._connect() as connection:
+            if self._update_task_snapshot(connection, snapshot, expected_status="prepared").rowcount != 1:
+                return False
+            self._upsert_task_state(connection, task_state)
+            connection.execute(
+                """INSERT INTO session_completeness_results (
+                    result_id, session_id, task_id, snapshot_id, status, summary, recovery_action,
+                    processed_ordinals_json, outcomes_json, duration_ms, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    result.result_id, result.session_id, result.task_id, result.snapshot_id,
+                    result.status, result.summary, result.recovery_action,
+                    json.dumps(result.processed_ordinals),
+                    json.dumps([
+                        {
+                            "ordinal": outcome.ordinal,
+                            "status": outcome.status,
+                            "evidence_ordinal": outcome.evidence_ordinal,
+                            "reason": outcome.reason,
+                        }
+                        for outcome in result.outcomes
+                    ]),
+                    result.duration_ms, result.created_at,
+                ),
+            )
+            self._touch_session(connection, snapshot.session_id, task_state.updated_at)
+        return True
+
     @staticmethod
     def _session_select(where: str) -> str:
         return """SELECT sessions.*, (
@@ -565,6 +669,20 @@ class SqliteSessionRepository:
                     source.source_path,
                 )
                 for source in snapshot.sources
+            ],
+        )
+        connection.executemany(
+            """INSERT INTO session_task_snapshot_coverage_items (
+                snapshot_id, ordinal, identity_kind, relative_path, content_sha256, source_id,
+                source_content_hash, source_path, heading, location, page, excerpt, disposition, reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    snapshot.snapshot_id, item.ordinal, item.identity_kind, item.relative_path,
+                    item.content_sha256, item.source_id, item.source_content_hash, item.source_path,
+                    item.heading, item.location, item.page, item.excerpt, item.disposition, item.reason,
+                )
+                for item in snapshot.coverage_items
             ],
         )
 
@@ -734,7 +852,7 @@ class SqliteSessionRepository:
 
     @staticmethod
     def _snapshot_from_row(
-        row: sqlite3.Row, source_rows: list[sqlite3.Row]
+        row: sqlite3.Row, source_rows: list[sqlite3.Row], coverage_rows: list[sqlite3.Row]
     ) -> SessionTaskSnapshot:
         return SessionTaskSnapshot(
             row["snapshot_id"],
@@ -772,6 +890,15 @@ class SqliteSessionRepository:
                     source["source_path"],
                 )
                 for source in source_rows
+            ),
+            tuple(
+                SessionCompletenessCoverageItem(
+                    item["ordinal"], item["identity_kind"], item["relative_path"],
+                    item["content_sha256"], item["source_id"], item["source_content_hash"],
+                    item["source_path"], item["heading"], item["location"], item["page"],
+                    item["excerpt"], item["disposition"], item["reason"],
+                )
+                for item in coverage_rows
             ),
         )
 
@@ -821,6 +948,20 @@ class SqliteSessionRepository:
                     tuple(json.loads(evidence["matched_channels_json"])),
                 )
                 for evidence in evidence_rows
+            ),
+        )
+
+    @staticmethod
+    def _completeness_result_from_row(row: sqlite3.Row) -> SessionCompletenessResult:
+        return SessionCompletenessResult(
+            row["result_id"], row["session_id"], row["task_id"], row["snapshot_id"],
+            row["status"], row["summary"], row["recovery_action"],
+            tuple(json.loads(row["processed_ordinals_json"])), int(row["duration_ms"]), row["created_at"],
+            tuple(
+                SessionCompletenessItemOutcome(
+                    outcome["ordinal"], outcome["status"], outcome.get("evidence_ordinal"), outcome.get("reason")
+                )
+                for outcome in json.loads(row["outcomes_json"])
             ),
         )
 

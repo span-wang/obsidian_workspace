@@ -11,6 +11,9 @@ from uuid import uuid4
 from domain.sessions import (
     MAX_SESSION_PAGE,
     PersistentSession,
+    SessionCompletenessCoverageItem,
+    SessionCompletenessItemOutcome,
+    SessionCompletenessResult,
     SessionAttachment,
     SessionDetail,
     SessionMessage,
@@ -38,6 +41,7 @@ class SessionNotFoundError(KeyError):
 
 MAX_RETRIEVAL_EVIDENCES = 8
 MAX_RETRIEVAL_BLOCK_CHARS = 800
+COMPLETENESS_BATCH_SIZE = 32
 MAX_RETRIEVAL_CONTEXT_CHARS = 4_000
 
 
@@ -61,6 +65,7 @@ class TaskPreview:
     source_count: int
     source_digest: str
     sources: tuple[SessionTaskSnapshotSource, ...]
+    coverage_items: tuple[SessionCompletenessCoverageItem, ...]
     is_ready: bool
     blocking_reason: str | None
     recovery_action: str | None
@@ -270,7 +275,7 @@ class SessionService:
             preview.index_updated_at, preview.index_digest, preview.policy_revision,
             preview.exclusion_summary, preview.outbound_mode, preview.outbound_scope_summary,
             preview.source_count, preview.source_digest, "prepared", timestamp, timestamp,
-            sources=preview.sources,
+            sources=preview.sources, coverage_items=preview.coverage_items,
         )
         self.repository.persist_task(
             message,
@@ -279,7 +284,7 @@ class SessionService:
         )
         return snapshot
 
-    def execute_task(self, session_id: str, task_id: str) -> SessionRetrievalResult:
+    def execute_task(self, session_id: str, task_id: str):
         started = perf_counter()
         try:
             detail = self.repository.get_detail(session_id)
@@ -291,7 +296,7 @@ class SessionService:
             raise SessionValidationError("The selected task is unavailable. Prepare a new task.")
         if task_state.status != "prepared" or snapshot.status != "prepared":
             raise SessionValidationError("The selected task is no longer ready. Prepare a new task.")
-        if snapshot.intent not in {"source-lookup", "knowledge-organization"}:
+        if snapshot.intent not in {"source-lookup", "knowledge-organization", "completeness"}:
             raise SessionValidationError("The selected task type is handled by a later workflow.")
 
         content = next(
@@ -300,6 +305,19 @@ class SessionService:
         )
         preview = self._task_preview(detail.session, content, intent=snapshot.intent)
         if not preview.is_ready:
+            if snapshot.intent == "completeness":
+                return self._persist_completeness_execution(
+                    replace(
+                        snapshot, status="recoverable", updated_at=utc_now(),
+                    ),
+                    replace(task_state, status="recoverable", updated_at=utc_now()),
+                    SessionCompletenessResult(
+                        str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id,
+                        "recoverable", preview.blocking_reason or "索引不可用，未执行完整性检索。",
+                        preview.recovery_action or "恢复索引后重新准备任务。", (),
+                        int((perf_counter() - started) * 1000), utc_now(),
+                    ),
+                )
             status = (
                 "provider-model-unavailable"
                 if preview.index_status == "provider-model-unavailable"
@@ -333,11 +351,14 @@ class SessionService:
             or preview.source_digest != snapshot.source_digest
             or preview.policy_revision != snapshot.policy_revision
             or preview.outbound_mode != snapshot.outbound_mode
+            or preview.coverage_items != snapshot.coverage_items
         ):
             reason = preview.blocking_reason or "来源、索引或授权策略已改变。"
             self._invalidate_active_snapshots(session_id, reason)
             raise SessionValidationError(f"{reason} 请重新准备任务。")
 
+        if snapshot.intent == "completeness":
+            return self._execute_completeness(snapshot, task_state, started)
         result = self._retrieve(snapshot, content, started)
         timestamp = utc_now()
         completed_snapshot = replace(snapshot, status="completed", updated_at=timestamp)
@@ -395,6 +416,11 @@ class SessionService:
         policy = self.policy_service.get(vault.vault_id)
         rules = self.policy_service.list_rules(vault.vault_id)
         sources = self._snapshot_sources(session, vault.vault_id)
+        coverage_items = (
+            self._completeness_coverage_items(session, vault.vault_id)
+            if resolved_intent == "completeness"
+            else ()
+        )
         source_digest = self._digest([
             {
                 "kind": source.identity_kind,
@@ -425,8 +451,88 @@ class SessionService:
             session.selected_model_id, health.status, health.updated_at, index_digest,
             policy.policy_revision, exclusion_summary, policy.outbound_mode,
             "尚未发送；实际检索块将在执行前按任务快照申请或核验授权。",
-            len(sources), source_digest, sources, is_ready, blocking_reason, recovery_action,
+            len(sources), source_digest, sources, coverage_items, is_ready, blocking_reason, recovery_action,
         )
+
+    def _execute_completeness(
+        self, snapshot: SessionTaskSnapshot, task_state: SessionTaskState, started: float
+    ) -> SessionCompletenessResult:
+        planned = tuple(item for item in snapshot.coverage_items if item.disposition == "planned")
+        uncovered = [item for item in snapshot.coverage_items if item.disposition == "uncovered"]
+        excluded = [item for item in snapshot.coverage_items if item.disposition == "excluded"]
+        outcomes = self._process_completeness_items(planned)
+        processed = tuple(
+            outcome.ordinal for outcome in outcomes if outcome.status in {"processed", "duplicate"}
+        )
+        failed = [outcome for outcome in outcomes if outcome.status == "failed"]
+        duration = int((perf_counter() - started) * 1000)
+        if failed:
+            result = SessionCompletenessResult(
+                str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id, "failed",
+                f"{len(failed)} 个覆盖单元处理失败，不能宣称完整完成。",
+                "修复失败项后重新准备任务。", processed, duration, utc_now(), outcomes,
+            )
+        elif uncovered:
+            result = SessionCompletenessResult(
+                str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id, "recoverable",
+                "覆盖清单存在未覆盖项，不能宣称完整完成。",
+                "修复索引或范围缺口后重新准备任务。", processed, duration, utc_now(), outcomes,
+            )
+        elif excluded:
+            result = SessionCompletenessResult(
+                str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id,
+                "completed-with-confirmed-gaps",
+                f"已处理 {len(processed)} 个覆盖单元；{len(excluded)} 项已确认排除，结果带已确认缺口。",
+                "检查排除规则后重新准备任务。", processed, duration, utc_now(), outcomes,
+            )
+        elif not planned:
+            result = SessionCompletenessResult(
+                str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id, "recoverable",
+                "范围内没有可处理的覆盖单元，不能宣称完整完成。",
+                "确认范围并修复索引后重新准备任务。", (), duration, utc_now(), outcomes,
+            )
+        else:
+            result = SessionCompletenessResult(
+                str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id, "complete",
+                f"完整完成：已逐项处理覆盖清单中的 {len(processed)} 个内容单元。",
+                None, processed, duration, utc_now(), outcomes,
+            )
+        timestamp = utc_now()
+        return self._persist_completeness_execution(
+            replace(
+                snapshot,
+                status="completed" if result.status in {"complete", "completed-with-confirmed-gaps"} else result.status,
+                updated_at=timestamp,
+            ),
+            replace(task_state, status=result.status, updated_at=timestamp),
+            result,
+        )
+
+    def _process_completeness_items(
+        self, planned: tuple[SessionCompletenessCoverageItem, ...]
+    ) -> tuple[SessionCompletenessItemOutcome, ...]:
+        outcomes: list[SessionCompletenessItemOutcome] = []
+        evidence_ordinals: dict[str, int] = {}
+        for start in range(0, len(planned), COMPLETENESS_BATCH_SIZE):
+            for item in planned[start:start + COMPLETENESS_BATCH_SIZE]:
+                try:
+                    excerpt = self._extract_completeness_item(item)
+                except ValueError as error:
+                    outcomes.append(SessionCompletenessItemOutcome(item.ordinal, "failed", reason=str(error)))
+                    continue
+                evidence_ordinal = evidence_ordinals.get(excerpt)
+                if evidence_ordinal is None:
+                    evidence_ordinals[excerpt] = item.ordinal
+                    outcomes.append(SessionCompletenessItemOutcome(item.ordinal, "processed", item.ordinal))
+                else:
+                    outcomes.append(SessionCompletenessItemOutcome(item.ordinal, "duplicate", evidence_ordinal))
+        return tuple(outcomes)
+
+    @staticmethod
+    def _extract_completeness_item(item: SessionCompletenessCoverageItem) -> str:
+        if not item.excerpt:
+            raise ValueError("覆盖单元缺少可处理的索引内容。")
+        return item.excerpt
 
     def _retrieve(
         self, snapshot: SessionTaskSnapshot, content: str, started: float
@@ -559,6 +665,22 @@ class SessionService:
             return existing
         raise SessionValidationError("The selected task is no longer ready. Prepare a new task.")
 
+    def _persist_completeness_execution(
+        self,
+        snapshot: SessionTaskSnapshot,
+        task_state: SessionTaskState,
+        result: SessionCompletenessResult,
+    ) -> SessionCompletenessResult:
+        if self.repository.persist_completeness_execution(snapshot, task_state, result):
+            return result
+        detail = self.repository.get_detail(snapshot.session_id)
+        existing = next(
+            (item for item in detail.completeness_results if item.task_id == snapshot.task_id), None
+        )
+        if existing is not None:
+            return existing
+        raise SessionValidationError("The selected task is no longer ready. Prepare a new task.")
+
     @staticmethod
     def _retrieval_score(content, document, block) -> tuple[float, tuple[str, ...]]:
         query_terms = SessionService._retrieval_terms(content)
@@ -645,7 +767,7 @@ class SessionService:
             session.scope_path, session.selected_provider_id, session.selected_model_id,
             index_status, None, self._digest({"status": index_status}), 0,
             "无法读取排除项。", "unavailable",
-            "尚未发送；恢复不可用对象后重新准备任务。", 0, empty_digest, (), False,
+            "尚未发送；恢复不可用对象后重新准备任务。", 0, empty_digest, (), (), False,
             blocking_reason, recovery_action,
         )
 
@@ -681,6 +803,47 @@ class SessionService:
                 )
             )
         return tuple(sources)
+
+    def _completeness_coverage_items(
+        self, session: PersistentSession, vault_id: str
+    ) -> tuple[SessionCompletenessCoverageItem, ...]:
+        items: list[SessionCompletenessCoverageItem] = []
+        documents = sorted(
+            self.index_repository.current_documents(vault_id), key=lambda document: document.relative_path
+        )
+        for document in documents:
+            if not self._in_scope(document.relative_path, session.scope_kind, session.scope_path):
+                continue
+            evaluation = self.policy_service.preview(
+                vault_id, document.source_path or document.relative_path, document.relative_path, "retrieval"
+            )
+            blocks = document.blocks or (None,)
+            for block in blocks:
+                heading, page = (
+                    self._evidence_location(document, block.location)
+                    if block is not None
+                    else (None, None)
+                )
+                excerpt = self._bounded_excerpt(block.text, MAX_RETRIEVAL_BLOCK_CHARS) if block else ""
+                if not self._is_snapshot_source_eligible(document):
+                    disposition = "uncovered"
+                    reason = document.stale_reason or "派生笔记缺少可核验的来源血缘。"
+                    excerpt = None
+                elif not evaluation.allowed:
+                    disposition, reason, excerpt = "excluded", "内容被当前排除规则确认排除。", None
+                elif not excerpt:
+                    disposition, reason, excerpt = "uncovered", "索引未提供可处理的内容块。", None
+                else:
+                    disposition, reason = "planned", None
+                items.append(
+                    SessionCompletenessCoverageItem(
+                        len(items) + 1, document.document_kind, document.relative_path,
+                        document.content_sha256, document.source_id, document.source_sha256,
+                        document.source_path, heading, block.location if block else "index: no blocks",
+                        page, excerpt, disposition, reason,
+                    )
+                )
+        return tuple(items)
 
     @staticmethod
     def _is_snapshot_source_eligible(document) -> bool:
@@ -793,6 +956,7 @@ class SessionService:
                 or preview.source_digest != snapshot.source_digest
                 or preview.policy_revision != snapshot.policy_revision
                 or preview.outbound_mode != snapshot.outbound_mode
+                or preview.coverage_items != snapshot.coverage_items
             ):
                 reason = preview.blocking_reason or "来源、索引或授权策略已改变。"
                 self._invalidate_active_snapshots(detail.session.session_id, reason)

@@ -7,6 +7,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import {
   App,
   ConversionReviewControls,
+  derivedMarkdownPreview,
   HEALTH_ENDPOINT,
   IMPORT_DIRECTORY_SELECTION_ENDPOINT,
   IMPORT_FILES_SELECTION_ENDPOINT,
@@ -23,6 +24,22 @@ import {
   VaultIndexStatus,
   VAULTS_ENDPOINT
 } from "../src/app.js";
+
+test("hides derived-note provenance frontmatter from Markdown previews", () => {
+  const markdown = [
+    "---",
+    "platform_provenance:",
+    "  schema_version: 2",
+    "  source_id: source-1",
+    "---",
+    "# Final Markdown",
+    "",
+    "Only this content is shown."
+  ].join("\n");
+
+  assert.equal(derivedMarkdownPreview(markdown), "# Final Markdown\n\nOnly this content is shown.");
+  assert.equal(derivedMarkdownPreview("# Native Markdown"), "# Native Markdown");
+});
 
 test("renders the five-destination local workbench shell", () => {
   const markup = renderToStaticMarkup(React.createElement(App));
@@ -272,6 +289,23 @@ test("renders a bounded three-pane session workspace with a context composer", (
   assert.match(markup, /独立来源：2/);
   assert.match(markup, /系统不会自动合并、选择或判定哪一种说法正确。/);
   assert.match(markup, /同一来源中的 2 条证据只计为 1 个独立来源。/);
+});
+
+test("renders completeness coverage with explicit gaps and stale source status", () => {
+  const markup = renderToStaticMarkup(React.createElement(SessionManagement, {
+    sessionPage: { sessions: [{ session_id: "session-1", title: "英语", message_count: 0 }], page: 1, page_size: 25, total: 1, total_pages: 1 },
+    filters: { query: "", sort: "updated_at", order: "desc" }, isLoading: false, error: "", selectedSessionId: "session-1",
+    selectedDetail: {
+      session: { session_id: "session-1", title: "英语" }, messages: [], citations: [], retrieval_results: [],
+      task_snapshots: [{ snapshot_id: "snapshot-1", task_id: "task-1", vault_id: "vault-1", intent: "completeness", status: "invalidated", scope_kind: "vault", source_count: 1, source_digest: "a".repeat(64), index_status: "healthy", outbound_scope_summary: "尚未发送", coverage: { planned_count: 1, excluded_count: 1, uncovered_count: 0 } }],
+      completeness_results: [{ result_id: "result-1", snapshot_id: "snapshot-1", status: "source-changed", summary: "来源已变化", recovery_action: "重新准备", invalidation_reason: "索引已变化", coverage_total: 3, coverage_has_more: true, coverage_counts: { planned: 1, processed: 1, duplicate: 0, failed: 0, excluded: 1, uncovered: 0 }, coverage: [{ ordinal: 1, status: "processed", relative_path: "notes/unit.md", content_sha256: "a".repeat(64), identity_kind: "native", location: "heading: Unit", excerpt: "word" }, { ordinal: 2, status: "excluded", relative_path: "notes/excluded.md", content_sha256: "b".repeat(64), identity_kind: "native", location: "heading: Excluded", reason: "内容被排除" }] }]
+    }, vaults: [{ vault_id: "vault-1", display_name: "英语资料", authorization_status: "active", access_status: "available" }], onLoadCompletenessCoverage: async () => ({})
+  }));
+
+  assert.match(markup, /来源已变化/);
+  assert.match(markup, /排除 1 项/);
+  assert.match(markup, /内容被排除/);
+  assert.match(markup, /加载更多覆盖项/);
 });
 
 test("marks stale evidence and keeps its original vault identity", () => {

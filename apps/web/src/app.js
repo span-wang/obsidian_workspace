@@ -75,6 +75,15 @@ export const NAVIGATION_DESTINATIONS = [
 const VAULT_SURFACES = new Set(["workbench", "materials"]);
 const IMPORT_PROGRESS_PHASES = ["queued", "scanning", "converting", "parsing", "ocr", "deriving-markdown", "waiting-for-review", "committing", "indexing"];
 
+export function derivedMarkdownPreview(markdown) {
+  const frontmatter = typeof markdown === "string"
+    ? markdown.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/)
+    : null;
+  return frontmatter?.[1].includes("platform_provenance:")
+    ? markdown.slice(frontmatter[0].length)
+    : markdown;
+}
+
 function importLifecycleText(lifecycle) {
   return {
     queued: "排队",
@@ -641,7 +650,8 @@ export function SessionManagement({
   onRemoveAttachment,
   onPreviewTask,
   onCreateTask,
-  onExecuteTask
+  onExecuteTask,
+  onLoadCompletenessCoverage
 }) {
   const [query, setQuery] = React.useState(filters.query || "");
   const [editingSessionId, setEditingSessionId] = React.useState(null);
@@ -652,6 +662,7 @@ export function SessionManagement({
   const [message, setMessage] = React.useState("");
   const [taskIntent, setTaskIntent] = React.useState("auto");
   const [taskPreview, setTaskPreview] = React.useState(null);
+  const [coveragePages, setCoveragePages] = React.useState({});
   const renameInputRef = React.useRef(null);
   const page = sessionPage?.page || 1;
   const totalPages = sessionPage?.total_pages || 1;
@@ -663,12 +674,17 @@ export function SessionManagement({
     || sessions.find((session) => session.session_id === selectedSessionId)
     || null;
   const retrievalResults = activeDetail?.retrieval_results || [];
+  const completenessResults = activeDetail?.completeness_results || [];
   const snapshotsById = new Map((activeDetail?.task_snapshots || []).map((snapshot) => [snapshot.snapshot_id, snapshot]));
   const vaultsById = new Map(vaults.map((vault) => [vault.vault_id, vault]));
 
   React.useEffect(() => {
     setQuery(filters.query || "");
   }, [filters.query]);
+
+  React.useEffect(() => {
+    setCoveragePages({});
+  }, [activeDetail]);
 
   React.useEffect(() => {
     if (editingSessionId) renameInputRef.current?.focus();
@@ -832,6 +848,8 @@ export function SessionManagement({
   function taskSnapshotStatusText(snapshot) {
     if (snapshot.status === "invalidated") return "已失效";
     if (snapshot.status === "completed") return "已完成";
+    if (snapshot.status === "recoverable") return "待恢复";
+    if (snapshot.status === "failed") return "失败";
     return "已准备";
   }
 
@@ -944,6 +962,103 @@ export function SessionManagement({
     );
   }
 
+  function completenessResultView(result) {
+    const coveragePage = coveragePages[result.result_id] || result;
+    const snapshot = snapshotsById.get(result.snapshot_id);
+    const vaultId = result.vault_id || snapshot?.vault_id || null;
+    const vault = vaultId ? vaultsById.get(vaultId) : null;
+    const canOpenInObsidian = vault
+      && vault.authorization_status === "active" && vault.access_status === "available";
+    const statusText = {
+      complete: "完整完成",
+      "completed-with-confirmed-gaps": "带已确认缺口完成",
+      recoverable: "存在可恢复缺口",
+      failed: "完整性任务失败",
+      "source-changed": "来源已变化",
+      planned: "待处理",
+      processed: "已处理",
+      duplicate: "已合并重复证据"
+    }[result.status] || "完整性状态未知";
+    const counts = coveragePage.coverage_counts || (coveragePage.coverage || []).reduce((total, item) => {
+      total[item.status] = (total[item.status] || 0) + 1;
+      return total;
+    }, {});
+    return React.createElement(
+      "section",
+      { className: "session-retrieval-result completeness-result", key: result.result_id, "aria-label": statusText },
+      React.createElement("p", { className: "session-message-role" }, statusText),
+      React.createElement("p", { className: "session-retrieval-summary" }, result.summary),
+      React.createElement("div", { className: "progress-sequence", "aria-label": "覆盖进度" },
+        React.createElement("span", null, `计划 ${counts.planned || 0} 项`),
+        React.createElement("span", null, `已处理 ${counts.processed || 0} 项`),
+        React.createElement("span", null, `重复合并 ${counts.duplicate || 0} 项`),
+        React.createElement("span", null, `失败 ${counts.failed || 0} 项`),
+        React.createElement("span", null, `排除 ${counts.excluded || 0} 项`),
+        React.createElement("span", null, `未覆盖 ${counts.uncovered || 0} 项`)),
+      result.invalidation_reason
+        ? React.createElement("p", { className: "form-error" }, `来源已变化：${result.invalidation_reason}`)
+        : null,
+      result.recovery_action
+        ? React.createElement("p", { className: "form-error" }, `下一步：${result.recovery_action}`)
+        : null,
+      (coveragePage.coverage || []).map((item) => React.createElement(
+        "details", { className: "evidence-row", key: `${result.result_id}:${item.ordinal}` },
+        React.createElement("summary", null, `${item.status} · ${item.relative_path} · ${item.heading || item.location}`),
+        item.excerpt ? React.createElement("p", null, item.excerpt) : null,
+        item.reason ? React.createElement("p", { className: "form-error" }, item.reason) : null,
+        React.createElement("p", null, `定位：${item.location}${item.page ? `；第 ${item.page} 页` : ""}`),
+        item.identity_kind === "derived" && item.source_id
+          ? React.createElement("p", null, `Source ID ${item.source_id}；源内容哈希 ${item.source_content_hash}`)
+          : item.identity_kind === "derived"
+            ? React.createElement("p", null, `派生笔记：${item.relative_path}；来源血缘不可核验`)
+          : React.createElement("p", null, `原生 Markdown：${item.relative_path}；内容哈希 ${item.content_sha256}`),
+        item.source_path ? React.createElement("p", null, `源文件：${item.source_path}`) : null,
+        item.status === "duplicate" && item.evidence_ordinal
+          ? React.createElement("p", null, `与覆盖项 ${item.evidence_ordinal} 合并为同一证据。`)
+          : null,
+        canOpenInObsidian
+          ? React.createElement("a", {
+              href: `${VAULTS_ENDPOINT}/${encodeURIComponent(vaultId)}/open?file=${encodeURIComponent(item.relative_path)}`,
+              target: "_blank", rel: "noreferrer"
+            }, "在 Obsidian 中打开")
+          : null
+      )),
+      coveragePage.coverage_has_more && onLoadCompletenessCoverage
+        ? React.createElement("button", {
+            className: "secondary-button",
+            type: "button",
+            disabled: isSubmitting,
+            onClick: async () => {
+              if (!selectedSession) return;
+              setIsSubmitting(true);
+              try {
+                const loaded = coveragePages[result.result_id] || result;
+                const offset = (loaded.coverage_offset || 0) + (loaded.coverage || []).length;
+                const nextPage = await onLoadCompletenessCoverage(
+                  selectedSession.session_id, result.result_id, offset
+                );
+                setCoveragePages((current) => {
+                  const currentPage = current[result.result_id] || result;
+                  return {
+                    ...current,
+                    [result.result_id]: {
+                      ...nextPage,
+                      coverage_offset: currentPage.coverage_offset || 0,
+                      coverage: [...(currentPage.coverage || []), ...(nextPage.coverage || [])]
+                    }
+                  };
+                });
+              } catch (requestError) {
+                setStatus(requestError.message);
+              } finally {
+                setIsSubmitting(false);
+              }
+            }
+          }, "加载更多覆盖项")
+        : null
+    );
+  }
+
   async function prepareTask(event) {
     event?.preventDefault();
     if (!canPrepare || !selectedSession || contextIsDirty) return;
@@ -985,7 +1100,7 @@ export function SessionManagement({
       const execution = await onExecuteTask(selectedSession.session_id, taskId);
       if (execution?.isCurrent === false) return;
       const result = execution?.result || execution;
-      setStatus(result.status === "completed" ? "检索已完成，证据已刷新。" : result.summary);
+      setStatus(["completed", "complete"].includes(result.status) ? "任务已完成，证据已刷新。" : result.summary);
     } catch (requestError) {
       setStatus(requestError.message);
     } finally {
@@ -1143,10 +1258,11 @@ export function SessionManagement({
                     React.createElement("p", { className: "session-message-role" }, messageRoleText(message.role)),
                     React.createElement("p", { className: "session-message-content" }, message.content)
                   )),
-                  retrievalResults.map(retrievalResultView)
+                  retrievalResults.map(retrievalResultView),
+                  completenessResults.map(completenessResultView)
                 )
-              : retrievalResults.length
-                ? retrievalResults.map(retrievalResultView)
+              : retrievalResults.length || completenessResults.length
+                ? [...retrievalResults.map(retrievalResultView), ...completenessResults.map(completenessResultView)]
               : selectedSession
                 ? React.createElement("p", { className: "empty-state" }, "该会话尚无已保存的消息。")
                 : React.createElement("p", { className: "empty-state" }, "从左侧选择一个会话以查看内容。")
@@ -1157,18 +1273,21 @@ export function SessionManagement({
             { className: "session-task-snapshot-list", "aria-label": "任务快照状态", "aria-live": "polite" },
             activeDetail.task_snapshots.map((snapshot) => {
               const canExecute = snapshot.status === "prepared"
-                && ["source-lookup", "knowledge-organization"].includes(snapshot.intent);
+                && ["source-lookup", "knowledge-organization", "completeness"].includes(snapshot.intent);
               return React.createElement(
                 "section",
                 { className: "scope-summary session-task-snapshot", key: snapshot.snapshot_id },
                 React.createElement("strong", null, `任务 ${taskIntentText(snapshot.intent)}：${taskSnapshotStatusText(snapshot)}`),
                 React.createElement("span", null, `范围：${snapshot.scope_kind === "directory" ? snapshot.scope_path : "整个 vault"}；来源 ${snapshot.source_count} 项；摘要 ${snapshot.source_digest.slice(0, 12)}`),
                 React.createElement("span", null, `索引：${snapshot.index_status}；外发：${snapshot.outbound_scope_summary}`),
+                snapshot.coverage
+                  ? React.createElement("span", null, `覆盖：计划 ${snapshot.coverage.planned_count} 项；排除 ${snapshot.coverage.excluded_count} 项；未覆盖 ${snapshot.coverage.uncovered_count} 项`)
+                  : null,
                 snapshot.invalidation_reason
                   ? React.createElement("span", { className: "form-error" }, `需重新准备：${snapshot.invalidation_reason}`)
                   : null,
                 canExecute
-                  ? React.createElement("button", { className: "secondary-button", type: "button", disabled: isSubmitting, onClick: () => executeTask(snapshot.task_id) }, "执行检索")
+                  ? React.createElement("button", { className: "secondary-button", type: "button", disabled: isSubmitting, onClick: () => executeTask(snapshot.task_id) }, snapshot.intent === "completeness" ? "执行完整性检索" : "执行检索")
                   : null
               );
             })
@@ -3355,7 +3474,7 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
                   noteProposalActionReason
                     ? React.createElement("p", { className: "row-note" }, `边界调整不可用：${noteProposalActionReason}`)
                     : null,
-                  React.createElement("pre", { className: "markdown-preview" }, proposal.index_note.markdown),
+                  React.createElement("pre", { className: "markdown-preview" }, derivedMarkdownPreview(proposal.index_note.markdown)),
                   proposal.notes.map((note, index) => {
                     const splitKey = `${proposal.item_id}:${note.sequence}`;
                     const safeBoundaries = note.safe_split_after_unit_indexes || [];
@@ -3369,7 +3488,7 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
                       note.provenance_verifiable === false
                         ? React.createElement("span", { className: "row-status status-danger" }, `来源信息不可验证：${note.provenance_reason || "schema 不受支持。"}`)
                         : null,
-                      React.createElement("pre", { className: "markdown-preview" }, note.markdown),
+                      React.createElement("pre", { className: "markdown-preview" }, derivedMarkdownPreview(note.markdown)),
                       index < proposal.notes.length - 1
                         ? React.createElement("button", {
                             className: "secondary-button",
@@ -4106,6 +4225,13 @@ export function App() {
     return { result: response.result, isCurrent };
   }
 
+  async function loadPersistentCompletenessCoverage(sessionId, resultId, offset) {
+    const search = new window.URLSearchParams({ offset: String(offset), limit: "100" });
+    return requestJson(
+      `${SESSIONS_ENDPOINT}/${sessionId}/completeness-results/${resultId}/coverage?${search}`
+    );
+  }
+
   async function exportPersistentSession(session) {
     const response = await fetch(`${SESSIONS_ENDPOINT}/${session.session_id}/export`);
     if (!response.ok) {
@@ -4259,7 +4385,8 @@ export function App() {
       onRemoveAttachment: removePersistentSessionAttachment,
       onPreviewTask: previewPersistentSessionTask,
       onCreateTask: createPersistentSessionTask,
-      onExecuteTask: executePersistentSessionTask
+      onExecuteTask: executePersistentSessionTask,
+      onLoadCompletenessCoverage: loadPersistentCompletenessCoverage
     });
   } else if (activeDestination === "workbench") {
     workspaceContent = React.createElement(KnowledgeGraphWorkbench, {

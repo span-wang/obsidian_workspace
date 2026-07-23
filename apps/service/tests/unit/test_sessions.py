@@ -719,3 +719,133 @@ def test_concurrent_task_execution_returns_the_existing_result(tmp_path) -> None
 
     assert {result.result_id for result in results} == {results[0].result_id}
     assert len(repository.get_detail(session.session_id).retrieval_results) == 1
+
+
+def test_completeness_execution_persists_every_snapshot_block_and_confirmed_gaps(tmp_path) -> None:
+    documents = (
+        IndexedDocument(
+            "native-1", "vault-1", "notes/unit.md", "a" * 64, "native", (), (), (),
+            (
+                IndexBlock(1, "heading: Unit; page: 1", "first word"),
+                IndexBlock(2, "heading: Unit; page: 2", "second word"),
+            ), "now",
+        ),
+        IndexedDocument(
+            "native-2", "vault-1", "notes/excluded.md", "b" * 64, "native", (), (), (),
+            (IndexBlock(1, "heading: Excluded", "hidden word"),), "now",
+        ),
+    )
+    service, repository, session, _, _, policies, indexes = task_service_fixture(tmp_path, documents)
+    policies.preview = lambda _vault_id, _source_path, derived_path, stage: PolicyEvaluation(
+        derived_path != "notes/excluded.md", stage, (), (), "fixture"
+    )
+
+    snapshot = service.create_task(session.session_id, "列出全部单词", intent="completeness")
+    result = service.execute_task(session.session_id, snapshot.task_id)
+    restarted = SqliteSessionRepository(tmp_path / "sessions.sqlite3").get_detail(session.session_id)
+
+    assert [item.disposition for item in snapshot.coverage_items] == ["excluded", "planned", "planned"]
+    assert result.status == "completed-with-confirmed-gaps"
+    assert result.processed_ordinals == (2, 3)
+    assert restarted.completeness_results[0] == result
+    assert restarted.task_snapshots[0].coverage_items[0].reason
+    indexes.current = [
+        IndexedDocument(
+            "native-1", "vault-1", "notes/unit.md", "c" * 64, "native", (), (), (),
+            (IndexBlock(1, "heading: Unit; page: 1", "changed word"),), "now",
+        )
+    ]
+
+    assert service.detail(session.session_id).task_snapshots[0].status == "invalidated"
+
+
+def test_completeness_records_unverifiable_derived_notes_as_uncovered(tmp_path) -> None:
+    document = IndexedDocument(
+        "derived-unverifiable", "vault-1", "platform/notes/unit.md", "a" * 64, "derived",
+        ("line:1",), (), (), (IndexBlock(1, "line:1", "# Unit"),), "now",
+        verifiable=False, stale_reason="unverifiable-provenance",
+    )
+    service, repository, session, *_ = task_service_fixture(tmp_path, (document,))
+
+    snapshot = service.create_task(session.session_id, "列出全部资料", intent="completeness")
+    result = service.execute_task(session.session_id, snapshot.task_id)
+    detail = repository.get_detail(session.session_id)
+
+    assert [item.disposition for item in snapshot.coverage_items] == ["uncovered"]
+    assert snapshot.coverage_items[0].reason == "unverifiable-provenance"
+    assert result.status == "recoverable"
+    assert detail.task_snapshots[0].status == "recoverable"
+
+
+def test_completeness_processes_batches_and_merges_duplicate_evidence(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1", "vault-1", "notes/unit.md", "a" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Unit", "same evidence"), IndexBlock(2, "heading: Review", "same evidence")),
+        "now",
+    )
+    service, _, session, *_ = task_service_fixture(tmp_path, (document,))
+
+    snapshot = service.create_task(session.session_id, "列出全部资料", intent="completeness")
+    result = service.execute_task(session.session_id, snapshot.task_id)
+
+    assert result.status == "complete"
+    assert result.processed_ordinals == (1, 2)
+    assert [(outcome.status, outcome.evidence_ordinal) for outcome in result.outcomes] == [
+        ("processed", 1), ("duplicate", 1)
+    ]
+
+
+def test_completeness_records_item_failures_without_marking_snapshot_complete(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1", "vault-1", "notes/unit.md", "a" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Unit", "evidence"),), "now",
+    )
+    service, repository, session, *_ = task_service_fixture(tmp_path, (document,))
+    service._extract_completeness_item = lambda _item: (_ for _ in ()).throw(ValueError("fixture failure"))
+
+    snapshot = service.create_task(session.session_id, "列出全部资料", intent="completeness")
+    result = service.execute_task(session.session_id, snapshot.task_id)
+
+    assert result.status == "failed"
+    assert result.outcomes[0].reason == "fixture failure"
+    assert repository.get_detail(session.session_id).task_snapshots[0].status == "failed"
+
+
+def test_completeness_all_excluded_is_a_confirmed_gap_result_and_invalidates_on_change(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1", "vault-1", "notes/excluded.md", "a" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Excluded", "hidden evidence"),), "now",
+    )
+    service, _, session, _, _, policies, indexes = task_service_fixture(tmp_path, (document,))
+    policies.preview = lambda _vault_id, _source_path, _derived_path, stage: PolicyEvaluation(
+        False, stage, (), (), "fixture"
+    )
+
+    snapshot = service.create_task(session.session_id, "列出全部资料", intent="completeness")
+    result = service.execute_task(session.session_id, snapshot.task_id)
+
+    assert result.status == "completed-with-confirmed-gaps"
+    assert result.processed_ordinals == ()
+    indexes.current = [
+        IndexedDocument(
+            "native-1", "vault-1", "notes/excluded.md", "b" * 64, "native", (), (), (),
+            (IndexBlock(1, "heading: Excluded", "changed evidence"),), "now",
+        )
+    ]
+
+    assert service.detail(session.session_id).task_snapshots[0].status == "invalidated"
+
+
+def test_completeness_unavailable_execution_remains_recoverable(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1", "vault-1", "notes/unit.md", "a" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Unit", "evidence"),), "now",
+    )
+    service, repository, session, _, providers, _, _ = task_service_fixture(tmp_path, (document,))
+    snapshot = service.create_task(session.session_id, "列出全部资料", intent="completeness")
+    providers.available = False
+
+    result = service.execute_task(session.session_id, snapshot.task_id)
+
+    assert result.status == "recoverable"
+    assert repository.get_detail(session.session_id).task_snapshots[0].status == "recoverable"

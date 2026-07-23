@@ -9,11 +9,16 @@ from adapters.sqlite_vault_repository import SqliteVaultRepository
 from application.policies import PolicyService
 from application.sessions import SessionService
 from application.vaults import VaultService
-from api.main import create_app, session_retrieval_result_payload
+from api.main import create_app, session_completeness_result_payload, session_retrieval_result_payload
 from api.runtime import RuntimeState
 from domain.providers import Provider, ProviderModel, ProviderProbeResults, ProbeResult, ResolvedProviderModel
 from domain.indexing import IndexHealth
-from domain.sessions import SessionRetrievalEvidence, SessionRetrievalResult
+from domain.sessions import (
+    SessionCompletenessCoverageItem,
+    SessionCompletenessResult,
+    SessionRetrievalEvidence,
+    SessionRetrievalResult,
+)
 
 
 def asgi_request(app, method: str, path: str, *, body: dict[str, object] | None = None, cookie: str = ""):
@@ -102,6 +107,34 @@ def test_retrieval_payload_exposes_independent_source_groups_from_snapshot_vault
     assert unavailable["source_independence_available"] is False
     assert unavailable["independent_source_count"] is None
     assert unavailable["source_groups"] == []
+
+
+def test_completeness_payload_marks_invalidated_snapshot_as_source_changed() -> None:
+    first = SessionCompletenessCoverageItem(
+        1, "native", "notes/unit.md", "a" * 64, None, None, None,
+        "第一章", "heading: 第一章; page: 1", 1, "word", "planned",
+    )
+    second = SessionCompletenessCoverageItem(
+        2, "native", "notes/next.md", "b" * 64, None, None, None,
+        "第二章", "heading: 第二章; page: 2", 2, "next word", "planned",
+    )
+    result = SessionCompletenessResult(
+        "result-1", "session-1", "task-1", "snapshot-1", "complete", "完整完成。",
+        None, (1,), 1, "2026-07-23T00:00:00+00:00",
+    )
+    snapshot = type("Snapshot", (), {
+        "vault_id": "vault-1", "status": "invalidated", "invalidation_reason": "来源已改变。",
+        "coverage_items": (first, second),
+    })()
+
+    payload = session_completeness_result_payload(result, snapshot, coverage_limit=1)
+
+    assert payload["status"] == "source-changed"
+    assert payload["coverage"][0]["status"] == "processed"
+    assert payload["coverage"][0]["relative_path"] == "notes/unit.md"
+    assert payload["coverage_total"] == 2
+    assert payload["coverage_has_more"] is True
+    assert payload["coverage_counts"]["planned"] == 2
 
 
 def test_session_api_is_local_session_protected_and_uses_bounded_private_records(tmp_path: Path) -> None:
@@ -385,6 +418,14 @@ def test_session_task_preview_and_confirmation_use_strict_private_snapshot_contr
         body={"content": "列出全部单词", "intent": "completeness"},
         cookie=cookie,
     )
+    completeness_task_id = json.loads(task_body)["snapshot"]["task_id"]
+    completeness_execute_status, _, completeness_execute_body = asgi_request(
+        app,
+        "POST",
+        f"/api/sessions/{session_id}/tasks/{completeness_task_id}/execute",
+        body={},
+        cookie=cookie,
+    )
     source_task_status, _, source_task_body = asgi_request(
         app,
         "POST",
@@ -408,6 +449,13 @@ def test_session_task_preview_and_confirmation_use_strict_private_snapshot_contr
         "POST",
         f"/api/sessions/{session_id}/tasks/{source_task_id}/execute",
         body={},
+        cookie=cookie,
+    )
+    completeness_result_id = json.loads(completeness_execute_body)["result"]["result_id"]
+    completeness_page_status, _, completeness_page_body = asgi_request(
+        app,
+        "GET",
+        f"/api/sessions/{session_id}/completeness-results/{completeness_result_id}/coverage",
         cookie=cookie,
     )
     open_status, open_headers, _ = asgi_request(
@@ -442,6 +490,12 @@ def test_session_task_preview_and_confirmation_use_strict_private_snapshot_contr
     assert snapshot["status"] == "prepared"
     assert snapshot["source_count"] == 0
     assert "content" not in snapshot
+    assert completeness_execute_status == 200
+    completeness_execution = json.loads(completeness_execute_body)["result"]
+    assert completeness_execution["status"] == "recoverable"
+    assert completeness_execution["snapshot_status"] == "recoverable"
+    assert completeness_page_status == 200
+    assert json.loads(completeness_page_body)["coverage_total"] == 0
     assert source_task_status == 200
     assert execute_denied_status == 403
     assert execute_invalid_status == 422
