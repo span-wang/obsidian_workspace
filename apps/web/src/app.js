@@ -1154,50 +1154,45 @@ export function SessionManagement({
     );
   }
 
+  function knowledgeOrganizationSectionStatusText(status) {
+    return {
+      completed: "已完成",
+      running: "正在生成",
+      preparing: "正在准备",
+      prepared: "已准备",
+      failed: "失败",
+      recoverable: "待恢复",
+      planned: "已计划"
+    }[status] || "已计划";
+  }
+
   function knowledgeOrganizationPlanView(plan, outcomeByOrdinal = new Map()) {
     if (!plan?.sections?.length) {
       return React.createElement("p", { className: "organization-plan-empty" }, "当前范围没有可准备的计划段。");
     }
+    const counts = (plan.sections || []).reduce((total, section) => {
+      const outcome = outcomeByOrdinal.get(section.ordinal);
+      const status = outcome?.status || "planned";
+      total[status] = (total[status] || 0) + 1;
+      total.evidence += section.evidence_count ?? section.evidence?.length ?? 0;
+      return total;
+    }, { evidence: 0 });
     return React.createElement(
       "section",
       { className: "knowledge-organization-plan", "aria-label": "知识整理计划" },
       React.createElement("h3", null, "知识整理计划"),
-      React.createElement("p", { className: "organization-plan-note" }, "仅使用本地知识库中已冻结的证据作为事实依据；生成前会显示实际发送范围并请求本次授权。"),
+      React.createElement("p", { className: "organization-plan-note" }, "仅使用已冻结的本地知识库证据作为事实依据；详细依据已放入右侧“引用证据”。"),
+      React.createElement("p", { className: "organization-plan-meta" }, `计划 ${plan.sections.length} 段；冻结证据 ${counts.evidence} 条。`),
+      React.createElement("p", { className: "organization-plan-meta" }, `已完成 ${counts.completed || 0} 段；已准备 ${counts.prepared || 0} 段；失败 ${counts.failed || 0} 段；待恢复 ${counts.recoverable || 0} 段。`),
       plan.is_bounded_preview
         ? React.createElement("p", { className: "form-error" }, "该计划仅为有界诊断预览，缩小范围后才能固定快照。")
         : null,
       plan.sections.map((section) => {
         const outcome = outcomeByOrdinal.get(section.ordinal);
-        const statusText = outcome?.status === "completed"
-          ? "已完成"
-          : outcome?.status === "running" || outcome?.status === "preparing"
-            ? "正在生成"
-            : outcome?.status === "prepared"
-              ? "已准备"
-          : outcome?.status === "failed"
-            ? "准备失败"
-            : outcome?.status === "recoverable"
-              ? "待恢复"
-              : "已计划";
         return React.createElement(
-          "section",
-          { className: "organization-plan-section", key: `organization-section:${section.ordinal}` },
-          React.createElement("p", { className: "organization-plan-heading" }, `第 ${section.ordinal} 段：${section.title}`),
-          React.createElement("p", { className: "organization-plan-meta" }, `目标：${section.goal}`),
-          React.createElement("p", { className: "organization-plan-meta" }, `范围：${section.scope_path || "范围根目录"}；预期证据 ${section.evidence_count ?? section.evidence?.length ?? 0} 条；状态：${statusText}`),
-          outcome?.reason
-            ? React.createElement("p", { className: "form-error" }, `原因：${outcome.reason}`)
-            : null,
-          (section.evidence || []).map((evidence) => React.createElement(
-            "details",
-            { className: "evidence-row", key: `organization-evidence:${section.ordinal}:${evidence.ordinal}` },
-            React.createElement("summary", null, `${evidence.relative_path} · ${evidence.heading || evidence.location}`),
-            React.createElement("p", null, evidence.excerpt),
-            React.createElement("p", null, `定位：${evidence.location}${evidence.page ? `；第 ${evidence.page} 页` : ""}`),
-            evidence.identity_kind === "derived"
-              ? React.createElement("p", null, `Source ID ${evidence.source_id}；源内容哈希 ${evidence.source_content_hash}`)
-              : React.createElement("p", null, `原生 Markdown：${evidence.relative_path}；内容哈希 ${evidence.content_sha256}`)
-          ))
+          "p",
+          { className: "organization-plan-meta", key: `organization-section-summary:${section.ordinal}` },
+          `第 ${section.ordinal} 段：${knowledgeOrganizationSectionStatusText(outcome?.status || "planned")}；目标：${section.goal}`
         );
       })
     );
@@ -1213,11 +1208,6 @@ export function SessionManagement({
       recoverable: "计划待恢复",
       "source-changed": "来源已变化"
     }[result.status] || "计划状态未知";
-    const outcomes = new Map((result.sections || []).map((section) => [section.ordinal, section]));
-    const vault = result.vault_id ? vaultsById.get(result.vault_id) : null;
-    const canOpenInObsidian = vault
-      && vault.authorization_status === "active"
-      && vault.access_status === "available";
     const structureText = {
       summary: "归纳", classification: "分类", comparison: "比较", timeline: "时间线",
       outline: "大纲", "chapter-summary": "章节汇总"
@@ -1251,32 +1241,24 @@ export function SessionManagement({
       (result.sections || []).map((section) => React.createElement(
         "section",
         { className: "organization-result-section", key: `organization-result:${result.result_id}:${section.ordinal}` },
-        React.createElement("p", { className: "organization-plan-heading" }, `第 ${section.ordinal} 段：${section.title} · ${section.status}`),
-        React.createElement("p", { className: "organization-plan-meta" }, `独立来源：${section.independent_source_count || 0}；同一 Source 的派生笔记只计为一个来源。`),
-        (section.conclusions || []).map((conclusion) => React.createElement(
-          "div",
-          { className: "organization-conclusion", key: `organization-conclusion:${section.ordinal}:${conclusion.ordinal}` },
-          React.createElement("p", { className: "organization-conclusion-content" }, conclusion.content),
-          React.createElement("p", { className: "organization-plan-meta" }, "可展开核验依据："),
-          (conclusion.evidence || []).map((evidence) => React.createElement(
-            "details",
-            { className: "evidence-row", key: `organization-conclusion-evidence:${section.ordinal}:${conclusion.ordinal}:${evidence.ordinal}` },
-            React.createElement("summary", null, `${evidence.relative_path} · ${evidence.heading || evidence.location}`),
-            React.createElement("p", null, evidence.excerpt),
-            React.createElement("p", null, `定位：${evidence.location}${evidence.page ? `；第 ${evidence.page} 页` : ""}`),
-            evidence.identity_kind === "derived"
-              ? React.createElement("p", null, `Source ID ${evidence.source_id}；源内容哈希 ${evidence.source_content_hash}`)
-              : React.createElement("p", null, `原生 Markdown：${evidence.relative_path}；内容哈希 ${evidence.content_sha256}`),
-            canOpenInObsidian
-              ? React.createElement("a", {
-                href: `${VAULTS_ENDPOINT}/${encodeURIComponent(result.vault_id)}/open?file=${encodeURIComponent(evidence.relative_path)}`,
-                target: "_blank", rel: "noreferrer"
-              }, "在 Obsidian 中打开")
-              : null
-          ))
-        ))
-      )),
-      knowledgeOrganizationPlanView({ sections: result.sections || [] }, outcomes)
+        React.createElement("p", { className: "organization-plan-heading" }, `第 ${section.ordinal} 段：${knowledgeOrganizationSectionStatusText(section.status)}`),
+        section.reason
+          ? React.createElement("p", { className: "form-error" }, `原因：${section.reason}`)
+          : null,
+        section.independent_source_count
+          ? React.createElement("p", { className: "organization-plan-meta" }, `独立来源：${section.independent_source_count}；详细依据见右侧“引用证据”。`)
+          : null,
+        (section.conclusions || []).length
+          ? (section.conclusions || []).map((conclusion) => React.createElement(
+              "div",
+              { className: "organization-conclusion", key: `organization-conclusion:${section.ordinal}:${conclusion.ordinal}` },
+              React.createElement("p", { className: "organization-conclusion-content" }, conclusion.content),
+              React.createElement("p", { className: "organization-plan-meta" }, "依据已归入右侧“引用证据”。")
+            ))
+          : section.status === "completed"
+            ? React.createElement("p", { className: "organization-plan-meta" }, "该段暂无可显示结论。")
+            : null
+      ))
     );
   }
 
@@ -1346,9 +1328,160 @@ export function SessionManagement({
     }
   }
 
+  function citationEvidenceItem(citation) {
+    const vault = citation.vault_id ? vaultsById.get(citation.vault_id) : null;
+    return {
+      key: `citation:${citation.citation_id}`,
+      kind: "citation",
+      label: "已记录引用",
+      status: citation.status,
+      statusText: citationStatusText(citation.status),
+      vaultId: citation.vault_id,
+      vaultLabel: vault?.display_name || citation.vault_id || "历史记录不可用",
+      relativePath: citation.relative_path,
+      location: citation.location,
+      identityKind: citation.identity_kind,
+      contentSha256: citation.content_sha256,
+      sourceId: citation.source_id,
+      sourceContentHash: citation.source_content_hash,
+      sourcePath: citation.source_path,
+      invalidationReason: citation.invalidation_reason,
+      canOpenInObsidian: vault?.authorization_status === "active" && vault?.access_status === "available"
+    };
+  }
+
+  function organizationEvidenceKey(vaultId, evidence) {
+    return [
+      "organization",
+      vaultId || "",
+      evidence.identity_kind || "",
+      evidence.source_id || "",
+      evidence.source_content_hash || "",
+      evidence.content_sha256 || "",
+      evidence.source_path || "",
+      evidence.relative_path || "",
+      evidence.location || "",
+      evidence.excerpt || ""
+    ].join("|");
+  }
+
+  function addOrganizationEvidence(itemsByKey, evidence, context) {
+    if (!evidence?.relative_path) return;
+    const key = organizationEvidenceKey(context.vaultId, evidence);
+    const vault = context.vaultId ? vaultsById.get(context.vaultId) : null;
+    const existing = itemsByKey.get(key);
+    const usage = existing?.usage ? [...existing.usage] : [];
+    if (!usage.includes(context.usage)) usage.push(context.usage);
+    itemsByKey.set(key, {
+      ...(existing || {}),
+      key,
+      kind: "organization-evidence",
+      label: usage.includes("整理依据") ? "知识整理依据" : "知识整理计划证据",
+      status: "valid",
+      statusText: usage.join("；"),
+      usage,
+      vaultId: context.vaultId,
+      vaultLabel: vault?.display_name || context.vaultId || "历史记录不可用",
+      relativePath: evidence.relative_path,
+      location: evidence.location,
+      heading: evidence.heading,
+      page: evidence.page,
+      excerpt: evidence.excerpt,
+      identityKind: evidence.identity_kind,
+      contentSha256: evidence.content_sha256,
+      sourceId: evidence.source_id,
+      sourceContentHash: evidence.source_content_hash,
+      sourcePath: evidence.source_path,
+      sectionLabel: context.sectionLabel,
+      resultLabel: existing?.resultLabel || context.resultLabel,
+      canOpenInObsidian: vault?.authorization_status === "active" && vault?.access_status === "available"
+    });
+  }
+
+  function organizationEvidenceItems() {
+    const itemsByKey = new Map();
+    (activeDetail?.task_snapshots || [])
+      .filter((snapshot) => snapshot.intent === "knowledge-organization")
+      .forEach((snapshot) => {
+        (snapshot.knowledge_organization_plan?.sections || []).forEach((section) => {
+          (section.evidence || []).forEach((evidence) => addOrganizationEvidence(itemsByKey, evidence, {
+            vaultId: snapshot.vault_id,
+            usage: "计划证据",
+            sectionLabel: `第 ${section.ordinal} 段计划`,
+            resultLabel: `快照 ${snapshot.snapshot_id}`
+          }));
+        });
+      });
+    (knowledgeOrganizationResults || []).forEach((result) => {
+      (result.sections || []).forEach((section) => {
+        (section.conclusions || []).forEach((conclusion) => {
+          (conclusion.evidence || []).forEach((evidence) => addOrganizationEvidence(itemsByKey, evidence, {
+            vaultId: result.vault_id,
+            usage: "整理依据",
+            sectionLabel: `第 ${section.ordinal} 段结论 ${conclusion.ordinal}`,
+            resultLabel: `结果 ${result.result_id}`
+          }));
+        });
+      });
+    });
+    return [...itemsByKey.values()].sort((first, second) =>
+      `${first.relativePath || ""}:${first.location || ""}`.localeCompare(`${second.relativePath || ""}:${second.location || ""}`)
+    );
+  }
+
+  function evidencePanelItemView(item) {
+    const statusClass = `session-citation-status status-${item.status || "valid"}`;
+    const summary = item.heading || item.location || "未标注位置";
+    return React.createElement(
+      "article",
+      { className: "session-citation", key: item.key },
+      React.createElement("p", { className: "session-citation-label" }, item.label),
+      React.createElement("p", { className: "session-citation-path" }, item.relativePath || "未标注来源"),
+      React.createElement("p", { className: "session-citation-location" }, `vault：${item.vaultLabel}`),
+      item.kind === "organization-evidence"
+        ? React.createElement(
+            "details",
+            { className: "evidence-row citation-evidence-row" },
+            React.createElement("summary", null, `${item.statusText} · ${summary}`),
+            item.sectionLabel ? React.createElement("p", null, item.sectionLabel) : null,
+            item.excerpt ? React.createElement("p", null, item.excerpt) : null,
+            React.createElement("p", null, `定位：${item.location || "未标注位置"}${item.page ? `；第 ${item.page} 页` : ""}`),
+            item.identityKind === "derived"
+              ? React.createElement("p", null, `Source ID ${item.sourceId}；源内容哈希 ${item.sourceContentHash}`)
+              : React.createElement("p", null, `原生 Markdown：${item.relativePath}；内容哈希 ${item.contentSha256}`),
+            item.sourcePath ? React.createElement("p", null, `源文件：${item.sourcePath}`) : null,
+            item.canOpenInObsidian && item.vaultId
+              ? React.createElement("a", {
+                  href: `${VAULTS_ENDPOINT}/${encodeURIComponent(item.vaultId)}/open?file=${encodeURIComponent(item.relativePath)}`,
+                  target: "_blank", rel: "noreferrer"
+                }, "在 Obsidian 中打开")
+              : null
+          )
+        : React.createElement(
+            React.Fragment,
+            null,
+            React.createElement("p", { className: "session-citation-location" }, item.location || "未标注位置"),
+            item.identityKind === "derived"
+              ? React.createElement("p", { className: "session-citation-location" }, `Source ID ${item.sourceId}；源内容哈希 ${item.sourceContentHash}`)
+              : item.identityKind === "native"
+                ? React.createElement("p", { className: "session-citation-location" }, `原生 Markdown 内容哈希 ${item.contentSha256}`)
+                : null,
+            item.invalidationReason
+              ? React.createElement("p", { className: "form-error" }, item.invalidationReason)
+              : null
+          ),
+      React.createElement("span", { className: statusClass }, item.statusText)
+    );
+  }
+
   if (isLoading && !sessions.length) {
     return React.createElement("p", { className: "empty-state", role: "status" }, "正在加载会话。");
   }
+
+  const evidencePanelItems = [
+    ...(activeDetail?.citations || []).map(citationEvidenceItem),
+    ...organizationEvidenceItems()
+  ];
 
   return React.createElement(
     "section",
@@ -1527,29 +1660,37 @@ export function SessionManagement({
               const canExecute = snapshot.status === "prepared"
                 && ["source-lookup", "knowledge-organization", "completeness"].includes(snapshot.intent);
               const frozenVault = vaultsById.get(snapshot.vault_id);
+              const isKnowledgeOrganization = snapshot.intent === "knowledge-organization";
+              const organizationResult = isKnowledgeOrganization
+                ? knowledgeOrganizationResults.find((result) => result.snapshot_id === snapshot.snapshot_id)
+                : null;
+              const organizationOutcomes = new Map(
+                (organizationResult?.sections || []).map((section) => [section.ordinal, section])
+              );
               return React.createElement(
                 "section",
                 { className: "scope-summary session-task-snapshot", key: snapshot.snapshot_id },
                 React.createElement("strong", null, `任务 ${taskIntentText(snapshot.intent)}：${taskSnapshotStatusText(snapshot)}`),
-                React.createElement("span", null, `范围：${snapshot.scope_kind === "directory" ? snapshot.scope_path : "整个 vault"}；来源 ${snapshot.source_count} 项；摘要 ${snapshot.source_digest.slice(0, 12)}`),
-                React.createElement("span", null, `索引：${snapshot.index_status}；外发：${snapshot.outbound_scope_summary}`),
-                snapshot.intent === "knowledge-organization"
+                isKnowledgeOrganization
+                  ? React.createElement("span", null, `范围：已冻结资料范围；来源 ${snapshot.source_count} 项；详细依据见右侧“引用证据”。`)
+                  : React.createElement("span", null, `范围：${snapshot.scope_kind === "directory" ? snapshot.scope_path : "整个 vault"}；来源 ${snapshot.source_count} 项；摘要 ${snapshot.source_digest.slice(0, 12)}`),
+                isKnowledgeOrganization
+                  ? React.createElement("span", null, `索引：${snapshot.index_status}；外发：${snapshot.outbound_scope_summary}`)
+                  : React.createElement("span", null, `索引：${snapshot.index_status}；外发：${snapshot.outbound_scope_summary}`),
+                isKnowledgeOrganization
                   ? React.createElement("span", null, `冻结 vault：${frozenVault?.display_name || snapshot.vault_id}`)
                   : null,
-                snapshot.intent === "knowledge-organization"
-                  ? React.createElement("span", null, `来源：${snapshot.source_count} 项；来源摘要：${snapshot.source_digest.slice(0, 12)}`)
+                isKnowledgeOrganization
+                  ? React.createElement("span", null, `索引版本：${snapshot.index_updated_at || "无"}；策略修订：${snapshot.policy_revision ?? "无"}`)
                   : null,
-                snapshot.intent === "knowledge-organization"
-                  ? React.createElement("span", null, `索引：${snapshot.index_status}；版本：${snapshot.index_updated_at || "无"}；索引摘要：${snapshot.index_digest?.slice(0, 12) || "无"}`)
-                  : null,
-                snapshot.intent === "knowledge-organization"
-                  ? React.createElement("span", null, `策略修订：${snapshot.policy_revision ?? "无"}；排除项：${snapshot.exclusion_summary || "无"}`)
+                isKnowledgeOrganization
+                  ? React.createElement("span", null, `排除项：${snapshot.exclusion_summary || "无"}`)
                   : null,
                 snapshot.coverage
                   ? React.createElement("span", null, `覆盖：计划 ${snapshot.coverage.planned_count} 项；排除 ${snapshot.coverage.excluded_count} 项；未覆盖 ${snapshot.coverage.uncovered_count} 项`)
                   : null,
                 snapshot.knowledge_organization_plan
-                  ? knowledgeOrganizationPlanView(snapshot.knowledge_organization_plan)
+                  ? knowledgeOrganizationPlanView(snapshot.knowledge_organization_plan, organizationOutcomes)
                   : null,
                 snapshot.invalidation_reason
                   ? React.createElement("span", { className: "form-error" }, `需重新准备：${snapshot.invalidation_reason}`)
@@ -1688,30 +1829,15 @@ export function SessionManagement({
         "header",
         { className: "session-evidence-heading" },
         React.createElement("h2", null, "引用证据"),
-        React.createElement("span", null, activeDetail?.citations?.length || 0)
+        React.createElement("span", null, evidencePanelItems.length)
       ),
       React.createElement(
         "div",
         { className: "session-citation-list" },
         isDetailLoading
           ? React.createElement("p", { className: "empty-state", role: "status" }, "正在加载引用。")
-          : activeDetail?.citations?.length
-            ? activeDetail.citations.map((citation) => React.createElement(
-                "article",
-                { className: "session-citation", key: citation.citation_id },
-                React.createElement("p", { className: "session-citation-path" }, citation.relative_path || "未标注来源"),
-                React.createElement("p", { className: "session-citation-location" }, `vault：${citation.vault_id || "历史记录不可用"}`),
-                React.createElement("p", { className: "session-citation-location" }, citation.location || "未标注位置"),
-                citation.identity_kind === "derived"
-                  ? React.createElement("p", { className: "session-citation-location" }, `Source ID ${citation.source_id}；源内容哈希 ${citation.source_content_hash}`)
-                  : citation.identity_kind === "native"
-                    ? React.createElement("p", { className: "session-citation-location" }, `原生 Markdown 内容哈希 ${citation.content_sha256}`)
-                    : null,
-                citation.invalidation_reason
-                  ? React.createElement("p", { className: "form-error" }, citation.invalidation_reason)
-                  : null,
-                React.createElement("span", { className: `session-citation-status status-${citation.status}` }, citationStatusText(citation.status))
-              ))
+          : evidencePanelItems.length
+            ? evidencePanelItems.map(evidencePanelItemView)
             : React.createElement("p", { className: "empty-state" }, selectedSession ? "当前会话暂无引用。" : "选择会话后将在此显示引用。")
       )
     )

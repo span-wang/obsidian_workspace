@@ -325,15 +325,23 @@ test("renders an evidence-bound knowledge organization conclusion with expandabl
     vaults: [{ vault_id: "vault-1", display_name: "英语资料", authorization_status: "active", access_status: "available" }]
   }));
 
-  assert.match(markup, /知识整理计划/);
-  assert.match(markup, /仅使用本地知识库中已冻结的证据/);
-  assert.match(markup, /已按冻结证据生成 1 个知识整理计划段。/);
-  assert.match(markup, /词汇要点。/);
-  assert.match(markup, /独立来源：1/);
-  assert.match(markup, /在 Obsidian 中打开/);
-  assert.match(markup, /notes\/unit\/vocabulary\.md/);
-  assert.match(markup, /word evidence/);
-  assert.match(markup, /计划 1 段；已准备 0 段；已完成 1 段；进行中 0 段/);
+  const conversationMarkup = markup.slice(
+    markup.indexOf('class="session-conversation-pane"'),
+    markup.indexOf('class="session-evidence-pane"')
+  );
+  const evidenceMarkup = markup.slice(markup.indexOf('class="session-evidence-pane"'));
+
+  assert.match(conversationMarkup, /已按冻结证据生成 1 个知识整理计划段。/);
+  assert.match(conversationMarkup, /词汇要点。/);
+  assert.match(conversationMarkup, /独立来源：1；详细依据见右侧“引用证据”/);
+  assert.match(conversationMarkup, /计划 1 段；已准备 0 段；已完成 1 段；进行中 0 段/);
+  assert.doesNotMatch(conversationMarkup, /notes\/unit\/vocabulary\.md/);
+  assert.doesNotMatch(conversationMarkup, /word evidence/);
+  assert.doesNotMatch(conversationMarkup, /内容哈希/);
+  assert.match(evidenceMarkup, /知识整理依据/);
+  assert.match(evidenceMarkup, /在 Obsidian 中打开/);
+  assert.match(evidenceMarkup, /notes\/unit\/vocabulary\.md/);
+  assert.match(evidenceMarkup, /word evidence/);
 });
 
 test("renders restored knowledge-organization bindings and recoverable progress truthfully", () => {
@@ -369,14 +377,13 @@ test("renders restored knowledge-organization bindings and recoverable progress 
 
   assert.match(markup, /任务 知识整理：待恢复/);
   assert.match(markup, /冻结 vault：冻结资料/);
-  assert.match(markup, /来源：2 项；来源摘要：ssssssssssss/);
-  assert.match(markup, /索引：healthy；版本：2026-07-23T00:00:00\+00:00；索引摘要：iiiiiiiiiiii/);
-  assert.match(markup, /策略修订：9；排除项：排除规则 1 项：never-send-cloud: notes\/private/);
+  assert.match(markup, /范围：已冻结资料范围；来源 2 项；详细依据见右侧“引用证据”/);
+  assert.match(markup, /索引版本：2026-07-23T00:00:00\+00:00；策略修订：9/);
+  assert.match(markup, /排除项：排除规则 1 项：never-send-cloud: notes\/private/);
   assert.match(markup, /计划待恢复/);
   assert.match(markup, /计划 2 段；已准备 1 段；已完成 0 段；进行中 0 段/);
   assert.match(markup, /失败 0 段；待恢复 1 段/);
-  assert.match(markup, /第 2 段：notes\/review/);
-  assert.match(markup, /状态：待恢复/);
+  assert.match(markup, /第 2 段：待恢复/);
   assert.match(markup, /服务在准备此段前中断。/);
 });
 

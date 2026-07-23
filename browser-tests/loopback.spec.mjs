@@ -1929,9 +1929,13 @@ test("generates an evidence-bound knowledge organization result from the frozen 
 
   await page.goto("/");
   await page.getByRole("link", { name: "会话", exact: true }).click();
-  await expect(page.getByLabel("知识整理计划").first()).toContainText("第 1 段：notes/english");
-  await expect(page.getByText("仅使用本地知识库中已冻结的证据作为事实依据；生成前会显示实际发送范围并请求本次授权。", { exact: true })).toBeVisible();
-  const evidence = page.getByLabel("知识整理计划").first().locator(".evidence-row");
+  const conversation = page.getByLabel("会话内容");
+  const evidencePane = page.getByLabel("引用证据");
+  await expect(page.getByLabel("知识整理计划").first()).toContainText("冻结证据 1 条");
+  await expect(conversation).not.toContainText("notes/english/vocabulary.md");
+  await expect(conversation).not.toContainText("word evidence");
+  const evidence = evidencePane.locator(".session-citation").first();
+  await expect(evidence).toContainText("知识整理计划证据");
   await evidence.locator("summary").focus();
   await evidence.locator("summary").press("Enter");
   await expect(evidence).toContainText("word evidence");
@@ -1943,8 +1947,10 @@ test("generates an evidence-bound knowledge organization result from the frozen 
   await expect(generatedResult).toContainText("结构：大纲；事实依据：冻结知识库证据");
   await expect(generatedResult).toContainText("词汇整理结论。");
   await expect(generatedResult).toContainText("独立来源：1");
+  await expect(generatedResult).not.toContainText("notes/english/vocabulary.md");
+  await expect(generatedResult).not.toContainText("word evidence");
   await expect(page.getByLabel("知识整理计划进度")).toHaveText("计划 1 段；已准备 0 段；已完成 1 段；进行中 0 段失败 0 段；待恢复 0 段");
-  const conclusionEvidence = generatedResult.locator(".organization-conclusion .evidence-row");
+  const conclusionEvidence = evidencePane.locator(".session-citation").first();
   await conclusionEvidence.locator("summary").focus();
   await conclusionEvidence.locator("summary").press("Enter");
   await expect(conclusionEvidence).toContainText("word evidence");
