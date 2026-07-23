@@ -64,6 +64,16 @@ class PrivateArtifactStore:
             raise ValueError("The temporary attempt directory is invalid.")
         shutil.rmtree(target, ignore_errors=True)
 
+    def discard_promoted_attempt(self, *, task_id: str, item_id: int, attempt_id: str) -> None:
+        """Remove one unpersisted promoted attempt without touching its input snapshot."""
+
+        root = self.root.resolve()
+        item_root = (root / task_id / str(item_id)).resolve()
+        target = (item_root / attempt_id).resolve()
+        if root not in item_root.parents or target.parent != item_root:
+            raise ValueError("The promoted attempt path escapes private storage.")
+        shutil.rmtree(target, ignore_errors=True)
+
     def read_input_snapshot(self, *, task_id: str, item_id: int, expected_sha256: str) -> bytes:
         path = self.root / task_id / str(item_id) / "input" / expected_sha256
         return self._read_verified(path, expected_sha256, "input snapshot")

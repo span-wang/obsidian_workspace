@@ -371,7 +371,12 @@ function requestJson(endpoint, options = {}) {
 }
 
 function vaultName(vault) {
-  return vault.path.replace(/\\/g, "/").split("/").at(-1) || vault.path;
+  return vault.display_name || vault.path?.replace(/\\/g, "/").split("/").at(-1) || vault.vault_id;
+}
+
+function sessionVaultName(session, vaults) {
+  const vault = vaults.find((candidate) => candidate.vault_id === session.selected_vault_id);
+  return vault ? vaultName(vault) : session.selected_vault_label || "未设置";
 }
 
 function statusText(vault) {
@@ -635,7 +640,8 @@ export function SessionManagement({
   onPickAttachments,
   onRemoveAttachment,
   onPreviewTask,
-  onCreateTask
+  onCreateTask,
+  onExecuteTask
 }) {
   const [query, setQuery] = React.useState(filters.query || "");
   const [editingSessionId, setEditingSessionId] = React.useState(null);
@@ -656,6 +662,9 @@ export function SessionManagement({
   const selectedSession = activeDetail?.session
     || sessions.find((session) => session.session_id === selectedSessionId)
     || null;
+  const retrievalResults = activeDetail?.retrieval_results || [];
+  const snapshotsById = new Map((activeDetail?.task_snapshots || []).map((snapshot) => [snapshot.snapshot_id, snapshot]));
+  const vaultsById = new Map(vaults.map((vault) => [vault.vault_id, vault]));
 
   React.useEffect(() => {
     setQuery(filters.query || "");
@@ -820,6 +829,77 @@ export function SessionManagement({
     }[intent] || "自动识别";
   }
 
+  function taskSnapshotStatusText(snapshot) {
+    if (snapshot.status === "invalidated") return "已失效";
+    if (snapshot.status === "completed") return "已完成";
+    return "已准备";
+  }
+
+  function retrievalStatusText(result) {
+    if (result.is_stale || result.snapshot_status === "invalidated") return "证据已失效";
+    return {
+      completed: "本地知识库证据",
+      "no-evidence": "未找到证据",
+      excluded: "内容被排除",
+      "index-unavailable": "索引不可用",
+      "provider-model-unavailable": "Provider/Model 不可用"
+    }[result.status] || "检索状态未知";
+  }
+
+  function retrievalResultView(result) {
+    const snapshot = snapshotsById.get(result.snapshot_id);
+    const vaultId = result.vault_id || snapshot?.vault_id || null;
+    const vault = vaultId ? vaultsById.get(vaultId) : null;
+    const vaultLabel = vault ? vaultName(vault) : vaultId || "不可用";
+    const canOpenInObsidian = vault
+      && vault.authorization_status === "active"
+      && vault.access_status === "available";
+    const staleReason = result.invalidation_reason || snapshot?.invalidation_reason;
+    return React.createElement(
+      "section",
+      { className: "session-retrieval-result", key: result.result_id, "aria-label": retrievalStatusText(result) },
+      React.createElement("p", { className: "session-message-role" }, retrievalStatusText(result)),
+      React.createElement("p", { className: "session-retrieval-summary" }, result.summary),
+      React.createElement("p", { className: "session-retrieval-timing" }, `检索 ${result.retrieval_duration_ms} ms；生成 ${result.generation_duration_ms} ms（未调用 Model）`),
+      staleReason
+        ? React.createElement("p", { className: "form-error" }, `需重新准备：${staleReason}`)
+        : null,
+      result.recovery_action
+        ? React.createElement("p", { className: "form-error" }, `下一步：${result.recovery_action}`)
+        : null,
+      result.evidences?.map((evidence) => React.createElement(
+        "details",
+        { className: "evidence-row", key: `${result.result_id}:${evidence.ordinal}` },
+        React.createElement(
+          "summary",
+          null,
+          `${evidence.relative_path} · ${evidence.heading || evidence.location}`
+        ),
+        React.createElement("p", null, evidence.excerpt),
+        React.createElement("p", null, `vault：${vaultLabel}`),
+        evidence.identity_kind === "derived"
+          ? React.createElement("p", null, `Source ID ${evidence.source_id}；源内容哈希 ${evidence.source_content_hash}`)
+          : React.createElement("p", null, `原生 Markdown：${evidence.relative_path}；内容哈希 ${evidence.content_sha256}`),
+        evidence.source_path
+          ? React.createElement("p", null, `源文件：${evidence.source_path}；派生笔记：${evidence.relative_path}`)
+          : null,
+        React.createElement("p", null, `定位：${evidence.location}${evidence.page ? `；第 ${evidence.page} 页` : ""}`),
+        React.createElement("p", null, `召回：${(evidence.matched_channels || []).join("、") || "未标注"}`),
+        canOpenInObsidian
+          ? React.createElement(
+              "a",
+              {
+                href: `${VAULTS_ENDPOINT}/${encodeURIComponent(vaultId)}/open?file=${encodeURIComponent(evidence.relative_path)}`,
+                target: "_blank",
+                rel: "noreferrer"
+              },
+              "在 Obsidian 中打开"
+            )
+          : null
+      ))
+    );
+  }
+
   async function prepareTask(event) {
     event?.preventDefault();
     if (!canPrepare || !selectedSession || contextIsDirty) return;
@@ -846,6 +926,22 @@ export function SessionManagement({
       setMessage("");
       setTaskPreview(null);
       setStatus("任务快照已固定，等待后续检索执行。");
+    } catch (requestError) {
+      setStatus(requestError.message);
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  async function executeTask(taskId) {
+    if (!selectedSession || !onExecuteTask) return;
+    setStatus("");
+    setIsSubmitting(true);
+    try {
+      const execution = await onExecuteTask(selectedSession.session_id, taskId);
+      if (execution?.isCurrent === false) return;
+      const result = execution?.result || execution;
+      setStatus(result.status === "completed" ? "检索已完成，证据已刷新。" : result.summary);
     } catch (requestError) {
       setStatus(requestError.message);
     } finally {
@@ -923,7 +1019,7 @@ export function SessionManagement({
                 onClick: () => onSelect(session)
               },
               React.createElement("strong", null, session.title),
-              React.createElement("span", null, `所用 vault：${session.selected_vault_label || "未设置"}`),
+              React.createElement("span", null, `所用 vault：${sessionVaultName(session, vaults)}`),
               React.createElement("span", null, `消息 ${session.message_count || 0} 条`)
             ))
           )
@@ -984,7 +1080,7 @@ export function SessionManagement({
             )
       ),
       selectedSession
-        ? React.createElement("p", { className: "session-detail-meta" }, `所用 vault：${selectedSession.selected_vault_label || "未设置"} · 范围：${selectedSession.scope_kind === "directory" ? selectedSession.scope_path : selectedSession.scope_kind === "vault" ? "整个 vault" : "未设置"} · Model：${selectedSession.selected_model_label || "未设置"} · ${authorizationText}`)
+        ? React.createElement("p", { className: "session-detail-meta" }, `所用 vault：${sessionVaultName(selectedSession, vaults)} · 范围：${selectedSession.scope_kind === "directory" ? selectedSession.scope_path : selectedSession.scope_kind === "vault" ? "整个 vault" : "未设置"} · Model：${selectedSession.selected_model_label || "未设置"} · ${authorizationText}`)
         : null,
       React.createElement(
         "div",
@@ -994,12 +1090,19 @@ export function SessionManagement({
           : detailError
             ? React.createElement("p", { className: "form-error", role: "alert" }, detailError)
             : activeDetail?.messages?.length
-              ? activeDetail.messages.map((message) => React.createElement(
-                  "article",
-                  { className: `session-message session-message-${message.role}`, key: message.message_id },
-                  React.createElement("p", { className: "session-message-role" }, messageRoleText(message.role)),
-                  React.createElement("p", { className: "session-message-content" }, message.content)
-                ))
+              ? React.createElement(
+                  React.Fragment,
+                  null,
+                  activeDetail.messages.map((message) => React.createElement(
+                    "article",
+                    { className: `session-message session-message-${message.role}`, key: message.message_id },
+                    React.createElement("p", { className: "session-message-role" }, messageRoleText(message.role)),
+                    React.createElement("p", { className: "session-message-content" }, message.content)
+                  )),
+                  retrievalResults.map(retrievalResultView)
+                )
+              : retrievalResults.length
+                ? retrievalResults.map(retrievalResultView)
               : selectedSession
                 ? React.createElement("p", { className: "empty-state" }, "该会话尚无已保存的消息。")
                 : React.createElement("p", { className: "empty-state" }, "从左侧选择一个会话以查看内容。")
@@ -1008,16 +1111,23 @@ export function SessionManagement({
         ? React.createElement(
             "div",
             { className: "session-task-snapshot-list", "aria-label": "任务快照状态", "aria-live": "polite" },
-            activeDetail.task_snapshots.map((snapshot) => React.createElement(
-              "section",
-              { className: "scope-summary session-task-snapshot", key: snapshot.snapshot_id },
-              React.createElement("strong", null, `任务 ${taskIntentText(snapshot.intent)}：${snapshot.status === "invalidated" ? "已失效" : "已准备"}`),
-              React.createElement("span", null, `范围：${snapshot.scope_kind === "directory" ? snapshot.scope_path : "整个 vault"}；来源 ${snapshot.source_count} 项；摘要 ${snapshot.source_digest.slice(0, 12)}`),
-              React.createElement("span", null, `索引：${snapshot.index_status}；外发：${snapshot.outbound_scope_summary}`),
-              snapshot.invalidation_reason
-                ? React.createElement("span", { className: "form-error" }, `需重新准备：${snapshot.invalidation_reason}`)
-                : null
-            ))
+            activeDetail.task_snapshots.map((snapshot) => {
+              const canExecute = snapshot.status === "prepared"
+                && ["source-lookup", "knowledge-organization"].includes(snapshot.intent);
+              return React.createElement(
+                "section",
+                { className: "scope-summary session-task-snapshot", key: snapshot.snapshot_id },
+                React.createElement("strong", null, `任务 ${taskIntentText(snapshot.intent)}：${taskSnapshotStatusText(snapshot)}`),
+                React.createElement("span", null, `范围：${snapshot.scope_kind === "directory" ? snapshot.scope_path : "整个 vault"}；来源 ${snapshot.source_count} 项；摘要 ${snapshot.source_digest.slice(0, 12)}`),
+                React.createElement("span", null, `索引：${snapshot.index_status}；外发：${snapshot.outbound_scope_summary}`),
+                snapshot.invalidation_reason
+                  ? React.createElement("span", { className: "form-error" }, `需重新准备：${snapshot.invalidation_reason}`)
+                  : null,
+                canExecute
+                  ? React.createElement("button", { className: "secondary-button", type: "button", disabled: isSubmitting, onClick: () => executeTask(snapshot.task_id) }, "执行检索")
+                  : null
+              );
+            })
           )
         : null,
       selectedSession
@@ -1086,7 +1196,7 @@ export function SessionManagement({
                     setTaskPreview(null);
                     setContext({ vault_id: event.target.value, scope_kind: "vault", scope_path: "", provider_id: "", model_id: "" });
                   }
-                }, React.createElement("option", { value: "" }, "选择 vault"), availableVaults.map((vault) => React.createElement("option", { key: vault.vault_id, value: vault.vault_id }, vault.managed_root_relative_path)))
+                }, React.createElement("option", { value: "" }, "选择 vault"), availableVaults.map((vault) => React.createElement("option", { key: vault.vault_id, value: vault.vault_id }, vaultName(vault))))
               ),
               React.createElement("label", null, "资料范围",
                 React.createElement("select", {
@@ -3643,6 +3753,7 @@ export function App() {
   const actionTriggerRef = React.useRef(null);
   const sessionListRequestRef = React.useRef(0);
   const sessionDetailRequestRef = React.useRef(0);
+  const selectedSessionIdRef = React.useRef(null);
   const menuButtonRef = React.useRef(null);
   const firstMenuLinkRef = React.useRef(null);
   const menuPanelRef = React.useRef(null);
@@ -3735,6 +3846,7 @@ export function App() {
   }, []);
 
   React.useEffect(() => {
+    selectedSessionIdRef.current = selectedSessionId;
     loadSessionDetail(selectedSessionId);
   }, [loadSessionDetail, selectedSessionId]);
 
@@ -3939,6 +4051,17 @@ export function App() {
     return response.snapshot;
   }
 
+  async function executePersistentSessionTask(sessionId, taskId) {
+    const response = await requestJson(`${SESSIONS_ENDPOINT}/${sessionId}/tasks/${taskId}/execute`, {
+      method: "POST",
+      body: JSON.stringify({})
+    });
+    const isCurrent = selectedSessionIdRef.current === sessionId;
+    if (isCurrent) await loadSessionDetail(sessionId);
+    await loadSessions(sessionFilters);
+    return { result: response.result, isCurrent };
+  }
+
   async function exportPersistentSession(session) {
     const response = await fetch(`${SESSIONS_ENDPOINT}/${session.session_id}/export`);
     if (!response.ok) {
@@ -4077,7 +4200,10 @@ export function App() {
       isDetailLoading: sessionDetailLoading,
       detailError: sessionDetailError,
       onLoad: loadSessions,
-      onSelect: (session) => setSelectedSessionId(session.session_id),
+      onSelect: (session) => {
+        selectedSessionIdRef.current = session.session_id;
+        setSelectedSessionId(session.session_id);
+      },
       onCreate: createPersistentSession,
       onRename: renamePersistentSession,
       onExport: exportPersistentSession,
@@ -4088,7 +4214,8 @@ export function App() {
       onPickAttachments: pickPersistentSessionAttachments,
       onRemoveAttachment: removePersistentSessionAttachment,
       onPreviewTask: previewPersistentSessionTask,
-      onCreateTask: createPersistentSessionTask
+      onCreateTask: createPersistentSessionTask,
+      onExecuteTask: executePersistentSessionTask
     });
   } else if (activeDestination === "workbench") {
     workspaceContent = React.createElement(KnowledgeGraphWorkbench, {
@@ -4131,7 +4258,7 @@ export function App() {
     ? vaults.find((vault) => vault.vault_id === contextSession.selected_vault_id)
     : null;
   const contextLocation = contextSession
-    ? `会话 / vault：${contextSession.selected_vault_label || "未设置"} / 范围：${contextSession.scope_kind === "directory" ? contextSession.scope_path : contextSession.scope_kind === "vault" ? "整个 vault" : "未设置"} / Model：${contextSession.selected_model_label || "未设置"}`
+    ? `会话 / vault：${sessionVaultName(contextSession, vaults)} / 范围：${contextSession.scope_kind === "directory" ? contextSession.scope_path : contextSession.scope_kind === "vault" ? "整个 vault" : "未设置"} / Model：${contextSession.selected_model_label || "未设置"}`
     : (currentVault ? `本机 / 当前 vault：${vaultName(currentVault)}` : "本机 / 当前工作区");
   const contextOutbound = contextSessionVault
     ? `外发：${outboundModeText(policyFor(contextSessionVault).outbound_mode)}`

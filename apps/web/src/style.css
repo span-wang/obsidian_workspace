@@ -370,6 +370,53 @@ h1 {
   white-space: pre-wrap;
 }
 
+.session-retrieval-result {
+  max-width: 760px;
+  margin-top: 20px;
+  padding-top: 20px;
+  border-top: 1px solid #d7d7d2;
+}
+
+.session-retrieval-summary,
+.session-retrieval-timing,
+.evidence-row p {
+  margin: 0;
+  color: #545454;
+  font-size: 13px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.session-retrieval-timing {
+  margin-top: 8px;
+}
+
+.evidence-row {
+  margin-top: 10px;
+  border-top: 1px solid #e9e9e4;
+  border-bottom: 1px solid #e9e9e4;
+  color: #222222;
+  font-size: 13px;
+}
+
+.evidence-row summary {
+  padding: 10px 0;
+  cursor: pointer;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.evidence-row p {
+  margin: 0 0 8px;
+}
+
+.evidence-row a {
+  display: inline-block;
+  margin: 0 0 10px;
+  color: #1f5139;
+  font-size: 13px;
+}
+
 .session-composer {
   display: grid;
   gap: 10px;

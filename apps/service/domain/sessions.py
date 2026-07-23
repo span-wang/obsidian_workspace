@@ -10,6 +10,10 @@ from domain.policies import normalize_vault_relative_path
 
 MAX_SESSION_PAGE = 10_000_000
 TASK_INTENTS = frozenset({"source-lookup", "completeness", "knowledge-organization", "deep-creation"})
+RETRIEVAL_CHANNELS = frozenset({"keyword", "semantic", "structure", "metadata", "tag", "link"})
+RETRIEVAL_RESULT_STATUSES = frozenset(
+    {"completed", "no-evidence", "excluded", "index-unavailable", "provider-model-unavailable"}
+)
 
 
 def utc_now() -> str:
@@ -142,7 +146,7 @@ class SessionTaskSnapshot:
             or not self.model_id
             or self.policy_revision < 1
             or self.source_count != len(self.sources)
-            or self.status not in {"prepared", "waiting-authorization", "invalidated"}
+            or self.status not in {"prepared", "waiting-authorization", "completed", "invalidated"}
         ):
             raise ValueError("Task snapshot is invalid.")
         normalize_session_scope(self.scope_kind, self.scope_path)
@@ -226,6 +230,79 @@ class SessionGenerationResult:
 
 
 @dataclass(frozen=True)
+class SessionRetrievalEvidence:
+    ordinal: int
+    identity_kind: str
+    relative_path: str
+    content_sha256: str
+    source_id: str | None
+    source_content_hash: str | None
+    source_path: str | None
+    heading: str | None
+    location: str
+    page: int | None
+    excerpt: str
+    score: float
+    matched_channels: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if self.ordinal < 1 or self.identity_kind not in {"derived", "native"}:
+            raise ValueError("Retrieval evidence identity is invalid.")
+        _validate_relative_path(self.relative_path)
+        _validate_sha256(self.content_sha256, "Retrieval evidence content hash")
+        if self.identity_kind == "native":
+            if any(value is not None for value in (self.source_id, self.source_content_hash, self.source_path)):
+                raise ValueError("Native retrieval evidence cannot fabricate source identity.")
+        else:
+            if not all((self.source_id, self.source_content_hash, self.source_path)):
+                raise ValueError("Derived retrieval evidence needs source identity.")
+            _validate_sha256(self.source_content_hash, "Retrieval evidence source hash")
+            _validate_relative_path(self.source_path)
+        if not self.location.strip() or not self.excerpt.strip() or len(self.excerpt) > 1000:
+            raise ValueError("Retrieval evidence location or excerpt is invalid.")
+        if self.page is not None and self.page < 1:
+            raise ValueError("Retrieval evidence page is invalid.")
+        if self.score < 0 or not set(self.matched_channels).issubset(RETRIEVAL_CHANNELS):
+            raise ValueError("Retrieval evidence ranking is invalid.")
+
+
+@dataclass(frozen=True)
+class SessionRetrievalResult:
+    result_id: str
+    session_id: str
+    task_id: str
+    snapshot_id: str
+    status: str
+    summary: str
+    recovery_action: str | None
+    retrieval_duration_ms: int
+    generation_duration_ms: int
+    created_at: str
+    evidences: tuple[SessionRetrievalEvidence, ...] = ()
+
+    def __post_init__(self) -> None:
+        if (
+            not self.result_id
+            or not self.session_id
+            or not self.task_id
+            or not self.snapshot_id
+            or self.status not in RETRIEVAL_RESULT_STATUSES
+            or not self.summary.strip()
+            or self.retrieval_duration_ms < 0
+            or self.generation_duration_ms < 0
+        ):
+            raise ValueError("Retrieval result is invalid.")
+        if self.status == "completed" and not self.evidences:
+            raise ValueError("Completed retrieval results need evidence.")
+        if self.status != "completed" and self.evidences:
+            raise ValueError("Unavailable retrieval results cannot contain evidence.")
+        if tuple(evidence.ordinal for evidence in self.evidences) != tuple(
+            range(1, len(self.evidences) + 1)
+        ):
+            raise ValueError("Retrieval evidence ordering is invalid.")
+
+
+@dataclass(frozen=True)
 class SessionAttachment:
     attachment_id: str
     session_id: str
@@ -263,6 +340,7 @@ class SessionDetail:
     generation_results: tuple[SessionGenerationResult, ...]
     attachments: tuple[SessionAttachment, ...] = ()
     task_snapshots: tuple[SessionTaskSnapshot, ...] = ()
+    retrieval_results: tuple[SessionRetrievalResult, ...] = ()
 
 
 @dataclass(frozen=True)

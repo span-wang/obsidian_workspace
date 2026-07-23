@@ -1,4 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from threading import Barrier
 import pytest
 
 from adapters.sqlite_session_repository import SqliteSessionRepository
@@ -258,6 +260,7 @@ def test_session_context_accepts_only_a_verified_chat_model_and_keeps_external_a
     external = service.add_attachment(session.session_id, tmp_path / "outside.pdf")
 
     assert updated.scope_path == "notes"
+    assert updated.selected_vault_label == vault_path.name
     assert attachment.status == "pending-authorization"
     assert attachment.relative_path == "notes/unit.md"
     assert external.status == "needs-import"
@@ -497,3 +500,170 @@ def test_unavailable_provider_returns_non_executable_task_preview(tmp_path) -> N
     with pytest.raises(SessionValidationError, match="所选 Provider/Model 不可用"):
         service.create_task(session.session_id, "定位第一单元")
     assert repository.get_detail(session.session_id).task_snapshots == ()
+
+
+def test_task_preview_skips_unverifiable_derived_index_entries(tmp_path) -> None:
+    document = IndexedDocument(
+        "derived-unverifiable",
+        "vault-1",
+        "platform/notes/unit.md",
+        "a" * 64,
+        "derived",
+        ("line:1",),
+        (),
+        (),
+        (IndexBlock(1, "line:1", "# Unit"),),
+        "now",
+        verifiable=False,
+        stale_reason="unverifiable-provenance",
+    )
+    service, _, session, _, _, _, indexes = task_service_fixture(tmp_path, (document,))
+    indexes.health = lambda vault_id: IndexHealth(
+        vault_id, "stale", "now", 1, 1, 0, "unavailable"
+    )
+
+    preview = service.preview_task(session.session_id, "定位第一单元")
+
+    assert preview.is_ready is False
+    assert preview.index_status == "stale"
+    assert preview.source_count == 0
+    assert preview.sources == ()
+
+
+def test_execute_prepared_task_persists_bounded_local_evidence_and_timings(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1",
+        "vault-1",
+        "notes/force-motion.md",
+        "a" * 64,
+        "native",
+        ("力和运动",),
+        ("notes/motion.md",),
+        ("physics",),
+        (
+            IndexBlock(1, "heading: 力和运动; page: 12", "力会改变物体的运动状态。"),
+            IndexBlock(2, "heading: 速度", "速度描述物体运动的快慢。"),
+        ),
+        "now",
+    )
+    service, repository, session, *_ = task_service_fixture(tmp_path, (document,))
+    snapshot = service.create_task(session.session_id, "力如何影响运动？", intent="source-lookup")
+
+    result = service.execute_task(session.session_id, snapshot.task_id)
+    restarted = SqliteSessionRepository(tmp_path / "sessions.sqlite3").get_detail(session.session_id)
+
+    assert result.status == "completed"
+    assert result.retrieval_duration_ms >= 0
+    assert result.generation_duration_ms == 0
+    assert len(result.evidences) == 2
+    evidence = result.evidences[0]
+    assert evidence.relative_path == "notes/force-motion.md"
+    assert evidence.content_sha256 == "a" * 64
+    assert evidence.source_id is None
+    assert evidence.source_content_hash is None
+    assert evidence.heading == "力和运动"
+    assert evidence.page == 12
+    assert {"keyword", "semantic", "structure"}.issubset(
+        evidence.matched_channels
+    )
+    assert restarted.task_states[0].status == "completed"
+    assert restarted.task_snapshots[0].status == "completed"
+    assert restarted.retrieval_results[0].evidences[0].excerpt == evidence.excerpt
+
+
+def test_execute_task_persists_provider_unavailable_state_without_claiming_no_evidence(tmp_path) -> None:
+    service, repository, session, _, providers, _, _ = task_service_fixture(tmp_path)
+    snapshot = service.create_task(session.session_id, "定位第一单元", intent="source-lookup")
+    providers.available = False
+
+    result = service.execute_task(session.session_id, snapshot.task_id)
+    detail = repository.get_detail(session.session_id)
+
+    assert result.status == "provider-model-unavailable"
+    assert result.evidences == ()
+    assert "Provider/Model" in result.summary
+    assert detail.task_states[0].status == "provider-model-unavailable"
+    assert detail.task_snapshots[0].status == "invalidated"
+
+
+def test_execute_task_distinguishes_content_excluded_from_a_healthy_no_evidence_result(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1", "vault-1", "notes/unit.md", "a" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Unit", "fixture content"),), "now",
+    )
+    service, _, session, _, _, policies, _ = task_service_fixture(tmp_path, (document,))
+    policies.list_rules = lambda _vault_id: [
+        type("Rule", (), {"kind": "completely-ignore", "relative_path": "notes"})()
+    ]
+    policies.preview = lambda _vault_id, _source_path, _derived_path, stage: PolicyEvaluation(
+        False, stage, ("completely-ignore",), (), "fixture excluded"
+    )
+    snapshot = service.create_task(session.session_id, "定位第一单元", intent="source-lookup")
+
+    result = service.execute_task(session.session_id, snapshot.task_id)
+
+    assert snapshot.source_count == 0
+    assert result.status == "excluded"
+    assert "排除" in result.summary
+    assert result.recovery_action == "检查排除规则后重新准备任务。"
+
+
+def test_execute_task_keeps_completed_evidence_but_invalidates_it_when_sources_change(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1", "vault-1", "notes/unit.md", "a" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Unit", "keyword evidence"),), "now",
+    )
+    service, _, session, _, _, _, indexes = task_service_fixture(tmp_path, (document,))
+    snapshot = service.create_task(session.session_id, "keyword", intent="source-lookup")
+
+    result = service.execute_task(session.session_id, snapshot.task_id)
+    indexes.current = [
+        IndexedDocument(
+            "native-1", "vault-1", "notes/unit.md", "b" * 64, "native", (), (), (),
+            (IndexBlock(1, "heading: Unit", "keyword evidence"),), "now",
+        )
+    ]
+
+    detail = service.detail(session.session_id)
+
+    assert result.status == "completed"
+    assert detail.task_snapshots[0].status == "invalidated"
+    assert detail.retrieval_results[0].status == "completed"
+
+
+def test_execute_task_reports_no_evidence_when_only_nonblocking_rules_exist(tmp_path) -> None:
+    service, _, session, _, _, policies, _ = task_service_fixture(tmp_path)
+    policies.list_rules = lambda _vault_id: [
+        type("Rule", (), {"kind": "never-send-cloud", "relative_path": "notes"})()
+    ]
+    snapshot = service.create_task(session.session_id, "关键词", intent="source-lookup")
+
+    result = service.execute_task(session.session_id, snapshot.task_id)
+
+    assert snapshot.source_count == 0
+    assert result.status == "no-evidence"
+    assert result.recovery_action == "修改问题或范围后重新准备任务。"
+
+
+def test_concurrent_task_execution_returns_the_existing_result(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1", "vault-1", "notes/unit.md", "a" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Unit", "keyword evidence"),), "now",
+    )
+    service, repository, session, *_ = task_service_fixture(tmp_path, (document,))
+    snapshot = service.create_task(session.session_id, "keyword", intent="source-lookup")
+    barrier = Barrier(2)
+    retrieve = service._retrieve
+
+    def synchronized_retrieve(snapshot, content, started):
+        barrier.wait(timeout=5)
+        return retrieve(snapshot, content, started)
+
+    service._retrieve = synchronized_retrieve
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(lambda _: service.execute_task(session.session_id, snapshot.task_id), range(2))
+        )
+
+    assert {result.result_id for result in results} == {results[0].result_id}
+    assert len(repository.get_detail(session.session_id).retrieval_results) == 1

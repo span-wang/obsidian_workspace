@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -12,6 +13,8 @@ from domain.sessions import (
     SessionGenerationResult,
     SessionMessage,
     SessionPage,
+    SessionRetrievalEvidence,
+    SessionRetrievalResult,
     SessionTaskSnapshot,
     SessionTaskSnapshotSource,
     SessionTaskState,
@@ -160,6 +163,43 @@ class SqliteSessionRepository:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS session_task_snapshot_session_idx ON session_task_snapshots(session_id, created_at)"
             )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS session_retrieval_results (
+                    result_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                    task_id TEXT NOT NULL,
+                    snapshot_id TEXT NOT NULL REFERENCES session_task_snapshots(snapshot_id) ON DELETE CASCADE,
+                    status TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    recovery_action TEXT,
+                    retrieval_duration_ms INTEGER NOT NULL,
+                    generation_duration_ms INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(session_id, task_id)
+                )"""
+            )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS session_retrieval_evidences (
+                    result_id TEXT NOT NULL REFERENCES session_retrieval_results(result_id) ON DELETE CASCADE,
+                    ordinal INTEGER NOT NULL,
+                    identity_kind TEXT NOT NULL,
+                    relative_path TEXT NOT NULL,
+                    content_sha256 TEXT NOT NULL,
+                    source_id TEXT,
+                    source_content_hash TEXT,
+                    source_path TEXT,
+                    heading TEXT,
+                    location TEXT NOT NULL,
+                    page INTEGER,
+                    excerpt TEXT NOT NULL,
+                    score REAL NOT NULL,
+                    matched_channels_json TEXT NOT NULL,
+                    PRIMARY KEY (result_id, ordinal)
+                )"""
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS session_retrieval_result_session_idx ON session_retrieval_results(session_id, created_at)"
+            )
 
     @staticmethod
     def _ensure_session_column(connection: sqlite3.Connection, name: str, declaration: str) -> None:
@@ -225,6 +265,17 @@ class SqliteSessionRepository:
                 ).fetchall()
                 for row in snapshots
             }
+            retrieval_results = connection.execute(
+                "SELECT * FROM session_retrieval_results WHERE session_id = ? ORDER BY created_at, result_id",
+                (session_id,),
+            ).fetchall()
+            retrieval_evidences = {
+                row["result_id"]: connection.execute(
+                    "SELECT * FROM session_retrieval_evidences WHERE result_id = ? ORDER BY ordinal",
+                    (row["result_id"],),
+                ).fetchall()
+                for row in retrieval_results
+            }
         return SessionDetail(
             self._session_from_row(session_row),
             tuple(self._message_from_row(row) for row in messages),
@@ -235,6 +286,10 @@ class SqliteSessionRepository:
             tuple(
                 self._snapshot_from_row(row, snapshot_sources[row["snapshot_id"]])
                 for row in snapshots
+            ),
+            tuple(
+                self._retrieval_result_from_row(row, retrieval_evidences[row["result_id"]])
+                for row in retrieval_results
             ),
         )
 
@@ -423,6 +478,22 @@ class SqliteSessionRepository:
             )
             self._touch_session(connection, result.session_id, result.created_at)
 
+    def persist_retrieval_execution(
+        self,
+        snapshot: SessionTaskSnapshot,
+        task_state: SessionTaskState,
+        result: SessionRetrievalResult,
+    ) -> bool:
+        with self._connect() as connection:
+            if self._update_task_snapshot(
+                connection, snapshot, expected_status="prepared"
+            ).rowcount != 1:
+                return False
+            self._upsert_task_state(connection, task_state)
+            self._insert_retrieval_result(connection, result)
+            self._touch_session(connection, snapshot.session_id, task_state.updated_at)
+        return True
+
     @staticmethod
     def _session_select(where: str) -> str:
         return """SELECT sessions.*, (
@@ -498,6 +569,55 @@ class SqliteSessionRepository:
         )
 
     @staticmethod
+    def _insert_retrieval_result(
+        connection: sqlite3.Connection, result: SessionRetrievalResult
+    ) -> None:
+        connection.execute(
+            """INSERT INTO session_retrieval_results (
+                result_id, session_id, task_id, snapshot_id, status, summary, recovery_action,
+                retrieval_duration_ms, generation_duration_ms, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                result.result_id,
+                result.session_id,
+                result.task_id,
+                result.snapshot_id,
+                result.status,
+                result.summary,
+                result.recovery_action,
+                result.retrieval_duration_ms,
+                result.generation_duration_ms,
+                result.created_at,
+            ),
+        )
+        connection.executemany(
+            """INSERT INTO session_retrieval_evidences (
+                result_id, ordinal, identity_kind, relative_path, content_sha256, source_id,
+                source_content_hash, source_path, heading, location, page, excerpt, score,
+                matched_channels_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    result.result_id,
+                    evidence.ordinal,
+                    evidence.identity_kind,
+                    evidence.relative_path,
+                    evidence.content_sha256,
+                    evidence.source_id,
+                    evidence.source_content_hash,
+                    evidence.source_path,
+                    evidence.heading,
+                    evidence.location,
+                    evidence.page,
+                    evidence.excerpt,
+                    evidence.score,
+                    json.dumps(evidence.matched_channels),
+                )
+                for evidence in result.evidences
+            ],
+        )
+
+    @staticmethod
     def _upsert_task_state(connection: sqlite3.Connection, task_state: SessionTaskState) -> None:
         connection.execute(
             """INSERT INTO session_task_states (
@@ -517,18 +637,26 @@ class SqliteSessionRepository:
 
     @staticmethod
     def _update_task_snapshot(
-        connection: sqlite3.Connection, snapshot: SessionTaskSnapshot
+        connection: sqlite3.Connection,
+        snapshot: SessionTaskSnapshot,
+        *,
+        expected_status: str | None = None,
     ) -> sqlite3.Cursor:
+        query = """UPDATE session_task_snapshots SET status = ?, updated_at = ?, invalidation_reason = ?
+            WHERE snapshot_id = ? AND session_id = ?"""
+        values: list[object] = [
+            snapshot.status,
+            snapshot.updated_at,
+            snapshot.invalidation_reason,
+            snapshot.snapshot_id,
+            snapshot.session_id,
+        ]
+        if expected_status is not None:
+            query += " AND status = ?"
+            values.append(expected_status)
         return connection.execute(
-            """UPDATE session_task_snapshots SET status = ?, updated_at = ?, invalidation_reason = ?
-                WHERE snapshot_id = ? AND session_id = ?""",
-            (
-                snapshot.status,
-                snapshot.updated_at,
-                snapshot.invalidation_reason,
-                snapshot.snapshot_id,
-                snapshot.session_id,
-            ),
+            query,
+            values,
         )
 
     @staticmethod
@@ -659,6 +787,41 @@ class SqliteSessionRepository:
     def _result_from_row(row: sqlite3.Row) -> SessionGenerationResult:
         return SessionGenerationResult(
             row["result_id"], row["session_id"], row["status"], row["content"], row["created_at"]
+        )
+
+    @staticmethod
+    def _retrieval_result_from_row(
+        row: sqlite3.Row, evidence_rows: list[sqlite3.Row]
+    ) -> SessionRetrievalResult:
+        return SessionRetrievalResult(
+            row["result_id"],
+            row["session_id"],
+            row["task_id"],
+            row["snapshot_id"],
+            row["status"],
+            row["summary"],
+            row["recovery_action"],
+            int(row["retrieval_duration_ms"]),
+            int(row["generation_duration_ms"]),
+            row["created_at"],
+            tuple(
+                SessionRetrievalEvidence(
+                    evidence["ordinal"],
+                    evidence["identity_kind"],
+                    evidence["relative_path"],
+                    evidence["content_sha256"],
+                    evidence["source_id"],
+                    evidence["source_content_hash"],
+                    evidence["source_path"],
+                    evidence["heading"],
+                    evidence["location"],
+                    evidence["page"],
+                    evidence["excerpt"],
+                    float(evidence["score"]),
+                    tuple(json.loads(evidence["matched_channels_json"])),
+                )
+                for evidence in evidence_rows
+            ),
         )
 
     @staticmethod

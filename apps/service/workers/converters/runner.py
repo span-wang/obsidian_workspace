@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from multiprocessing.synchronize import Event
 from pathlib import PurePosixPath
 from typing import Protocol
 
-from domain.evidence import ConversionAttempt, ConversionEvidence
+from domain.evidence import ConversionAttempt, ConversionEvidence, DocumentGraph
 from workers.converters.quality_gate import StructuralQualityGate
 
 
@@ -20,6 +20,7 @@ class ConversionRequest:
     source_sha256: str
     input_snapshot_hash: str
     input_snapshot_path: str
+    preflight_inventory: Mapping[str, object] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> ConversionRequest:
@@ -30,6 +31,7 @@ class ConversionRequest:
             source_sha256=str(value["content_sha256"]),
             input_snapshot_hash=str(value["input_snapshot_hash"]),
             input_snapshot_path=str(value["input_snapshot_path"]),
+            preflight_inventory=dict(value.get("preflight_inventory", {})),
         )
         if not request.input_snapshot_path or request.source_sha256 != request.input_snapshot_hash:
             raise ValueError("Conversion requests require a verified immutable input snapshot.")
@@ -92,6 +94,45 @@ class ConversionCandidate:
 
 
 @dataclass(frozen=True)
+class RejectedConversionCandidate:
+    """A complete, unselected graph that must be persisted before fallback runs."""
+
+    attempt: ConversionAttempt
+    graph: DocumentGraph
+    temporary_directory: str
+    artifact_drafts: tuple[ConversionArtifactDraft, ...]
+    quality_gate_decision: dict[str, object]
+
+    def __post_init__(self) -> None:
+        if self.attempt.status != "rejected" or self.attempt.graph_id != self.graph.graph_id:
+            raise ValueError("Rejected candidates need a matching rejected attempt and graph.")
+        if not self.temporary_directory or not self.artifact_drafts:
+            raise ValueError("Rejected candidates need promotable temporary artifacts.")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "attempt": self.attempt.to_dict(),
+            "graph": self.graph.to_dict(),
+            "temporary_directory": self.temporary_directory,
+            "artifact_drafts": [artifact.to_dict() for artifact in self.artifact_drafts],
+            "quality_gate_decision": self.quality_gate_decision,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> RejectedConversionCandidate:
+        return cls(
+            attempt=ConversionAttempt.from_dict(dict(value["attempt"])),
+            graph=DocumentGraph.from_dict(dict(value["graph"])),
+            temporary_directory=str(value["temporary_directory"]),
+            artifact_drafts=tuple(
+                ConversionArtifactDraft.from_dict(dict(artifact))
+                for artifact in list(value.get("artifact_drafts", []))
+            ),
+            quality_gate_decision=dict(value["quality_gate_decision"]),
+        )
+
+
+@dataclass(frozen=True)
 class ConversionOutcome:
     """A launcher reports unselected whole-graph attempts before its selected envelope."""
 
@@ -113,6 +154,7 @@ def conversion_items(
     items: tuple[dict[str, object], ...],
     launcher: ConversionLauncher | None = None,
     should_cancel: Callable[[], bool] | None = None,
+    record_rejected_attempt: Callable[[RejectedConversionCandidate], bool] | None = None,
 ) -> Iterator[dict[str, object]]:
     """Emit service-owned events while never exposing mutable source paths to a launcher."""
 
@@ -128,13 +170,22 @@ def conversion_items(
             if launcher is None:
                 raise RuntimeError("No provisioned converter launcher is available in this build.")
             request = ConversionRequest.from_dict(item)
-            outcome = launcher.convert(request)
+            staged_convert = getattr(launcher, "convert_after_primary_persisted", None)
+            if callable(staged_convert) and record_rejected_attempt is not None:
+                outcome = staged_convert(request, record_rejected_attempt)
+            else:
+                outcome = launcher.convert(request)
             for attempt in outcome.recorded_attempts:
                 if attempt.task_id != request.task_id or attempt.item_id != request.item_id:
                     raise ValueError("A conversion attempt does not belong to its request item.")
                 yield {"type": "conversion-attempted", "attempt": attempt.to_dict()}
             if outcome.evidence is None:
-                raise RuntimeError(outcome.failure_reason or "No complete document graph was selected.")
+                yield {
+                    "type": "conversion-failed-item",
+                    "item_id": item_id,
+                    "reason": outcome.failure_reason or "No complete document graph was selected.",
+                }
+                continue
             candidates = (
                 ConversionCandidate(
                     outcome.evidence,
@@ -205,6 +256,32 @@ def run_conversion_worker(
     cancelled: Event,
     *,
     launcher: ConversionLauncher | None = None,
+    rejected_attempt_confirmations=None,
 ) -> None:
-    for event in conversion_items(items, launcher=launcher, should_cancel=cancelled.is_set):
+    def record_rejected_attempt(candidate: RejectedConversionCandidate) -> bool:
+        if rejected_attempt_confirmations is None:
+            return False
+        queue.put(
+            {
+                "type": "conversion-attempted",
+                "item_id": candidate.attempt.item_id,
+                "candidate": candidate.to_dict(),
+            }
+        )
+        try:
+            confirmation = rejected_attempt_confirmations.get(timeout=30)
+        except Exception:
+            return False
+        return (
+            isinstance(confirmation, dict)
+            and confirmation.get("attempt_id") == candidate.attempt.attempt_id
+            and confirmation.get("persisted") is True
+        )
+
+    for event in conversion_items(
+        items,
+        launcher=launcher,
+        should_cancel=cancelled.is_set,
+        record_rejected_attempt=record_rejected_attempt,
+    ):
         queue.put(event)

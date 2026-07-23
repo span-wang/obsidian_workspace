@@ -330,6 +330,13 @@ class IndexingService:
             or existing.observed_size != observed.st_size
         ):
             return True
+        if existing.stale_reason == "unverifiable-provenance":
+            try:
+                provenance, _ = _platform_provenance(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError):
+                provenance = None
+            if provenance is not None:
+                return True
         if existing.source_path is None:
             return False
         source = vault.path / existing.source_path
@@ -384,6 +391,8 @@ def _platform_provenance(markdown: str) -> tuple[dict[str, object] | None, str |
                 continue
             if not in_provenance:
                 continue
+            if line and not line.startswith(" "):
+                break
             if line.startswith("  source_locators:"):
                 in_locators = True
                 continue

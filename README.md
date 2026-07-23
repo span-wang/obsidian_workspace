@@ -48,6 +48,19 @@ npm run start
 
 若 6240 已被其他进程占用，启动会输出 `Port 6240 is already in use.` 并退出。请先确认并停止占用该端口的进程，再重新执行启动命令。
 
+## 一键启动与关闭
+
+双击顶层目录的以下 Windows 命令脚本，可统一管理工作台和本项目的专用 Cloudflare Tunnel；命令窗口会保留运行结果，不会打开 PowerShell 源码：
+
+```text
+start-all.cmd
+stop-all.cmd
+```
+
+`start-all.cmd` 每次都会先关闭所有可核验的现有项目进程，再使用 `npm run start` 启动工作台，因此工作台健康后会打开默认浏览器；随后启动专用 Tunnel。运行状态和工作台日志写入 `output/runtime/`。如果新 Tunnel 的凭据、配置或前置检查失败，脚本会关闭本次启动的工作台，不留下半完成实例。
+
+`stop-all.cmd` 会关闭所有可核验的项目进程，顺序为 Tunnel、工作台。它会通过专用 Tunnel 配置、已验证的本机健康端点、进程树、PID、启动时间和命令行识别目标；状态文件过期或丢失时仍会清理实际运行中的项目进程，但不会按通用进程名批量结束其他应用。
+
 ## Cloudflare Tunnel
 
 `obsidian.panspan.cloud` 使用独立的 `obsidian-panspan-cloud` Tunnel，所有配置和运行文件都位于 `cloudflare/`，不会复用 `C:\Users\panshimao\.cloudflared\config.yml` 或其他域名的配置。它仍然只将请求转发至 `http://127.0.0.1:6240`。

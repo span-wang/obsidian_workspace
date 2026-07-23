@@ -1401,7 +1401,7 @@ test("requires a saved session context before composer actions and announces att
     session_id: "session-1",
     title: "语境测试",
     selected_vault_id: "vault-a",
-    selected_vault_label: "Vault A",
+    selected_vault_label: "platform",
     selected_provider_id: "provider-1",
     selected_provider_label: "Local",
     selected_model_id: "chat-1",
@@ -1415,10 +1415,11 @@ test("requires a saved session context before composer actions and announces att
   };
   const attachments = [];
   const taskSnapshots = [];
+  const retrievalResults = [];
   let previewRequests = 0;
   const vaults = [
-    { vault_id: "vault-a", managed_root_relative_path: "Vault A", authorization_status: "active", access_status: "available" },
-    { vault_id: "vault-b", managed_root_relative_path: "Vault B", authorization_status: "active", access_status: "available" }
+    { vault_id: "vault-a", display_name: "Session Vault A", managed_root_relative_path: "platform", authorization_status: "active", access_status: "available" },
+    { vault_id: "vault-b", display_name: "Session Vault B", managed_root_relative_path: "platform", authorization_status: "active", access_status: "available" }
   ];
 
   await page.route("**/api/**", async (route) => {
@@ -1442,7 +1443,7 @@ test("requires a saved session context before composer actions and announces att
       return route.fulfill({ json: { sessions: [session], page: 1, page_size: 25, total: 1, total_pages: 1 } });
     }
     if (url.pathname === "/api/sessions/session-1" && request.method() === "GET") {
-      return route.fulfill({ json: { session, messages: [], task_states: [], citations: [], generation_results: [], attachments, task_snapshots: taskSnapshots } });
+      return route.fulfill({ json: { session, messages: [], task_states: [], citations: [], generation_results: [], attachments, task_snapshots: taskSnapshots, retrieval_results: retrievalResults } });
     }
     if (url.pathname === "/api/sessions/session-1/context" && request.method() === "PATCH") {
       const context = request.postDataJSON();
@@ -1504,12 +1505,25 @@ test("requires a saved session context before composer actions and announces att
       taskSnapshots.push(snapshot);
       return route.fulfill({ json: { snapshot } });
     }
+    if (url.pathname === "/api/sessions/session-1/tasks/task-1/execute" && request.method() === "POST") {
+      taskSnapshots[0].status = "completed";
+      const result = {
+        result_id: "result-1", task_id: "task-1", snapshot_id: "snapshot-1", status: "no-evidence",
+        summary: "健康索引与有效范围内未找到可支持该请求的知识库证据。",
+        recovery_action: "修改问题或范围后重新准备任务。",
+        retrieval_duration_ms: 3, generation_duration_ms: 0, evidences: []
+      };
+      retrievalResults.push(result);
+      return route.fulfill({ json: { result } });
+    }
     return route.fallback();
   });
 
   await page.goto("/");
   await page.getByRole("link", { name: "会话", exact: true }).click();
   await expect(page.getByLabel("会话输入")).toBeVisible();
+  await expect(page.getByText("所用 vault：Session Vault A", { exact: true })).toBeVisible();
+  await expect(page.getByLabel("选择 vault").locator("option")).toHaveText(["选择 vault", "Session Vault A", "Session Vault B"]);
 
   await page.getByLabel("选择 vault").selectOption("vault-b");
   await page.getByLabel("选择 Model").selectOption(JSON.stringify(["provider-1", "chat-1"]));
@@ -1542,6 +1556,9 @@ test("requires a saved session context before composer actions and announces att
   await page.getByRole("button", { name: "固定快照", exact: true }).click();
   await expect(page.getByText("任务快照已固定，等待后续检索执行。", { exact: true })).toBeVisible();
   await expect(page.getByText("任务 原文定位：已准备", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "执行检索", exact: true }).click();
+  await expect(page.getByLabel("未找到证据").getByText("健康索引与有效范围内未找到可支持该请求的知识库证据。", { exact: true })).toBeVisible();
+  await expect(page.getByText("检索 3 ms；生成 0 ms（未调用 Model）", { exact: true })).toBeVisible();
 });
 
 test("keeps the current session detail when an earlier selection resolves last", async ({ page }) => {
@@ -1596,4 +1613,90 @@ test("keeps the current session detail when an earlier selection resolves last",
   await expect(page.getByText("B 的内容", { exact: true })).toBeVisible();
   await expect(page.getByText("A 的内容", { exact: true })).toHaveCount(0);
   await expect(page.locator(".context-location")).toContainText("Vault B");
+});
+
+test("keeps the newly selected session visible when an earlier execution finishes", async ({ page }) => {
+  const session = (sessionId, title, vault) => ({
+    session_id: sessionId,
+    title,
+    selected_vault_id: vault.toLowerCase().replace(" ", "-"),
+    selected_vault_label: vault,
+    selected_provider_id: "provider-1",
+    selected_provider_label: "Local",
+    selected_model_id: "chat-1",
+    selected_model_label: "chat-1",
+    scope_kind: "vault",
+    scope_path: null,
+    message_count: 1,
+    created_at: "2026-07-23T00:00:00+00:00",
+    updated_at: "2026-07-23T00:00:00+00:00",
+    last_activity_at: "2026-07-23T00:00:00+00:00"
+  });
+  const first = session("session-a", "会话 A", "Vault A");
+  const second = session("session-b", "会话 B", "Vault B");
+  const detail = (item, content, snapshots = []) => ({
+    session: item,
+    messages: [{ message_id: `message-${item.session_id}`, role: "assistant", content }],
+    task_states: [],
+    citations: [],
+    generation_results: [],
+    attachments: [],
+    task_snapshots: snapshots,
+    retrieval_results: []
+  });
+  const firstSnapshot = {
+    snapshot_id: "snapshot-a",
+    task_id: "task-a",
+    vault_id: "vault-a",
+    intent: "source-lookup",
+    status: "prepared",
+    scope_kind: "vault",
+    source_count: 1,
+    source_digest: "a".repeat(64),
+    index_status: "healthy",
+    outbound_scope_summary: "尚未发送"
+  };
+  let releaseExecution;
+
+  await page.route("**/api/sessions**", async (route) => {
+    const request = route.request();
+    const pathname = new URL(request.url()).pathname;
+    if (request.method() === "GET" && pathname === "/api/sessions") {
+      return route.fulfill({ json: { sessions: [first, second], page: 1, page_size: 25, total: 2, total_pages: 1 } });
+    }
+    if (request.method() === "GET" && pathname === "/api/sessions/session-a") {
+      return route.fulfill({ json: detail(first, "A 的内容", [firstSnapshot]) });
+    }
+    if (request.method() === "GET" && pathname === "/api/sessions/session-b") {
+      return route.fulfill({ json: detail(second, "B 的内容") });
+    }
+    if (request.method() === "POST" && pathname === "/api/sessions/session-a/tasks/task-a/execute") {
+      await new Promise((resolve) => {
+        releaseExecution = async () => {
+          await route.fulfill({ json: { result: {
+            result_id: "result-a", task_id: "task-a", snapshot_id: "snapshot-a", status: "no-evidence",
+            summary: "健康索引与有效范围内未找到可支持该请求的知识库证据。",
+            recovery_action: "修改问题或范围后重新准备任务。",
+            retrieval_duration_ms: 1, generation_duration_ms: 0, evidences: []
+          } } });
+          resolve();
+        };
+      });
+      return;
+    }
+    return route.fallback();
+  });
+
+  await page.goto("/");
+  await page.getByRole("link", { name: "会话", exact: true }).click();
+  await expect(page.getByText("A 的内容", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "执行检索", exact: true }).click();
+  await expect.poll(() => Boolean(releaseExecution)).toBe(true);
+  await page.getByRole("button", { name: /会话 B/ }).click();
+  await expect(page.getByText("B 的内容", { exact: true })).toBeVisible();
+  await releaseExecution();
+
+  await expect(page.getByText("B 的内容", { exact: true })).toBeVisible();
+  await expect(page.getByText("A 的内容", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("检索已完成，证据已刷新。", { exact: true })).toHaveCount(0);
 });

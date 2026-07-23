@@ -107,8 +107,8 @@ test("renders a bounded three-pane session workspace with a context composer", (
   const session = {
     session_id: "session-1",
     title: "代数复习",
-    selected_vault_id: null,
-    selected_vault_label: null,
+    selected_vault_id: "vault-1",
+    selected_vault_label: "platform",
     message_count: 1,
     updated_at: "2026-07-22T00:00:00+00:00"
   };
@@ -128,7 +128,43 @@ test("renders a bounded three-pane session workspace with a context composer", (
       selectedDetail: {
         session,
         messages: [{ message_id: "message-1", role: "assistant", content: "先复习二次方程。" }],
-        citations: [{ citation_id: "citation-1", relative_path: "notes/algebra.md", location: "第 2 节", status: "valid" }]
+        citations: [{ citation_id: "citation-1", relative_path: "notes/algebra.md", location: "第 2 节", status: "valid" }],
+        task_snapshots: [{
+          snapshot_id: "snapshot-1",
+          task_id: "task-1",
+          vault_id: "vault-2",
+          intent: "source-lookup",
+          status: "prepared",
+          scope_kind: "vault",
+          source_count: 1,
+          source_digest: "a".repeat(64),
+          index_status: "healthy",
+          outbound_scope_summary: "尚未发送"
+        }],
+        retrieval_results: [{
+          result_id: "result-1",
+          task_id: "task-1",
+          snapshot_id: "snapshot-1",
+          status: "completed",
+          summary: "已在已确认范围内找到 1 条本地知识库证据；未调用 Model。",
+          recovery_action: null,
+          retrieval_duration_ms: 12,
+          generation_duration_ms: 0,
+          evidences: [{
+            ordinal: 1,
+            identity_kind: "derived",
+            relative_path: "notes/algebra.md",
+            content_sha256: "a".repeat(64),
+            source_id: "source-1",
+            source_content_hash: "b".repeat(64),
+            source_path: "sources/algebra.pdf",
+            heading: "二次方程",
+            location: "heading: 二次方程; page: 2",
+            page: 2,
+            excerpt: "二次方程有两个根。",
+            matched_channels: ["keyword", "semantic"]
+          }]
+        }]
       },
       isDetailLoading: false,
       detailError: "",
@@ -138,7 +174,10 @@ test("renders a bounded three-pane session workspace with a context composer", (
       onRename: async () => ({}),
       onExport: async () => {},
       onDelete: () => {},
-      vaults: [{ vault_id: "vault-1", managed_root_relative_path: "English", authorization_status: "active", access_status: "available" }],
+      vaults: [
+        { vault_id: "vault-1", display_name: "English", managed_root_relative_path: "platform", authorization_status: "active", access_status: "available" },
+        { vault_id: "vault-2", display_name: "Mathematics", managed_root_relative_path: "platform", authorization_status: "active", access_status: "available" }
+      ],
       providers: [{
         provider_id: "provider-1",
         name: "Local chat",
@@ -150,7 +189,8 @@ test("renders a bounded three-pane session workspace with a context composer", (
       onRemoveAttachment: async () => {},
       onSendMessage: async () => {},
       onPreviewTask: async () => ({}),
-      onCreateTask: async () => ({})
+      onCreateTask: async () => ({}),
+      onExecuteTask: async () => ({})
     })
   );
 
@@ -160,7 +200,8 @@ test("renders a bounded three-pane session workspace with a context composer", (
   assert.match(markup, /aria-label="会话内容"/);
   assert.match(markup, /aria-label="引用证据"/);
   assert.match(markup, /代数复习/);
-  assert.match(markup, /所用 vault：未设置/);
+  assert.match(markup, /所用 vault：English/);
+  assert.doesNotMatch(markup, /所用 vault：platform/);
   assert.match(markup, /先复习二次方程。/);
   assert.match(markup, /notes\/algebra\.md/);
   assert.match(markup, /上一页/);
@@ -168,11 +209,113 @@ test("renders a bounded three-pane session workspace with a context composer", (
   assert.match(markup, /第 1 \/ 2 页/);
   assert.match(markup, /aria-label="会话输入"/);
   assert.match(markup, /aria-label="选择 vault"/);
+  assert.match(markup, /<option value="vault-1">English<\/option>/);
+  assert.match(markup, /<option value="vault-2">Mathematics<\/option>/);
+  assert.doesNotMatch(markup, /<option value="vault-[12]">platform<\/option>/);
   assert.match(markup, /aria-label="选择 Model"/);
   assert.match(markup, /aria-label="选择任务类型"/);
   assert.match(markup, /自动识别/);
   assert.match(markup, /aria-label="输入问题或继续创作"/);
   assert.match(markup, /session-composer/);
+  assert.match(markup, /执行检索/);
+  assert.match(markup, /本地知识库证据/);
+  assert.match(markup, /检索 12 ms；生成 0 ms（未调用 Model）/);
+  assert.match(markup, /Source ID source-1/);
+  assert.match(markup, /在 Obsidian 中打开/);
+  assert.match(markup, /vault：Mathematics/);
+  assert.match(markup, /\/api\/vaults\/vault-2\/open\?file=notes%2Falgebra.md/);
+});
+
+test("marks stale evidence and keeps its original vault identity", () => {
+  const session = {
+    session_id: "session-1",
+    title: "当前会话",
+    selected_vault_id: "vault-1",
+    selected_vault_label: "当前 vault",
+    message_count: 0,
+    updated_at: "2026-07-23T00:00:00+00:00"
+  };
+  const markup = renderToStaticMarkup(
+    React.createElement(SessionManagement, {
+      sessionPage: { sessions: [session], page: 1, page_size: 25, total: 1, total_pages: 1 },
+      filters: { query: "", sort: "updated_at", order: "desc" },
+      isLoading: false,
+      error: "",
+      selectedSessionId: "session-1",
+      selectedDetail: {
+        session,
+        messages: [],
+        citations: [],
+        task_snapshots: [{
+          snapshot_id: "snapshot-old",
+          task_id: "task-old",
+          vault_id: "vault-2",
+          intent: "source-lookup",
+          status: "invalidated",
+          scope_kind: "vault",
+          source_count: 1,
+          source_digest: "a".repeat(64),
+          index_status: "healthy",
+          outbound_scope_summary: "尚未发送",
+          invalidation_reason: "来源已改变。"
+        }],
+        retrieval_results: [{
+          result_id: "result-old",
+          task_id: "task-old",
+          snapshot_id: "snapshot-old",
+          vault_id: "vault-2",
+          snapshot_status: "invalidated",
+          is_stale: true,
+          invalidation_reason: "来源已改变。",
+          status: "completed",
+          summary: "已在已确认范围内找到 1 条本地知识库证据；未调用 Model。",
+          recovery_action: null,
+          retrieval_duration_ms: 12,
+          generation_duration_ms: 0,
+          evidences: [{
+            ordinal: 1,
+            identity_kind: "native",
+            relative_path: "notes/evidence.md",
+            content_sha256: "a".repeat(64),
+            source_id: null,
+            source_content_hash: null,
+            source_path: null,
+            heading: "证据",
+            location: "heading: 证据",
+            page: null,
+            excerpt: "历史证据。",
+            matched_channels: ["keyword"]
+          }]
+        }]
+      },
+      isDetailLoading: false,
+      detailError: "",
+      onLoad: () => {},
+      onSelect: () => {},
+      onCreate: async () => ({}),
+      onRename: async () => ({}),
+      onExport: async () => {},
+      onDelete: () => {},
+      vaults: [
+        { vault_id: "vault-1", display_name: "当前 vault", authorization_status: "active", access_status: "available" },
+        { vault_id: "vault-2", display_name: "证据 vault", authorization_status: "active", access_status: "available" }
+      ],
+      providers: [],
+      onUpdateContext: async () => {},
+      onPickAttachments: async () => {},
+      onRemoveAttachment: async () => {},
+      onSendMessage: async () => {},
+      onPreviewTask: async () => ({}),
+      onCreateTask: async () => ({}),
+      onExecuteTask: async () => ({})
+    })
+  );
+
+  assert.match(markup, /证据已失效/);
+  assert.match(markup, /需重新准备：来源已改变。/);
+  assert.match(markup, /vault：证据 vault/);
+  assert.match(markup, /\/api\/vaults\/vault-2\/open\?file=notes%2Fevidence.md/);
+  assert.doesNotMatch(markup, /aria-label="本地知识库证据"/);
 });
 
 test("renders conversion retry and typed correction controls only for conversion review items", () => {

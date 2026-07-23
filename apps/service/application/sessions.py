@@ -5,6 +5,7 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import re
+from time import perf_counter
 from uuid import uuid4
 
 from domain.sessions import (
@@ -14,6 +15,8 @@ from domain.sessions import (
     SessionDetail,
     SessionMessage,
     SessionPage,
+    SessionRetrievalEvidence,
+    SessionRetrievalResult,
     SessionTaskSnapshot,
     SessionTaskSnapshotSource,
     SessionTaskState,
@@ -31,6 +34,11 @@ class SessionValidationError(ValueError):
 
 class SessionNotFoundError(KeyError):
     """Raised when a session does not exist in private application state."""
+
+
+MAX_RETRIEVAL_EVIDENCES = 8
+MAX_RETRIEVAL_BLOCK_CHARS = 800
+MAX_RETRIEVAL_CONTEXT_CHARS = 4_000
 
 
 @dataclass(frozen=True)
@@ -179,7 +187,7 @@ class SessionService:
         updated = replace(
             current,
             selected_vault_id=vault.vault_id,
-            selected_vault_label=vault.managed_root_relative_path,
+            selected_vault_label=vault.display_name,
             selected_provider_id=resolved.provider.provider_id,
             selected_provider_label=resolved.provider.name,
             selected_model_id=resolved.model.model_id,
@@ -271,6 +279,71 @@ class SessionService:
         )
         return snapshot
 
+    def execute_task(self, session_id: str, task_id: str) -> SessionRetrievalResult:
+        started = perf_counter()
+        try:
+            detail = self.repository.get_detail(session_id)
+        except KeyError as error:
+            raise SessionNotFoundError(session_id) from error
+        task_state = next((state for state in detail.task_states if state.task_id == task_id), None)
+        snapshot = next((item for item in detail.task_snapshots if item.task_id == task_id), None)
+        if task_state is None or snapshot is None or task_state.snapshot_id != snapshot.snapshot_id:
+            raise SessionValidationError("The selected task is unavailable. Prepare a new task.")
+        if task_state.status != "prepared" or snapshot.status != "prepared":
+            raise SessionValidationError("The selected task is no longer ready. Prepare a new task.")
+        if snapshot.intent not in {"source-lookup", "knowledge-organization"}:
+            raise SessionValidationError("The selected task type is handled by a later workflow.")
+
+        content = next(
+            (message.content for message in detail.messages if message.message_id == snapshot.message_id),
+            "",
+        )
+        preview = self._task_preview(detail.session, content, intent=snapshot.intent)
+        if not preview.is_ready:
+            status = (
+                "provider-model-unavailable"
+                if preview.index_status == "provider-model-unavailable"
+                else "index-unavailable"
+            )
+            result = SessionRetrievalResult(
+                str(uuid4()),
+                snapshot.session_id,
+                snapshot.task_id,
+                snapshot.snapshot_id,
+                status,
+                preview.blocking_reason or "索引不可用，未执行检索。",
+                preview.recovery_action,
+                int((perf_counter() - started) * 1000),
+                0,
+                utc_now(),
+            )
+            timestamp = utc_now()
+            return self._persist_retrieval_execution(
+                replace(
+                    snapshot,
+                    status="invalidated",
+                    updated_at=timestamp,
+                    invalidation_reason=preview.blocking_reason or "执行条件不可用。",
+                ),
+                replace(task_state, status=status, updated_at=timestamp),
+                result,
+            )
+        if (
+            preview.index_digest != snapshot.index_digest
+            or preview.source_digest != snapshot.source_digest
+            or preview.policy_revision != snapshot.policy_revision
+            or preview.outbound_mode != snapshot.outbound_mode
+        ):
+            reason = preview.blocking_reason or "来源、索引或授权策略已改变。"
+            self._invalidate_active_snapshots(session_id, reason)
+            raise SessionValidationError(f"{reason} 请重新准备任务。")
+
+        result = self._retrieve(snapshot, content, started)
+        timestamp = utc_now()
+        completed_snapshot = replace(snapshot, status="completed", updated_at=timestamp)
+        completed_state = replace(task_state, status=result.status, updated_at=timestamp)
+        return self._persist_retrieval_execution(completed_snapshot, completed_state, result)
+
     def send_user_message(self, session_id: str, content: str) -> SessionMessage:
         session = self.get(session_id)
         if not all((session.selected_vault_id, session.scope_kind, session.selected_provider_id, session.selected_model_id)):
@@ -355,6 +428,207 @@ class SessionService:
             len(sources), source_digest, sources, is_ready, blocking_reason, recovery_action,
         )
 
+    def _retrieve(
+        self, snapshot: SessionTaskSnapshot, content: str, started: float
+    ) -> SessionRetrievalResult:
+        manifest = {
+            (
+                source.identity_kind,
+                source.relative_path,
+                source.content_sha256,
+                source.source_id,
+                source.source_content_hash,
+                source.source_path,
+            )
+            for source in snapshot.sources
+        }
+        allowed_documents = []
+        excluded_count = 0
+        eligible_document_count = 0
+        for document in self.index_repository.current_documents(snapshot.vault_id):
+            if not self._in_scope(document.relative_path, snapshot.scope_kind, snapshot.scope_path):
+                continue
+            if not self._is_snapshot_source_eligible(document):
+                continue
+            eligible_document_count += 1
+            identity = (
+                document.document_kind,
+                document.relative_path,
+                document.content_sha256,
+                document.source_id,
+                document.source_sha256,
+                document.source_path,
+            )
+            evaluation = self.policy_service.preview(
+                snapshot.vault_id,
+                document.source_path or document.relative_path,
+                document.relative_path,
+                "retrieval",
+            )
+            if not evaluation.allowed:
+                excluded_count += 1
+                continue
+            if identity not in manifest:
+                continue
+            allowed_documents.append(document)
+
+        ranked: list[tuple[float, object, object, tuple[str, ...]]] = []
+        for document in allowed_documents:
+            for block in document.blocks:
+                score, channels = self._retrieval_score(content, document, block)
+                if score > 0:
+                    ranked.append((score, document, block, channels))
+        ranked.sort(key=lambda item: (-item[0], item[1].relative_path, item[2].sequence))
+
+        evidences: list[SessionRetrievalEvidence] = []
+        remaining_characters = MAX_RETRIEVAL_CONTEXT_CHARS
+        for score, document, block, channels in ranked:
+            if len(evidences) >= MAX_RETRIEVAL_EVIDENCES or remaining_characters <= 0:
+                break
+            excerpt = self._bounded_excerpt(block.text, min(MAX_RETRIEVAL_BLOCK_CHARS, remaining_characters))
+            if not excerpt:
+                continue
+            heading, page = self._evidence_location(document, block.location)
+            evidences.append(
+                SessionRetrievalEvidence(
+                    len(evidences) + 1,
+                    document.document_kind,
+                    document.relative_path,
+                    document.content_sha256,
+                    document.source_id,
+                    document.source_sha256,
+                    document.source_path,
+                    heading,
+                    block.location,
+                    page,
+                    excerpt,
+                    round(score, 6),
+                    channels,
+                )
+            )
+            remaining_characters -= len(excerpt)
+
+        duration = int((perf_counter() - started) * 1000)
+        if evidences:
+            return SessionRetrievalResult(
+                str(uuid4()),
+                snapshot.session_id,
+                snapshot.task_id,
+                snapshot.snapshot_id,
+                "completed",
+                f"已在已确认范围内找到 {len(evidences)} 条本地知识库证据；未调用 Model。",
+                None,
+                duration,
+                0,
+                utc_now(),
+                tuple(evidences),
+            )
+        if eligible_document_count and excluded_count == eligible_document_count:
+            return SessionRetrievalResult(
+                str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id,
+                "excluded", "确认范围内的内容当前均被排除，未执行检索。",
+                "检查排除规则后重新准备任务。", duration, 0, utc_now(),
+            )
+        return SessionRetrievalResult(
+            str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id,
+            "no-evidence", "健康索引与有效范围内未找到可支持该请求的知识库证据。",
+            "修改问题或范围后重新准备任务。", duration, 0, utc_now(),
+        )
+
+    def _persist_retrieval_execution(
+        self,
+        snapshot: SessionTaskSnapshot,
+        task_state: SessionTaskState,
+        result: SessionRetrievalResult,
+    ) -> SessionRetrievalResult:
+        if self.repository.persist_retrieval_execution(snapshot, task_state, result):
+            return result
+        try:
+            detail = self.repository.get_detail(snapshot.session_id)
+        except KeyError as error:
+            raise SessionNotFoundError(snapshot.session_id) from error
+        existing = next(
+            (
+                item
+                for item in detail.retrieval_results
+                if item.task_id == snapshot.task_id and item.snapshot_id == snapshot.snapshot_id
+            ),
+            None,
+        )
+        if existing is not None:
+            return existing
+        raise SessionValidationError("The selected task is no longer ready. Prepare a new task.")
+
+    @staticmethod
+    def _retrieval_score(content, document, block) -> tuple[float, tuple[str, ...]]:
+        query_terms = SessionService._retrieval_terms(content)
+        if not query_terms:
+            return 0.0, ()
+        block_terms = SessionService._retrieval_terms(block.text)
+        location_terms = SessionService._retrieval_terms(
+            " ".join((*document.heading_locations, block.location))
+        )
+        metadata_terms = SessionService._retrieval_terms(
+            f"{document.relative_path} {document.document_kind}"
+        )
+        tag_terms = SessionService._retrieval_terms(" ".join(document.tags))
+        link_terms = SessionService._retrieval_terms(" ".join(document.links))
+        query_set = set(query_terms)
+
+        def overlap(terms: tuple[str, ...]) -> float:
+            return len(query_set.intersection(terms)) / len(query_set)
+
+        keyword = overlap(block_terms)
+        semantic = SessionService._semantic_similarity(query_terms, block_terms)
+        structure = overlap(location_terms)
+        metadata = overlap(metadata_terms)
+        tag = overlap(tag_terms)
+        link = overlap(link_terms)
+        scores = {
+            "keyword": keyword,
+            "semantic": semantic,
+            "structure": structure,
+            "metadata": metadata,
+            "tag": tag,
+            "link": link,
+        }
+        channels = tuple(name for name, score in scores.items() if score > 0)
+        return (
+            keyword * 4 + semantic * 2 + structure * 2 + metadata + tag * 1.5 + link,
+            channels,
+        )
+
+    @staticmethod
+    def _retrieval_terms(value: str) -> tuple[str, ...]:
+        lowered = value.lower()
+        words = re.findall(r"[a-z0-9]+", lowered)
+        chinese = re.findall(r"[\u4e00-\u9fff]", lowered)
+        bigrams = ["".join(chinese[index:index + 2]) for index in range(len(chinese) - 1)]
+        return tuple(dict.fromkeys((*words, *chinese, *bigrams)))
+
+    @staticmethod
+    def _semantic_similarity(query_terms: tuple[str, ...], block_terms: tuple[str, ...]) -> float:
+        if not query_terms or not block_terms:
+            return 0.0
+        query_set, block_set = set(query_terms), set(block_terms)
+        return len(query_set.intersection(block_set)) / len(query_set.union(block_set))
+
+    @staticmethod
+    def _bounded_excerpt(value: str, limit: int) -> str:
+        normalized = " ".join(value.split())
+        if not normalized or limit < 1:
+            return ""
+        return normalized[:limit].rstrip()
+
+    @staticmethod
+    def _evidence_location(document, location: str) -> tuple[str | None, int | None]:
+        heading_match = re.search(r"heading:\s*([^;]+)", location, flags=re.IGNORECASE)
+        heading = heading_match.group(1).strip() if heading_match else (
+            document.heading_locations[0] if document.heading_locations else None
+        )
+        page_match = re.search(r"page:\s*(\d+)", location, flags=re.IGNORECASE)
+        return heading, int(page_match.group(1)) if page_match else None
+
     def _unavailable_task_preview(
         self,
         session: PersistentSession,
@@ -385,6 +659,8 @@ class SessionService:
         for document in documents:
             if not self._in_scope(document.relative_path, session.scope_kind, session.scope_path):
                 continue
+            if not self._is_snapshot_source_eligible(document):
+                continue
             evaluation = self.policy_service.preview(
                 vault_id,
                 document.source_path or document.relative_path,
@@ -405,6 +681,13 @@ class SessionService:
                 )
             )
         return tuple(sources)
+
+    @staticmethod
+    def _is_snapshot_source_eligible(document) -> bool:
+        return document.document_kind != "derived" or (
+            document.verifiable
+            and all((document.source_id, document.source_sha256, document.source_path))
+        )
 
     @staticmethod
     def _in_scope(relative_path: str, scope_kind: str, scope_path: str | None) -> bool:
@@ -472,7 +755,7 @@ class SessionService:
         invalidated_snapshots: list[SessionTaskSnapshot] = []
         invalidated_states: list[SessionTaskState] = []
         for snapshot in detail.task_snapshots:
-            if snapshot.status not in {"prepared", "waiting-authorization"}:
+            if snapshot.status not in {"prepared", "waiting-authorization", "completed"}:
                 continue
             invalidated = replace(
                 snapshot, status="invalidated", updated_at=timestamp, invalidation_reason=reason
@@ -491,7 +774,7 @@ class SessionService:
         if not detail.task_snapshots or self.index_repository is None:
             return
         for snapshot in detail.task_snapshots:
-            if snapshot.status not in {"prepared", "waiting-authorization"}:
+            if snapshot.status not in {"prepared", "waiting-authorization", "completed"}:
                 continue
             if self._context_changed(
                 detail.session, vault_id=snapshot.vault_id, scope_kind=snapshot.scope_kind,

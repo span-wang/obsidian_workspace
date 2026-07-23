@@ -25,6 +25,10 @@ class Vault:
     access_reason: str | None = None
 
     @property
+    def display_name(self) -> str:
+        return self.path.name or self.path.drive or "vault"
+
+    @property
     def managed_root(self) -> Path:
         return self.path / self.managed_root_relative_path
 

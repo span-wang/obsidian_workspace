@@ -10,6 +10,7 @@ from domain.sessions import (
     SessionGenerationResult,
     SessionMessage,
     SessionPage,
+    SessionRetrievalResult,
     SessionTaskSnapshot,
     SessionTaskState,
 )
@@ -64,3 +65,10 @@ class SessionRepository(Protocol):
     def record_citation(self, citation: SessionCitation) -> None: ...
 
     def record_generation_result(self, result: SessionGenerationResult) -> None: ...
+
+    def persist_retrieval_execution(
+        self,
+        snapshot: SessionTaskSnapshot,
+        task_state: SessionTaskState,
+        result: SessionRetrievalResult,
+    ) -> bool: ...

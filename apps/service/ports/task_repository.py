@@ -9,6 +9,7 @@ from domain.derived_notes import NoteProposal
 from domain.evidence import (
     ConversionAttempt,
     ConversionEvidence,
+    DocumentGraph,
     EvidenceLocator,
     OcrEvidence,
     OcrTarget,
@@ -50,6 +51,10 @@ class TaskRepository(Protocol):
     ) -> ParseEvidence | None: ...
 
     def record_conversion_attempt(self, attempt: ConversionAttempt) -> ConversionAttempt: ...
+
+    def record_rejected_conversion_attempt(
+        self, item_id: int, attempt: ConversionAttempt, graph: DocumentGraph, decision: dict[str, object]
+    ) -> None: ...
 
     def record_conversion_quality_gate_decision(
         self, attempt: ConversionAttempt, graph_id: str, decision: dict[str, object]

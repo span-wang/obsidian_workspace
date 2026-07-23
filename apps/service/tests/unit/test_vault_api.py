@@ -221,7 +221,9 @@ def test_vault_commands_persist_application_state_without_changing_existing_vaul
     _, _, removed_body = asgi_request(app, "DELETE", f"/api/vaults/{vault_id}", cookie=cookie)
 
     assert created_status == 200
-    assert json.loads(listed_body)["vaults"][0]["vault_id"] == vault_id
+    listed_vault = json.loads(listed_body)["vaults"][0]
+    assert listed_vault["vault_id"] == vault_id
+    assert listed_vault["display_name"] == vault_path.name
     assert json.loads(removed_body) == {"status": "removed"}
     assert existing_note.read_text(encoding="utf-8") == "keep me"
 

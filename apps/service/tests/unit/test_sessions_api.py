@@ -263,6 +263,9 @@ def test_session_task_preview_and_confirmation_use_strict_private_snapshot_contr
     vault_repository = SqliteVaultRepository(runtime.data_directory / "vaults.sqlite3")
     vault_service = VaultService(vault_repository, LocalVaultFilesystem(), vault_repository)
     vault = vault_service.authorize(vault_path, "platform")
+    note_path = vault_path / "notes" / "unit.md"
+    note_path.parent.mkdir()
+    note_path.write_text("# Unit", encoding="utf-8")
     policy_service = PolicyService(vault_service, vault_repository)
     provider = Provider(
         "provider-1", "Local", "http://localhost:9000", "opaque", True,
@@ -337,6 +340,41 @@ def test_session_task_preview_and_confirmation_use_strict_private_snapshot_contr
         body={"content": "列出全部单词", "intent": "completeness"},
         cookie=cookie,
     )
+    source_task_status, _, source_task_body = asgi_request(
+        app,
+        "POST",
+        f"/api/sessions/{session_id}/tasks",
+        body={"content": "定位第一单元", "intent": "source-lookup"},
+        cookie=cookie,
+    )
+    source_task_id = json.loads(source_task_body)["snapshot"]["task_id"]
+    execute_denied_status, _, _ = asgi_request(
+        app, "POST", f"/api/sessions/{session_id}/tasks/{source_task_id}/execute", body={}
+    )
+    execute_invalid_status, _, _ = asgi_request(
+        app,
+        "POST",
+        f"/api/sessions/{session_id}/tasks/{source_task_id}/execute",
+        body={"unexpected": True},
+        cookie=cookie,
+    )
+    execute_status, _, execute_body = asgi_request(
+        app,
+        "POST",
+        f"/api/sessions/{session_id}/tasks/{source_task_id}/execute",
+        body={},
+        cookie=cookie,
+    )
+    open_status, open_headers, _ = asgi_request(
+        app,
+        "GET",
+        f"/api/vaults/{vault.vault_id}/open?file=notes%2Funit.md",
+        cookie=cookie,
+    )
+    policy_service.set_outbound_mode(vault.vault_id, "always-allow")
+    stale_detail_status, _, stale_detail_body = asgi_request(
+        app, "GET", f"/api/sessions/{session_id}", cookie=cookie
+    )
     Providers.available = False
     unavailable_preview_status, _, unavailable_preview_body = asgi_request(
         app,
@@ -359,6 +397,24 @@ def test_session_task_preview_and_confirmation_use_strict_private_snapshot_contr
     assert snapshot["status"] == "prepared"
     assert snapshot["source_count"] == 0
     assert "content" not in snapshot
+    assert source_task_status == 200
+    assert execute_denied_status == 403
+    assert execute_invalid_status == 422
+    assert execute_status == 200
+    execution = json.loads(execute_body)["result"]
+    assert execution["status"] == "no-evidence"
+    assert execution["evidences"] == []
+    assert execution["generation_duration_ms"] == 0
+    assert execution["vault_id"] == vault.vault_id
+    assert execution["snapshot_status"] == "completed"
+    assert execution["is_stale"] is False
+    assert open_status == 307
+    assert open_headers["location"] == "obsidian://open?vault=vault&file=notes/unit.md"
+    assert stale_detail_status == 200
+    stale_result = json.loads(stale_detail_body)["retrieval_results"][0]
+    assert stale_result["is_stale"] is True
+    assert stale_result["snapshot_status"] == "invalidated"
+    assert stale_result["invalidation_reason"]
     assert unavailable_preview_status == 200
     unavailable_preview = json.loads(unavailable_preview_body)["preview"]
     assert unavailable_preview["is_ready"] is False

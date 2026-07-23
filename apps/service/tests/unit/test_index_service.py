@@ -7,7 +7,7 @@ from adapters.sqlite_vault_repository import SqliteVaultRepository
 from application.indexing import IndexingService
 from application.policies import PolicyService
 from application.vaults import VaultService
-from domain.indexing import IndexJob
+from domain.indexing import IndexBlock, IndexedDocument, IndexJob
 from domain.tasks import utc_now
 
 
@@ -62,6 +62,51 @@ def test_reconcile_keeps_derived_and_native_evidence_identities_distinct(tmp_pat
     assert documents["native.md"].source_id is None
     assert documents["native.md"].source_sha256 is None
     assert documents["native.md"].heading_locations == ("line:1",)
+
+
+def test_reconcile_recovers_tagged_provenance_from_historical_unverifiable_index(
+    tmp_path: Path,
+) -> None:
+    service, repository, vault = _service(tmp_path)
+    source_hash = sha256(b"source").hexdigest()
+    source = vault.path / "platform" / "sources" / "book.pdf"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"source")
+    note = vault.path / "platform" / "notes" / "book.md"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    markdown = _derived_markdown(vault.vault_id, source_hash).replace(
+        "\n---\n# Derived note",
+        "\ntags:\n  - unclassified\n\n---\n# Derived note",
+    )
+    note.write_text(markdown, encoding="utf-8")
+    stat = note.stat()
+    repository.save_document(
+        IndexedDocument(
+            "historical-document",
+            vault.vault_id,
+            "platform/notes/book.md",
+            sha256(markdown.encode("utf-8")).hexdigest(),
+            "derived",
+            ("line:14",),
+            (),
+            ("unclassified",),
+            (IndexBlock(1, "line:14", "# Derived note"),),
+            "now",
+            verifiable=False,
+            stale_reason="unverifiable-provenance",
+            observed_mtime_ns=stat.st_mtime_ns,
+            observed_size=stat.st_size,
+        )
+    )
+
+    health = service.reconcile(vault.vault_id)
+    document = repository.current_documents(vault.vault_id)[0]
+
+    assert health.status == "healthy"
+    assert document.source_id == "source-1"
+    assert document.source_sha256 == source_hash
+    assert document.source_path == "platform/sources/book.pdf"
+    assert document.verifiable is True
 
 
 def test_path_and_content_change_invalidates_old_evidence_without_auto_merging(tmp_path: Path) -> None:

@@ -3,11 +3,14 @@ from __future__ import annotations
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
+import queue
 import sqlite3
+import threading
 
 import pytest
 from docx import Document as WordDocument
 
+import adapters.local_import_task_runner as local_runner_module
 from adapters.local_import_task_runner import LocalImportTaskRunner
 from domain.derived_notes import (
     UnresolvedDocumentGraphError,
@@ -48,7 +51,9 @@ from workers.converters.runner import (
     ConversionArtifactDraft,
     ConversionCandidate,
     ConversionOutcome,
+    RejectedConversionCandidate,
     conversion_items,
+    run_conversion_worker,
 )
 from adapters.filesystem_vault_adapter import LocalVaultFilesystem
 from adapters.sqlite_task_repository import SqliteImportTaskRepository
@@ -322,6 +327,31 @@ def test_injected_launcher_can_select_a_snapshot_matched_graph_while_default_sta
     ]
 
 
+def test_conversion_items_reports_the_launcher_failure_reason() -> None:
+    request = {
+        "task_id": "task-1",
+        "item_id": 1,
+        "document_kind": "pdf",
+        "content_sha256": _HASH,
+        "input_snapshot_hash": _HASH,
+        "input_snapshot_path": "private/input-snapshot",
+    }
+
+    class FailedLauncher:
+        def convert(self, request) -> ConversionOutcome:
+            return ConversionOutcome(
+                failure_reason="Neither local converter produced an acceptable complete graph."
+            )
+
+    events = list(conversion_items((request,), launcher=FailedLauncher()))
+
+    assert events[1] == {
+        "type": "conversion-failed-item",
+        "item_id": 1,
+        "reason": "Neither local converter produced an acceptable complete graph.",
+    }
+
+
 def test_mock_adapter_requires_approved_profile_and_real_adapter_never_enables_itself() -> None:
     graph = _graph(_block())
     profile = ConverterProfile(
@@ -423,6 +453,73 @@ def test_sqlite_keeps_v1_evidence_and_persists_selected_v2_graph_in_additive_tab
     with sqlite3.connect(repository.database_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM import_parse_evidence").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM import_conversion_graph_revisions").fetchone()[0] == 1
+
+
+def test_sqlite_persists_a_rejected_graph_and_gate_before_fallback_selection(tmp_path: Path) -> None:
+    repository = SqliteImportTaskRepository(tmp_path / "tasks.sqlite3")
+    task = new_import_task(
+        vault_id="vault-1", vault_label="Vault", source_paths=(tmp_path / "book.pdf",), scope_label="book.pdf"
+    )
+    repository.create(task, "created")
+    repository.append_item(
+        task.task_id,
+        ImportTaskItem(
+            item_id=0,
+            task_id=task.task_id,
+            source_path=tmp_path / "book.pdf",
+            label="book.pdf",
+            category="supported",
+            document_kind="pdf",
+            reason=None,
+            source_id="source-1",
+            content_sha256=_HASH,
+            identity_status="new",
+        ),
+    )
+    item = repository.list_items(task.task_id)[0]
+    graph = replace(_graph(_block()), graph_id="graph-rejected")
+    attempt = replace(
+        _attempt(graph, status="rejected"),
+        task_id=task.task_id,
+        item_id=item.item_id,
+        quality_gate_decision_id="gate-rejected",
+        failure_code="pdf-inventory-coverage",
+    )
+    decision = {
+        "decision_id": "gate-rejected",
+        "policy_id": "document-structure",
+        "policy_version": 1,
+        "action": "fallback",
+        "fallback_eligible": True,
+        "rule_ids": ["pdf-inventory-coverage"],
+        "issues": [],
+    }
+
+    repository.save(replace(task, lifecycle="running", phase="converting"), "conversion-started")
+    service = ImportTaskService(None, repository, _ServiceDerivationWorker())
+
+    assert service._handle_worker_event(
+        task.task_id,
+        {
+            "type": "conversion-attempted",
+            "item_id": item.item_id,
+            "attempt": attempt.to_dict(),
+            "graph": graph.to_dict(),
+            "quality_gate_decision": decision,
+        },
+    ) is True
+
+    assert repository.get_conversion_evidence(item.item_id) is None
+    assert repository.list_conversion_attempts(item.item_id) == (attempt,)
+    assert repository.list_items(task.task_id)[0].conversion_status == "rejected"
+    with sqlite3.connect(repository.database_path) as connection:
+        assert connection.execute(
+            "SELECT selected FROM import_conversion_graph_revisions WHERE graph_id = ?", (graph.graph_id,)
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT decision_json FROM import_conversion_quality_gate_decisions WHERE decision_id = ?",
+            ("gate-rejected",),
+        ).fetchone()[0]
 
 
 def test_deriver_consumes_only_selected_v2_graph_and_refuses_unresolved_content() -> None:
@@ -909,3 +1006,205 @@ def test_runner_gates_and_promotes_only_a_verified_snapshot_matched_graph(tmp_pa
         f"{task.task_id}/{item.item_id}/attempt-managed/"
     )
     assert not temporary.exists()
+
+
+def test_runner_promotes_a_rejected_attempt_before_the_fallback_can_start(tmp_path: Path) -> None:
+    store = PrivateArtifactStore(tmp_path / "private")
+    runner = LocalImportTaskRunner(artifact_store=store)
+    temporary = store.create_attempt_directory("attempt-rejected")
+    raw = temporary / "content-list.json"
+    raw_content = b'{"primary":"rejected"}'
+    raw.write_bytes(raw_content)
+    raw_hash = sha256(raw_content).hexdigest()
+    artifact = ArtifactRef(
+        artifact_id="artifact-rejected",
+        attempt_id="attempt-rejected",
+        sha256=raw_hash,
+        media_type="application/json",
+        role="converter-json",
+        private_relative_path="pending/artifact-rejected",
+        producer_object_id="content-list.json",
+    )
+    block = replace(
+        _block(),
+        evidence_refs=(EvidenceRef(artifact.artifact_id, raw_hash, producer_object_id="content-list.json"),),
+    )
+    graph = DocumentGraph(
+        graph_id="graph-rejected-managed",
+        source_sha256=_HASH,
+        input_snapshot_hash=_HASH,
+        selected_attempt_id="attempt-rejected",
+        blocks=(block,),
+        assets=(),
+        issues=(),
+    )
+    attempt = ConversionAttempt(
+        attempt_id="attempt-rejected",
+        task_id="task-rejected",
+        item_id=1,
+        engine="mineru",
+        engine_version="3.4.4",
+        config_hash=_CONFIG_HASH,
+        converter_profile_id="mineru-local",
+        input_snapshot_hash=_HASH,
+        status="rejected",
+        output_artifact_refs=(artifact,),
+        graph_id=graph.graph_id,
+        quality_gate_decision_id="gate-rejected-managed",
+        failure_code="pdf-inventory-coverage",
+    )
+    candidate = RejectedConversionCandidate(
+        attempt,
+        graph,
+        str(temporary),
+        (ConversionArtifactDraft(artifact.artifact_id, "content-list.json", "application/json", "converter-json", "content-list.json"),),
+        {
+            "decision_id": "gate-rejected-managed",
+            "policy_id": "document-structure",
+            "policy_version": 1,
+            "action": "fallback",
+            "fallback_eligible": True,
+            "rule_ids": ["pdf-inventory-coverage"],
+            "issues": [],
+        },
+    )
+
+    prepared = runner._prepare_rejected_conversion_event(
+        {"type": "conversion-attempted", "item_id": 1, "candidate": candidate.to_dict()},
+        {
+            1: {
+                "task_id": "task-rejected",
+                "item_id": 1,
+                "content_sha256": _HASH,
+                "input_snapshot_hash": _HASH,
+            }
+        },
+    )
+
+    persisted = ConversionAttempt.from_dict(dict(prepared["attempt"]))
+    assert persisted.status == "rejected"
+    assert persisted.output_artifact_refs[0].private_relative_path.startswith(
+        "task-rejected/1/attempt-rejected/"
+    )
+    assert prepared["quality_gate_decision"]["action"] == "fallback"
+    assert not temporary.exists()
+
+
+def test_conversion_worker_waits_for_rejected_attempt_persistence_before_starting_fallback() -> None:
+    primary_graph = replace(
+        _graph(_block()), graph_id="graph-primary", selected_attempt_id="attempt-primary"
+    )
+    primary_attempt = ConversionAttempt(
+        attempt_id="attempt-primary",
+        task_id="task-1",
+        item_id=1,
+        engine="mineru",
+        engine_version="3.4.4",
+        config_hash=_CONFIG_HASH,
+        converter_profile_id="mineru-local",
+        input_snapshot_hash=_HASH,
+        status="rejected",
+        output_artifact_refs=(_artifact("attempt-primary"),),
+        graph_id=primary_graph.graph_id,
+        quality_gate_decision_id="gate-primary",
+        failure_code="pdf-inventory-coverage",
+    )
+    candidate = RejectedConversionCandidate(
+        primary_attempt,
+        primary_graph,
+        "temporary-primary",
+        (ConversionArtifactDraft("artifact-1", "primary.json", "application/json", "converter-json"),),
+        {
+            "decision_id": "gate-primary",
+            "policy_id": "document-structure",
+            "policy_version": 1,
+            "action": "fallback",
+            "fallback_eligible": True,
+            "rule_ids": ["pdf-inventory-coverage"],
+            "issues": [],
+        },
+    )
+    fallback_graph = replace(_graph(_block(text="Fallback")), graph_id="graph-fallback")
+    fallback_evidence = ConversionEvidence("pdf", fallback_graph, _attempt(fallback_graph))
+
+    class StagedLauncher:
+        fallback_started = False
+
+        def convert(self, request):
+            raise AssertionError("The staged conversion path must be used.")
+
+        def convert_after_primary_persisted(self, request, record_rejected_attempt):
+            assert record_rejected_attempt(candidate) is True
+            self.fallback_started = True
+            return ConversionOutcome(evidence=fallback_evidence)
+
+    launcher = StagedLauncher()
+    events: queue.Queue = queue.Queue()
+    confirmations: queue.Queue = queue.Queue()
+    cancelled = threading.Event()
+    worker = threading.Thread(
+        target=run_conversion_worker,
+        args=(
+            (
+                {
+                    "task_id": "task-1",
+                    "item_id": 1,
+                    "document_kind": "pdf",
+                    "content_sha256": _HASH,
+                    "input_snapshot_hash": _HASH,
+                    "input_snapshot_path": "private/input-snapshot",
+                },
+            ),
+            events,
+            cancelled,
+        ),
+        kwargs={"launcher": launcher, "rejected_attempt_confirmations": confirmations},
+    )
+
+    worker.start()
+    assert events.get(timeout=1)["type"] == "conversion-started"
+    rejected_event = events.get(timeout=1)
+    assert rejected_event["type"] == "conversion-attempted"
+    assert launcher.fallback_started is False
+    confirmations.put({"attempt_id": "attempt-primary", "persisted": True})
+    worker.join(timeout=1)
+
+    assert not worker.is_alive()
+    assert launcher.fallback_started is True
+    assert [events.get(timeout=1)["type"] for _ in range(2)] == [
+        "conversion-item",
+        "conversion-completed",
+    ]
+
+
+def test_runner_cancellation_kills_the_managed_windows_process_tree(monkeypatch) -> None:
+    class Process:
+        pid = 43210
+
+        def join(self, timeout):
+            return None
+
+        def is_alive(self):
+            return True
+
+    class Cancelled:
+        set_called = False
+
+        def set(self):
+            self.set_called = True
+
+    commands: list[list[str]] = []
+    runner = LocalImportTaskRunner()
+    cancelled = Cancelled()
+    runner._runs["task-cancel"] = local_runner_module._ActiveRun(Process(), cancelled)
+    monkeypatch.setattr(local_runner_module.os, "name", "nt")
+    monkeypatch.setattr(
+        local_runner_module.subprocess,
+        "run",
+        lambda command, **_kwargs: commands.append(command),
+    )
+
+    runner.cancel("task-cancel")
+
+    assert cancelled.set_called is True
+    assert commands == [["taskkill", "/PID", "43210", "/T", "/F"]]

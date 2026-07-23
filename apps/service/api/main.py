@@ -8,13 +8,14 @@ import webbrowser
 from pathlib import Path
 from typing import Annotated, Literal
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import urlopen
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -60,6 +61,7 @@ from domain.policies import (
     OutboundScope,
     PolicyEvaluation,
     VaultPolicy,
+    normalize_vault_relative_path,
 )
 from domain.providers import ModelSelection, ProbeResult, Provider, ProviderModel
 from domain.derived_notes import (
@@ -82,6 +84,7 @@ from domain.sessions import (
     SessionGenerationResult,
     SessionMessage,
     SessionPage,
+    SessionRetrievalResult,
     SessionTaskState,
 )
 from domain.vaults import Vault
@@ -220,6 +223,10 @@ class SessionTaskCommand(BaseModel):
 
     content: str
     intent: Literal["auto", "source-lookup", "completeness", "knowledge-organization", "deep-creation"] = "auto"
+
+
+class SessionTaskExecutionCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
 
 class PendingAssociationResolutionCommand(BaseModel):
@@ -704,6 +711,44 @@ def session_generation_result_payload(result: SessionGenerationResult) -> dict[s
     }
 
 
+def session_retrieval_result_payload(
+    result: SessionRetrievalResult, snapshot=None
+) -> dict[str, object]:
+    return {
+        "result_id": result.result_id,
+        "task_id": result.task_id,
+        "snapshot_id": result.snapshot_id,
+        "status": result.status,
+        "summary": result.summary,
+        "recovery_action": result.recovery_action,
+        "retrieval_duration_ms": result.retrieval_duration_ms,
+        "generation_duration_ms": result.generation_duration_ms,
+        "created_at": result.created_at,
+        "vault_id": snapshot.vault_id if snapshot is not None else None,
+        "snapshot_status": snapshot.status if snapshot is not None else None,
+        "is_stale": snapshot is not None and snapshot.status == "invalidated",
+        "invalidation_reason": snapshot.invalidation_reason if snapshot is not None else None,
+        "evidences": [
+            {
+                "ordinal": evidence.ordinal,
+                "identity_kind": evidence.identity_kind,
+                "relative_path": evidence.relative_path,
+                "content_sha256": evidence.content_sha256,
+                "source_id": evidence.source_id,
+                "source_content_hash": evidence.source_content_hash,
+                "source_path": evidence.source_path,
+                "heading": evidence.heading,
+                "location": evidence.location,
+                "page": evidence.page,
+                "excerpt": evidence.excerpt,
+                "score": evidence.score,
+                "matched_channels": list(evidence.matched_channels),
+            }
+            for evidence in result.evidences
+        ],
+    }
+
+
 def session_attachment_payload(attachment) -> dict[str, object]:
     return {
         "attachment_id": attachment.attachment_id,
@@ -716,6 +761,7 @@ def session_attachment_payload(attachment) -> dict[str, object]:
 
 
 def session_detail_payload(detail: SessionDetail) -> dict[str, object]:
+    snapshots = {snapshot.snapshot_id: snapshot for snapshot in detail.task_snapshots}
     return {
         "session": persistent_session_payload(detail.session),
         "messages": [session_message_payload(message) for message in detail.messages],
@@ -726,6 +772,10 @@ def session_detail_payload(detail: SessionDetail) -> dict[str, object]:
         ],
         "attachments": [session_attachment_payload(attachment) for attachment in detail.attachments],
         "task_snapshots": [session_task_snapshot_payload(snapshot) for snapshot in detail.task_snapshots],
+        "retrieval_results": [
+            session_retrieval_result_payload(result, snapshots.get(result.snapshot_id))
+            for result in detail.retrieval_results
+        ],
     }
 
 
@@ -771,6 +821,7 @@ def vault_payload(
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "vault_id": vault.vault_id,
+        "display_name": vault.display_name,
         "path": str(vault.path),
         "managed_root_relative_path": vault.managed_root_relative_path,
         "managed_root": str(vault.managed_root),
@@ -1694,6 +1745,27 @@ def create_app(
         except Exception as error:
             raise session_error(error) from error
 
+    @app.post(
+        "/api/sessions/{session_id}/tasks/{task_id}/execute",
+        dependencies=[Depends(require_current_local_session)],
+    )
+    def execute_persistent_session_task(
+        request: Request,
+        session_id: str,
+        task_id: str,
+        command: SessionTaskExecutionCommand,
+    ) -> dict[str, object]:
+        try:
+            result = app.state.session_service.execute_task(session_id, task_id)
+            detail = app.state.session_service.detail(session_id)
+            snapshot = next(
+                (item for item in detail.task_snapshots if item.snapshot_id == result.snapshot_id),
+                None,
+            )
+            return {"result": session_retrieval_result_payload(result, snapshot)}
+        except Exception as error:
+            raise session_error(error) from error
+
     @app.delete("/api/sessions/{session_id}", dependencies=[Depends(require_current_local_session)])
     def delete_persistent_session(request: Request, session_id: str) -> dict[str, str]:
         try:
@@ -2467,6 +2539,31 @@ def create_app(
             }
         except Exception as error:
             raise vault_error(error) from error
+
+    @app.get("/api/vaults/{vault_id}/open", dependencies=[Depends(require_current_local_session)])
+    def open_vault_relative_path(request: Request, vault_id: str, file: str = Query()) -> RedirectResponse:
+        try:
+            vault = app.state.vault_service.get(vault_id)
+            if vault.authorization_status != "active" or vault.access_status != "available":
+                raise VaultValidationError("The selected vault must be active and available.")
+            try:
+                relative_path = normalize_vault_relative_path(file)
+            except ValueError as error:
+                raise VaultValidationError("The selected vault path must be vault-relative.") from error
+            target = (vault.path / relative_path).resolve()
+            target.relative_to(vault.path.resolve())
+            if not target.is_file():
+                raise VaultValidationError("The selected vault path is unavailable.")
+        except VaultValidationError as error:
+            raise vault_error(error) from error
+        except ValueError as error:
+            raise VaultValidationError("The selected vault path must be vault-relative.") from error
+        except Exception as error:
+            raise vault_error(error) from error
+        return RedirectResponse(
+            f"obsidian://open?vault={quote(vault.path.name)}&file={quote(relative_path)}",
+            status_code=307,
+        )
 
     @app.get("/api/vaults/{vault_id}/index")
     def get_vault_index(request: Request, vault_id: str) -> dict[str, object]:

@@ -11,6 +11,7 @@ from domain.classification import ClassificationSuggestion
 from domain.evidence import (
     ConversionAttempt,
     ConversionEvidence,
+    DocumentGraph,
     EvidenceLocator,
     OcrEvidence,
     OcrTarget,
@@ -825,17 +826,152 @@ class SqliteImportTaskRepository:
             )
         return attempt
 
+    def record_rejected_conversion_attempt(
+        self,
+        item_id: int,
+        attempt: ConversionAttempt,
+        graph: DocumentGraph,
+        decision: dict[str, object],
+    ) -> None:
+        decision_id = decision.get("decision_id")
+        if (
+            attempt.status != "rejected"
+            or attempt.item_id != item_id
+            or attempt.graph_id != graph.graph_id
+            or graph.selected_attempt_id != attempt.attempt_id
+            or not isinstance(decision_id, str)
+            or decision_id != attempt.quality_gate_decision_id
+            or decision.get("action") not in {"fallback", "waiting-for-review"}
+        ):
+            raise ValueError("Rejected conversion attempts need a matching persisted quality gate decision.")
+        attempt_json = json.dumps(attempt.to_dict())
+        graph_json = json.dumps(graph.to_dict())
+        decision_json = json.dumps(decision, sort_keys=True)
+        with self._connect() as connection:
+            item = connection.execute(
+                "SELECT task_id, content_sha256 FROM import_task_items WHERE item_id = ?", (item_id,)
+            ).fetchone()
+            if item is None:
+                raise KeyError(item_id)
+            if (
+                item["task_id"] != attempt.task_id
+                or item["content_sha256"] != graph.source_sha256
+                or graph.input_snapshot_hash != attempt.input_snapshot_hash
+            ):
+                raise ValueError("Rejected conversion evidence does not match its task item snapshot.")
+            existing_attempt = connection.execute(
+                "SELECT attempt_json FROM import_conversion_attempts WHERE attempt_id = ?",
+                (attempt.attempt_id,),
+            ).fetchone()
+            if existing_attempt is None:
+                connection.execute(
+                    """
+                    INSERT INTO import_conversion_attempts(
+                        attempt_id, task_id, item_id, idempotency_key, engine, status,
+                        input_snapshot_hash, attempt_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        attempt.attempt_id,
+                        attempt.task_id,
+                        item_id,
+                        attempt.idempotency_key,
+                        attempt.engine,
+                        attempt.status,
+                        attempt.input_snapshot_hash,
+                        attempt_json,
+                        utc_now(),
+                    ),
+                )
+            elif existing_attempt["attempt_json"] != attempt_json:
+                raise ValueError("Immutable conversion attempts cannot be rewritten.")
+            for artifact in attempt.output_artifact_refs:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO import_conversion_artifacts(
+                        artifact_id, attempt_id, sha256, media_type, role, private_relative_path, artifact_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        artifact.artifact_id,
+                        artifact.attempt_id,
+                        artifact.sha256,
+                        artifact.media_type,
+                        artifact.role,
+                        artifact.private_relative_path,
+                        json.dumps(artifact.to_dict()),
+                    ),
+                )
+            existing_graph = connection.execute(
+                "SELECT graph_json, selected FROM import_conversion_graph_revisions WHERE graph_id = ?",
+                (graph.graph_id,),
+            ).fetchone()
+            if existing_graph is None:
+                connection.execute(
+                    """
+                    INSERT INTO import_conversion_graph_revisions(
+                        graph_id, item_id, attempt_id, graph_revision, source_sha256, graph_json, selected, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+                    """,
+                    (
+                        graph.graph_id,
+                        item_id,
+                        attempt.attempt_id,
+                        graph.graph_revision,
+                        graph.source_sha256,
+                        graph_json,
+                        utc_now(),
+                    ),
+                )
+            elif existing_graph["graph_json"] != graph_json or existing_graph["selected"]:
+                raise ValueError("Rejected conversion graphs are immutable and cannot be selected.")
+            existing_decision = connection.execute(
+                "SELECT attempt_id, graph_id, decision_json FROM import_conversion_quality_gate_decisions "
+                "WHERE decision_id = ?",
+                (decision_id,),
+            ).fetchone()
+            if existing_decision is None:
+                connection.execute(
+                    """
+                    INSERT INTO import_conversion_quality_gate_decisions(
+                        decision_id, attempt_id, graph_id, decision_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (decision_id, attempt.attempt_id, graph.graph_id, decision_json, utc_now()),
+                )
+            elif (
+                existing_decision["attempt_id"] != attempt.attempt_id
+                or existing_decision["graph_id"] != graph.graph_id
+                or existing_decision["decision_json"] != decision_json
+            ):
+                raise ValueError("Quality gate decisions are immutable.")
+            connection.execute(
+                """
+                UPDATE import_task_items
+                SET conversion_status = 'rejected', conversion_fallback_reason = ?
+                WHERE item_id = ?
+                """,
+                (",".join(str(rule) for rule in decision.get("rule_ids", [])) or decision["action"], item_id),
+            )
+            self._append_event(connection, item["task_id"], "conversion-attempt-rejected", utc_now())
+
     def record_conversion_quality_gate_decision(
         self, attempt: ConversionAttempt, graph_id: str, decision: dict[str, object]
     ) -> None:
         decision_id = decision.get("decision_id")
+        valid_action = (
+            attempt.status == "selected" and decision.get("action") == "accepted"
+        ) or (
+            attempt.status == "rejected"
+            and decision.get("action") in {"fallback", "waiting-for-review"}
+        )
         if (
             not isinstance(decision_id, str)
             or decision_id != attempt.quality_gate_decision_id
-            or decision.get("action") != "accepted"
+            or not valid_action
             or not graph_id
         ):
-            raise ValueError("Selected conversion attempts need their accepted quality gate decision.")
+            raise ValueError("Conversion attempts need their matching immutable quality gate decision.")
         decision_json = json.dumps(decision, sort_keys=True)
         with self._connect() as connection:
             existing = connection.execute(

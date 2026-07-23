@@ -44,6 +44,7 @@ from domain.metadata_tags import (
 from domain.evidence import (
     ConversionAttempt,
     ConversionEvidence,
+    DocumentGraph,
     BlockPayload,
     correct_document_graph,
     DocumentBlock,
@@ -304,14 +305,14 @@ class ImportTaskService:
             return failed
         return self.get(running.task_id)
 
-    def _handle_worker_event(self, task_id: str, event: dict[str, object]) -> None:
+    def _handle_worker_event(self, task_id: str, event: dict[str, object]) -> bool | None:
         with self._state_lock:
             try:
                 task = self.get(task_id)
             except KeyError:
-                return
+                return False if event.get("type") == "conversion-attempted" else None
             if task.lifecycle != "running":
-                return
+                return False if event.get("type") == "conversion-attempted" else None
             event_type = event["type"]
             if event_type == "item":
                 self.repository.append_item(task_id, self._item_from_event(task, event))
@@ -368,16 +369,7 @@ class ImportTaskService:
                 self._record_conversion_item(task, event)
                 return
             if event_type == "conversion-attempted":
-                attempt = ConversionAttempt.from_dict(dict(event["attempt"]))
-                if attempt.task_id != task.task_id:
-                    return
-                if not any(
-                    item.item_id == attempt.item_id
-                    for item in self.repository.list_items(task.task_id)
-                ):
-                    return
-                self.repository.record_conversion_attempt(attempt)
-                return
+                return self._record_rejected_conversion_attempt(task, event)
             if event_type == "conversion-failed-item":
                 self.repository.record_conversion_rejection(
                     int(event["item_id"]),
@@ -701,6 +693,34 @@ class ImportTaskService:
             evidence.attempt, evidence.graph.graph_id, decision
         )
         self.repository.record_conversion_evidence(item_id, evidence)
+
+    def _record_rejected_conversion_attempt(
+        self, task: ImportTask, event: dict[str, object]
+    ) -> bool:
+        item_id = int(event["item_id"])
+        item = next(
+            (candidate for candidate in self.repository.list_items(task.task_id) if candidate.item_id == item_id),
+            None,
+        )
+        if item is None:
+            raise ValueError("Rejected conversion attempt has no task item.")
+        attempt = ConversionAttempt.from_dict(dict(event["attempt"]))
+        graph = DocumentGraph.from_dict(dict(event["graph"]))
+        decision = event.get("quality_gate_decision")
+        if (
+            attempt.task_id != task.task_id
+            or attempt.item_id != item_id
+            or attempt.status != "rejected"
+            or item.content_sha256 != graph.source_sha256
+            or graph.input_snapshot_hash != attempt.input_snapshot_hash
+            or graph.selected_attempt_id != attempt.attempt_id
+            or not isinstance(decision, dict)
+            or decision.get("decision_id") != attempt.quality_gate_decision_id
+            or decision.get("action") not in {"fallback", "waiting-for-review"}
+        ):
+            raise ValueError("Rejected conversion attempt failed immutable snapshot or gate validation.")
+        self.repository.record_rejected_conversion_attempt(item_id, attempt, graph, decision)
+        return True
 
     def _record_parse_item(self, task: ImportTask, event: dict[str, object]) -> None:
         item_id = int(event["item_id"])

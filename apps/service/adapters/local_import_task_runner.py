@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import multiprocessing
+import os
 import queue
+import subprocess
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -15,7 +17,12 @@ from workers.document_ocr import run_ocr_worker
 from workers.document_parser import preflight_document, run_parse_worker
 from workers.converters.artifact_store import PrivateArtifactStore
 from workers.converters.quality_gate import StructuralQualityGate
-from workers.converters.runner import ConversionArtifactDraft, ConversionLauncher, run_conversion_worker
+from workers.converters.runner import (
+    ConversionArtifactDraft,
+    ConversionLauncher,
+    RejectedConversionCandidate,
+    run_conversion_worker,
+)
 from workers.import_scanner import run_scan_worker
 from workers.markdown_deriver import run_derivation_worker
 
@@ -86,11 +93,44 @@ class LocalImportTaskRunner:
             if self._artifact_store is None:
                 raise RuntimeError("An injected converter launcher requires a private artifact store.")
             converter_items = tuple(self._conversion_input(task, item) for item in items)
-            target = partial(run_conversion_worker, launcher=self._conversion_launcher)
+            confirmations = multiprocessing.get_context("spawn").Queue()
+            target = partial(
+                run_conversion_worker,
+                launcher=self._conversion_launcher,
+                rejected_attempt_confirmations=confirmations,
+            )
             inputs_by_item = {int(item["item_id"]): item for item in converter_items}
 
             def conversion_event(event_task_id: str, event: dict[str, object]) -> None:
                 if event["type"] == "conversion-attempted":
+                    candidate = dict(event.get("candidate", {}))
+                    attempt_id = str(dict(candidate.get("attempt", {})).get("attempt_id", ""))
+                    persisted = False
+                    prepared: dict[str, object] | None = None
+                    try:
+                        prepared = self._prepare_rejected_conversion_event(event, inputs_by_item)
+                        if on_event(event_task_id, prepared) is not True:
+                            raise RuntimeError("The service did not confirm rejected conversion persistence.")
+                        persisted = True
+                    except Exception as error:
+                        if prepared is not None and self._artifact_store is not None:
+                            self._artifact_store.discard_promoted_attempt(
+                                task_id=str(dict(prepared["attempt"])["task_id"]),
+                                item_id=int(prepared["item_id"]),
+                                attempt_id=str(dict(prepared["attempt"])["attempt_id"]),
+                            )
+                        else:
+                            self._discard_conversion_temporary_directories(event)
+                        on_event(
+                            event_task_id,
+                            {
+                                "type": "conversion-failed-item",
+                                "item_id": int(event.get("item_id", -1)),
+                                "reason": f"Rejected conversion persistence failed: {type(error).__name__}.",
+                            },
+                        )
+                    finally:
+                        confirmations.put({"attempt_id": attempt_id, "persisted": persisted})
                     return
                 if event["type"] == "conversion-failed-item":
                     self._discard_conversion_temporary_directories(event)
@@ -167,53 +207,15 @@ class LocalImportTaskRunner:
             ConversionArtifactDraft.from_dict(dict(value))
             for value in list(event.get("artifact_drafts", []))
         )
-        expected = {artifact.artifact_id: artifact for artifact in evidence.attempt.output_artifact_refs}
-        if not drafts or set(expected) != {draft.artifact_id for draft in drafts}:
-            self._artifact_store.discard_attempt_directory(Path(temporary_directory))
-            raise ValueError("Conversion artifacts do not match the selected graph manifest.")
-        temporary_root = Path(temporary_directory).resolve()
-        for draft in drafts:
-            artifact_path = (temporary_root / draft.relative_path).resolve()
-            artifact = expected[draft.artifact_id]
-            if (
-                temporary_root not in artifact_path.parents
-                or not artifact_path.is_file()
-                or sha256(artifact_path.read_bytes()).hexdigest() != artifact.sha256
-                or artifact.media_type != draft.media_type
-                or artifact.role != draft.role
-            ):
-                self._artifact_store.discard_attempt_directory(Path(temporary_directory))
-                raise ValueError("Conversion artifacts do not match the selected graph manifest.")
+        manifest = self._promote_conversion_artifacts(
+            request, evidence.attempt, temporary_directory, drafts
+        )
         decision = StructuralQualityGate().evaluate(
             evidence.graph, dict(request["preflight_inventory"])
         )
         if decision.action != "accepted":
-            self._artifact_store.discard_attempt_directory(Path(temporary_directory))
             raise ValueError("The structural quality gate rejected the complete conversion graph.")
-        manifest = self._artifact_store.promote_attempt(
-            task_id=str(request["task_id"]),
-            item_id=item_id,
-            attempt_id=evidence.attempt.attempt_id,
-            temporary_directory=Path(temporary_directory),
-            artifact_paths=tuple(
-                (
-                    Path(temporary_directory) / draft.relative_path,
-                    draft.media_type,
-                    draft.role,
-                    draft.producer_object_id or "",
-                )
-                for draft in drafts
-            ),
-            artifact_ids=tuple(draft.artifact_id for draft in drafts),
-        )
         promoted = {artifact.artifact_id: artifact for artifact in manifest.artifacts}
-        if any(
-            expected[artifact_id].sha256 != artifact.sha256
-            or expected[artifact_id].media_type != artifact.media_type
-            or expected[artifact_id].role != artifact.role
-            for artifact_id, artifact in promoted.items()
-        ):
-            raise ValueError("Promoted conversion artifacts do not match the selected graph manifest.")
         graph = replace(
             evidence.graph,
             assets=tuple(
@@ -235,6 +237,101 @@ class LocalImportTaskRunner:
             "evidence": trusted.to_dict(),
             "quality_gate_decision": decision.to_dict(),
         }
+
+    def _prepare_rejected_conversion_event(
+        self, event: dict[str, object], inputs_by_item: dict[int, dict[str, object]]
+    ) -> dict[str, object]:
+        candidate = RejectedConversionCandidate.from_dict(dict(event["candidate"]))
+        item_id = int(event["item_id"])
+        request = inputs_by_item.get(item_id)
+        if request is None:
+            raise ValueError("The rejected conversion item is not part of this runner request.")
+        attempt = candidate.attempt
+        decision = candidate.quality_gate_decision
+        if (
+            attempt.task_id != request["task_id"]
+            or attempt.item_id != item_id
+            or candidate.graph.source_sha256 != request["content_sha256"]
+            or candidate.graph.input_snapshot_hash != request["input_snapshot_hash"]
+            or candidate.graph.selected_attempt_id != attempt.attempt_id
+            or decision.get("decision_id") != attempt.quality_gate_decision_id
+            or decision.get("action") not in {"fallback", "waiting-for-review"}
+        ):
+            raise ValueError("The rejected conversion candidate does not match the verified runner input.")
+        drafts = candidate.artifact_drafts
+        manifest = self._promote_conversion_artifacts(
+            request, attempt, candidate.temporary_directory, drafts
+        )
+        promoted = {artifact.artifact_id: artifact for artifact in manifest.artifacts}
+        graph = replace(
+            candidate.graph,
+            assets=tuple(
+                replace(asset, artifact_ref=promoted[asset.artifact_ref.artifact_id])
+                for asset in candidate.graph.assets
+            ),
+        )
+        persisted_attempt = replace(attempt, output_artifact_refs=manifest.artifacts)
+        return {
+            "type": "conversion-attempted",
+            "item_id": item_id,
+            "attempt": persisted_attempt.to_dict(),
+            "graph": graph.to_dict(),
+            "quality_gate_decision": decision,
+        }
+
+    def _promote_conversion_artifacts(
+        self,
+        request: dict[str, object],
+        attempt,
+        temporary_directory: str,
+        drafts: tuple[ConversionArtifactDraft, ...],
+    ):
+        if self._artifact_store is None:
+            raise RuntimeError("Verified conversion artifacts are unavailable.")
+        expected = {artifact.artifact_id: artifact for artifact in attempt.output_artifact_refs}
+        temporary_root = Path(temporary_directory).resolve()
+        try:
+            if not drafts or set(expected) != {draft.artifact_id for draft in drafts}:
+                raise ValueError("Conversion artifacts do not match the graph manifest.")
+            for draft in drafts:
+                artifact_path = (temporary_root / draft.relative_path).resolve()
+                artifact = expected[draft.artifact_id]
+                if (
+                    temporary_root not in artifact_path.parents
+                    or not artifact_path.is_file()
+                    or sha256(artifact_path.read_bytes()).hexdigest() != artifact.sha256
+                    or artifact.media_type != draft.media_type
+                    or artifact.role != draft.role
+                ):
+                    raise ValueError("Conversion artifacts do not match the graph manifest.")
+            manifest = self._artifact_store.promote_attempt(
+                task_id=str(request["task_id"]),
+                item_id=int(request["item_id"]),
+                attempt_id=attempt.attempt_id,
+                temporary_directory=temporary_root,
+                artifact_paths=tuple(
+                    (
+                        temporary_root / draft.relative_path,
+                        draft.media_type,
+                        draft.role,
+                        draft.producer_object_id or "",
+                    )
+                    for draft in drafts
+                ),
+                artifact_ids=tuple(draft.artifact_id for draft in drafts),
+            )
+            promoted = {artifact.artifact_id: artifact for artifact in manifest.artifacts}
+            if any(
+                expected[artifact_id].sha256 != artifact.sha256
+                or expected[artifact_id].media_type != artifact.media_type
+                or expected[artifact_id].role != artifact.role
+                for artifact_id, artifact in promoted.items()
+            ):
+                raise ValueError("Promoted conversion artifacts do not match the graph manifest.")
+            return manifest
+        except Exception:
+            self._artifact_store.discard_attempt_directory(temporary_root)
+            raise
 
     def _discard_conversion_temporary_directories(
         self, event: dict[str, object], *, include_selected: bool = True
@@ -351,7 +448,16 @@ class LocalImportTaskRunner:
             active_run.cancellation_requested = True
             active_run.process.join(timeout=0.5)
             if active_run.process.is_alive():
-                active_run.process.terminate()
+                if os.name == "nt":
+                    subprocess.run(
+                        ["taskkill", "/PID", str(active_run.process.pid), "/T", "/F"],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                    )
+                else:
+                    active_run.process.terminate()
 
     def _collect(
         self,

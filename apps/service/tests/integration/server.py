@@ -4,6 +4,7 @@ from pathlib import Path
 import uvicorn
 
 from api.main import DEFAULT_HOST, DEFAULT_PORT, create_app, reserve_loopback_listener
+from workers.converters.provisioning import ProvisionedProfiles
 
 
 class FixtureDirectoryPicker:
@@ -30,6 +31,11 @@ def main() -> None:
             create_app(
                 directory_picker=FixtureDirectoryPicker(),
                 import_picker=FixtureImportPicker(),
+                converter_profiles=ProvisionedProfiles(
+                    Path("test-converters"),
+                    {},
+                    {"mineru": "test-disabled", "pandoc": "test-disabled", "docling": "test-disabled"},
+                ),
             ),
             host=DEFAULT_HOST,
             port=test_port,
