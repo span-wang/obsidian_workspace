@@ -232,6 +232,17 @@ class SessionTaskExecutionCommand(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class SessionGenerationEditCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    content: str
+    content_origin: Literal["user-content", "model-judgement"] = "user-content"
+
+
+class SessionGenerationVerificationCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
 class PendingAssociationResolutionCommand(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -707,6 +718,14 @@ def session_citation_payload(citation: SessionCitation) -> dict[str, object]:
         "location": citation.location,
         "status": citation.status,
         "created_at": citation.created_at,
+        "result_id": citation.result_id,
+        "snapshot_id": citation.snapshot_id,
+        "identity_kind": citation.identity_kind,
+        "content_sha256": citation.content_sha256,
+        "source_path": citation.source_path,
+        "paragraph_content_hash": citation.paragraph_content_hash,
+        "invalidation_reason": citation.invalidation_reason,
+        "verified_at": citation.verified_at,
     }
 
 
@@ -716,6 +735,18 @@ def session_generation_result_payload(result: SessionGenerationResult) -> dict[s
         "status": result.status,
         "content": result.content,
         "created_at": result.created_at,
+        "task_id": result.task_id,
+        "snapshot_id": result.snapshot_id,
+        "message_id": result.message_id,
+        "provider_id": result.provider_id,
+        "model_id": result.model_id,
+        "vault_id": result.vault_id,
+        "scope_kind": result.scope_kind,
+        "scope_path": result.scope_path,
+        "content_sha256": result.content_sha256,
+        "content_origin": result.content_origin,
+        "context_summary": result.context_summary,
+        "updated_at": result.updated_at,
     }
 
 
@@ -1902,6 +1933,40 @@ def create_app(
                 else session_retrieval_result_payload(result, snapshot)
             )
             return {"result": payload}
+        except Exception as error:
+            raise session_error(error) from error
+
+    @app.patch(
+        "/api/sessions/{session_id}/generation-results/{result_id}",
+        dependencies=[Depends(require_current_local_session)],
+    )
+    def edit_persistent_session_generation_result(
+        request: Request,
+        session_id: str,
+        result_id: str,
+        command: SessionGenerationEditCommand,
+    ) -> dict[str, object]:
+        try:
+            result = app.state.session_service.edit_generation_result(
+                session_id, result_id, command.content, command.content_origin
+            )
+            return {"result": session_generation_result_payload(result)}
+        except Exception as error:
+            raise session_error(error) from error
+
+    @app.post(
+        "/api/sessions/{session_id}/generation-results/{result_id}/reverify",
+        dependencies=[Depends(require_current_local_session)],
+    )
+    def reverify_persistent_session_generation_result(
+        request: Request,
+        session_id: str,
+        result_id: str,
+        command: SessionGenerationVerificationCommand,
+    ) -> dict[str, object]:
+        try:
+            result = app.state.session_service.reverify_generation_result(session_id, result_id)
+            return {"result": session_generation_result_payload(result)}
         except Exception as error:
             raise session_error(error) from error
 

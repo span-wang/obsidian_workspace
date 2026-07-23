@@ -45,6 +45,10 @@ class SessionRepository(Protocol):
         self, message: SessionMessage, snapshot: SessionTaskSnapshot, task_state: SessionTaskState
     ) -> None: ...
 
+    def persist_reverification_task(
+        self, snapshot: SessionTaskSnapshot, task_state: SessionTaskState
+    ) -> None: ...
+
     def append_attachment(self, attachment: SessionAttachment) -> None: ...
 
     def delete_attachment(self, session_id: str, attachment_id: str) -> None: ...
@@ -67,11 +71,32 @@ class SessionRepository(Protocol):
 
     def record_generation_result(self, result: SessionGenerationResult) -> None: ...
 
+    def update_generation_result_and_citations(
+        self, result: SessionGenerationResult, citation_status: str, reason: str | None
+    ) -> None: ...
+
+    def claim_generation_result_for_reverification(
+        self, session_id: str, result_id: str, content_sha256: str, updated_at: str
+    ) -> bool: ...
+
+    def restore_generation_result_status(
+        self, result: SessionGenerationResult, expected_content_sha256: str
+    ) -> bool: ...
+
+    def replace_generation_result_citations(
+        self,
+        result: SessionGenerationResult,
+        citations: tuple[SessionCitation, ...],
+        expected_content_sha256: str,
+    ) -> bool: ...
+
     def persist_retrieval_execution(
         self,
         snapshot: SessionTaskSnapshot,
         task_state: SessionTaskState,
         result: SessionRetrievalResult,
+        generation_results: tuple[SessionGenerationResult, ...] = (),
+        citations: tuple[SessionCitation, ...] = (),
     ) -> bool: ...
 
     def persist_completeness_execution(

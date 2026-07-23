@@ -100,6 +100,26 @@ class SqliteSessionRepository:
                     created_at TEXT NOT NULL
                 )"""
             )
+            self._ensure_table_column(connection, "session_citations", "result_id", "TEXT")
+            self._ensure_table_column(connection, "session_citations", "snapshot_id", "TEXT")
+            self._ensure_table_column(connection, "session_citations", "identity_kind", "TEXT")
+            self._ensure_table_column(connection, "session_citations", "content_sha256", "TEXT")
+            self._ensure_table_column(connection, "session_citations", "source_path", "TEXT")
+            self._ensure_table_column(connection, "session_citations", "paragraph_content_hash", "TEXT")
+            self._ensure_table_column(connection, "session_citations", "invalidation_reason", "TEXT")
+            self._ensure_table_column(connection, "session_citations", "verified_at", "TEXT")
+            self._ensure_table_column(connection, "session_generation_results", "task_id", "TEXT")
+            self._ensure_table_column(connection, "session_generation_results", "snapshot_id", "TEXT")
+            self._ensure_table_column(connection, "session_generation_results", "message_id", "TEXT")
+            self._ensure_table_column(connection, "session_generation_results", "provider_id", "TEXT")
+            self._ensure_table_column(connection, "session_generation_results", "model_id", "TEXT")
+            self._ensure_table_column(connection, "session_generation_results", "vault_id", "TEXT")
+            self._ensure_table_column(connection, "session_generation_results", "scope_kind", "TEXT")
+            self._ensure_table_column(connection, "session_generation_results", "scope_path", "TEXT")
+            self._ensure_table_column(connection, "session_generation_results", "content_sha256", "TEXT")
+            self._ensure_table_column(connection, "session_generation_results", "content_origin", "TEXT NOT NULL DEFAULT 'local-evidence'")
+            self._ensure_table_column(connection, "session_generation_results", "context_summary", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_table_column(connection, "session_generation_results", "updated_at", "TEXT")
             self._ensure_session_column(connection, "scope_kind", "TEXT")
             self._ensure_session_column(connection, "scope_path", "TEXT")
             connection.execute(
@@ -262,6 +282,14 @@ class SqliteSessionRepository:
             connection.execute(
                 f"ALTER TABLE session_completeness_results ADD COLUMN {name} {declaration}"
             )
+
+    @staticmethod
+    def _ensure_table_column(
+        connection: sqlite3.Connection, table: str, name: str, declaration: str
+    ) -> None:
+        columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+        if name not in columns:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
 
     def create(self, session: PersistentSession) -> None:
         with self._connect() as connection:
@@ -453,6 +481,14 @@ class SqliteSessionRepository:
             self._upsert_task_state(connection, task_state)
             self._touch_session(connection, message.session_id, task_state.updated_at)
 
+    def persist_reverification_task(
+        self, snapshot: SessionTaskSnapshot, task_state: SessionTaskState
+    ) -> None:
+        with self._connect() as connection:
+            self._insert_task_snapshot(connection, snapshot)
+            self._upsert_task_state(connection, task_state)
+            self._touch_session(connection, snapshot.session_id, task_state.updated_at)
+
     def append_attachment(self, attachment: SessionAttachment) -> None:
         with self._connect() as connection:
             connection.execute(
@@ -513,46 +549,121 @@ class SqliteSessionRepository:
             for snapshot in snapshots:
                 if self._update_task_snapshot(connection, snapshot).rowcount != 1:
                     raise KeyError(snapshot.snapshot_id)
+                connection.execute(
+                    """UPDATE session_citations SET status = 'stale', invalidation_reason = ?
+                    WHERE snapshot_id = ? AND status IN ('valid', 'pending-verification')""",
+                    (snapshot.invalidation_reason, snapshot.snapshot_id),
+                )
+                connection.execute(
+                    """UPDATE session_generation_results SET status = 'stale', updated_at = ?
+                    WHERE snapshot_id = ? AND status = 'valid'""",
+                    (snapshot.updated_at, snapshot.snapshot_id),
+                )
             for task_state in task_states:
                 self._upsert_task_state(connection, task_state)
             self._touch_session(connection, snapshots[0].session_id, snapshots[0].updated_at)
 
     def record_citation(self, citation: SessionCitation) -> None:
         with self._connect() as connection:
-            connection.execute(
-                """INSERT INTO session_citations (
-                    citation_id, session_id, vault_id, source_id, source_content_hash,
-                    relative_path, location, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    citation.citation_id,
-                    citation.session_id,
-                    citation.vault_id,
-                    citation.source_id,
-                    citation.source_content_hash,
-                    citation.relative_path,
-                    citation.location,
-                    citation.status,
-                    citation.created_at,
-                ),
-            )
+            self._insert_citation(connection, citation)
             self._touch_session(connection, citation.session_id, citation.created_at)
 
     def record_generation_result(self, result: SessionGenerationResult) -> None:
         with self._connect() as connection:
-            connection.execute(
-                """INSERT INTO session_generation_results (
-                    result_id, session_id, status, content, created_at
-                ) VALUES (?, ?, ?, ?, ?)""",
-                (result.result_id, result.session_id, result.status, result.content, result.created_at),
-            )
+            self._insert_generation_result(connection, result)
             self._touch_session(connection, result.session_id, result.created_at)
+
+    def update_generation_result_and_citations(
+        self, result: SessionGenerationResult, citation_status: str, reason: str | None
+    ) -> None:
+        with self._connect() as connection:
+            updated = connection.execute(
+                """UPDATE session_generation_results SET status = ?, content = ?, content_sha256 = ?,
+                content_origin = ?, context_summary = ?, updated_at = ?
+                WHERE result_id = ? AND session_id = ?""",
+                (
+                    result.status, result.content, result.content_sha256, result.content_origin,
+                    result.context_summary, result.updated_at, result.result_id, result.session_id,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise KeyError(result.result_id)
+            connection.execute(
+                """UPDATE session_citations SET status = ?, paragraph_content_hash = ?,
+                invalidation_reason = ?, verified_at = NULL WHERE result_id = ? AND session_id = ?""",
+                (citation_status, result.content_sha256, reason, result.result_id, result.session_id),
+            )
+            self._touch_session(connection, result.session_id, result.updated_at or result.created_at)
+
+    def claim_generation_result_for_reverification(
+        self, session_id: str, result_id: str, content_sha256: str, updated_at: str
+    ) -> bool:
+        with self._connect() as connection:
+            claimed = connection.execute(
+                """UPDATE session_generation_results SET status = 'verifying', updated_at = ?
+                WHERE result_id = ? AND session_id = ? AND content_sha256 = ?
+                AND status IN ('pending-verification', 'stale', 'unsupported')""",
+                (updated_at, result_id, session_id, content_sha256),
+            )
+            if claimed.rowcount:
+                self._touch_session(connection, session_id, updated_at)
+            return claimed.rowcount == 1
+
+    def restore_generation_result_status(
+        self, result: SessionGenerationResult, expected_content_sha256: str
+    ) -> bool:
+        with self._connect() as connection:
+            restored = connection.execute(
+                """UPDATE session_generation_results SET status = ?, updated_at = ?
+                WHERE result_id = ? AND session_id = ? AND content_sha256 = ? AND status = 'verifying'""",
+                (
+                    result.status, result.updated_at, result.result_id, result.session_id,
+                    expected_content_sha256,
+                ),
+            )
+            if restored.rowcount:
+                self._touch_session(connection, result.session_id, result.updated_at or result.created_at)
+            return restored.rowcount == 1
+
+    def replace_generation_result_citations(
+        self,
+        result: SessionGenerationResult,
+        citations: tuple[SessionCitation, ...],
+        expected_content_sha256: str,
+    ) -> bool:
+        with self._connect() as connection:
+            updated = connection.execute(
+                """UPDATE session_generation_results SET status = ?, task_id = ?, snapshot_id = ?,
+                message_id = ?, provider_id = ?, model_id = ?, vault_id = ?, scope_kind = ?,
+                scope_path = ?, content = ?, content_sha256 = ?, content_origin = ?, context_summary = ?,
+                updated_at = ? WHERE result_id = ? AND session_id = ? AND content_sha256 = ?
+                AND status = 'verifying'""",
+                (
+                    result.status, result.task_id, result.snapshot_id, result.message_id,
+                    result.provider_id, result.model_id, result.vault_id, result.scope_kind,
+                    result.scope_path, result.content, result.content_sha256, result.content_origin,
+                    result.context_summary, result.updated_at, result.result_id, result.session_id,
+                    expected_content_sha256,
+                ),
+            )
+            if updated.rowcount != 1:
+                return False
+            connection.execute(
+                "DELETE FROM session_citations WHERE result_id = ? AND session_id = ?",
+                (result.result_id, result.session_id),
+            )
+            for citation in citations:
+                self._insert_citation(connection, citation)
+            self._touch_session(connection, result.session_id, result.updated_at or result.created_at)
+        return True
 
     def persist_retrieval_execution(
         self,
         snapshot: SessionTaskSnapshot,
         task_state: SessionTaskState,
         result: SessionRetrievalResult,
+        generation_results: tuple[SessionGenerationResult, ...] = (),
+        citations: tuple[SessionCitation, ...] = (),
     ) -> bool:
         with self._connect() as connection:
             if self._update_task_snapshot(
@@ -561,6 +672,10 @@ class SqliteSessionRepository:
                 return False
             self._upsert_task_state(connection, task_state)
             self._insert_retrieval_result(connection, result)
+            for generation_result in generation_results:
+                self._insert_generation_result(connection, generation_result)
+            for citation in citations:
+                self._insert_citation(connection, citation)
             self._touch_session(connection, snapshot.session_id, task_state.updated_at)
         return True
 
@@ -636,6 +751,42 @@ class SqliteSessionRepository:
                 message.provider_id,
                 message.model_id,
                 message.created_at,
+            ),
+        )
+
+    @staticmethod
+    def _insert_citation(connection: sqlite3.Connection, citation: SessionCitation) -> None:
+        connection.execute(
+            """INSERT INTO session_citations (
+                citation_id, session_id, vault_id, source_id, source_content_hash,
+                relative_path, location, status, created_at, result_id, snapshot_id,
+                identity_kind, content_sha256, source_path, paragraph_content_hash,
+                invalidation_reason, verified_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                citation.citation_id, citation.session_id, citation.vault_id, citation.source_id,
+                citation.source_content_hash, citation.relative_path, citation.location, citation.status,
+                citation.created_at, citation.result_id, citation.snapshot_id, citation.identity_kind,
+                citation.content_sha256, citation.source_path, citation.paragraph_content_hash,
+                citation.invalidation_reason, citation.verified_at,
+            ),
+        )
+
+    @staticmethod
+    def _insert_generation_result(
+        connection: sqlite3.Connection, result: SessionGenerationResult
+    ) -> None:
+        connection.execute(
+            """INSERT INTO session_generation_results (
+                result_id, session_id, status, content, created_at, task_id, snapshot_id,
+                message_id, provider_id, model_id, vault_id, scope_kind, scope_path,
+                content_sha256, content_origin, context_summary, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                result.result_id, result.session_id, result.status, result.content, result.created_at,
+                result.task_id, result.snapshot_id, result.message_id, result.provider_id, result.model_id,
+                result.vault_id, result.scope_kind, result.scope_path, result.content_sha256,
+                result.content_origin, result.context_summary, result.updated_at,
             ),
         )
 
@@ -907,13 +1058,18 @@ class SqliteSessionRepository:
         return SessionCitation(
             row["citation_id"], row["session_id"], row["vault_id"], row["source_id"],
             row["source_content_hash"], row["relative_path"], row["location"], row["status"],
-            row["created_at"],
+            row["created_at"], row["result_id"], row["snapshot_id"], row["identity_kind"],
+            row["content_sha256"], row["source_path"], row["paragraph_content_hash"],
+            row["invalidation_reason"], row["verified_at"],
         )
 
     @staticmethod
     def _result_from_row(row: sqlite3.Row) -> SessionGenerationResult:
         return SessionGenerationResult(
-            row["result_id"], row["session_id"], row["status"], row["content"], row["created_at"]
+            row["result_id"], row["session_id"], row["status"], row["content"], row["created_at"],
+            row["task_id"], row["snapshot_id"], row["message_id"], row["provider_id"],
+            row["model_id"], row["vault_id"], row["scope_kind"], row["scope_path"],
+            row["content_sha256"], row["content_origin"], row["context_summary"], row["updated_at"],
         )
 
     @staticmethod

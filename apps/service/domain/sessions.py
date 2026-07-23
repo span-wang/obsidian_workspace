@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from hashlib import sha256
 from pathlib import PurePosixPath, PureWindowsPath
 from uuid import uuid4
 
@@ -13,6 +14,10 @@ TASK_INTENTS = frozenset({"source-lookup", "completeness", "knowledge-organizati
 RETRIEVAL_CHANNELS = frozenset({"keyword", "semantic", "structure", "metadata", "tag", "link"})
 RETRIEVAL_RESULT_STATUSES = frozenset(
     {"completed", "no-evidence", "excluded", "index-unavailable", "provider-model-unavailable"}
+)
+CITATION_STATUSES = frozenset({"valid", "pending-verification", "stale", "unsupported"})
+GENERATION_RESULT_STATUSES = frozenset(
+    {"valid", "pending-verification", "stale", "verifying", "unsupported", "complete"}
 )
 
 
@@ -221,6 +226,14 @@ class SessionCitation:
     location: str | None
     status: str
     created_at: str
+    result_id: str | None = None
+    snapshot_id: str | None = None
+    identity_kind: str | None = None
+    content_sha256: str | None = None
+    source_path: str | None = None
+    paragraph_content_hash: str | None = None
+    invalidation_reason: str | None = None
+    verified_at: str | None = None
 
     @classmethod
     def new(
@@ -232,8 +245,33 @@ class SessionCitation:
         relative_path: str | None,
         location: str | None,
         status: str = "valid",
+        *,
+        result_id: str | None = None,
+        snapshot_id: str | None = None,
+        identity_kind: str | None = None,
+        content_sha256: str | None = None,
+        source_path: str | None = None,
+        paragraph_content_hash: str | None = None,
+        invalidation_reason: str | None = None,
+        verified_at: str | None = None,
     ) -> "SessionCitation":
+        if not session_id or not vault_id or not relative_path or not location or not result_id or not snapshot_id:
+            raise ValueError("Citations need turn and location identity.")
+        if status not in CITATION_STATUSES:
+            raise ValueError("Citation status is invalid.")
+        if identity_kind not in {"derived", "native"}:
+            raise ValueError("Citation identity is invalid.")
         _validate_relative_path(relative_path)
+        _validate_sha256(content_sha256, "Citation content hash")
+        _validate_sha256(paragraph_content_hash, "Citation paragraph hash")
+        if identity_kind == "native":
+            if any(value is not None for value in (source_id, source_content_hash, source_path)):
+                raise ValueError("Native citations cannot fabricate source identity.")
+        else:
+            if not all((source_id, source_content_hash, source_path)):
+                raise ValueError("Derived citations need source identity.")
+            _validate_sha256(source_content_hash, "Citation source hash")
+            _validate_relative_path(source_path)
         return cls(
             str(uuid4()),
             session_id,
@@ -244,6 +282,14 @@ class SessionCitation:
             location,
             status,
             utc_now(),
+            result_id,
+            snapshot_id,
+            identity_kind,
+            content_sha256,
+            source_path,
+            paragraph_content_hash,
+            invalidation_reason,
+            verified_at,
         )
 
 
@@ -273,10 +319,55 @@ class SessionGenerationResult:
     status: str
     content: str
     created_at: str
+    task_id: str | None = None
+    snapshot_id: str | None = None
+    message_id: str | None = None
+    provider_id: str | None = None
+    model_id: str | None = None
+    vault_id: str | None = None
+    scope_kind: str | None = None
+    scope_path: str | None = None
+    content_sha256: str | None = None
+    content_origin: str = "local-evidence"
+    context_summary: str = ""
+    updated_at: str | None = None
 
     @classmethod
-    def new(cls, session_id: str, status: str, content: str) -> "SessionGenerationResult":
-        return cls(str(uuid4()), session_id, status, content, utc_now())
+    def new(
+        cls,
+        session_id: str,
+        status: str,
+        content: str,
+        *,
+        task_id: str | None = None,
+        snapshot_id: str | None = None,
+        message_id: str | None = None,
+        provider_id: str | None = None,
+        model_id: str | None = None,
+        vault_id: str | None = None,
+        scope_kind: str | None = None,
+        scope_path: str | None = None,
+        content_origin: str = "local-evidence",
+        context_summary: str = "",
+    ) -> "SessionGenerationResult":
+        normalized = content.strip()
+        if not normalized:
+            raise ValueError("Generation result content is invalid.")
+        if status not in GENERATION_RESULT_STATUSES:
+            raise ValueError("Generation result status is invalid.")
+        if content_origin not in {"local-evidence", "user-content", "model-judgement", "unsupported"}:
+            raise ValueError("Generation result origin is invalid.")
+        if snapshot_id is not None and not all((task_id, message_id, provider_id, model_id, vault_id, scope_kind)):
+            raise ValueError("Bound generation results need immutable turn metadata.")
+        if scope_kind is not None:
+            normalize_session_scope(scope_kind, scope_path)
+        timestamp = utc_now()
+        return cls(
+            str(uuid4()), session_id, status, normalized, timestamp,
+            task_id, snapshot_id, message_id, provider_id, model_id, vault_id, scope_kind,
+            scope_path, sha256(normalized.encode()).hexdigest(), content_origin,
+            context_summary.strip()[:2_000], timestamp,
+        )
 
 
 @dataclass(frozen=True)

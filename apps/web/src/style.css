@@ -384,12 +384,41 @@ h1 {
 
 .session-retrieval-summary,
 .session-retrieval-timing,
+.session-generation-meta,
 .evidence-row p {
   margin: 0;
   color: #545454;
   font-size: 13px;
   line-height: 1.55;
   overflow-wrap: anywhere;
+}
+
+.session-generation-meta {
+  margin: 8px 0 0;
+  color: #545454;
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.session-generation-editor {
+  width: 100%;
+  min-height: 112px;
+  padding: 10px;
+  border: 1px solid #8a8a84;
+  border-radius: 4px;
+  background: #ffffff;
+  color: #111111;
+  font: inherit;
+  line-height: 1.6;
+  resize: vertical;
+}
+
+.session-generation-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
 }
 
 .session-retrieval-timing {
@@ -550,7 +579,9 @@ h1 {
 }
 
 .session-citation-status.status-stale,
-.session-citation-status.status-invalid {
+.session-citation-status.status-invalid,
+.session-citation-status.status-pending-verification,
+.session-citation-status.status-unsupported {
   color: #8a1f1f;
 }
 

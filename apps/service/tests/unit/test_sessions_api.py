@@ -9,7 +9,13 @@ from adapters.sqlite_vault_repository import SqliteVaultRepository
 from application.policies import PolicyService
 from application.sessions import SessionService
 from application.vaults import VaultService
-from api.main import create_app, session_completeness_result_payload, session_retrieval_result_payload
+from api.main import (
+    create_app,
+    session_citation_payload,
+    session_completeness_result_payload,
+    session_generation_result_payload,
+    session_retrieval_result_payload,
+)
 from api.runtime import RuntimeState
 from domain.providers import Provider, ProviderModel, ProviderProbeResults, ProbeResult, ResolvedProviderModel
 from domain.indexing import IndexHealth
@@ -18,6 +24,8 @@ from domain.sessions import (
     SessionCompletenessResult,
     SessionRetrievalEvidence,
     SessionRetrievalResult,
+    SessionCitation,
+    SessionGenerationResult,
 )
 
 
@@ -135,6 +143,31 @@ def test_completeness_payload_marks_invalidated_snapshot_as_source_changed() -> 
     assert payload["coverage_total"] == 2
     assert payload["coverage_has_more"] is True
     assert payload["coverage_counts"]["planned"] == 2
+
+
+def test_answer_and_citation_payload_preserve_turn_identity_and_verification_state() -> None:
+    answer = SessionGenerationResult.new(
+        "session-1", "valid", "可核验段落。", task_id="task-1", snapshot_id="snapshot-1",
+        message_id="message-1", provider_id="provider-1", model_id="model-1", vault_id="vault-1",
+        scope_kind="directory", scope_path="notes", context_summary="用户约束：只使用本地资料。",
+    )
+    citation = SessionCitation.new(
+        "session-1", "vault-1", None, None, "notes/unit.md", "heading: Unit",
+        result_id=answer.result_id, snapshot_id="snapshot-1", identity_kind="native",
+        content_sha256="a" * 64, paragraph_content_hash=answer.content_sha256,
+        invalidation_reason="段落内容已修改，需重新检索核验。",
+    )
+
+    answer_payload = session_generation_result_payload(answer)
+    citation_payload = session_citation_payload(citation)
+
+    assert answer_payload["snapshot_id"] == "snapshot-1"
+    assert answer_payload["scope_path"] == "notes"
+    assert answer_payload["content_origin"] == "local-evidence"
+    assert citation_payload["result_id"] == answer.result_id
+    assert citation_payload["identity_kind"] == "native"
+    assert citation_payload["content_sha256"] == "a" * 64
+    assert citation_payload["invalidation_reason"].startswith("段落内容")
 
 
 def test_session_api_is_local_session_protected_and_uses_bounded_private_records(tmp_path: Path) -> None:

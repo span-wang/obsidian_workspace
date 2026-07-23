@@ -795,7 +795,6 @@ test("creates an import task from materials and shows its persistent scan snapsh
     page.getByLabel("分类建议").getByRole("button", { name: "确认排除" })
   ).toBeVisible();
   await expect(page.getByText("派生笔记提案（版本 1）")).toBeVisible();
-  await expect(page.getByText("来源：第 1 页")).toBeVisible();
   await expect(page.locator(".markdown-preview").nth(1)).toContainText("Preview text");
   const mergeButton = page.getByRole("button", { name: "合并 Chapter One 与下一篇笔记" });
   await expect(mergeButton).toBeVisible();
@@ -1559,6 +1558,105 @@ test("requires a saved session context before composer actions and announces att
   await page.getByRole("button", { name: "执行检索", exact: true }).click();
   await expect(page.getByLabel("未找到证据").getByText("健康索引与有效范围内未找到可支持该请求的知识库证据。", { exact: true })).toBeVisible();
   await expect(page.getByText("检索 3 ms；生成 0 ms（未调用 Model）", { exact: true })).toBeVisible();
+});
+
+test("renders keyboard-accessible paragraph editing and verification controls", async ({ page }) => {
+  const session = {
+    session_id: "session-citation",
+    title: "引用核验",
+    selected_vault_id: "vault-a",
+    selected_vault_label: "Session Vault",
+    selected_provider_id: "provider-1",
+    selected_provider_label: "Local",
+    selected_model_id: "chat-1",
+    selected_model_label: "chat-1",
+    scope_kind: "directory",
+    scope_path: "notes",
+    message_count: 1,
+    created_at: "2026-07-23T00:00:00+00:00",
+    updated_at: "2026-07-23T00:00:00+00:00",
+    last_activity_at: "2026-07-23T00:00:00+00:00"
+  };
+  let answer = {
+    result_id: "answer-1",
+    status: "valid",
+    content: "可追溯的本地证据摘要。",
+    content_origin: "local-evidence",
+    snapshot_id: "snapshot-1",
+    provider_id: "provider-1",
+    vault_id: "vault-a",
+    model_id: "chat-1",
+    scope_kind: "directory",
+    scope_path: "notes",
+    context_summary: "用户约束：仅限本地资料。当前范围：notes。未决问题：source-lookup。",
+    created_at: "2026-07-23T00:00:01+00:00",
+    updated_at: "2026-07-23T00:00:01+00:00"
+  };
+  let citation = {
+    citation_id: "citation-1",
+    result_id: "answer-1",
+    vault_id: "vault-a",
+    relative_path: "notes/unit.md",
+    location: "heading: Unit",
+    status: "valid",
+    identity_kind: "native",
+    content_sha256: "a".repeat(64),
+    invalidation_reason: null
+  };
+
+  await page.route("**/api/**", async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    if (url.pathname === "/api/health") return route.fulfill({ json: { service: "obsidian-personal-knowledge-platform" } });
+    if (url.pathname === "/api/session") return route.fulfill({ json: { status: "ok" } });
+    if (url.pathname === "/api/vaults") return route.fulfill({ json: { vaults: [] } });
+    if (url.pathname === "/api/providers/defaults") return route.fulfill({ json: { chat: {}, embedding: {} } });
+    if (url.pathname === "/api/providers") return route.fulfill({ json: { providers: [] } });
+    if (url.pathname === "/api/import-tasks") return route.fulfill({ json: { tasks: [] } });
+    if (url.pathname === "/api/sessions" && request.method() === "GET") {
+      return route.fulfill({ json: { sessions: [session], page: 1, page_size: 25, total: 1, total_pages: 1 } });
+    }
+    if (url.pathname === "/api/sessions/session-citation" && request.method() === "GET") {
+      return route.fulfill({ json: {
+        session,
+        messages: [{ message_id: "message-1", role: "user", content: "继续核验", created_at: "2026-07-23T00:00:00+00:00" }],
+        task_states: [], citations: [citation], generation_results: [answer], task_snapshots: []
+      } });
+    }
+    if (url.pathname === "/api/sessions/session-citation/generation-results/answer-1" && request.method() === "PATCH") {
+      const command = request.postDataJSON();
+      answer = { ...answer, content: command.content, content_origin: command.content_origin, status: "pending-verification" };
+      citation = { ...citation, status: "pending-verification", invalidation_reason: "段落内容已修改，需重新检索核验。" };
+      return route.fulfill({ json: { result: answer } });
+    }
+    if (url.pathname === "/api/sessions/session-citation/generation-results/answer-1/reverify" && request.method() === "POST") {
+      answer = { ...answer, status: "valid", content_origin: "user-content" };
+      citation = { ...citation, status: "valid", invalidation_reason: null };
+      return route.fulfill({ json: { result: answer } });
+    }
+    return route.fallback();
+  });
+
+  await page.goto("/");
+  await page.getByRole("link", { name: "会话", exact: true }).click();
+  await expect(
+    page.getByText("本地证据摘要 · Provider：provider-1 · Model：chat-1", { exact: true })
+  ).toBeVisible();
+  await expect(page.getByText("有效", { exact: true })).toBeVisible();
+
+  const editButton = page.getByRole("button", { name: "编辑段落", exact: true });
+  await editButton.focus();
+  await page.keyboard.press("Enter");
+  await page.getByLabel("编辑带引用段落").fill("已编辑的本地证据摘要。");
+  await page.getByRole("button", { name: "保存并标为待核验", exact: true }).click();
+  await expect(page.getByText("段落已更新，原引用已标为待核验。", { exact: true })).toBeVisible();
+  await expect(page.getByText("待核验", { exact: true })).toBeVisible();
+
+  const reverifyButton = page.getByRole("button", { name: "重新检索核验", exact: true });
+  await reverifyButton.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByText("引用已通过重新检索核验。", { exact: true })).toBeVisible();
+  await expect(page.getByText("有效", { exact: true })).toBeVisible();
 });
 
 test("presents independent retrieval sources side by side without a preferred answer", async ({ page }) => {

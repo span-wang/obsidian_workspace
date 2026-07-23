@@ -310,6 +310,29 @@ test("renders completeness coverage with explicit gaps and stale source status",
   assert.match(markup, /加载更多覆盖项/);
 });
 
+test("renders a pending citation paragraph with its historical scope and verification action", () => {
+  const session = { session_id: "session-1", title: "英语", message_count: 1 };
+  const markup = renderToStaticMarkup(React.createElement(SessionManagement, {
+    sessionPage: { sessions: [session], page: 1, page_size: 25, total: 1, total_pages: 1 },
+    filters: { query: "", sort: "updated_at", order: "desc" }, isLoading: false, error: "", selectedSessionId: "session-1",
+    selectedDetail: {
+      session,
+      messages: [{ message_id: "message-1", role: "user", content: "继续解释", created_at: "2026-07-23T00:00:00+00:00" }],
+      citations: [{ citation_id: "citation-1", result_id: "answer-1", vault_id: "vault-history", relative_path: "notes/unit.md", location: "heading: Unit", status: "pending-verification", invalidation_reason: "段落内容已修改" }],
+      generation_results: [{ result_id: "answer-1", status: "pending-verification", content: "已编辑的段落", content_origin: "user-content", snapshot_id: "snapshot-1", provider_id: "provider-history", model_id: "chat-1", vault_id: "vault-history", scope_kind: "directory", scope_path: "notes", context_summary: "用户约束：仅限本地。", created_at: "2026-07-23T00:00:01+00:00" }],
+      task_snapshots: [], retrieval_results: [], completeness_results: []
+    },
+    vaults: [], providers: [], onEditGenerationResult: async () => ({}), onReverifyGenerationResult: async () => ({ status: "valid" })
+  }));
+
+  assert.match(markup, /引用待核验/);
+  assert.match(markup, /范围：notes/);
+  assert.match(markup, /Provider：provider-history/);
+  assert.match(markup, /vault：vault-history/);
+  assert.match(markup, /重新检索核验/);
+  assert.match(markup, /待核验/);
+});
+
 test("marks stale evidence and keeps its original vault identity", () => {
   const session = {
     session_id: "session-1",

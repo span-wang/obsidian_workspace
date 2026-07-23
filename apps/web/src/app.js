@@ -652,7 +652,9 @@ export function SessionManagement({
   onPreviewTask,
   onCreateTask,
   onExecuteTask,
-  onLoadCompletenessCoverage
+  onLoadCompletenessCoverage,
+  onEditGenerationResult,
+  onReverifyGenerationResult
 }) {
   const [query, setQuery] = React.useState(filters.query || "");
   const [editingSessionId, setEditingSessionId] = React.useState(null);
@@ -664,6 +666,8 @@ export function SessionManagement({
   const [taskIntent, setTaskIntent] = React.useState("auto");
   const [taskPreview, setTaskPreview] = React.useState(null);
   const [coveragePages, setCoveragePages] = React.useState({});
+  const [editingGenerationResultId, setEditingGenerationResultId] = React.useState(null);
+  const [editingGenerationContent, setEditingGenerationContent] = React.useState("");
   const renameInputRef = React.useRef(null);
   const page = sessionPage?.page || 1;
   const totalPages = sessionPage?.total_pages || 1;
@@ -676,6 +680,7 @@ export function SessionManagement({
     || null;
   const retrievalResults = activeDetail?.retrieval_results || [];
   const completenessResults = activeDetail?.completeness_results || [];
+  const generationResults = activeDetail?.generation_results || [];
   const snapshotsById = new Map((activeDetail?.task_snapshots || []).map((snapshot) => [snapshot.snapshot_id, snapshot]));
   const vaultsById = new Map(vaults.map((vault) => [vault.vault_id, vault]));
 
@@ -748,8 +753,17 @@ export function SessionManagement({
 
   function citationStatusText(status) {
     if (status === "stale") return "已失效";
-    if (status === "invalid") return "不可用";
+    if (status === "pending-verification") return "待核验";
+    if (status === "unsupported" || status === "invalid") return "无证据";
     return "有效";
+  }
+
+  function generationStatusText(result) {
+    if (result.status === "pending-verification") return "引用待核验";
+    if (result.status === "stale") return "来源已变化";
+    if (result.status === "verifying") return "正在重新核验";
+    if (result.status === "unsupported") return "无证据内容";
+    return result.content_origin === "model-judgement" ? "模型判断" : result.content_origin === "user-content" ? "用户内容" : "本地证据摘要";
   }
 
   function messageRoleText(role) {
@@ -960,6 +974,83 @@ export function SessionManagement({
         ? React.createElement("p", { className: "source-comparison-note" }, "系统不会自动合并、选择或判定哪一种说法正确。")
         : null,
       sourceGroups.map(sourceGroupView)
+    );
+  }
+
+  function generationResultView(result) {
+    const isEditing = editingGenerationResultId === result.result_id;
+    const scope = result.scope_kind === "directory" ? result.scope_path : result.scope_kind === "vault" ? "整个 vault" : "历史范围不可用";
+    const canVerify = ["pending-verification", "stale", "unsupported"].includes(result.status);
+    return React.createElement(
+      "article",
+      { className: "session-message session-generation-result", key: result.result_id },
+      React.createElement("p", { className: "session-message-role" }, `${generationStatusText(result)} · Provider：${result.provider_id || "历史记录不可用"} · Model：${result.model_id || "历史记录不可用"}`),
+      React.createElement("p", { className: "session-generation-meta" }, `vault：${result.vault_id || "历史记录不可用"}；范围：${scope}；快照：${result.snapshot_id || "历史记录不可用"}`),
+      isEditing
+        ? React.createElement("textarea", {
+            className: "session-generation-editor",
+            value: editingGenerationContent,
+            "aria-label": "编辑带引用段落",
+            disabled: isSubmitting,
+            onChange: (event) => setEditingGenerationContent(event.target.value)
+          })
+        : React.createElement("p", { className: "session-message-content" }, result.content),
+      result.context_summary
+        ? React.createElement("p", { className: "session-generation-meta" }, result.context_summary)
+        : null,
+      React.createElement(
+        "div",
+        { className: "session-generation-actions" },
+        isEditing
+          ? React.createElement(
+              React.Fragment,
+              null,
+              React.createElement("button", {
+                className: "secondary-button", type: "button", disabled: isSubmitting,
+                onClick: () => { setEditingGenerationResultId(null); setEditingGenerationContent(""); }
+              }, "取消"),
+              React.createElement("button", {
+                className: "primary-button", type: "button", disabled: isSubmitting || !editingGenerationContent.trim(),
+                onClick: async () => {
+                  if (!selectedSession || !onEditGenerationResult) return;
+                  setIsSubmitting(true);
+                  setStatus("");
+                  try {
+                    await onEditGenerationResult(selectedSession.session_id, result.result_id, editingGenerationContent);
+                    setEditingGenerationResultId(null);
+                    setEditingGenerationContent("");
+                    setStatus("段落已更新，原引用已标为待核验。");
+                  } catch (requestError) {
+                    setStatus(requestError.message);
+                  } finally {
+                    setIsSubmitting(false);
+                  }
+                }
+              }, "保存并标为待核验")
+            )
+          : React.createElement("button", {
+              className: "text-button", type: "button", disabled: isSubmitting || !result.snapshot_id,
+              onClick: () => { setEditingGenerationResultId(result.result_id); setEditingGenerationContent(result.content); }
+            }, "编辑段落"),
+        canVerify
+          ? React.createElement("button", {
+              className: "secondary-button", type: "button", disabled: isSubmitting || !result.snapshot_id,
+              onClick: async () => {
+                if (!selectedSession || !onReverifyGenerationResult) return;
+                setIsSubmitting(true);
+                setStatus("");
+                try {
+                  const verified = await onReverifyGenerationResult(selectedSession.session_id, result.result_id);
+                  setStatus(verified.status === "valid" ? "引用已通过重新检索核验。" : "当前内容未获证据支持，引用已移除。");
+                } catch (requestError) {
+                  setStatus(requestError.message);
+                } finally {
+                  setIsSubmitting(false);
+                }
+              }
+            }, "重新检索核验")
+          : null
+      )
     );
   }
 
@@ -1249,18 +1340,26 @@ export function SessionManagement({
           ? React.createElement("p", { className: "empty-state", role: "status" }, "正在加载会话内容。")
           : detailError
             ? React.createElement("p", { className: "form-error", role: "alert" }, detailError)
-            : activeDetail?.messages?.length
+          : activeDetail?.messages?.length || generationResults.length
               ? React.createElement(
                   React.Fragment,
                   null,
-                  activeDetail.messages.map((message) => React.createElement(
-                    "article",
-                    { className: `session-message session-message-${message.role}`, key: message.message_id },
-                    React.createElement("p", { className: "session-message-role" }, messageRoleText(message.role)),
-                    React.createElement("p", { className: "session-message-content" }, message.content)
-                  )),
-                  retrievalResults.map(retrievalResultView),
-                  completenessResults.map(completenessResultView)
+                  [...activeDetail.messages.map((message) => ({ kind: "message", value: message })),
+                    ...generationResults.map((result) => ({ kind: "generation", value: result })),
+                    ...retrievalResults.map((result) => ({ kind: "retrieval", value: result })),
+                    ...completenessResults.map((result) => ({ kind: "completeness", value: result }))]
+                    .sort((first, second) => (first.value.created_at || "").localeCompare(second.value.created_at || ""))
+                    .map((entry) => {
+                      if (entry.kind === "generation") return generationResultView(entry.value);
+                      if (entry.kind === "retrieval") return retrievalResultView(entry.value);
+                      if (entry.kind === "completeness") return completenessResultView(entry.value);
+                      return React.createElement(
+                        "article",
+                        { className: `session-message session-message-${entry.value.role}`, key: entry.value.message_id },
+                        React.createElement("p", { className: "session-message-role" }, messageRoleText(entry.value.role)),
+                        React.createElement("p", { className: "session-message-content" }, entry.value.content)
+                      );
+                    })
                 )
               : retrievalResults.length || completenessResults.length
                 ? [...retrievalResults.map(retrievalResultView), ...completenessResults.map(completenessResultView)]
@@ -1430,7 +1529,16 @@ export function SessionManagement({
                 "article",
                 { className: "session-citation", key: citation.citation_id },
                 React.createElement("p", { className: "session-citation-path" }, citation.relative_path || "未标注来源"),
+                React.createElement("p", { className: "session-citation-location" }, `vault：${citation.vault_id || "历史记录不可用"}`),
                 React.createElement("p", { className: "session-citation-location" }, citation.location || "未标注位置"),
+                citation.identity_kind === "derived"
+                  ? React.createElement("p", { className: "session-citation-location" }, `Source ID ${citation.source_id}；源内容哈希 ${citation.source_content_hash}`)
+                  : citation.identity_kind === "native"
+                    ? React.createElement("p", { className: "session-citation-location" }, `原生 Markdown 内容哈希 ${citation.content_sha256}`)
+                    : null,
+                citation.invalidation_reason
+                  ? React.createElement("p", { className: "form-error" }, citation.invalidation_reason)
+                  : null,
                 React.createElement("span", { className: `session-citation-status status-${citation.status}` }, citationStatusText(citation.status))
               ))
             : React.createElement("p", { className: "empty-state" }, selectedSession ? "当前会话暂无引用。" : "选择会话后将在此显示引用。")
@@ -4220,6 +4328,26 @@ export function App() {
     return { result: response.result, isCurrent };
   }
 
+  async function editPersistentSessionGenerationResult(sessionId, resultId, content) {
+    const response = await requestJson(`${SESSIONS_ENDPOINT}/${sessionId}/generation-results/${resultId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ content, content_origin: "user-content" })
+    });
+    if (selectedSessionIdRef.current === sessionId) await loadSessionDetail(sessionId);
+    await loadSessions(sessionFilters);
+    return response.result;
+  }
+
+  async function reverifyPersistentSessionGenerationResult(sessionId, resultId) {
+    const response = await requestJson(`${SESSIONS_ENDPOINT}/${sessionId}/generation-results/${resultId}/reverify`, {
+      method: "POST",
+      body: JSON.stringify({})
+    });
+    if (selectedSessionIdRef.current === sessionId) await loadSessionDetail(sessionId);
+    await loadSessions(sessionFilters);
+    return response.result;
+  }
+
   async function loadPersistentCompletenessCoverage(sessionId, resultId, offset) {
     const search = new window.URLSearchParams({ offset: String(offset), limit: "100" });
     return requestJson(
@@ -4381,7 +4509,9 @@ export function App() {
       onPreviewTask: previewPersistentSessionTask,
       onCreateTask: createPersistentSessionTask,
       onExecuteTask: executePersistentSessionTask,
-      onLoadCompletenessCoverage: loadPersistentCompletenessCoverage
+      onLoadCompletenessCoverage: loadPersistentCompletenessCoverage,
+      onEditGenerationResult: editPersistentSessionGenerationResult,
+      onReverifyGenerationResult: reverifyPersistentSessionGenerationResult
     });
   } else if (activeDestination === "workbench") {
     workspaceContent = React.createElement(KnowledgeGraphWorkbench, {

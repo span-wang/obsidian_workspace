@@ -110,6 +110,12 @@ def test_session_records_survive_repository_reopen_and_delete_only_private_child
             "a" * 64,
             "notes/chapter-1.md",
             "heading:1",
+            result_id="result-1",
+            snapshot_id="snapshot-1",
+            identity_kind="derived",
+            content_sha256="b" * 64,
+            source_path="sources/chapter-1.pdf",
+            paragraph_content_hash="c" * 64,
         )
     )
     repository.record_generation_result(
@@ -163,7 +169,17 @@ def test_session_service_creates_isolated_defaults_and_enforces_bounded_listing(
 @pytest.mark.parametrize("relative_path", [r"C:\\vault\\note.md", r"\\\\server\\share\\note.md", "../note.md"])
 def test_session_citations_reject_non_relative_paths(relative_path: str) -> None:
     with pytest.raises(ValueError, match="vault-relative"):
-        SessionCitation.new("session-1", "vault-1", "source-1", "a" * 64, relative_path, "line:1")
+        SessionCitation.new(
+            "session-1", "vault-1", "source-1", "a" * 64, relative_path, "line:1",
+            result_id="result-1", snapshot_id="snapshot-1", identity_kind="derived",
+            content_sha256="b" * 64, source_path="sources/unit.pdf",
+            paragraph_content_hash="c" * 64,
+        )
+
+
+def test_session_citations_require_complete_identity() -> None:
+    with pytest.raises(ValueError, match="turn and location"):
+        SessionCitation.new("session-1", "vault-1", None, None, "notes/unit.md", "line:1")
 
 
 def test_session_details_do_not_leak_records_between_sessions(tmp_path) -> None:
@@ -177,10 +193,20 @@ def test_session_details_do_not_leak_records_between_sessions(tmp_path) -> None:
     repository.record_task_state(SessionTaskState.new(first.session_id, "task-algebra", "complete"))
     repository.record_task_state(SessionTaskState.new(second.session_id, "task-geometry", "complete"))
     repository.record_citation(
-        SessionCitation.new(first.session_id, "vault-1", "source-1", "a" * 64, "notes/algebra.md", "line:1")
+        SessionCitation.new(
+            first.session_id, "vault-1", "source-1", "a" * 64, "notes/algebra.md", "line:1",
+            result_id="result-algebra", snapshot_id="snapshot-algebra", identity_kind="derived",
+            content_sha256="b" * 64, source_path="sources/algebra.pdf",
+            paragraph_content_hash="c" * 64,
+        )
     )
     repository.record_citation(
-        SessionCitation.new(second.session_id, "vault-1", "source-2", "b" * 64, "notes/geometry.md", "line:1")
+        SessionCitation.new(
+            second.session_id, "vault-1", "source-2", "b" * 64, "notes/geometry.md", "line:1",
+            result_id="result-geometry", snapshot_id="snapshot-geometry", identity_kind="derived",
+            content_sha256="c" * 64, source_path="sources/geometry.pdf",
+            paragraph_content_hash="d" * 64,
+        )
     )
     repository.record_generation_result(SessionGenerationResult.new(first.session_id, "complete", "代数结果。"))
     repository.record_generation_result(SessionGenerationResult.new(second.session_id, "complete", "几何结果。"))
@@ -571,6 +597,161 @@ def test_execute_prepared_task_persists_bounded_local_evidence_and_timings(tmp_p
     assert restarted.task_states[0].status == "completed"
     assert restarted.task_snapshots[0].status == "completed"
     assert restarted.retrieval_results[0].evidences[0].excerpt == evidence.excerpt
+
+
+def test_completed_turn_keeps_its_snapshot_and_requires_reverification_after_edit(tmp_path) -> None:
+    (tmp_path / "notes").mkdir()
+    document = IndexedDocument(
+        "native-1", "vault-1", "notes/unit.md", "a" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Unit", "keyword evidence remains traceable"),), "now",
+    )
+    service, repository, session, *_ = task_service_fixture(tmp_path, (document,))
+    snapshot = service.create_task(session.session_id, "keyword evidence", intent="source-lookup")
+    service.execute_task(session.session_id, snapshot.task_id)
+    first_detail = repository.get_detail(session.session_id)
+    answer = first_detail.generation_results[0]
+
+    service.update_context(
+        session.session_id, vault_id="vault-1", scope_kind="directory", scope_path="notes",
+        provider_id="provider-1", model_id="chat-1",
+    )
+    historical = service.detail(session.session_id)
+
+    assert historical.task_snapshots[0].status == "completed"
+    assert historical.generation_results[0].snapshot_id == snapshot.snapshot_id
+    assert historical.generation_results[0].scope_kind == "vault"
+    assert historical.citations[0].status == "valid"
+
+    edited = service.edit_generation_result(
+        session.session_id, answer.result_id, "keyword evidence remains traceable", "user-content"
+    )
+
+    assert edited.status == "pending-verification"
+    assert edited.context_summary == ""
+    assert repository.get_detail(session.session_id).citations[0].status == "pending-verification"
+
+    verified = service.reverify_generation_result(session.session_id, answer.result_id)
+
+    assert verified.status == "valid"
+    assert verified.message_id == answer.message_id
+    assert verified.scope_kind == "vault"
+    assert verified.scope_path is None
+    detail = repository.get_detail(session.session_id)
+    assert detail.generation_results[0].status == "valid"
+    assert detail.generation_results[0].snapshot_id != snapshot.snapshot_id
+    assert detail.citations[0].status == "valid"
+    assert len(detail.task_snapshots) == 2
+    assert detail.task_snapshots[-1].message_id == answer.message_id
+    assert all(message.role != "system" for message in detail.messages)
+    assert service.reverify_generation_result(session.session_id, answer.result_id) == verified
+    assert len(repository.get_detail(session.session_id).task_snapshots) == 2
+
+
+def test_reverification_rejects_partial_matches_and_preserves_recoverable_evidence(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1", "vault-1", "notes/unit.md", "a" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Unit", "keyword evidence remains traceable"),), "now",
+    )
+    service, repository, session, _, providers, _, _ = task_service_fixture(tmp_path, (document,))
+    snapshot = service.create_task(session.session_id, "keyword evidence", intent="source-lookup")
+    service.execute_task(session.session_id, snapshot.task_id)
+    answer = repository.get_detail(session.session_id).generation_results[0]
+
+    service.edit_generation_result(
+        session.session_id, answer.result_id, "keyword evidence remains traceable"
+    )
+    providers.available = False
+    recoverable = service.reverify_generation_result(session.session_id, answer.result_id)
+
+    assert recoverable.status == "pending-verification"
+    assert repository.get_detail(session.session_id).citations[0].status == "pending-verification"
+
+    providers.available = True
+    assert service.reverify_generation_result(session.session_id, answer.result_id).status == "valid"
+    service.edit_generation_result(
+        session.session_id, answer.result_id, "keyword evidence remains traceable，月亮是奶酪"
+    )
+    unsupported = service.reverify_generation_result(session.session_id, answer.result_id)
+
+    assert unsupported.status == "unsupported"
+    assert repository.get_detail(session.session_id).citations == ()
+
+
+def test_reverification_compare_and_set_preserves_a_concurrent_edit(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1", "vault-1", "notes/unit.md", "a" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Unit", "keyword evidence remains traceable"),), "now",
+    )
+    service, repository, session, *_ = task_service_fixture(tmp_path, (document,))
+    snapshot = service.create_task(session.session_id, "keyword evidence", intent="source-lookup")
+    service.execute_task(session.session_id, snapshot.task_id)
+    answer = repository.get_detail(session.session_id).generation_results[0]
+    service.edit_generation_result(session.session_id, answer.result_id, answer.content)
+    barrier = Barrier(2)
+    retrieve = service._retrieve
+
+    def synchronized_retrieve(snapshot, content, started):
+        barrier.wait(timeout=5)
+        barrier.wait(timeout=5)
+        return retrieve(snapshot, content, started)
+
+    service._retrieve = synchronized_retrieve
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(service.reverify_generation_result, session.session_id, answer.result_id)
+        barrier.wait(timeout=5)
+        replacement = service.edit_generation_result(
+            session.session_id, answer.result_id, "new user content"
+        )
+        barrier.wait(timeout=5)
+        returned = future.result(timeout=5)
+
+    stored = repository.get_detail(session.session_id).generation_results[0]
+    assert returned == replacement
+    assert stored.content == "new user content"
+    assert stored.content_sha256 == replacement.content_sha256
+    assert stored.status == "pending-verification"
+
+
+def test_follow_up_retrieval_includes_bounded_prior_user_context(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1", "vault-1", "notes/unit.md", "a" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Unit", "前序语境中的唯一标识"),), "now",
+    )
+    service, _, session, *_ = task_service_fixture(tmp_path, (document,))
+    service.send_user_message(session.session_id, "请记住前序语境中的唯一标识")
+    snapshot = service.create_task(session.session_id, "它在哪里？", intent="source-lookup")
+    captured = []
+    retrieve = service._retrieve
+
+    def capture(snapshot, content, started):
+        captured.append(content)
+        return retrieve(snapshot, content, started)
+
+    service._retrieve = capture
+    service.execute_task(session.session_id, snapshot.task_id)
+
+    assert "前序语境中的唯一标识" in captured[0]
+
+
+def test_context_summary_preserves_constraints_scope_citations_and_open_question(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1", "vault-1", "notes/unit.md", "a" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Unit", "keyword evidence remains traceable"),), "now",
+    )
+    service, repository, session, *_ = task_service_fixture(tmp_path, (document,))
+    service.send_user_message(session.session_id, "仅使用本地证据。" * 400)
+    first = service.create_task(session.session_id, "keyword evidence", intent="source-lookup")
+    service.execute_task(session.session_id, first.task_id)
+    second = service.create_task(session.session_id, "再次定位 keyword", intent="source-lookup")
+    service.execute_task(session.session_id, second.task_id)
+
+    latest = repository.get_detail(session.session_id).generation_results[-1]
+
+    assert latest.context_summary.startswith("用户约束：仅使用本地证据。")
+    assert "当前范围：整个 vault。" in latest.context_summary
+    assert "引用身份/状态：native:notes/unit.md:valid。" in latest.context_summary
+    assert "未决问题：source-lookup。" in latest.context_summary
+    assert len(latest.context_summary) <= 2_000
 
 
 def test_groups_retrieval_evidence_by_source_identity_without_hiding_paths() -> None:

@@ -15,7 +15,9 @@ from domain.sessions import (
     SessionCompletenessItemOutcome,
     SessionCompletenessResult,
     SessionAttachment,
+    SessionCitation,
     SessionDetail,
+    SessionGenerationResult,
     SessionMessage,
     SessionPage,
     SessionRetrievalEvidence,
@@ -249,16 +251,24 @@ class SessionService:
         self._invalidate_active_snapshots(session_id, "会话附件已改变。")
 
     def preview_task(self, session_id: str, content: str, *, intent: str = "auto"):
-        session = self.get(session_id)
-        return self._task_preview(session, content, intent=intent)
+        try:
+            detail = self.repository.get_detail(session_id)
+        except KeyError as error:
+            raise SessionNotFoundError(session_id) from error
+        return self._task_preview(
+            detail.session, content, intent=intent, intent_context=self._conversation_query(detail, content)
+        )
 
     def create_task(self, session_id: str, content: str, *, intent: str = "auto") -> SessionTaskSnapshot:
         try:
             self._refresh_task_snapshots(self.repository.get_detail(session_id))
         except KeyError as error:
             raise SessionNotFoundError(session_id) from error
-        session = self.get(session_id)
-        preview = self._task_preview(session, content, intent=intent)
+        detail = self.repository.get_detail(session_id)
+        session = detail.session
+        preview = self._task_preview(
+            session, content, intent=intent, intent_context=self._conversation_query(detail, content)
+        )
         if not preview.is_ready:
             raise SessionValidationError(
                 f"{preview.blocking_reason} 恢复操作：{preview.recovery_action}"
@@ -303,7 +313,10 @@ class SessionService:
             (message.content for message in detail.messages if message.message_id == snapshot.message_id),
             "",
         )
-        preview = self._task_preview(detail.session, content, intent=snapshot.intent)
+        query = self._conversation_query(detail, content, snapshot.message_id)
+        preview = self._task_preview(
+            detail.session, content, intent=snapshot.intent, intent_context=query
+        )
         if not preview.is_ready:
             if snapshot.intent == "completeness":
                 return self._persist_completeness_execution(
@@ -354,16 +367,165 @@ class SessionService:
             or preview.coverage_items != snapshot.coverage_items
         ):
             reason = preview.blocking_reason or "来源、索引或授权策略已改变。"
-            self._invalidate_active_snapshots(session_id, reason)
+            self._invalidate_active_snapshots(session_id, reason, include_completed=True)
             raise SessionValidationError(f"{reason} 请重新准备任务。")
 
         if snapshot.intent == "completeness":
             return self._execute_completeness(snapshot, task_state, started)
-        result = self._retrieve(snapshot, content, started)
+        result = self._retrieve(snapshot, query, started)
         timestamp = utc_now()
         completed_snapshot = replace(snapshot, status="completed", updated_at=timestamp)
         completed_state = replace(task_state, status=result.status, updated_at=timestamp)
-        return self._persist_retrieval_execution(completed_snapshot, completed_state, result)
+        generation_results, citations = self._evidence_turn_records(completed_snapshot, detail, result)
+        return self._persist_retrieval_execution(
+            completed_snapshot, completed_state, result, generation_results, citations
+        )
+
+    def edit_generation_result(
+        self, session_id: str, result_id: str, content: str, content_origin: str = "user-content"
+    ) -> SessionGenerationResult:
+        normalized = content.strip()
+        if not normalized or len(normalized) > 20_000:
+            raise SessionValidationError("Edited paragraph is invalid.")
+        if content_origin not in {"user-content", "model-judgement"}:
+            raise SessionValidationError("Edited paragraph origin is invalid.")
+        try:
+            detail = self.repository.get_detail(session_id)
+        except KeyError as error:
+            raise SessionNotFoundError(session_id) from error
+        existing = next((item for item in detail.generation_results if item.result_id == result_id), None)
+        if existing is None or not existing.snapshot_id or not existing.content_sha256:
+            raise SessionValidationError("The selected answer paragraph is unavailable.")
+        timestamp = utc_now()
+        updated = replace(
+            existing,
+            status="pending-verification",
+            content=normalized,
+            content_sha256=sha256(normalized.encode()).hexdigest(),
+            content_origin=content_origin,
+            context_summary="",
+            updated_at=timestamp,
+        )
+        self.repository.update_generation_result_and_citations(
+            updated, "pending-verification", "段落内容已修改，需重新检索核验。"
+        )
+        return updated
+
+    def reverify_generation_result(self, session_id: str, result_id: str) -> SessionGenerationResult:
+        try:
+            detail = self.repository.get_detail(session_id)
+        except KeyError as error:
+            raise SessionNotFoundError(session_id) from error
+        existing = next((item for item in detail.generation_results if item.result_id == result_id), None)
+        if existing is None or not existing.snapshot_id or not existing.content_sha256 or not existing.message_id:
+            raise SessionValidationError("The selected answer paragraph is unavailable for verification.")
+        if existing.status in {"valid", "verifying"}:
+            return existing
+        if existing.status not in {"pending-verification", "stale", "unsupported"}:
+            raise SessionValidationError("The selected answer paragraph is unavailable for verification.")
+        original_snapshot = next(
+            (item for item in detail.task_snapshots if item.snapshot_id == existing.snapshot_id), None
+        )
+        if original_snapshot is None:
+            raise SessionValidationError("The selected answer paragraph has no verifiable snapshot.")
+
+        timestamp = utc_now()
+        if not self.repository.claim_generation_result_for_reverification(
+            session_id, result_id, existing.content_sha256, timestamp
+        ):
+            return next(
+                item for item in self.repository.get_detail(session_id).generation_results
+                if item.result_id == result_id
+            )
+
+        historical_context = replace(
+            detail.session,
+            selected_vault_id=original_snapshot.vault_id,
+            selected_provider_id=original_snapshot.provider_id,
+            selected_model_id=original_snapshot.model_id,
+            scope_kind=original_snapshot.scope_kind,
+            scope_path=original_snapshot.scope_path,
+        )
+        preview = self._task_preview(historical_context, existing.content, intent="source-lookup")
+        if not preview.is_ready:
+            self.repository.restore_generation_result_status(
+                replace(existing, updated_at=utc_now()), existing.content_sha256
+            )
+            return existing
+
+        task_id = str(uuid4())
+        verification_snapshot = SessionTaskSnapshot(
+            str(uuid4()), session_id, task_id, existing.message_id, "source-lookup",
+            "explicit", preview.vault_id, preview.scope_kind, preview.scope_path,
+            preview.provider_id, preview.model_id, preview.index_status, preview.index_updated_at,
+            preview.index_digest, preview.policy_revision, preview.exclusion_summary,
+            preview.outbound_mode, preview.outbound_scope_summary, preview.source_count,
+            preview.source_digest, "prepared", timestamp, timestamp, sources=preview.sources,
+        )
+        verification_state = SessionTaskState.new(
+            session_id, task_id, "prepared", verification_snapshot.snapshot_id
+        )
+        self.repository.persist_reverification_task(verification_snapshot, verification_state)
+        retrieval = self._retrieve(verification_snapshot, existing.content, perf_counter())
+        completed_snapshot = replace(verification_snapshot, status="completed", updated_at=utc_now())
+        completed_state = replace(verification_state, status=retrieval.status, updated_at=utc_now())
+        self._persist_retrieval_execution(completed_snapshot, completed_state, retrieval)
+        if retrieval.status in {"excluded", "index-unavailable", "provider-model-unavailable"}:
+            self.repository.restore_generation_result_status(
+                replace(existing, updated_at=utc_now()), existing.content_sha256
+            )
+            return existing
+        supporting_evidences = self._supporting_evidences(existing.content, retrieval.evidences)
+        if retrieval.status != "completed" or not supporting_evidences:
+            unsupported = replace(
+                existing,
+                task_id=task_id,
+                snapshot_id=verification_snapshot.snapshot_id,
+                message_id=existing.message_id,
+                status="unsupported",
+                content_origin="unsupported",
+                updated_at=utc_now(),
+            )
+            if self.repository.replace_generation_result_citations(
+                unsupported, (), existing.content_sha256
+            ):
+                return unsupported
+            return next(
+                item for item in self.repository.get_detail(session_id).generation_results
+                if item.result_id == result_id
+            )
+
+        verified = replace(
+            existing,
+            task_id=task_id,
+            snapshot_id=verification_snapshot.snapshot_id,
+            message_id=existing.message_id,
+            status="valid",
+            updated_at=utc_now(),
+        )
+        citations = self._citations_for_result(verified, verification_snapshot, supporting_evidences)
+        verified = replace(
+            verified,
+            context_summary=self._context_summary(
+                verification_snapshot,
+                replace(
+                    detail,
+                    citations=tuple(
+                        citation
+                        for citation in detail.citations
+                        if citation.result_id != existing.result_id
+                    ) + citations,
+                ),
+            ),
+        )
+        if self.repository.replace_generation_result_citations(
+            verified, citations, existing.content_sha256
+        ):
+            return verified
+        return next(
+            item for item in self.repository.get_detail(session_id).generation_results
+            if item.result_id == result_id
+        )
 
     def send_user_message(self, session_id: str, content: str) -> SessionMessage:
         session = self.get(session_id)
@@ -378,14 +540,21 @@ class SessionService:
         self.repository.append_message(message)
         return message
 
-    def _task_preview(self, session: PersistentSession, content: str, *, intent: str) -> TaskPreview:
+    def _task_preview(
+        self,
+        session: PersistentSession,
+        content: str,
+        *,
+        intent: str,
+        intent_context: str | None = None,
+    ) -> TaskPreview:
         self._require_task_services()
         normalized_content = content.strip()
         if not normalized_content or len(normalized_content) > 20_000:
             raise SessionValidationError("Session message is invalid.")
         if intent != "auto" and intent not in TASK_INTENTS:
             raise SessionValidationError("Task intent is invalid.")
-        resolved_intent, intent_source = self._resolve_task_intent(normalized_content, intent)
+        resolved_intent, intent_source = self._resolve_task_intent(intent_context or normalized_content, intent)
         if not all((
             session.selected_vault_id, session.scope_kind, session.selected_provider_id,
             session.selected_model_id,
@@ -646,8 +815,12 @@ class SessionService:
         snapshot: SessionTaskSnapshot,
         task_state: SessionTaskState,
         result: SessionRetrievalResult,
+        generation_results: tuple[SessionGenerationResult, ...] = (),
+        citations: tuple[SessionCitation, ...] = (),
     ) -> SessionRetrievalResult:
-        if self.repository.persist_retrieval_execution(snapshot, task_state, result):
+        if self.repository.persist_retrieval_execution(
+            snapshot, task_state, result, generation_results, citations
+        ):
             return result
         try:
             detail = self.repository.get_detail(snapshot.session_id)
@@ -664,6 +837,106 @@ class SessionService:
         if existing is not None:
             return existing
         raise SessionValidationError("The selected task is no longer ready. Prepare a new task.")
+
+    def _evidence_turn_records(
+        self,
+        snapshot: SessionTaskSnapshot,
+        detail: SessionDetail,
+        retrieval: SessionRetrievalResult,
+    ) -> tuple[tuple[SessionGenerationResult, ...], tuple[SessionCitation, ...]]:
+        if retrieval.status != "completed":
+            return (), ()
+        context_summary = self._context_summary(snapshot, detail)
+        generation_results = tuple(
+            SessionGenerationResult.new(
+                snapshot.session_id,
+                "valid",
+                evidence.excerpt,
+                task_id=snapshot.task_id,
+                snapshot_id=snapshot.snapshot_id,
+                message_id=snapshot.message_id,
+                provider_id=snapshot.provider_id,
+                model_id=snapshot.model_id,
+                vault_id=snapshot.vault_id,
+                scope_kind=snapshot.scope_kind,
+                scope_path=snapshot.scope_path,
+                context_summary=context_summary,
+            )
+            for evidence in retrieval.evidences
+        )
+        citations = tuple(
+            citation
+            for result, evidence in zip(generation_results, retrieval.evidences)
+            for citation in self._citations_for_result(result, snapshot, (evidence,))
+        )
+        return generation_results, citations
+
+    @staticmethod
+    def _context_summary(snapshot: SessionTaskSnapshot, detail: SessionDetail) -> str:
+        user_constraints = [
+            message.content.strip() for message in detail.messages
+            if message.role == "user" and message.message_id != snapshot.message_id
+        ][-3:]
+        constraints = "；".join(constraint[:160] for constraint in user_constraints)
+        constraints = constraints or "无已确认的前序用户约束。"
+        scope = (snapshot.scope_path if snapshot.scope_kind == "directory" else "整个 vault")[:160]
+        citation_states = [
+            f"{citation.identity_kind or 'unknown'}:"
+            f"{(citation.source_path or citation.relative_path or citation.citation_id)[:100]}:"
+            f"{citation.status}"
+            for citation in detail.citations
+        ][-8:]
+        citations = "；".join(citation_states) or "无已记录引用。"
+        return (
+            f"用户约束：{constraints}。当前范围：{scope}。"
+            f"引用身份/状态：{citations}。未决问题：{snapshot.intent}。"
+        )
+
+    @staticmethod
+    def _conversation_query(
+        detail: SessionDetail, content: str, message_id: str | None = None
+    ) -> str:
+        history = [
+            message.content.strip()[:160]
+            for message in detail.messages
+            if message.role == "user" and message.message_id != message_id
+        ][-3:]
+        return "\n".join((*history, content.strip()))
+
+    @staticmethod
+    def _supporting_evidences(
+        content: str, evidences: tuple[SessionRetrievalEvidence, ...]
+    ) -> tuple[SessionRetrievalEvidence, ...]:
+        normalized = re.sub(r"\s+", "", content).casefold()
+        return tuple(
+            evidence for evidence in evidences
+            if normalized and normalized in re.sub(r"\s+", "", evidence.excerpt).casefold()
+        )
+
+    @staticmethod
+    def _citations_for_result(
+        result: SessionGenerationResult,
+        snapshot: SessionTaskSnapshot,
+        evidences: tuple[SessionRetrievalEvidence, ...],
+    ) -> tuple[SessionCitation, ...]:
+        return tuple(
+            SessionCitation.new(
+                result.session_id,
+                snapshot.vault_id,
+                evidence.source_id,
+                evidence.source_content_hash,
+                evidence.relative_path,
+                evidence.location,
+                result_id=result.result_id,
+                snapshot_id=snapshot.snapshot_id,
+                identity_kind=evidence.identity_kind,
+                content_sha256=evidence.content_sha256,
+                source_path=evidence.source_path,
+                paragraph_content_hash=result.content_sha256,
+                verified_at=result.updated_at or result.created_at,
+            )
+            for evidence in evidences
+        )
 
     def _persist_completeness_execution(
         self,
@@ -908,7 +1181,14 @@ class SessionService:
             or session.selected_model_id != model_id
         )
 
-    def _invalidate_active_snapshots(self, session_id: str, reason: str) -> None:
+    def _invalidate_active_snapshots(
+        self,
+        session_id: str,
+        reason: str,
+        *,
+        include_completed: bool = False,
+        snapshot_ids: set[str] | None = None,
+    ) -> None:
         try:
             detail = self.repository.get_detail(session_id)
         except KeyError:
@@ -917,8 +1197,13 @@ class SessionService:
         task_states = {state.snapshot_id: state for state in detail.task_states if state.snapshot_id}
         invalidated_snapshots: list[SessionTaskSnapshot] = []
         invalidated_states: list[SessionTaskState] = []
+        statuses = {"prepared", "waiting-authorization"}
+        if include_completed:
+            statuses.add("completed")
         for snapshot in detail.task_snapshots:
-            if snapshot.status not in {"prepared", "waiting-authorization", "completed"}:
+            if snapshot.status not in statuses or (
+                snapshot_ids is not None and snapshot.snapshot_id not in snapshot_ids
+            ):
                 continue
             invalidated = replace(
                 snapshot, status="invalidated", updated_at=timestamp, invalidation_reason=reason
@@ -939,17 +1224,30 @@ class SessionService:
         for snapshot in detail.task_snapshots:
             if snapshot.status not in {"prepared", "waiting-authorization", "completed"}:
                 continue
-            if self._context_changed(
+            if snapshot.status != "completed" and self._context_changed(
                 detail.session, vault_id=snapshot.vault_id, scope_kind=snapshot.scope_kind,
                 scope_path=snapshot.scope_path, provider_id=snapshot.provider_id, model_id=snapshot.model_id,
             ):
-                self._invalidate_active_snapshots(detail.session.session_id, "会话语境已改变。")
-                return
+                self._invalidate_active_snapshots(
+                    detail.session.session_id, "会话语境已改变。", snapshot_ids={snapshot.snapshot_id}
+                )
+                continue
+            snapshot_context = replace(
+                detail.session,
+                selected_vault_id=snapshot.vault_id,
+                selected_provider_id=snapshot.provider_id,
+                selected_model_id=snapshot.model_id,
+                scope_kind=snapshot.scope_kind,
+                scope_path=snapshot.scope_path,
+            )
             try:
-                preview = self._task_preview(detail.session, "快照复核", intent=snapshot.intent)
+                preview = self._task_preview(snapshot_context, "快照复核", intent=snapshot.intent)
             except SessionValidationError as error:
-                self._invalidate_active_snapshots(detail.session.session_id, str(error))
-                return
+                if snapshot.status != "completed":
+                    self._invalidate_active_snapshots(
+                        detail.session.session_id, str(error), snapshot_ids={snapshot.snapshot_id}
+                    )
+                continue
             if (
                 not preview.is_ready
                 or preview.index_digest != snapshot.index_digest
@@ -959,8 +1257,12 @@ class SessionService:
                 or preview.coverage_items != snapshot.coverage_items
             ):
                 reason = preview.blocking_reason or "来源、索引或授权策略已改变。"
-                self._invalidate_active_snapshots(detail.session.session_id, reason)
-                return
+                self._invalidate_active_snapshots(
+                    detail.session.session_id,
+                    reason,
+                    include_completed=snapshot.status == "completed",
+                    snapshot_ids={snapshot.snapshot_id},
+                )
 
     def _require_context_services(self) -> None:
         if not all((self.vault_service, self.provider_service, self.policy_service)):
