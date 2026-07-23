@@ -398,6 +398,16 @@ function modelOptions(providers, modelType) {
   ));
 }
 
+function sessionComposerContext(session) {
+  return {
+    vault_id: session?.selected_vault_id || "",
+    scope_kind: session?.scope_kind || "vault",
+    scope_path: session?.scope_path || "",
+    provider_id: session?.selected_provider_id || "",
+    model_id: session?.selected_model_id || ""
+  };
+}
+
 function NavigationLinks({ activeDestination, firstLinkRef, onNavigate }) {
   return NAVIGATION_DESTINATIONS.map((destination, index) =>
     React.createElement(
@@ -609,21 +619,40 @@ export function SessionManagement({
   filters,
   isLoading,
   error,
+  selectedSessionId,
+  selectedDetail,
+  isDetailLoading,
+  detailError,
   onLoad,
+  onSelect,
   onCreate,
   onRename,
   onExport,
-  onDelete
+  onDelete,
+  vaults = [],
+  providers = [],
+  onUpdateContext,
+  onPickAttachments,
+  onRemoveAttachment,
+  onSendMessage
 }) {
   const [query, setQuery] = React.useState(filters.query || "");
   const [editingSessionId, setEditingSessionId] = React.useState(null);
   const [editingTitle, setEditingTitle] = React.useState("");
   const [status, setStatus] = React.useState("");
   const [isSubmitting, setIsSubmitting] = React.useState(false);
+  const [context, setContext] = React.useState({ vault_id: "", scope_kind: "vault", scope_path: "", provider_id: "", model_id: "" });
+  const [message, setMessage] = React.useState("");
   const renameInputRef = React.useRef(null);
   const page = sessionPage?.page || 1;
   const totalPages = sessionPage?.total_pages || 1;
   const sessions = sessionPage?.sessions || [];
+  const activeDetail = selectedDetail?.session?.session_id === selectedSessionId
+    ? selectedDetail
+    : null;
+  const selectedSession = activeDetail?.session
+    || sessions.find((session) => session.session_id === selectedSessionId)
+    || null;
 
   React.useEffect(() => {
     setQuery(filters.query || "");
@@ -631,7 +660,13 @@ export function SessionManagement({
 
   React.useEffect(() => {
     if (editingSessionId) renameInputRef.current?.focus();
-  }, [editingSessionId]);
+  }, [editingSessionId, selectedSession?.session_id]);
+
+  React.useEffect(() => {
+    if (!selectedSession) return;
+    setContext(sessionComposerContext(selectedSession));
+    setMessage("");
+  }, [selectedSession?.session_id]);
 
   function load(nextFilters) {
     setStatus("");
@@ -680,17 +715,126 @@ export function SessionManagement({
     }
   }
 
+  function citationStatusText(status) {
+    if (status === "stale") return "已失效";
+    if (status === "invalid") return "不可用";
+    return "有效";
+  }
+
+  function messageRoleText(role) {
+    if (role === "user") return "我的消息";
+    if (role === "assistant") return "助手";
+    return "系统";
+  }
+
+  function attachmentStatusText(attachmentStatus) {
+    return {
+      available: "可用",
+      excluded: "被排除",
+      "pending-authorization": "待授权",
+      "needs-import": "待解析（需先导入）"
+    }[attachmentStatus] || "待解析";
+  }
+
+  const availableVaults = vaults.filter((vault) => (
+    vault.authorization_status === "active" && vault.access_status === "available"
+  ));
+  const chatModels = providers.flatMap((provider) => (
+    provider.verification?.is_verified
+      ? (provider.models || []).filter((model) => (
+        model.model_type === "chat" && model.is_discovered && model.verification?.ok
+      )).map((model) => ({ provider, model }))
+      : []
+  ));
+  const selectedVault = vaults.find((vault) => vault.vault_id === context.vault_id);
+  const persistedContext = sessionComposerContext(selectedSession);
+  const contextIsDirty = Object.keys(context).some((key) => context[key] !== persistedContext[key]);
+  const authorizationText = selectedVault
+    ? (policyFor(selectedVault).outbound_mode === "always-allow" ? "外部访问：已设为始终允许" : "外部访问：每次任务询问")
+    : "外部访问：先选择 vault";
+  const canSend = Boolean(
+    selectedSession && !contextIsDirty && selectedSession.selected_vault_id && selectedSession.scope_kind
+      && selectedSession.selected_provider_id && selectedSession.selected_model_id && message.trim()
+  );
+
+  async function saveContext() {
+    if (!selectedSession) return;
+    setStatus("");
+    setIsSubmitting(true);
+    try {
+      await onUpdateContext(selectedSession.session_id, {
+        ...context,
+        scope_path: context.scope_kind === "directory" ? context.scope_path : null
+      });
+      setStatus("会话语境已保存。");
+    } catch (requestError) {
+      setContext(sessionComposerContext(selectedSession));
+      setStatus(requestError.message);
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  async function pickAttachments() {
+    if (!selectedSession || contextIsDirty) return;
+    setStatus("");
+    setIsSubmitting(true);
+    try {
+      await onPickAttachments(selectedSession.session_id);
+      setStatus("附件已添加。");
+    } catch (requestError) {
+      setStatus(requestError.message);
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  async function removeAttachment(attachmentId) {
+    if (!selectedSession) return;
+    setStatus("");
+    setIsSubmitting(true);
+    try {
+      await onRemoveAttachment(selectedSession.session_id, attachmentId);
+      setStatus("附件已移除。");
+    } catch (requestError) {
+      setStatus(requestError.message);
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  async function sendMessage(event) {
+    event?.preventDefault();
+    if (!canSend || !selectedSession || contextIsDirty) return;
+    setStatus("");
+    setIsSubmitting(true);
+    try {
+      await onSendMessage(selectedSession.session_id, message);
+      setMessage("");
+      setStatus("消息已发送。");
+    } catch (requestError) {
+      setStatus(requestError.message);
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
   if (isLoading && !sessions.length) {
     return React.createElement("p", { className: "empty-state", role: "status" }, "正在加载会话。");
   }
 
   return React.createElement(
     "section",
-    { className: "workspace-section session-management", "aria-label": "持久会话" },
-    React.createElement("p", { className: "section-label" }, "持久会话"),
+    { className: "session-management", "aria-label": "会话工作区" },
     React.createElement(
-      "div",
-      { className: "session-toolbar" },
+      "aside",
+      { className: "session-history-pane", "aria-label": "会话历史" },
+      React.createElement(
+        "div",
+        { className: "session-history-heading" },
+        React.createElement("h2", null, "会话"),
+        React.createElement("button", { className: "primary-button", type: "button", disabled: isSubmitting, onClick: createSession }, "新建会话")
+      ),
       React.createElement(
         "form",
         {
@@ -704,7 +848,7 @@ export function SessionManagement({
           value: query,
           onChange: (event) => setQuery(event.target.value),
           "aria-label": "搜索会话",
-          placeholder: "按标题或所用 vault 搜索"
+          placeholder: "搜索会话"
         }),
         React.createElement("button", { className: "secondary-button", type: "submit", disabled: isSubmitting }, "搜索")
       ),
@@ -724,73 +868,205 @@ export function SessionManagement({
           React.createElement("option", { value: "vault" }, "所用 vault")
         )
       ),
+      error || status
+        ? React.createElement(
+            "p",
+            { className: error ? "form-error" : "status-line", role: error ? "alert" : "status" },
+            error || status
+          )
+        : null,
+      sessions.length
+        ? React.createElement(
+            "div",
+            { className: "session-list", role: "list" },
+            sessions.map((session) => React.createElement(
+              "button",
+              {
+                className: "session-history-item",
+                type: "button",
+                key: session.session_id,
+                "aria-pressed": selectedSession?.session_id === session.session_id,
+                onClick: () => onSelect(session)
+              },
+              React.createElement("strong", null, session.title),
+              React.createElement("span", null, `所用 vault：${session.selected_vault_label || "未设置"}`),
+              React.createElement("span", null, `消息 ${session.message_count || 0} 条`)
+            ))
+          )
+        : React.createElement("p", { className: "empty-state" }, "当前没有已保存的会话。"),
       React.createElement(
-        "button",
-        { className: "primary-button", type: "button", disabled: isSubmitting, onClick: createSession },
-        "新建会话"
+        "div",
+        { className: "session-pagination", "aria-label": "会话分页" },
+        React.createElement(
+          "button",
+          { className: "secondary-button", type: "button", disabled: isSubmitting || page <= 1, onClick: () => load({ ...filters, page: page - 1 }) },
+          "上一页"
+        ),
+        React.createElement("span", { role: "status" }, `第 ${page} / ${totalPages} 页`),
+        React.createElement(
+          "button",
+          { className: "secondary-button", type: "button", disabled: isSubmitting || page >= totalPages, onClick: () => load({ ...filters, page: page + 1 }) },
+          "下一页"
+        )
       )
     ),
-    error || status
-      ? React.createElement("p", { className: "form-error", role: "alert" }, error || status)
-      : null,
-    sessions.length
-      ? React.createElement(
-          "div",
-          { className: "session-list" },
-          sessions.map((session) => React.createElement(
-            "article",
-            { className: "section-row session-row", key: session.session_id },
-            editingSessionId === session.session_id
-              ? React.createElement(
-                  "form",
-                  { className: "session-rename", onSubmit: (event) => saveRename(event, session.session_id) },
-                  React.createElement("input", {
-                    ref: renameInputRef,
-                    value: editingTitle,
-                    onChange: (event) => setEditingTitle(event.target.value),
-                    "aria-label": `${session.title} 的会话标题`
-                  }),
-                  React.createElement("button", { className: "secondary-button", type: "button", disabled: isSubmitting, onClick: () => setEditingSessionId(null) }, "取消"),
-                  React.createElement("button", { className: "primary-button", type: "submit", disabled: isSubmitting }, "保存")
-                )
-              : React.createElement(
-                  React.Fragment,
-                  null,
-                  React.createElement(
-                    "div",
-                    { className: "session-row-summary" },
-                    React.createElement("strong", null, session.title),
-                    React.createElement("span", null, `所用 vault：${session.selected_vault_label || "未设置"}`),
-                    React.createElement("span", null, `消息 ${session.message_count || 0} 条`)
-                  ),
-                  React.createElement(
-                    "div",
-                    { className: "session-row-actions" },
-                    React.createElement("button", { className: "text-button", type: "button", onClick: () => openRename(session) }, "重命名"),
-                    React.createElement("button", { className: "text-button", type: "button", onClick: () => exportSession(session) }, "导出"),
-                    React.createElement(
-                      "button",
-                      { className: "text-button danger-text-button", type: "button", onClick: (event) => onDelete(session, event.currentTarget) },
-                      "删除"
-                    )
-                  )
-                )
-          ))
-        )
-      : React.createElement("p", { className: "empty-state" }, "当前没有已保存的会话。"),
     React.createElement(
-      "div",
-      { className: "session-pagination", "aria-label": "会话分页" },
+      "section",
+      { className: "session-conversation-pane", "aria-label": "会话内容" },
       React.createElement(
-        "button",
-        { className: "secondary-button", type: "button", disabled: isSubmitting || page <= 1, onClick: () => load({ ...filters, page: page - 1 }) },
-        "上一页"
+        "header",
+        { className: "session-detail-heading" },
+        editingSessionId === selectedSession?.session_id
+          ? React.createElement(
+              "form",
+              { className: "session-rename", onSubmit: (event) => saveRename(event, selectedSession.session_id) },
+              React.createElement("input", {
+                ref: renameInputRef,
+                value: editingTitle,
+                onChange: (event) => setEditingTitle(event.target.value),
+                "aria-label": `${selectedSession.title} 的会话标题`
+              }),
+              React.createElement("button", { className: "secondary-button", type: "button", disabled: isSubmitting, onClick: () => setEditingSessionId(null) }, "取消"),
+              React.createElement("button", { className: "primary-button", type: "submit", disabled: isSubmitting }, "保存")
+            )
+          : React.createElement(
+              React.Fragment,
+              null,
+              React.createElement(
+                "div",
+                null,
+                React.createElement("p", { className: "section-label" }, "当前会话"),
+                React.createElement("h2", null, selectedSession?.title || "选择一个会话")
+              ),
+              selectedSession
+                ? React.createElement(
+                    "div",
+                    { className: "session-detail-actions" },
+                    React.createElement("button", { className: "text-button", type: "button", onClick: () => openRename(selectedSession) }, "重命名"),
+                    React.createElement("button", { className: "text-button", type: "button", onClick: () => exportSession(selectedSession) }, "导出"),
+                    React.createElement("button", { className: "text-button danger-text-button", type: "button", onClick: (event) => onDelete(selectedSession, event.currentTarget) }, "删除")
+                  )
+                : null
+            )
       ),
-      React.createElement("span", { role: "status" }, `第 ${page} / ${totalPages} 页`),
+      selectedSession
+        ? React.createElement("p", { className: "session-detail-meta" }, `所用 vault：${selectedSession.selected_vault_label || "未设置"} · 范围：${selectedSession.scope_kind === "directory" ? selectedSession.scope_path : selectedSession.scope_kind === "vault" ? "整个 vault" : "未设置"} · Model：${selectedSession.selected_model_label || "未设置"} · ${authorizationText}`)
+        : null,
       React.createElement(
-        "button",
-        { className: "secondary-button", type: "button", disabled: isSubmitting || page >= totalPages, onClick: () => load({ ...filters, page: page + 1 }) },
-        "下一页"
+        "div",
+        { className: "session-message-list", "aria-live": "polite" },
+        isDetailLoading
+          ? React.createElement("p", { className: "empty-state", role: "status" }, "正在加载会话内容。")
+          : detailError
+            ? React.createElement("p", { className: "form-error", role: "alert" }, detailError)
+            : activeDetail?.messages?.length
+              ? activeDetail.messages.map((message) => React.createElement(
+                  "article",
+                  { className: `session-message session-message-${message.role}`, key: message.message_id },
+                  React.createElement("p", { className: "session-message-role" }, messageRoleText(message.role)),
+                  React.createElement("p", { className: "session-message-content" }, message.content)
+                ))
+              : selectedSession
+                ? React.createElement("p", { className: "empty-state" }, "该会话尚无已保存的消息。")
+                : React.createElement("p", { className: "empty-state" }, "从左侧选择一个会话以查看内容。")
+      ),
+      selectedSession
+        ? React.createElement(
+            "form",
+            { className: "session-composer", "aria-label": "会话输入", onSubmit: sendMessage },
+            React.createElement(
+              "div",
+              { className: "session-attachment-list", "aria-live": "polite", "aria-relevant": "additions removals text" },
+              activeDetail?.attachments?.map((attachment) => React.createElement(
+                "div",
+                { className: "attachment-row", key: attachment.attachment_id },
+                React.createElement("span", null,
+                  React.createElement("strong", null, attachment.filename),
+                  ` · ${attachmentStatusText(attachment.status)}`
+                ),
+                React.createElement("button", {
+                  className: "text-button", type: "button", disabled: isSubmitting,
+                  "aria-label": `移除附件 ${attachment.filename}`,
+                  onClick: () => removeAttachment(attachment.attachment_id)
+                }, "移除")
+              ))
+            ),
+            React.createElement("textarea", {
+              value: message,
+              disabled: isSubmitting,
+              "aria-label": "输入问题或继续创作",
+              placeholder: "输入问题，或继续创作...",
+              onChange: (event) => setMessage(event.target.value),
+              onKeyDown: (event) => {
+                if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+                  event.preventDefault();
+                  sendMessage();
+                }
+              }
+            }),
+            React.createElement(
+              "div", { className: "session-composer-controls" },
+              React.createElement("button", { className: "secondary-button", type: "button", disabled: isSubmitting || contextIsDirty || !selectedSession?.selected_vault_id, onClick: pickAttachments }, "添加附件"),
+              React.createElement("label", null, "vault",
+                React.createElement("select", {
+                  value: context.vault_id, disabled: isSubmitting, "aria-label": "选择 vault",
+                  onChange: (event) => {
+                    setContext({ vault_id: event.target.value, scope_kind: "vault", scope_path: "", provider_id: "", model_id: "" });
+                  }
+                }, React.createElement("option", { value: "" }, "选择 vault"), availableVaults.map((vault) => React.createElement("option", { key: vault.vault_id, value: vault.vault_id }, vault.managed_root_relative_path)))
+              ),
+              React.createElement("label", null, "资料范围",
+                React.createElement("select", {
+                  value: context.scope_kind, disabled: isSubmitting || !context.vault_id, "aria-label": "选择资料范围",
+                  onChange: (event) => {
+                    setContext({ ...context, scope_kind: event.target.value, scope_path: "" });
+                  }
+                }, React.createElement("option", { value: "vault" }, "整个 vault"), React.createElement("option", { value: "directory" }, "指定目录"))
+              ),
+              context.scope_kind === "directory"
+                ? React.createElement("input", { value: context.scope_path, disabled: isSubmitting, "aria-label": "资料范围目录", placeholder: "vault 相对目录", onChange: (event) => {
+                  setContext({ ...context, scope_path: event.target.value });
+                } })
+                : null,
+              React.createElement("label", null, "Model",
+                React.createElement("select", {
+                  value: JSON.stringify([context.provider_id, context.model_id]), disabled: isSubmitting || !context.vault_id, "aria-label": "选择 Model",
+                  onChange: (event) => {
+                    const [providerId, modelId] = JSON.parse(event.target.value);
+                    setContext({ ...context, provider_id: providerId || "", model_id: modelId || "" });
+                  }
+                }, React.createElement("option", { value: JSON.stringify(["", ""]) }, "选择已验证的 chat Model"), chatModels.map(({ provider, model }) => React.createElement("option", { key: `${provider.provider_id}:${model.model_id}`, value: JSON.stringify([provider.provider_id, model.model_id]) }, `${provider.name} · ${model.model_id}`)))
+              ),
+              React.createElement("span", { className: "session-authorization", role: "status" }, authorizationText),
+              React.createElement("button", { className: "secondary-button", type: "button", disabled: isSubmitting || !context.vault_id || !context.provider_id || !context.model_id || (context.scope_kind === "directory" && !context.scope_path.trim()), onClick: saveContext }, "保存语境"),
+              React.createElement("button", { className: "primary-button", type: "submit", disabled: isSubmitting || !canSend }, "发送")
+            )
+          )
+        : null
+    ),
+    React.createElement(
+      "aside",
+      { className: "session-evidence-pane", "aria-label": "引用证据" },
+      React.createElement(
+        "header",
+        { className: "session-evidence-heading" },
+        React.createElement("h2", null, "引用证据"),
+        React.createElement("span", null, activeDetail?.citations?.length || 0)
+      ),
+      React.createElement(
+        "div",
+        { className: "session-citation-list" },
+        isDetailLoading
+          ? React.createElement("p", { className: "empty-state", role: "status" }, "正在加载引用。")
+          : activeDetail?.citations?.length
+            ? activeDetail.citations.map((citation) => React.createElement(
+                "article",
+                { className: "session-citation", key: citation.citation_id },
+                React.createElement("p", { className: "session-citation-path" }, citation.relative_path || "未标注来源"),
+                React.createElement("p", { className: "session-citation-location" }, citation.location || "未标注位置"),
+                React.createElement("span", { className: `session-citation-status status-${citation.status}` }, citationStatusText(citation.status))
+              ))
+            : React.createElement("p", { className: "empty-state" }, selectedSession ? "当前会话暂无引用。" : "选择会话后将在此显示引用。")
       )
     )
   );
@@ -3255,6 +3531,10 @@ export function App() {
   const [sessionFilters, setSessionFilters] = React.useState({ query: "", sort: "updated_at", order: "desc", page: 1 });
   const [sessionsLoading, setSessionsLoading] = React.useState(true);
   const [sessionsError, setSessionsError] = React.useState("");
+  const [selectedSessionId, setSelectedSessionId] = React.useState(null);
+  const [selectedSessionDetail, setSelectedSessionDetail] = React.useState(null);
+  const [sessionDetailLoading, setSessionDetailLoading] = React.useState(false);
+  const [sessionDetailError, setSessionDetailError] = React.useState("");
   const [modelDefaults, setModelDefaults] = React.useState({
     chat: { default: null, status: "unconfigured", reason: "正在加载对话/文本生成 Model。" },
     embedding: { default: null, status: "unconfigured", reason: "正在加载 Embedding Model。" }
@@ -3268,6 +3548,7 @@ export function App() {
   const [confirmationSubmitting, setConfirmationSubmitting] = React.useState(false);
   const actionTriggerRef = React.useRef(null);
   const sessionListRequestRef = React.useRef(0);
+  const sessionDetailRequestRef = React.useRef(0);
   const menuButtonRef = React.useRef(null);
   const firstMenuLinkRef = React.useRef(null);
   const menuPanelRef = React.useRef(null);
@@ -3306,6 +3587,28 @@ export function App() {
       }))
   ), []);
 
+  const loadSessionDetail = React.useCallback(async (sessionId) => {
+    const requestId = ++sessionDetailRequestRef.current;
+    if (!sessionId) {
+      setSelectedSessionDetail(null);
+      setSessionDetailError("");
+      return;
+    }
+    setSessionDetailLoading(true);
+    setSessionDetailError("");
+    try {
+      const detail = await requestJson(`${SESSIONS_ENDPOINT}/${sessionId}`);
+      if (requestId === sessionDetailRequestRef.current) setSelectedSessionDetail(detail);
+    } catch (requestError) {
+      if (requestId === sessionDetailRequestRef.current) {
+        setSelectedSessionDetail(null);
+        setSessionDetailError(requestError.message);
+      }
+    } finally {
+      if (requestId === sessionDetailRequestRef.current) setSessionDetailLoading(false);
+    }
+  }, []);
+
   const loadSessions = React.useCallback(async (nextFilters) => {
     const requestId = ++sessionListRequestRef.current;
     const requested = { query: "", sort: "updated_at", order: "desc", page: 1, ...nextFilters };
@@ -3323,6 +3626,11 @@ export function App() {
       if (requestId !== sessionListRequestRef.current) return null;
       setSessionPage(response);
       setSessionFilters({ ...requested, page: response.page });
+      setSelectedSessionId((current) => (
+        response.sessions.some((session) => session.session_id === current)
+          ? current
+          : response.sessions[0]?.session_id || null
+      ));
       return response;
     } catch (requestError) {
       if (requestId === sessionListRequestRef.current) setSessionsError(requestError.message);
@@ -3331,6 +3639,10 @@ export function App() {
       if (requestId === sessionListRequestRef.current) setSessionsLoading(false);
     }
   }, []);
+
+  React.useEffect(() => {
+    loadSessionDetail(selectedSessionId);
+  }, [loadSessionDetail, selectedSessionId]);
 
   React.useEffect(() => {
     fetch(HEALTH_ENDPOINT)
@@ -3442,7 +3754,15 @@ export function App() {
       method: "POST",
       body: JSON.stringify({})
     });
+    setSelectedSessionDetail({
+      session: response.session,
+      messages: [],
+      task_states: [],
+      citations: [],
+      generation_results: []
+    });
     await loadSessions({ query: "", sort: "updated_at", order: "desc", page: 1 });
+    setSelectedSessionId(response.session.session_id);
     return response.session;
   }
 
@@ -3452,7 +3772,74 @@ export function App() {
       body: JSON.stringify({ title })
     });
     await loadSessions(sessionFilters);
+    setSelectedSessionDetail((current) => (
+      current?.session.session_id === sessionId ? { ...current, session: response.session } : current
+    ));
     return response.session;
+  }
+
+  async function updatePersistentSessionContext(sessionId, context) {
+    const response = await requestJson(`${SESSIONS_ENDPOINT}/${sessionId}/context`, {
+      method: "PATCH",
+      body: JSON.stringify(context)
+    });
+    setSelectedSessionDetail((current) => (
+      current?.session.session_id === sessionId
+        ? {
+            ...current,
+            session: response.session,
+            attachments: current.session.selected_vault_id === response.session.selected_vault_id
+              ? current.attachments
+              : []
+          }
+        : current
+    ));
+    setSessionPage((current) => ({
+      ...current,
+      sessions: current.sessions.map((session) => session.session_id === sessionId ? response.session : session)
+    }));
+    await loadSessionDetail(sessionId);
+    return response.session;
+  }
+
+  async function pickPersistentSessionAttachments(sessionId) {
+    const selection = await requestJson(`${SESSIONS_ENDPOINT}/${sessionId}/attachments/select`, { method: "POST" });
+    if (!selection.selection_id) return;
+    const response = await requestJson(`${SESSIONS_ENDPOINT}/${sessionId}/attachments`, {
+      method: "POST",
+      body: JSON.stringify({ selection_id: selection.selection_id })
+    });
+    setSelectedSessionDetail((current) => (
+      current?.session.session_id === sessionId
+        ? { ...current, attachments: [...(current.attachments || []), ...response.attachments] }
+        : current
+    ));
+    await loadSessionDetail(sessionId);
+  }
+
+  async function removePersistentSessionAttachment(sessionId, attachmentId) {
+    await requestJson(`${SESSIONS_ENDPOINT}/${sessionId}/attachments/${attachmentId}`, { method: "DELETE" });
+    setSelectedSessionDetail((current) => (
+      current?.session.session_id === sessionId
+        ? { ...current, attachments: (current.attachments || []).filter((item) => item.attachment_id !== attachmentId) }
+        : current
+    ));
+    await loadSessionDetail(sessionId);
+  }
+
+  async function sendPersistentSessionMessage(sessionId, content) {
+    const response = await requestJson(`${SESSIONS_ENDPOINT}/${sessionId}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content })
+    });
+    setSelectedSessionDetail((current) => (
+      current?.session.session_id === sessionId
+        ? { ...current, messages: [...(current.messages || []), response.message] }
+        : current
+    ));
+    await loadSessionDetail(sessionId);
+    await loadSessions(sessionFilters);
+    return response.message;
   }
 
   async function exportPersistentSession(session) {
@@ -3588,11 +3975,22 @@ export function App() {
       filters: sessionFilters,
       isLoading: sessionsLoading,
       error: sessionsError,
+      selectedSessionId,
+      selectedDetail: selectedSessionDetail,
+      isDetailLoading: sessionDetailLoading,
+      detailError: sessionDetailError,
       onLoad: loadSessions,
+      onSelect: (session) => setSelectedSessionId(session.session_id),
       onCreate: createPersistentSession,
       onRename: renamePersistentSession,
       onExport: exportPersistentSession,
-      onDelete: (session, trigger) => openConfirmation("session-remove", session, trigger)
+      onDelete: (session, trigger) => openConfirmation("session-remove", session, trigger),
+      vaults,
+      providers,
+      onUpdateContext: updatePersistentSessionContext,
+      onPickAttachments: pickPersistentSessionAttachments,
+      onRemoveAttachment: removePersistentSessionAttachment,
+      onSendMessage: sendPersistentSessionMessage
     });
   } else if (activeDestination === "workbench") {
     workspaceContent = React.createElement(KnowledgeGraphWorkbench, {
@@ -3627,6 +4025,20 @@ export function App() {
     );
   }
 
+  const contextSession = activeDestination === "sessions"
+    && selectedSessionDetail?.session?.session_id === selectedSessionId
+    ? selectedSessionDetail.session
+    : null;
+  const contextSessionVault = contextSession
+    ? vaults.find((vault) => vault.vault_id === contextSession.selected_vault_id)
+    : null;
+  const contextLocation = contextSession
+    ? `会话 / vault：${contextSession.selected_vault_label || "未设置"} / 范围：${contextSession.scope_kind === "directory" ? contextSession.scope_path : contextSession.scope_kind === "vault" ? "整个 vault" : "未设置"} / Model：${contextSession.selected_model_label || "未设置"}`
+    : (currentVault ? `本机 / 当前 vault：${vaultName(currentVault)}` : "本机 / 当前工作区");
+  const contextOutbound = contextSessionVault
+    ? `外发：${outboundModeText(policyFor(contextSessionVault).outbound_mode)}`
+    : currentPolicy ? `外发：${outboundModeText(currentPolicy.outbound_mode)}` : null;
+
   return React.createElement(
     "div",
     { className: "app-shell" },
@@ -3643,7 +4055,7 @@ export function App() {
     ),
     React.createElement(
       "section",
-      { className: "application-content" },
+      { className: `application-content${activeDestination === "sessions" ? " application-content-sessions" : ""}` },
       React.createElement(
         "header",
         { className: "context-bar" },
@@ -3664,28 +4076,35 @@ export function App() {
           React.createElement(
             "p",
             { className: "context-location" },
-          currentVault ? `本机 / 当前 vault：${vaultName(currentVault)}` : "本机 / 当前工作区"
+          contextLocation
         ),
         React.createElement(
           "div",
           { className: "context-statuses", "aria-live": "polite" },
           React.createElement("span", { "data-testid": "health-status" }, healthStatus),
           React.createElement("span", { "data-testid": "session-status" }, sessionStatus),
-          currentPolicy
-            ? React.createElement("span", { "data-testid": "outbound-status" }, `外发：${outboundModeText(currentPolicy.outbound_mode)}`)
+          contextOutbound
+            ? React.createElement("span", { "data-testid": "outbound-status" }, contextOutbound)
             : null
         )
       ),
       React.createElement(
         "main",
-        { className: "workspace", "aria-labelledby": "workspace-title" },
-        React.createElement(
-          "div",
-          { className: "workspace-inner" },
-          React.createElement("p", { className: "eyebrow" }, "本机工作区"),
-          React.createElement("h1", { id: "workspace-title" }, activePage.label),
-          workspaceContent
-        )
+        {
+          className: `workspace${activeDestination === "sessions" ? " session-workspace" : ""}`,
+          ...(activeDestination === "sessions"
+            ? { "aria-label": "会话工作区" }
+            : { "aria-labelledby": "workspace-title" })
+        },
+        activeDestination === "sessions"
+          ? workspaceContent
+          : React.createElement(
+              "div",
+              { className: "workspace-inner" },
+              React.createElement("p", { className: "eyebrow" }, "本机工作区"),
+              React.createElement("h1", { id: "workspace-title" }, activePage.label),
+              workspaceContent
+            )
       )
     ),
     React.createElement(

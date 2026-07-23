@@ -6,12 +6,14 @@ from pathlib import Path
 from domain.sessions import (
     MAX_SESSION_PAGE,
     PersistentSession,
+    SessionAttachment,
     SessionCitation,
     SessionDetail,
     SessionGenerationResult,
     SessionMessage,
     SessionPage,
     SessionTaskState,
+    utc_now,
 )
 
 
@@ -39,6 +41,8 @@ class SqliteSessionRepository:
                     selected_provider_label TEXT,
                     selected_model_id TEXT,
                     selected_model_label TEXT,
+                    scope_kind TEXT,
+                    scope_path TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     last_activity_at TEXT NOT NULL
@@ -88,12 +92,34 @@ class SqliteSessionRepository:
                     created_at TEXT NOT NULL
                 )"""
             )
+            self._ensure_session_column(connection, "scope_kind", "TEXT")
+            self._ensure_session_column(connection, "scope_path", "TEXT")
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS session_attachments (
+                    attachment_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                    filename TEXT NOT NULL,
+                    vault_id TEXT,
+                    relative_path TEXT,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )"""
+            )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS session_list_updated_idx ON sessions(updated_at DESC, session_id)"
             )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS session_list_vault_idx ON sessions(selected_vault_id, updated_at DESC)"
             )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS session_attachment_session_idx ON session_attachments(session_id, created_at)"
+            )
+
+    @staticmethod
+    def _ensure_session_column(connection: sqlite3.Connection, name: str, declaration: str) -> None:
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(sessions)")}
+        if name not in columns:
+            connection.execute(f"ALTER TABLE sessions ADD COLUMN {name} {declaration}")
 
     def create(self, session: PersistentSession) -> None:
         with self._connect() as connection:
@@ -101,8 +127,8 @@ class SqliteSessionRepository:
                 """INSERT INTO sessions (
                     session_id, title, selected_vault_id, selected_vault_label,
                     selected_provider_id, selected_provider_label, selected_model_id,
-                    selected_model_label, created_at, updated_at, last_activity_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    selected_model_label, scope_kind, scope_path, created_at, updated_at, last_activity_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 self._session_values(session),
             )
 
@@ -138,12 +164,17 @@ class SqliteSessionRepository:
                 "SELECT * FROM session_generation_results WHERE session_id = ? ORDER BY created_at, result_id",
                 (session_id,),
             ).fetchall()
+            attachments = connection.execute(
+                "SELECT * FROM session_attachments WHERE session_id = ? ORDER BY created_at, attachment_id",
+                (session_id,),
+            ).fetchall()
         return SessionDetail(
             self._session_from_row(session_row),
             tuple(self._message_from_row(row) for row in messages),
             tuple(self._task_state_from_row(row) for row in task_states),
             tuple(self._citation_from_row(row) for row in citations),
             tuple(self._result_from_row(row) for row in results),
+            tuple(self._attachment_from_row(row) for row in attachments),
         )
 
     def list_page(
@@ -196,7 +227,7 @@ class SqliteSessionRepository:
             result = connection.execute(
                 """UPDATE sessions SET title = ?, selected_vault_id = ?, selected_vault_label = ?,
                     selected_provider_id = ?, selected_provider_label = ?, selected_model_id = ?,
-                    selected_model_label = ?, updated_at = ?, last_activity_at = ?
+                    selected_model_label = ?, scope_kind = ?, scope_path = ?, updated_at = ?, last_activity_at = ?
                     WHERE session_id = ?""",
                 (
                     session.title,
@@ -206,6 +237,8 @@ class SqliteSessionRepository:
                     session.selected_provider_label,
                     session.selected_model_id,
                     session.selected_model_label,
+                    session.scope_kind,
+                    session.scope_path,
                     session.updated_at,
                     session.last_activity_at,
                     session.session_id,
@@ -237,6 +270,38 @@ class SqliteSessionRepository:
                 ),
             )
             self._touch_session(connection, message.session_id, message.created_at)
+
+    def append_attachment(self, attachment: SessionAttachment) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO session_attachments (
+                    attachment_id, session_id, filename, vault_id, relative_path, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    attachment.attachment_id,
+                    attachment.session_id,
+                    attachment.filename,
+                    attachment.vault_id,
+                    attachment.relative_path,
+                    attachment.status,
+                    attachment.created_at,
+                ),
+            )
+            self._touch_session(connection, attachment.session_id, attachment.created_at)
+
+    def delete_attachment(self, session_id: str, attachment_id: str) -> None:
+        with self._connect() as connection:
+            result = connection.execute(
+                "DELETE FROM session_attachments WHERE session_id = ? AND attachment_id = ?",
+                (session_id, attachment_id),
+            )
+            if result.rowcount != 1:
+                raise KeyError(attachment_id)
+            self._touch_session(connection, session_id, utc_now())
+
+    def clear_attachments(self, session_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM session_attachments WHERE session_id = ?", (session_id,))
 
     def record_task_state(self, task_state: SessionTaskState) -> None:
         with self._connect() as connection:
@@ -305,6 +370,8 @@ class SqliteSessionRepository:
             session.selected_provider_label,
             session.selected_model_id,
             session.selected_model_label,
+            session.scope_kind,
+            session.scope_path,
             session.created_at,
             session.updated_at,
             session.last_activity_at,
@@ -336,6 +403,8 @@ class SqliteSessionRepository:
             row["updated_at"],
             row["last_activity_at"],
             int(row["message_count"]),
+            row["scope_kind"],
+            row["scope_path"],
         )
 
     @staticmethod
@@ -364,4 +433,11 @@ class SqliteSessionRepository:
     def _result_from_row(row: sqlite3.Row) -> SessionGenerationResult:
         return SessionGenerationResult(
             row["result_id"], row["session_id"], row["status"], row["content"], row["created_at"]
+        )
+
+    @staticmethod
+    def _attachment_from_row(row: sqlite3.Row) -> SessionAttachment:
+        return SessionAttachment(
+            row["attachment_id"], row["session_id"], row["filename"], row["vault_id"],
+            row["relative_path"], row["status"], row["created_at"],
         )

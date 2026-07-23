@@ -5,6 +5,7 @@ from typing import Protocol
 from domain.sessions import (
     PersistentSession,
     SessionCitation,
+    SessionAttachment,
     SessionDetail,
     SessionGenerationResult,
     SessionMessage,
@@ -36,6 +37,12 @@ class SessionRepository(Protocol):
     def delete(self, session_id: str) -> None: ...
 
     def append_message(self, message: SessionMessage) -> None: ...
+
+    def append_attachment(self, attachment: SessionAttachment) -> None: ...
+
+    def delete_attachment(self, session_id: str, attachment_id: str) -> None: ...
+
+    def clear_attachments(self, session_id: str) -> None: ...
 
     def record_task_state(self, task_state: SessionTaskState) -> None: ...
 

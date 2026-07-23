@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from pathlib import PurePosixPath, PureWindowsPath
 from uuid import uuid4
 
+from domain.policies import normalize_vault_relative_path
+
 
 MAX_SESSION_PAGE = 10_000_000
 
@@ -27,6 +29,8 @@ class PersistentSession:
     updated_at: str
     last_activity_at: str
     message_count: int = 0
+    scope_kind: str | None = None
+    scope_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -135,12 +139,42 @@ class SessionGenerationResult:
 
 
 @dataclass(frozen=True)
+class SessionAttachment:
+    attachment_id: str
+    session_id: str
+    filename: str
+    vault_id: str | None
+    relative_path: str | None
+    status: str
+    created_at: str
+
+    @classmethod
+    def new(
+        cls, session_id: str, filename: str, *, vault_id: str | None,
+        relative_path: str | None, status: str,
+    ) -> "SessionAttachment":
+        name = filename.strip()
+        if not name or len(name) > 255:
+            raise ValueError("Attachment filename is invalid.")
+        if relative_path is not None:
+            relative_path = normalize_vault_relative_path(relative_path)
+        if status not in {"available", "excluded", "pending-authorization", "needs-import"}:
+            raise ValueError("Attachment status is invalid.")
+        if status == "needs-import" and (vault_id is not None or relative_path is not None):
+            raise ValueError("External attachment cannot have a vault path.")
+        if status != "needs-import" and (vault_id is None or relative_path is None):
+            raise ValueError("Vault attachment identity is required.")
+        return cls(str(uuid4()), session_id, name, vault_id, relative_path, status, utc_now())
+
+
+@dataclass(frozen=True)
 class SessionDetail:
     session: PersistentSession
     messages: tuple[SessionMessage, ...]
     task_states: tuple[SessionTaskState, ...]
     citations: tuple[SessionCitation, ...]
     generation_results: tuple[SessionGenerationResult, ...]
+    attachments: tuple[SessionAttachment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -167,3 +201,19 @@ def new_session(title: str) -> PersistentSession:
         updated_at=timestamp,
         last_activity_at=timestamp,
     )
+
+
+def normalize_session_scope(scope_kind: str | None, scope_path: str | None) -> tuple[str | None, str | None]:
+    if scope_kind is None:
+        if scope_path is not None:
+            raise ValueError("A session scope kind is required.")
+        return None, None
+    if scope_kind == "vault":
+        if scope_path is not None:
+            raise ValueError("A whole-vault scope cannot have a path.")
+        return scope_kind, None
+    if scope_kind == "directory":
+        if scope_path is None:
+            raise ValueError("A directory scope requires a vault-relative path.")
+        return scope_kind, normalize_vault_relative_path(scope_path)
+    raise ValueError("Session scope kind is invalid.")

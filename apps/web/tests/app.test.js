@@ -103,18 +103,19 @@ test("uses relative same-origin endpoints for health and local session checks", 
   ]);
 });
 
-test("renders a bounded persistent session list without a composer", () => {
+test("renders a bounded three-pane session workspace with a context composer", () => {
+  const session = {
+    session_id: "session-1",
+    title: "代数复习",
+    selected_vault_id: null,
+    selected_vault_label: null,
+    message_count: 1,
+    updated_at: "2026-07-22T00:00:00+00:00"
+  };
   const markup = renderToStaticMarkup(
     React.createElement(SessionManagement, {
       sessionPage: {
-        sessions: [{
-          session_id: "session-1",
-          title: "代数复习",
-          selected_vault_id: null,
-          selected_vault_label: null,
-          message_count: 0,
-          updated_at: "2026-07-22T00:00:00+00:00"
-        }],
+        sessions: [session],
         page: 1,
         page_size: 25,
         total: 26,
@@ -123,22 +124,52 @@ test("renders a bounded persistent session list without a composer", () => {
       filters: { query: "", sort: "updated_at", order: "desc" },
       isLoading: false,
       error: "",
+      selectedSessionId: "session-1",
+      selectedDetail: {
+        session,
+        messages: [{ message_id: "message-1", role: "assistant", content: "先复习二次方程。" }],
+        citations: [{ citation_id: "citation-1", relative_path: "notes/algebra.md", location: "第 2 节", status: "valid" }]
+      },
+      isDetailLoading: false,
+      detailError: "",
       onLoad: () => {},
+      onSelect: () => {},
       onCreate: async () => ({}),
       onRename: async () => ({}),
       onExport: async () => {},
-      onDelete: () => {}
+      onDelete: () => {},
+      vaults: [{ vault_id: "vault-1", managed_root_relative_path: "English", authorization_status: "active", access_status: "available" }],
+      providers: [{
+        provider_id: "provider-1",
+        name: "Local chat",
+        verification: { is_verified: true },
+        models: [{ model_id: "chat-1", model_type: "chat", is_discovered: true, verification: { ok: true } }]
+      }],
+      onUpdateContext: async () => {},
+      onPickAttachments: async () => {},
+      onRemoveAttachment: async () => {},
+      onSendMessage: async () => {}
     })
   );
 
   assert.match(markup, /新建会话/);
   assert.match(markup, /aria-label="搜索会话"/);
+  assert.match(markup, /aria-label="会话历史"/);
+  assert.match(markup, /aria-label="会话内容"/);
+  assert.match(markup, /aria-label="引用证据"/);
   assert.match(markup, /代数复习/);
   assert.match(markup, /所用 vault：未设置/);
+  assert.match(markup, /先复习二次方程。/);
+  assert.match(markup, /notes\/algebra\.md/);
   assert.match(markup, /上一页/);
   assert.match(markup, /下一页/);
   assert.match(markup, /第 1 \/ 2 页/);
-  assert.doesNotMatch(markup, /session-composer/);
+  assert.match(markup, /aria-label="会话输入"/);
+  assert.match(markup, /aria-label="选择 vault"/);
+  assert.match(markup, /aria-label="选择 Model"/);
+  assert.match(markup, /aria-label="输入问题或继续创作"/);
+  assert.match(markup, /发送/);
+  assert.match(markup, /session-composer/);
 });
 
 test("renders conversion retry and typed correction controls only for conversion review items", () => {

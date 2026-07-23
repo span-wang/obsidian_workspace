@@ -4,10 +4,14 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from adapters.filesystem_vault_adapter import LocalVaultFilesystem
+from adapters.sqlite_session_repository import SqliteSessionRepository
 from adapters.sqlite_vault_repository import SqliteVaultRepository
+from application.policies import PolicyService
+from application.sessions import SessionService
 from application.vaults import VaultService
 from api.main import create_app
 from api.runtime import RuntimeState
+from domain.providers import Provider, ProviderModel, ProviderProbeResults, ProbeResult, ResolvedProviderModel
 
 
 def asgi_request(app, method: str, path: str, *, body: dict[str, object] | None = None, cookie: str = ""):
@@ -150,3 +154,98 @@ def test_session_deletion_does_not_change_a_vault_file(tmp_path: Path) -> None:
     assert delete_status == 200
     assert note.read_text(encoding="utf-8") == "# Reviewed\n\nKeep this note."
     assert vault_service.get(vault.vault_id).path == vault_path
+
+
+def test_session_context_attachment_and_message_api_keep_private_metadata(tmp_path: Path) -> None:
+    runtime = RuntimeState(data_directory=tmp_path / "app-data", sqlite_version="3.45.1")
+    vault_path = tmp_path / "vault"
+    attachment_path = vault_path / "notes" / "chapter.md"
+    attachment_path.parent.mkdir(parents=True)
+    attachment_path.write_text("# Local fixture", encoding="utf-8")
+    vault_repository = SqliteVaultRepository(runtime.data_directory / "vaults.sqlite3")
+    vault_service = VaultService(vault_repository, LocalVaultFilesystem(), vault_repository)
+    vault = vault_service.authorize(vault_path, "platform")
+    policy_service = PolicyService(vault_service, vault_repository)
+    provider = Provider(
+        "provider-1", "Local", "http://localhost:9000", "opaque", True,
+        ProviderProbeResults(ProbeResult.success(), ProbeResult.success()),
+        (ProviderModel("provider-1", "chat-1", "chat", ProbeResult.success(), True, "now"),),
+        "now", "now", "now",
+    )
+
+    class Providers:
+        def resolve_specific_model(self, model_type: str, provider_id: str, model_id: str) -> ResolvedProviderModel:
+            assert (model_type, provider_id, model_id) == ("chat", "provider-1", "chat-1")
+            return ResolvedProviderModel(provider, provider.models[0])
+
+    class Picker:
+        def select_files(self, *, multiple: bool) -> tuple[Path, ...]:
+            assert multiple
+            return (attachment_path,)
+
+    session_service = SessionService(
+        SqliteSessionRepository(runtime.data_directory / "sessions.sqlite3"),
+        vault_service=vault_service,
+        provider_service=Providers(),
+        policy_service=policy_service,
+    )
+    app = create_app(
+        runtime=runtime,
+        vault_service=vault_service,
+        policy_service=policy_service,
+        provider_service=Providers(),
+        session_service=session_service,
+        import_picker=Picker(),
+    )
+    _, root_headers, _ = asgi_request(app, "GET", "/")
+    cookie = root_headers["set-cookie"].split(";", maxsplit=1)[0]
+    _, _, create_body = asgi_request(app, "POST", "/api/sessions", body={"title": "私有语境"}, cookie=cookie)
+    session_id = json.loads(create_body)["session"]["session_id"]
+
+    invalid_status, _, _ = asgi_request(
+        app,
+        "PATCH",
+        f"/api/sessions/{session_id}/context",
+        body={"vault_id": vault.vault_id, "scope_kind": "vault", "provider_id": "provider-1", "model_id": "chat-1", "unexpected": True},
+        cookie=cookie,
+    )
+    context_status, _, context_body = asgi_request(
+        app,
+        "PATCH",
+        f"/api/sessions/{session_id}/context",
+        body={"vault_id": vault.vault_id, "scope_kind": "directory", "scope_path": "notes", "provider_id": "provider-1", "model_id": "chat-1"},
+        cookie=cookie,
+    )
+    select_status, _, select_body = asgi_request(
+        app, "POST", f"/api/sessions/{session_id}/attachments/select", cookie=cookie
+    )
+    selection_id = json.loads(select_body)["selection_id"]
+    attachment_status, _, attachment_body = asgi_request(
+        app,
+        "POST",
+        f"/api/sessions/{session_id}/attachments",
+        body={"selection_id": selection_id},
+        cookie=cookie,
+    )
+    attachment = json.loads(attachment_body)["attachments"][0]
+    message_status, _, message_body = asgi_request(
+        app, "POST", f"/api/sessions/{session_id}/messages", body={"content": "继续"}, cookie=cookie
+    )
+    remove_status, _, _ = asgi_request(
+        app, "DELETE", f"/api/sessions/{session_id}/attachments/{attachment['attachment_id']}", cookie=cookie
+    )
+    detail_status, _, detail_body = asgi_request(app, "GET", f"/api/sessions/{session_id}", cookie=cookie)
+
+    assert invalid_status == 422
+    assert context_status == 200
+    assert json.loads(context_body)["session"]["scope_path"] == "notes"
+    assert select_status == 200
+    assert attachment_status == 200
+    assert attachment["filename"] == "chapter.md"
+    assert str(vault_path).encode() not in attachment_body
+    assert message_status == 200
+    assert json.loads(message_body)["message"]["model_id"] == "chat-1"
+    assert remove_status == 200
+    assert attachment_path.read_text(encoding="utf-8") == "# Local fixture"
+    assert detail_status == 200
+    assert json.loads(detail_body)["attachments"] == []

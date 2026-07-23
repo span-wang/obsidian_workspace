@@ -190,6 +190,28 @@ class SessionRenameCommand(BaseModel):
     title: str
 
 
+class SessionContextCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    vault_id: str
+    scope_kind: Literal["vault", "directory"]
+    scope_path: str | None = None
+    provider_id: str
+    model_id: str
+
+
+class SessionAttachmentCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    selection_id: str
+
+
+class SessionMessageCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    content: str
+
+
 class PendingAssociationResolutionCommand(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -543,6 +565,8 @@ def persistent_session_payload(session: PersistentSession) -> dict[str, object]:
         "selected_model_id": session.selected_model_id,
         "selected_model_label": session.selected_model_label,
         "message_count": session.message_count,
+        "scope_kind": session.scope_kind,
+        "scope_path": session.scope_path,
         "created_at": session.created_at,
         "updated_at": session.updated_at,
         "last_activity_at": session.last_activity_at,
@@ -592,6 +616,17 @@ def session_generation_result_payload(result: SessionGenerationResult) -> dict[s
     }
 
 
+def session_attachment_payload(attachment) -> dict[str, object]:
+    return {
+        "attachment_id": attachment.attachment_id,
+        "filename": attachment.filename,
+        "vault_id": attachment.vault_id,
+        "relative_path": attachment.relative_path,
+        "status": attachment.status,
+        "created_at": attachment.created_at,
+    }
+
+
 def session_detail_payload(detail: SessionDetail) -> dict[str, object]:
     return {
         "session": persistent_session_payload(detail.session),
@@ -601,6 +636,7 @@ def session_detail_payload(detail: SessionDetail) -> dict[str, object]:
         "generation_results": [
             session_generation_result_payload(result) for result in detail.generation_results
         ],
+        "attachments": [session_attachment_payload(attachment) for attachment in detail.attachments],
     }
 
 
@@ -1308,7 +1344,10 @@ def create_app(
         authorization_invalidator=app.state.vault_service.repository,
     )
     app.state.session_service = session_service or SessionService(
-        SqliteSessionRepository(runtime.data_directory / "sessions.sqlite3")
+        SqliteSessionRepository(runtime.data_directory / "sessions.sqlite3"),
+        vault_service=app.state.vault_service,
+        provider_service=app.state.provider_service,
+        policy_service=app.state.policy_service,
     )
     app.state.directory_picker = directory_picker or WindowsDirectoryPicker()
     app.state.directory_selections = directory_selections or DirectorySelectionStore()
@@ -1451,6 +1490,82 @@ def create_app(
             return {"session": persistent_session_payload(
                 app.state.session_service.rename(session_id, command.title)
             )}
+        except Exception as error:
+            raise session_error(error) from error
+
+    @app.patch("/api/sessions/{session_id}/context", dependencies=[Depends(require_current_local_session)])
+    def update_persistent_session_context(
+        request: Request, session_id: str, command: SessionContextCommand
+    ) -> dict[str, object]:
+        try:
+            session = app.state.session_service.update_context(
+                session_id,
+                vault_id=command.vault_id,
+                scope_kind=command.scope_kind,
+                scope_path=command.scope_path,
+                provider_id=command.provider_id,
+                model_id=command.model_id,
+            )
+            return {"session": persistent_session_payload(session)}
+        except Exception as error:
+            raise session_error(error) from error
+
+    @app.post("/api/sessions/{session_id}/attachments/select", dependencies=[Depends(require_current_local_session)])
+    async def select_session_attachments(request: Request, session_id: str) -> dict[str, str | None]:
+        session_secret = require_local_session(app, request)
+        try:
+            app.state.session_service.get(session_id)
+            paths = await asyncio.to_thread(app.state.import_picker.select_files, multiple=True)
+        except RuntimeError as error:
+            raise HTTPException(
+                status_code=501,
+                detail={"code": "attachment_picker_unavailable", "message": str(error), "details": {}, "retryable": False},
+            ) from error
+        except Exception as error:
+            raise session_error(error) from error
+        if paths is None:
+            return {"selection_id": None, "label": None}
+        selection_id = app.state.import_selections.remember(session_secret, "files", paths)
+        label = paths[0].name if len(paths) == 1 else f"{paths[0].name} and {len(paths) - 1} more"
+        return {"selection_id": selection_id, "label": label}
+
+    @app.post("/api/sessions/{session_id}/attachments", dependencies=[Depends(require_current_local_session)])
+    def add_persistent_session_attachments(
+        request: Request, session_id: str, command: SessionAttachmentCommand
+    ) -> dict[str, object]:
+        session_secret = require_local_session(app, request)
+        try:
+            selection = app.state.import_selections.consume(command.selection_id, session_secret)
+            attachments = [
+                session_attachment_payload(app.state.session_service.add_attachment(session_id, path))
+                for path in selection.paths
+            ]
+            return {"attachments": attachments}
+        except ImportSelectionError as error:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "attachment_selection_invalid", "message": str(error), "details": {}, "retryable": True},
+            ) from error
+        except Exception as error:
+            raise session_error(error) from error
+
+    @app.delete("/api/sessions/{session_id}/attachments/{attachment_id}", dependencies=[Depends(require_current_local_session)])
+    def remove_persistent_session_attachment(
+        request: Request, session_id: str, attachment_id: str
+    ) -> dict[str, str]:
+        try:
+            app.state.session_service.remove_attachment(session_id, attachment_id)
+            return {"status": "removed"}
+        except Exception as error:
+            raise session_error(error) from error
+
+    @app.post("/api/sessions/{session_id}/messages", dependencies=[Depends(require_current_local_session)])
+    def send_persistent_session_message(
+        request: Request, session_id: str, command: SessionMessageCommand
+    ) -> dict[str, object]:
+        try:
+            message = app.state.session_service.send_user_message(session_id, command.content)
+            return {"message": session_message_payload(message)}
         except Exception as error:
             raise session_error(error) from error
 

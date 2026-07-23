@@ -255,8 +255,14 @@ class ProviderService:
         selection = self.repository.get_default(model_type)
         if selection is None:
             raise ProviderUnavailableError(f"No {model_type} Provider model is selected. Choose a verified model.")
+        return self.resolve_specific_model(model_type, selection.provider_id, selection.model_id)
+
+    def resolve_specific_model(
+        self, model_type: str, provider_id: str, model_id: str
+    ) -> ResolvedProviderModel:
+        self._validate_model_type(model_type)
         try:
-            provider = self.repository.get(selection.provider_id)
+            provider = self.repository.get(provider_id)
         except KeyError as error:
             raise ProviderUnavailableError(f"The selected {model_type} Provider is unavailable. Choose another model.") from error
         if not provider.credential_configured or not self._credential_is_available(provider):
@@ -264,7 +270,7 @@ class ProviderService:
         if not provider.verification.is_verified:
             raise ProviderUnavailableError("The selected Provider has not passed discovery and health checks.")
         try:
-            model = self._find_model(provider, selection.model_id)
+            model = self._find_model(provider, model_id)
         except ProviderValidationError as error:
             raise ProviderUnavailableError(f"The selected {model_type} Model is unavailable. Choose another model.") from error
         if model.model_type != model_type or not model.verification.ok or not model.is_discovered:

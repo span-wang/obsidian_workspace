@@ -1224,6 +1224,22 @@ test("manages bounded private sessions without inheriting a vault or closing del
       return;
     }
     const session = sessions.find((item) => item.session_id === sessionId);
+    if (method === "GET" && session && parts.at(-1) !== "export") {
+      await route.fulfill({
+        json: {
+          session,
+          messages: sessionId === "session-1"
+            ? [{ message_id: "message-1", role: "assistant", content: "会话详情已加载。" }]
+            : [],
+          task_states: [],
+          citations: sessionId === "session-1"
+            ? [{ citation_id: "citation-1", relative_path: "notes/algebra.md", location: "第 2 节", status: "valid" }]
+            : [],
+          generation_results: []
+        }
+      });
+      return;
+    }
     if (method === "PATCH") {
       const { title } = request.postDataJSON();
       session.title = title;
@@ -1244,7 +1260,7 @@ test("manages bounded private sessions without inheriting a vault or closing del
       if (sessionDeleteAttempts === 1) {
         await route.fulfill({
           status: 500,
-          json: { code: "session_operation_failed", message: "Delete failed.", details: {}, retryable: true }
+          json: { code: "session_operation_failed", message: "无法删除会话。", details: {}, retryable: true }
         });
         return;
       }
@@ -1258,15 +1274,17 @@ test("manages bounded private sessions without inheriting a vault or closing del
   await page.goto("/");
   await page.getByRole("link", { name: "会话", exact: true }).click();
 
-  await expect(page.getByText("会话 1", { exact: true })).toBeVisible();
-  await expect(page.getByText("所用 vault：数学资料", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: /会话 1 所用 vault：数学资料/ })).toBeVisible();
+  await expect(page.getByLabel("会话内容").getByText(/所用 vault：数学资料/)).toBeVisible();
+  await expect(page.getByText("会话详情已加载。", { exact: true })).toBeVisible();
+  await expect(page.getByText("notes/algebra.md", { exact: true })).toBeVisible();
   await expect(page.getByText("第 1 / 2 页", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "下一页" }).click();
-  await expect(page.getByText("会话 26", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: /会话 26/ })).toBeVisible();
 
   await page.getByLabel("搜索会话").fill("会话 26");
   await page.getByRole("button", { name: "搜索", exact: true }).click();
-  await expect(page.getByText("会话 26", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: /会话 26/ })).toBeVisible();
   await expect(page.getByText("会话 1", { exact: true })).toHaveCount(0);
 
   await page.getByLabel("搜索会话").fill("");
@@ -1279,14 +1297,14 @@ test("manages bounded private sessions without inheriting a vault or closing del
   await expect(titleInput).toBeFocused();
   await titleInput.fill("代数复习");
   await page.getByRole("button", { name: "保存", exact: true }).click();
-  const sessionRow = page.locator(".session-row", { hasText: "代数复习" });
+  const sessionRow = page.locator(".session-history-item", { hasText: "代数复习" });
   await expect(sessionRow).toContainText("所用 vault：未设置");
 
   const download = page.waitForEvent("download");
-  await sessionRow.getByRole("button", { name: "导出", exact: true }).click();
+  await page.getByRole("button", { name: "导出", exact: true }).click();
   await (await download).cancel();
 
-  const deleteButton = sessionRow.getByRole("button", { name: "删除", exact: true });
+  const deleteButton = page.getByRole("button", { name: "删除", exact: true });
   await deleteButton.focus();
   await deleteButton.click();
   const dialog = page.getByRole("dialog", { name: "删除会话“代数复习”？" });
@@ -1299,7 +1317,7 @@ test("manages bounded private sessions without inheriting a vault or closing del
   await dialog.getByRole("button", { name: "删除会话", exact: true }).click();
   await expect(dialog).toBeHidden();
   await expect(deleteButton).toBeFocused();
-  await expect(page.getByText("Delete failed.", { exact: true })).toBeVisible();
+  await expect(page.getByText("无法删除会话。", { exact: true })).toBeVisible();
   await deleteButton.click();
   await dialog.getByRole("button", { name: "删除会话", exact: true }).click();
   await expect(page.getByText("代数复习", { exact: true })).toHaveCount(0);
@@ -1332,21 +1350,31 @@ test("keeps the latest session list result when an older search resolves last", 
   await page.route("**/api/sessions**", async (route) => {
     const request = route.request();
     const url = new URL(request.url());
-    if (request.method() === "GET" && url.pathname === "/api/sessions") {
+    const parts = url.pathname.split("/").filter(Boolean);
+    if (request.method() === "GET" && !parts[2]) {
       const query = url.searchParams.get("query");
-      if (query === "older") {
+      if (query === "旧搜索") {
         await new Promise((resolve) => {
           releaseOlderSearch = async () => {
-            await route.fulfill({ json: pagePayload([session("older", "older result")]) });
+            await route.fulfill({ json: pagePayload([session("older", "旧搜索结果")]) });
             resolve();
           };
         });
         return;
       }
       await route.fulfill({
-        json: pagePayload(query === "newer"
-          ? [session("newer", "newer result")]
-          : [session("initial", "initial result")])
+        json: pagePayload(
+          query === "新搜索"
+            ? [session("newer", "新搜索结果")]
+            : [session("initial", "初始结果")]
+        )
+      });
+      return;
+    }
+    if (request.method() === "GET" && parts[2]) {
+      const detailSession = session(parts[2], parts[2] === "newer" ? "新搜索结果" : "旧搜索结果");
+      await route.fulfill({
+        json: { session: detailSession, messages: [], task_states: [], citations: [], generation_results: [] }
       });
       return;
     }
@@ -1355,15 +1383,180 @@ test("keeps the latest session list result when an older search resolves last", 
 
   await page.goto("/");
   await page.getByRole("link", { name: "会话", exact: true }).click();
-  await page.getByLabel("搜索会话").fill("older");
+  await page.getByLabel("搜索会话").fill("旧搜索");
   await page.getByRole("button", { name: "搜索", exact: true }).click();
   await expect.poll(() => Boolean(releaseOlderSearch)).toBe(true);
-  await page.getByLabel("搜索会话").fill("newer");
+  await page.getByLabel("搜索会话").fill("新搜索");
   await page.getByRole("button", { name: "搜索", exact: true }).click();
-  await expect(page.getByText("newer result", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: /新搜索结果/ })).toBeVisible();
 
   await releaseOlderSearch();
 
-  await expect(page.getByText("newer result", { exact: true })).toBeVisible();
-  await expect(page.getByText("older result", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /新搜索结果/ })).toBeVisible();
+  await expect(page.getByText("旧搜索结果", { exact: true })).toHaveCount(0);
+});
+
+test("requires a saved session context before composer actions and announces attachment changes", async ({ page }) => {
+  let session = {
+    session_id: "session-1",
+    title: "语境测试",
+    selected_vault_id: "vault-a",
+    selected_vault_label: "Vault A",
+    selected_provider_id: "provider-1",
+    selected_provider_label: "Local",
+    selected_model_id: "chat-1",
+    selected_model_label: "chat-1",
+    scope_kind: "vault",
+    scope_path: null,
+    message_count: 0,
+    created_at: "2026-07-23T00:00:00+00:00",
+    updated_at: "2026-07-23T00:00:00+00:00",
+    last_activity_at: "2026-07-23T00:00:00+00:00"
+  };
+  const attachments = [];
+  const sentMessages = [];
+  const vaults = [
+    { vault_id: "vault-a", managed_root_relative_path: "Vault A", authorization_status: "active", access_status: "available" },
+    { vault_id: "vault-b", managed_root_relative_path: "Vault B", authorization_status: "active", access_status: "available" }
+  ];
+
+  await page.route("**/api/**", async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    if (url.pathname === "/api/health") return route.fulfill({ json: { service: "obsidian-personal-knowledge-platform" } });
+    if (url.pathname === "/api/session") return route.fulfill({ json: { status: "ok" } });
+    if (url.pathname === "/api/vaults") return route.fulfill({ json: { vaults } });
+    if (url.pathname === "/api/providers/defaults") return route.fulfill({ json: { chat: {}, embedding: {} } });
+    if (url.pathname === "/api/providers") {
+      return route.fulfill({ json: { providers: [{
+        provider_id: "provider-1",
+        name: "Local",
+        credential_configured: true,
+        verification: { is_verified: true },
+        models: [{ model_id: "chat-1", model_type: "chat", is_discovered: true, verification: { ok: true } }]
+      }] } });
+    }
+    if (url.pathname === "/api/import-tasks") return route.fulfill({ json: { tasks: [] } });
+    if (url.pathname === "/api/sessions" && request.method() === "GET") {
+      return route.fulfill({ json: { sessions: [session], page: 1, page_size: 25, total: 1, total_pages: 1 } });
+    }
+    if (url.pathname === "/api/sessions/session-1" && request.method() === "GET") {
+      return route.fulfill({ json: { session, messages: [], task_states: [], citations: [], generation_results: [], attachments } });
+    }
+    if (url.pathname === "/api/sessions/session-1/context" && request.method() === "PATCH") {
+      const context = request.postDataJSON();
+      session = {
+        ...session,
+        selected_vault_id: context.vault_id,
+        selected_vault_label: context.vault_id === "vault-b" ? "Vault B" : "Vault A",
+        selected_provider_id: context.provider_id,
+        selected_provider_label: "Local",
+        selected_model_id: context.model_id,
+        selected_model_label: context.model_id,
+        scope_kind: context.scope_kind,
+        scope_path: context.scope_path
+      };
+      return route.fulfill({ json: { session } });
+    }
+    if (url.pathname === "/api/sessions/session-1/attachments/select") {
+      return route.fulfill({ json: { selection_id: "selection-1", label: "handout.md" } });
+    }
+    if (url.pathname === "/api/sessions/session-1/attachments" && request.method() === "POST") {
+      const attachment = { attachment_id: "attachment-1", filename: "handout.md", status: "available" };
+      attachments.push(attachment);
+      return route.fulfill({ json: { attachments: [attachment] } });
+    }
+    if (url.pathname === "/api/sessions/session-1/attachments/attachment-1" && request.method() === "DELETE") {
+      attachments.splice(0, attachments.length);
+      return route.fulfill({ json: { status: "removed" } });
+    }
+    if (url.pathname === "/api/sessions/session-1/messages" && request.method() === "POST") {
+      const { content } = request.postDataJSON();
+      sentMessages.push(content);
+      return route.fulfill({ json: { message: { message_id: "message-1", role: "user", content } } });
+    }
+    return route.fallback();
+  });
+
+  await page.goto("/");
+  await page.getByRole("link", { name: "会话", exact: true }).click();
+  await expect(page.getByLabel("会话输入")).toBeVisible();
+
+  await page.getByLabel("选择 vault").selectOption("vault-b");
+  await page.getByLabel("选择 Model").selectOption(JSON.stringify(["provider-1", "chat-1"]));
+  const composer = page.getByLabel("输入问题或继续创作");
+  await composer.fill("第一行");
+  await composer.press("Shift+Enter");
+  await composer.pressSequentially("第二行");
+  await expect(composer).toHaveValue("第一行\n第二行");
+  await expect(page.getByRole("button", { name: "发送", exact: true })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "添加附件", exact: true })).toBeDisabled();
+
+  await page.getByRole("button", { name: "保存语境", exact: true }).click();
+  await expect(page.getByText("会话语境已保存。", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "发送", exact: true })).toBeEnabled();
+  await page.getByRole("button", { name: "添加附件", exact: true }).click();
+  await expect(page.getByText("附件已添加。", { exact: true })).toBeVisible();
+  const removeAttachment = page.getByRole("button", { name: "移除附件 handout.md" });
+  await removeAttachment.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByText("附件已移除。", { exact: true })).toBeVisible();
+  await expect(removeAttachment).toHaveCount(0);
+
+  await page.getByRole("button", { name: "发送", exact: true }).click();
+  await expect.poll(() => sentMessages).toEqual(["第一行\n第二行"]);
+});
+
+test("keeps the current session detail when an earlier selection resolves last", async ({ page }) => {
+  const session = (sessionId, title, vault) => ({
+    session_id: sessionId,
+    title,
+    selected_vault_id: vault.toLowerCase(),
+    selected_vault_label: vault,
+    selected_provider_id: "provider-1",
+    selected_provider_label: "Local",
+    selected_model_id: "chat-1",
+    selected_model_label: "chat-1",
+    scope_kind: "vault",
+    scope_path: null,
+    message_count: 0,
+    created_at: "2026-07-23T00:00:00+00:00",
+    updated_at: "2026-07-23T00:00:00+00:00",
+    last_activity_at: "2026-07-23T00:00:00+00:00"
+  });
+  const first = session("session-a", "会话 A", "Vault A");
+  const second = session("session-b", "会话 B", "Vault B");
+  let releaseFirstDetail;
+
+  await page.route("**/api/sessions**", async (route) => {
+    const request = route.request();
+    const pathname = new URL(request.url()).pathname;
+    if (request.method() === "GET" && pathname === "/api/sessions") {
+      return route.fulfill({ json: { sessions: [first, second], page: 1, page_size: 25, total: 2, total_pages: 1 } });
+    }
+    if (request.method() === "GET" && pathname === "/api/sessions/session-a") {
+      await new Promise((resolve) => {
+        releaseFirstDetail = async () => {
+          await route.fulfill({ json: { session: first, messages: [{ message_id: "message-a", role: "assistant", content: "A 的内容" }], task_states: [], citations: [], generation_results: [], attachments: [] } });
+          resolve();
+        };
+      });
+      return;
+    }
+    if (request.method() === "GET" && pathname === "/api/sessions/session-b") {
+      return route.fulfill({ json: { session: second, messages: [{ message_id: "message-b", role: "assistant", content: "B 的内容" }], task_states: [], citations: [], generation_results: [], attachments: [] } });
+    }
+    return route.fallback();
+  });
+
+  await page.goto("/");
+  await page.getByRole("link", { name: "会话", exact: true }).click();
+  await expect.poll(() => Boolean(releaseFirstDetail)).toBe(true);
+  await page.getByRole("button", { name: /会话 B/ }).click();
+  await expect(page.getByText("B 的内容", { exact: true })).toBeVisible();
+  await releaseFirstDetail();
+
+  await expect(page.getByText("B 的内容", { exact: true })).toBeVisible();
+  await expect(page.getByText("A 的内容", { exact: true })).toHaveCount(0);
+  await expect(page.locator(".context-location")).toContainText("Vault B");
 });
