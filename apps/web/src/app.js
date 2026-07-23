@@ -79,9 +79,10 @@ export function derivedMarkdownPreview(markdown) {
   const frontmatter = typeof markdown === "string"
     ? markdown.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/)
     : null;
-  return frontmatter?.[1].includes("platform_provenance:")
-    ? markdown.slice(frontmatter[0].length)
-    : markdown;
+  if (!frontmatter?.[1].includes("platform_provenance:")) return markdown;
+  return markdown
+    .slice(frontmatter[0].length)
+    .replace(/^来源：\[\[[^\r\n\]]+\|原始资料\]\]\r?\n(?:\r?\n)?/m, "");
 }
 
 function importLifecycleText(lifecycle) {
@@ -3467,7 +3468,6 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
                   React.Fragment,
                   null,
                   React.createElement("p", { className: "row-title" }, `派生笔记提案（版本 ${proposal.revision}）`),
-                  React.createElement("p", { className: "row-note" }, `计划源位置：${proposal.source_relative_path}`),
                   proposal.risks?.length
                     ? React.createElement("p", { className: "row-status status-danger" }, `待审核范围：${proposal.risks.join("；")}`)
                     : null,
@@ -3483,11 +3483,6 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
                       "div",
                       { className: "section-row note-proposal-row", key: note.note_id },
                       React.createElement("span", { className: "row-title" }, `${note.sequence}. ${note.title}`),
-                      React.createElement("span", { className: "row-note" }, `位置：${note.relative_path}`),
-                      React.createElement("span", { className: "row-note" }, `来源：${note.source_locators.map(sourceLocatorText).join("、")}`),
-                      note.provenance_verifiable === false
-                        ? React.createElement("span", { className: "row-status status-danger" }, `来源信息不可验证：${note.provenance_reason || "schema 不受支持。"}`)
-                        : null,
                       React.createElement("pre", { className: "markdown-preview" }, derivedMarkdownPreview(note.markdown)),
                       index < proposal.notes.length - 1
                         ? React.createElement("button", {

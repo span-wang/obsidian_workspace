@@ -34,6 +34,8 @@ test("hides derived-note provenance frontmatter from Markdown previews", () => {
     "---",
     "# Final Markdown",
     "",
+    "来源：[[platform/sources/source-1.pdf|原始资料]]",
+    "",
     "Only this content is shown."
   ].join("\n");
 
