@@ -10,8 +10,10 @@ from domain.sessions import (
     SessionCitation,
     SessionGenerationResult,
     SessionMessage,
+    SessionRetrievalEvidence,
     SessionTaskState,
     SessionAttachment,
+    group_retrieval_evidence,
     new_session,
 )
 from domain.indexing import IndexBlock, IndexHealth, IndexedDocument
@@ -569,6 +571,56 @@ def test_execute_prepared_task_persists_bounded_local_evidence_and_timings(tmp_p
     assert restarted.task_states[0].status == "completed"
     assert restarted.task_snapshots[0].status == "completed"
     assert restarted.retrieval_results[0].evidences[0].excerpt == evidence.excerpt
+
+
+def test_groups_retrieval_evidence_by_source_identity_without_hiding_paths() -> None:
+    def derived(ordinal: int, relative_path: str, source_id: str) -> SessionRetrievalEvidence:
+        return SessionRetrievalEvidence(
+            ordinal, "derived", relative_path, f"{ordinal:x}" * 64,
+            source_id, "a" * 64, "sources/book.pdf", "章节", "heading: 章节", None,
+            f"派生证据 {ordinal}", 1.0, ("keyword",),
+        )
+
+    def native(ordinal: int, relative_path: str, content_hash: str) -> SessionRetrievalEvidence:
+        return SessionRetrievalEvidence(
+            ordinal, "native", relative_path, content_hash,
+            None, None, None, "笔记", "heading: 笔记", None,
+            f"原生证据 {ordinal}", 1.0, ("keyword",),
+        )
+
+    groups = group_retrieval_evidence(
+        "vault-1",
+        (
+            derived(1, "notes/chapter-a.md", "source-1"),
+            derived(2, "notes/chapter-b.md", "source-1"),
+            derived(3, "notes/other.md", "source-2"),
+            native(4, "notes/copy-a.md", "b" * 64),
+            native(5, "notes/copy-b.md", "b" * 64),
+            native(6, "notes/different.md", "c" * 64),
+        ),
+    )
+
+    assert [(group.identity_kind, group.basis) for group in groups] == [
+        ("derived", "vault-source-id"),
+        ("derived", "vault-source-id"),
+        ("native", "vault-content-sha256"),
+        ("native", "vault-content-sha256"),
+    ]
+    assert all(group.vault_id == "vault-1" for group in groups)
+    assert groups[0].source_id == "source-1"
+    assert groups[0].evidence_ordinals == (1, 2)
+    assert groups[0].relative_paths == ("notes/chapter-a.md", "notes/chapter-b.md")
+    assert groups[2].content_sha256 == "b" * 64
+    assert groups[2].evidence_ordinals == (4, 5)
+    assert groups[2].relative_paths == ("notes/copy-a.md", "notes/copy-b.md")
+    same_source_in_current_vault = group_retrieval_evidence(
+        "vault-1", (derived(1, "notes/chapter-a.md", "source-1"),)
+    )
+    same_source_in_other_vault = group_retrieval_evidence(
+        "vault-2", (derived(1, "notes/chapter-a.md", "source-1"),)
+    )
+    assert same_source_in_other_vault[0].vault_id == "vault-2"
+    assert same_source_in_other_vault[0] != same_source_in_current_vault[0]
 
 
 def test_execute_task_persists_provider_unavailable_state_without_claiming_no_evidence(tmp_path) -> None:

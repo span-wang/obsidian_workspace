@@ -1561,6 +1561,145 @@ test("requires a saved session context before composer actions and announces att
   await expect(page.getByText("检索 3 ms；生成 0 ms（未调用 Model）", { exact: true })).toBeVisible();
 });
 
+test("presents independent retrieval sources side by side without a preferred answer", async ({ page }) => {
+  const session = {
+    session_id: "session-1",
+    title: "来源对照",
+    selected_vault_id: "vault-a",
+    selected_vault_label: "Session Vault",
+    selected_provider_id: "provider-1",
+    selected_provider_label: "Local",
+    selected_model_id: "chat-1",
+    selected_model_label: "chat-1",
+    scope_kind: "vault",
+    scope_path: null,
+    message_count: 1,
+    created_at: "2026-07-23T00:00:00+00:00",
+    updated_at: "2026-07-23T00:00:00+00:00",
+    last_activity_at: "2026-07-23T00:00:00+00:00"
+  };
+  const retrievalResult = {
+    result_id: "result-1",
+    task_id: "task-1",
+    snapshot_id: "snapshot-1",
+    vault_id: "vault-a",
+    status: "completed",
+    summary: "已找到可对照的本地证据。",
+    recovery_action: null,
+    retrieval_duration_ms: 3,
+    generation_duration_ms: 0,
+    source_independence_available: true,
+    independent_source_count: 2,
+    source_groups: [
+      {
+        vault_id: "vault-a",
+        identity_kind: "derived",
+        basis: "vault-source-id",
+        source_id: "source-lesson",
+        content_sha256: null,
+        evidence_ordinals: [1, 2],
+        relative_paths: ["notes/lesson-a.md", "notes/lesson-b.md"]
+      },
+      {
+        vault_id: "vault-a",
+        identity_kind: "native",
+        basis: "vault-content-sha256",
+        source_id: null,
+        content_sha256: "c".repeat(64),
+        evidence_ordinals: [3],
+        relative_paths: ["notes/teacher-note.md"]
+      }
+    ],
+    evidences: [
+      {
+        ordinal: 1,
+        identity_kind: "derived",
+        relative_path: "notes/lesson-a.md",
+        content_sha256: "a".repeat(64),
+        source_id: "source-lesson",
+        source_content_hash: "b".repeat(64),
+        source_path: "sources/lesson.pdf",
+        heading: "第一章",
+        location: "heading: 第一章; page: 1",
+        page: 1,
+        excerpt: "同一教材的第一条证据。",
+        matched_channels: ["keyword"]
+      },
+      {
+        ordinal: 2,
+        identity_kind: "derived",
+        relative_path: "notes/lesson-b.md",
+        content_sha256: "d".repeat(64),
+        source_id: "source-lesson",
+        source_content_hash: "b".repeat(64),
+        source_path: "sources/lesson.pdf",
+        heading: "第二章",
+        location: "heading: 第二章; page: 2",
+        page: 2,
+        excerpt: "同一教材的第二条证据。",
+        matched_channels: ["keyword"]
+      },
+      {
+        ordinal: 3,
+        identity_kind: "native",
+        relative_path: "notes/teacher-note.md",
+        content_sha256: "c".repeat(64),
+        source_id: null,
+        source_content_hash: null,
+        source_path: null,
+        heading: "教师笔记",
+        location: "heading: 教师笔记",
+        page: null,
+        excerpt: "独立笔记提供另一种说法。",
+        matched_channels: ["keyword"]
+      }
+    ]
+  };
+
+  await page.route("**/api/**", async (route) => {
+    const request = route.request();
+    const pathname = new URL(request.url()).pathname;
+    if (pathname === "/api/health") return route.fulfill({ json: { service: "obsidian-personal-knowledge-platform" } });
+    if (pathname === "/api/session") return route.fulfill({ json: { status: "ok" } });
+    if (pathname === "/api/vaults") return route.fulfill({ json: { vaults: [{
+      vault_id: "vault-a", display_name: "Session Vault", managed_root_relative_path: "platform",
+      authorization_status: "active", access_status: "available"
+    }] } });
+    if (pathname === "/api/providers/defaults") return route.fulfill({ json: { chat: {}, embedding: {} } });
+    if (pathname === "/api/providers") return route.fulfill({ json: { providers: [{
+      provider_id: "provider-1", name: "Local", credential_configured: true,
+      verification: { is_verified: true },
+      models: [{ model_id: "chat-1", model_type: "chat", is_discovered: true, verification: { ok: true } }]
+    }] } });
+    if (pathname === "/api/import-tasks") return route.fulfill({ json: { tasks: [] } });
+    if (pathname === "/api/sessions" && request.method() === "GET") {
+      return route.fulfill({ json: { sessions: [session], page: 1, page_size: 25, total: 1, total_pages: 1 } });
+    }
+    if (pathname === "/api/sessions/session-1" && request.method() === "GET") {
+      return route.fulfill({ json: {
+        session,
+        messages: [{ message_id: "message-1", role: "assistant", content: "请对照资料。" }],
+        task_states: [], citations: [], generation_results: [], attachments: [], task_snapshots: [],
+        retrieval_results: [retrievalResult]
+      } });
+    }
+    return route.fallback();
+  });
+
+  await page.goto("/");
+  await page.getByRole("link", { name: "会话", exact: true }).click();
+
+  await expect(page.getByText("独立来源：2", { exact: true })).toBeVisible();
+  await expect(page.getByText("系统不会自动合并、选择或判定哪一种说法正确。", { exact: true })).toBeVisible();
+  await expect(page.getByText("同一来源中的 2 条证据只计为 1 个独立来源。", { exact: true })).toBeVisible();
+  const evidenceRows = page.locator(".source-comparison-group .evidence-row");
+  await expect(page.locator(".source-comparison-group")).toHaveCount(2);
+  await expect(evidenceRows).toHaveCount(3);
+  await evidenceRows.first().locator("summary").click();
+  await expect(evidenceRows.first()).toContainText("vault：Session Vault");
+  await expect(evidenceRows.first()).toContainText("Source ID source-lesson");
+});
+
 test("keeps the current session detail when an earlier selection resolves last", async ({ page }) => {
   const session = (sessionId, title, vault) => ({
     session_id: sessionId,

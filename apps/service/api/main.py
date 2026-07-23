@@ -86,6 +86,7 @@ from domain.sessions import (
     SessionPage,
     SessionRetrievalResult,
     SessionTaskState,
+    group_retrieval_evidence,
 )
 from domain.vaults import Vault
 
@@ -714,6 +715,8 @@ def session_generation_result_payload(result: SessionGenerationResult) -> dict[s
 def session_retrieval_result_payload(
     result: SessionRetrievalResult, snapshot=None
 ) -> dict[str, object]:
+    vault_id = snapshot.vault_id if snapshot is not None else None
+    source_groups = group_retrieval_evidence(vault_id, result.evidences) if vault_id else ()
     return {
         "result_id": result.result_id,
         "task_id": result.task_id,
@@ -724,10 +727,24 @@ def session_retrieval_result_payload(
         "retrieval_duration_ms": result.retrieval_duration_ms,
         "generation_duration_ms": result.generation_duration_ms,
         "created_at": result.created_at,
-        "vault_id": snapshot.vault_id if snapshot is not None else None,
+        "vault_id": vault_id,
         "snapshot_status": snapshot.status if snapshot is not None else None,
         "is_stale": snapshot is not None and snapshot.status == "invalidated",
         "invalidation_reason": snapshot.invalidation_reason if snapshot is not None else None,
+        "source_independence_available": bool(vault_id),
+        "independent_source_count": len(source_groups) if vault_id else None,
+        "source_groups": [
+            {
+                "vault_id": group.vault_id,
+                "identity_kind": group.identity_kind,
+                "basis": group.basis,
+                "source_id": group.source_id,
+                "content_sha256": group.content_sha256,
+                "evidence_ordinals": list(group.evidence_ordinals),
+                "relative_paths": list(group.relative_paths),
+            }
+            for group in source_groups
+        ],
         "evidences": [
             {
                 "ordinal": evidence.ordinal,

@@ -855,6 +855,73 @@ export function SessionManagement({
       && vault.authorization_status === "active"
       && vault.access_status === "available";
     const staleReason = result.invalidation_reason || snapshot?.invalidation_reason;
+    const evidenceByOrdinal = new Map((result.evidences || []).map((evidence) => [evidence.ordinal, evidence]));
+    const sourceGroups = result.source_independence_available
+      && Array.isArray(result.source_groups) && result.source_groups.length
+      ? result.source_groups
+      : [...evidenceByOrdinal.keys()].map((ordinal) => ({ evidence_ordinals: [ordinal] }));
+    const sourceGroupView = (group, groupIndex) => {
+      const groupedEvidences = (group.evidence_ordinals || [])
+        .map((ordinal) => evidenceByOrdinal.get(ordinal))
+        .filter(Boolean);
+      if (groupedEvidences.length === 0) return null;
+      const evidenceCount = groupedEvidences.length;
+      const hasVerifiedBasis = group.basis === "vault-source-id"
+        || group.basis === "vault-content-sha256";
+      const basisText = group.basis === "vault-source-id"
+        ? "派生笔记按 vault + Source ID 计算独立来源。"
+        : group.basis === "vault-content-sha256"
+          ? "原生 Markdown 按 vault + 内容哈希计算独立来源。"
+          : "该历史结果未提供独立来源计算依据。";
+      return React.createElement(
+        "section",
+        { className: "source-comparison-group", key: `${result.result_id}:source:${groupIndex}` },
+        React.createElement(
+          "p",
+          { className: "source-comparison-heading" },
+          hasVerifiedBasis ? `来源 ${groupIndex + 1}：${basisText}` : `历史证据：${basisText}`
+        ),
+        hasVerifiedBasis && evidenceCount > 1
+          ? React.createElement(
+              "p",
+              { className: "source-comparison-note" },
+              group.basis === "vault-content-sha256"
+                ? `相同内容组中的 ${evidenceCount} 条原生 Markdown 证据只计为 1 个独立来源。`
+                : `同一来源中的 ${evidenceCount} 条证据只计为 1 个独立来源。`
+            )
+          : null,
+        groupedEvidences.map((evidence) => React.createElement(
+          "details",
+          { className: "evidence-row", key: `${result.result_id}:${evidence.ordinal}` },
+          React.createElement(
+            "summary",
+            null,
+            `${evidence.relative_path} · ${evidence.heading || evidence.location}`
+          ),
+          React.createElement("p", null, evidence.excerpt),
+          React.createElement("p", null, `vault：${vaultLabel}`),
+          evidence.identity_kind === "derived"
+            ? React.createElement("p", null, `Source ID ${evidence.source_id}；源内容哈希 ${evidence.source_content_hash}`)
+            : React.createElement("p", null, `原生 Markdown：${evidence.relative_path}；内容哈希 ${evidence.content_sha256}`),
+          evidence.source_path
+            ? React.createElement("p", null, `源文件：${evidence.source_path}；派生笔记：${evidence.relative_path}`)
+            : null,
+          React.createElement("p", null, `定位：${evidence.location}${evidence.page ? `；第 ${evidence.page} 页` : ""}`),
+          React.createElement("p", null, `召回：${(evidence.matched_channels || []).join("、") || "未标注"}`),
+          canOpenInObsidian
+            ? React.createElement(
+                "a",
+                {
+                  href: `${VAULTS_ENDPOINT}/${encodeURIComponent(vaultId)}/open?file=${encodeURIComponent(evidence.relative_path)}`,
+                  target: "_blank",
+                  rel: "noreferrer"
+                },
+                "在 Obsidian 中打开"
+              )
+            : null
+        ))
+      );
+    };
     return React.createElement(
       "section",
       { className: "session-retrieval-result", key: result.result_id, "aria-label": retrievalStatusText(result) },
@@ -867,36 +934,13 @@ export function SessionManagement({
       result.recovery_action
         ? React.createElement("p", { className: "form-error" }, `下一步：${result.recovery_action}`)
         : null,
-      result.evidences?.map((evidence) => React.createElement(
-        "details",
-        { className: "evidence-row", key: `${result.result_id}:${evidence.ordinal}` },
-        React.createElement(
-          "summary",
-          null,
-          `${evidence.relative_path} · ${evidence.heading || evidence.location}`
-        ),
-        React.createElement("p", null, evidence.excerpt),
-        React.createElement("p", null, `vault：${vaultLabel}`),
-        evidence.identity_kind === "derived"
-          ? React.createElement("p", null, `Source ID ${evidence.source_id}；源内容哈希 ${evidence.source_content_hash}`)
-          : React.createElement("p", null, `原生 Markdown：${evidence.relative_path}；内容哈希 ${evidence.content_sha256}`),
-        evidence.source_path
-          ? React.createElement("p", null, `源文件：${evidence.source_path}；派生笔记：${evidence.relative_path}`)
-          : null,
-        React.createElement("p", null, `定位：${evidence.location}${evidence.page ? `；第 ${evidence.page} 页` : ""}`),
-        React.createElement("p", null, `召回：${(evidence.matched_channels || []).join("、") || "未标注"}`),
-        canOpenInObsidian
-          ? React.createElement(
-              "a",
-              {
-                href: `${VAULTS_ENDPOINT}/${encodeURIComponent(vaultId)}/open?file=${encodeURIComponent(evidence.relative_path)}`,
-                target: "_blank",
-                rel: "noreferrer"
-              },
-              "在 Obsidian 中打开"
-            )
-          : null
-      ))
+      result.source_independence_available
+        ? React.createElement("p", { className: "source-comparison-summary" }, `独立来源：${result.independent_source_count}`)
+        : null,
+      result.source_independence_available && result.independent_source_count > 1
+        ? React.createElement("p", { className: "source-comparison-note" }, "系统不会自动合并、选择或判定哪一种说法正确。")
+        : null,
+      sourceGroups.map(sourceGroupView)
     );
   }
 

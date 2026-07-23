@@ -150,6 +150,25 @@ test("renders a bounded three-pane session workspace with a context composer", (
           recovery_action: null,
           retrieval_duration_ms: 12,
           generation_duration_ms: 0,
+          source_independence_available: true,
+          independent_source_count: 2,
+          source_groups: [{
+            vault_id: "vault-2",
+            identity_kind: "derived",
+            basis: "vault-source-id",
+            source_id: "source-1",
+            content_sha256: null,
+            evidence_ordinals: [1, 2],
+            relative_paths: ["notes/algebra.md", "notes/algebra-examples.md"]
+          }, {
+            vault_id: "vault-2",
+            identity_kind: "native",
+            basis: "vault-content-sha256",
+            source_id: null,
+            content_sha256: "c".repeat(64),
+            evidence_ordinals: [3],
+            relative_paths: ["notes/teacher-note.md"]
+          }],
           evidences: [{
             ordinal: 1,
             identity_kind: "derived",
@@ -163,6 +182,32 @@ test("renders a bounded three-pane session workspace with a context composer", (
             page: 2,
             excerpt: "二次方程有两个根。",
             matched_channels: ["keyword", "semantic"]
+          }, {
+            ordinal: 2,
+            identity_kind: "derived",
+            relative_path: "notes/algebra-examples.md",
+            content_sha256: "d".repeat(64),
+            source_id: "source-1",
+            source_content_hash: "b".repeat(64),
+            source_path: "sources/algebra.pdf",
+            heading: "例题",
+            location: "heading: 例题; page: 3",
+            page: 3,
+            excerpt: "同一来源的第二条证据。",
+            matched_channels: ["keyword"]
+          }, {
+            ordinal: 3,
+            identity_kind: "native",
+            relative_path: "notes/teacher-note.md",
+            content_sha256: "c".repeat(64),
+            source_id: null,
+            source_content_hash: null,
+            source_path: null,
+            heading: "教师笔记",
+            location: "heading: 教师笔记",
+            page: null,
+            excerpt: "另一个独立来源的说法。",
+            matched_channels: ["keyword"]
           }]
         }]
       },
@@ -224,6 +269,9 @@ test("renders a bounded three-pane session workspace with a context composer", (
   assert.match(markup, /在 Obsidian 中打开/);
   assert.match(markup, /vault：Mathematics/);
   assert.match(markup, /\/api\/vaults\/vault-2\/open\?file=notes%2Falgebra.md/);
+  assert.match(markup, /独立来源：2/);
+  assert.match(markup, /系统不会自动合并、选择或判定哪一种说法正确。/);
+  assert.match(markup, /同一来源中的 2 条证据只计为 1 个独立来源。/);
 });
 
 test("marks stale evidence and keeps its original vault identity", () => {
@@ -285,6 +333,19 @@ test("marks stale evidence and keeps its original vault identity", () => {
             page: null,
             excerpt: "历史证据。",
             matched_channels: ["keyword"]
+          }, {
+            ordinal: 2,
+            identity_kind: "derived",
+            relative_path: "notes/other-evidence.md",
+            content_sha256: "b".repeat(64),
+            source_id: "other-source",
+            source_content_hash: "c".repeat(64),
+            source_path: "sources/other.pdf",
+            heading: "另一份证据",
+            location: "heading: 另一份证据",
+            page: null,
+            excerpt: "另一来源的历史证据。",
+            matched_channels: ["keyword"]
           }]
         }]
       },
@@ -315,6 +376,11 @@ test("marks stale evidence and keeps its original vault identity", () => {
   assert.match(markup, /需重新准备：来源已改变。/);
   assert.match(markup, /vault：证据 vault/);
   assert.match(markup, /\/api\/vaults\/vault-2\/open\?file=notes%2Fevidence.md/);
+  assert.match(markup, /历史证据：该历史结果未提供独立来源计算依据。/);
+  assert.match(markup, /notes\/other-evidence.md/);
+  assert.equal((markup.match(/source-comparison-group/g) || []).length, 2);
+  assert.doesNotMatch(markup, /来源 1：/);
+  assert.doesNotMatch(markup, /同一来源中的 2 条证据只计为 1 个独立来源。/);
   assert.doesNotMatch(markup, /aria-label="本地知识库证据"/);
 });
 

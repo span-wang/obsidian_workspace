@@ -9,10 +9,11 @@ from adapters.sqlite_vault_repository import SqliteVaultRepository
 from application.policies import PolicyService
 from application.sessions import SessionService
 from application.vaults import VaultService
-from api.main import create_app
+from api.main import create_app, session_retrieval_result_payload
 from api.runtime import RuntimeState
 from domain.providers import Provider, ProviderModel, ProviderProbeResults, ProbeResult, ResolvedProviderModel
 from domain.indexing import IndexHealth
+from domain.sessions import SessionRetrievalEvidence, SessionRetrievalResult
 
 
 def asgi_request(app, method: str, path: str, *, body: dict[str, object] | None = None, cookie: str = ""):
@@ -57,6 +58,50 @@ def asgi_request(app, method: str, path: str, *, body: dict[str, object] | None 
         for key, value in response_start.get("headers", [])
     }
     return response_start["status"], headers, response_body
+
+
+def test_retrieval_payload_exposes_independent_source_groups_from_snapshot_vault() -> None:
+    result = SessionRetrievalResult(
+        "result-1", "session-1", "task-1", "snapshot-1", "completed", "本地证据。", None, 1, 0,
+        "2026-07-23T00:00:00+00:00",
+        (
+            SessionRetrievalEvidence(
+                1, "derived", "notes/first.md", "a" * 64, "source-1", "b" * 64,
+                "sources/book.pdf", "第一章", "heading: 第一章", 1, "第一条派生证据", 1.0, ("keyword",),
+            ),
+            SessionRetrievalEvidence(
+                2, "derived", "notes/second.md", "c" * 64, "source-1", "b" * 64,
+                "sources/book.pdf", "第二章", "heading: 第二章", 2, "第二条派生证据", 0.9, ("keyword",),
+            ),
+            SessionRetrievalEvidence(
+                3, "native", "notes/copy.md", "d" * 64, None, None, None,
+                "笔记", "heading: 笔记", None, "原生笔记", 0.8, ("keyword",),
+            ),
+        ),
+    )
+    snapshot = type("Snapshot", (), {
+        "vault_id": "vault-1", "status": "completed", "invalidation_reason": None,
+    })()
+
+    payload = session_retrieval_result_payload(result, snapshot)
+
+    assert payload["source_independence_available"] is True
+    assert payload["independent_source_count"] == 2
+    assert payload["source_groups"][0] == {
+        "vault_id": "vault-1",
+        "identity_kind": "derived",
+        "basis": "vault-source-id",
+        "source_id": "source-1",
+        "content_sha256": None,
+        "evidence_ordinals": [1, 2],
+        "relative_paths": ["notes/first.md", "notes/second.md"],
+    }
+    assert payload["source_groups"][1]["basis"] == "vault-content-sha256"
+    assert payload["source_groups"][1]["relative_paths"] == ["notes/copy.md"]
+    unavailable = session_retrieval_result_payload(result, None)
+    assert unavailable["source_independence_available"] is False
+    assert unavailable["independent_source_count"] is None
+    assert unavailable["source_groups"] == []
 
 
 def test_session_api_is_local_session_protected_and_uses_bounded_private_records(tmp_path: Path) -> None:

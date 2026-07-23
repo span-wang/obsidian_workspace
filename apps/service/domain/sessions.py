@@ -267,6 +267,65 @@ class SessionRetrievalEvidence:
 
 
 @dataclass(frozen=True)
+class SessionRetrievalSourceGroup:
+    vault_id: str
+    identity_kind: str
+    basis: str
+    source_id: str | None
+    content_sha256: str | None
+    evidence_ordinals: tuple[int, ...]
+    relative_paths: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not self.vault_id.strip():
+            raise ValueError("Source group vault identity is required.")
+        if self.identity_kind == "derived":
+            if self.basis != "vault-source-id" or not self.source_id or self.content_sha256 is not None:
+                raise ValueError("Derived source group identity is invalid.")
+        elif self.identity_kind == "native":
+            if self.basis != "vault-content-sha256" or self.source_id is not None:
+                raise ValueError("Native source group identity is invalid.")
+            _validate_sha256(self.content_sha256, "Native source group content hash")
+        else:
+            raise ValueError("Source group identity kind is invalid.")
+        if not self.evidence_ordinals or any(ordinal < 1 for ordinal in self.evidence_ordinals):
+            raise ValueError("Source group evidence ordinals are invalid.")
+        if len(self.evidence_ordinals) != len(self.relative_paths):
+            raise ValueError("Source group paths must match evidence ordinals.")
+        for relative_path in self.relative_paths:
+            _validate_relative_path(relative_path)
+
+
+def group_retrieval_evidence(
+    vault_id: str, evidences: tuple[SessionRetrievalEvidence, ...]
+) -> tuple[SessionRetrievalSourceGroup, ...]:
+    normalized_vault_id = vault_id.strip()
+    if not normalized_vault_id:
+        raise ValueError("Vault identity is required to group retrieval evidence.")
+
+    groups: dict[tuple[str, str, str], list[SessionRetrievalEvidence]] = {}
+    for evidence in evidences:
+        if evidence.identity_kind == "derived":
+            key = (normalized_vault_id, "derived", evidence.source_id or "")
+        else:
+            key = (normalized_vault_id, "native", evidence.content_sha256)
+        groups.setdefault(key, []).append(evidence)
+
+    return tuple(
+        SessionRetrievalSourceGroup(
+            group_vault_id,
+            identity_kind,
+            "vault-source-id" if identity_kind == "derived" else "vault-content-sha256",
+            grouped[0].source_id if identity_kind == "derived" else None,
+            grouped[0].content_sha256 if identity_kind == "native" else None,
+            tuple(evidence.ordinal for evidence in grouped),
+            tuple(evidence.relative_path for evidence in grouped),
+        )
+        for (group_vault_id, identity_kind, _identity), grouped in groups.items()
+    )
+
+
+@dataclass(frozen=True)
 class SessionRetrievalResult:
     result_id: str
     session_id: str
