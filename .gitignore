@@ -1,5 +1,6 @@
 node_modules/
 apps/web/dist/
+apps/web/retrieval-chunking-lab/dist/
 apps/service/.venv/
 __pycache__/
 .pytest_cache/

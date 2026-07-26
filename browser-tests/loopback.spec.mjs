@@ -13,6 +13,13 @@ const testPort = Number(process.env.OBSIDIAN_PLATFORM_TEST_PORT || "6240");
 const baseUrl = `http://127.0.0.1:${testPort}`;
 let service;
 
+function resultEventStream(result) {
+  return {
+    contentType: "text/event-stream",
+    body: `event: result\ndata: ${JSON.stringify({ result })}\n\n`
+  };
+}
+
 function assertLoopbackPortAvailable() {
   return new Promise((resolve, reject) => {
     const candidateServer = createServer();
@@ -50,7 +57,8 @@ test.beforeAll(async ({}, testInfo) => {
     stdio: "pipe",
     env: {
       ...process.env,
-      OBSIDIAN_PLATFORM_DATA_DIR: testInfo.outputPath("app-data")
+      OBSIDIAN_PLATFORM_DATA_DIR: testInfo.outputPath("app-data"),
+      OBSIDIAN_PLATFORM_RETRIEVAL_TEST_UI: "true"
     }
   });
   await waitForHealth();
@@ -80,6 +88,28 @@ test("serves the workbench and its API requests from the fixed loopback origin",
   await expect(page.getByRole("navigation").getByRole("link")).toHaveCount(5);
   expect(healthRequests).toEqual([`${baseUrl}/api/health`]);
   expect(sessionRequests).toEqual([`${baseUrl}/api/session`]);
+});
+
+test("previews synthetic Markdown in the isolated retrieval chunking lab", async ({ page }) => {
+  const previewRequests = [];
+  page.on("request", (request) => {
+    if (request.url().endsWith("/api/_test/retrieval/chunk-preview")) {
+      previewRequests.push(request.url());
+    }
+  });
+
+  await page.goto("/_test/retrieval-chunking");
+
+  await expect(page).toHaveURL(`${baseUrl}/_test/retrieval-chunking`);
+  await expect(page.getByRole("heading", { name: "检索分块实验台" })).toBeVisible();
+  await expect(page.getByText("不会读取 vault 或 SQLite，也不会访问外网；关闭服务开关后该页面不可用。")).toBeVisible();
+  await page.getByLabel("Markdown 输入").fill("# 测试单元\n\n这是用于本机预览的合成段落。");
+  await page.getByRole("button", { name: "生成分块预览" }).click();
+
+  await expect(page.getByText(/已生成 \d+ 个分块。/)).toBeVisible();
+  await expect(page.getByRole("article").first()).toBeVisible();
+  await expect(page.getByLabel("分块结果")).toContainText("测试单元");
+  expect(previewRequests).toEqual([`${baseUrl}/api/_test/retrieval/chunk-preview`]);
 });
 
 test("uses the current-vault graph as the default workbench without widening other scopes", async ({ page }) => {
@@ -1632,7 +1662,7 @@ test("requires a saved session context before composer actions and announces att
       taskSnapshots.push(snapshot);
       return route.fulfill({ json: { snapshot } });
     }
-    if (url.pathname === "/api/sessions/session-1/tasks/task-1/execute" && request.method() === "POST") {
+    if (url.pathname === "/api/sessions/session-1/tasks/task-1/execute/stream" && request.method() === "POST") {
       taskSnapshots[0].status = "completed";
       const result = {
         result_id: "result-1", task_id: "task-1", snapshot_id: "snapshot-1", status: "no-evidence",
@@ -1641,7 +1671,7 @@ test("requires a saved session context before composer actions and announces att
         retrieval_duration_ms: 3, generation_duration_ms: 0, evidences: []
       };
       retrievalResults.push(result);
-      return route.fulfill({ json: { result } });
+      return route.fulfill(resultEventStream(result));
     }
     return route.fallback();
   });
@@ -2048,9 +2078,9 @@ test("generates an evidence-bound knowledge organization result from the frozen 
     if (pathname === "/api/sessions/session-organization" && request.method() === "GET") {
       return route.fulfill({ json: detail() });
     }
-    if (pathname === "/api/sessions/session-organization/tasks/task-organization/execute" && request.method() === "POST") {
+    if (pathname === "/api/sessions/session-organization/tasks/task-organization/execute/stream" && request.method() === "POST") {
       generated = true;
-      return route.fulfill({ json: { result } });
+      return route.fulfill(resultEventStream(result));
     }
     return route.fallback();
   });
@@ -2159,11 +2189,11 @@ test("confirms per-task knowledge-organization authorization before generating",
       authorized = true;
       return route.fulfill({ json: { authorization: { authorization_id: "authorization-organization", status: "approved" } } });
     }
-    if (pathname === "/api/sessions/session-authorization/tasks/task-authorization/execute" && request.method() === "POST") {
+    if (pathname === "/api/sessions/session-authorization/tasks/task-authorization/execute/stream" && request.method() === "POST") {
       expect(authorized).toBe(true);
       executionRequests += 1;
       generated = true;
-      return route.fulfill({ json: { result: completedResult } });
+      return route.fulfill(resultEventStream(completedResult));
     }
     return route.fallback();
   });
@@ -2430,15 +2460,15 @@ test("keeps the newly selected session visible when an earlier execution finishe
     if (request.method() === "GET" && pathname === "/api/sessions/session-b") {
       return route.fulfill({ json: detail(second, "B 的内容") });
     }
-    if (request.method() === "POST" && pathname === "/api/sessions/session-a/tasks/task-a/execute") {
+    if (request.method() === "POST" && pathname === "/api/sessions/session-a/tasks/task-a/execute/stream") {
       await new Promise((resolve) => {
         releaseExecution = async () => {
-          await route.fulfill({ json: { result: {
+          await route.fulfill(resultEventStream({
             result_id: "result-a", task_id: "task-a", snapshot_id: "snapshot-a", status: "no-evidence",
             summary: "健康索引与有效范围内未找到可支持该请求的知识库证据。",
             recovery_action: "修改问题或范围后重新准备任务。",
             retrieval_duration_ms: 1, generation_duration_ms: 0, evidences: []
-          } } });
+          }));
           resolve();
         };
       });

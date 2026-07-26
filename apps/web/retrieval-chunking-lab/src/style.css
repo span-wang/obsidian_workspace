@@ -1,0 +1,144 @@
+:root {
+  color: #1f2937;
+  background: #f5f7fa;
+  font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+.retrieval-chunking-lab {
+  width: min(1120px, calc(100% - 32px));
+  margin: 32px auto 64px;
+}
+
+.lab-intro,
+form,
+.chunk-results {
+  padding: 24px;
+  border: 1px solid #d6dde7;
+  border-radius: 10px;
+  background: #fff;
+}
+
+.lab-intro,
+form {
+  margin-bottom: 20px;
+}
+
+.lab-eyebrow {
+  margin: 0;
+  color: #475569;
+  font-size: 0.85rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin-top: 0;
+}
+
+label,
+button {
+  display: block;
+  font-weight: 700;
+}
+
+textarea {
+  display: block;
+  width: 100%;
+  margin: 8px 0 14px;
+  padding: 12px;
+  border: 1px solid #94a3b8;
+  border-radius: 6px;
+  color: #111827;
+  font: 0.95rem/1.5 Consolas, "Cascadia Mono", monospace;
+  resize: vertical;
+}
+
+button {
+  padding: 10px 16px;
+  border: 0;
+  border-radius: 6px;
+  color: #fff;
+  background: #1d4ed8;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  background: #94a3b8;
+}
+
+.lab-muted {
+  color: #475569;
+}
+
+.chunk-results ol {
+  display: grid;
+  gap: 16px;
+  padding-left: 24px;
+}
+
+.chunk-card {
+  overflow: hidden;
+  border: 1px solid #d6dde7;
+  border-radius: 8px;
+}
+
+.chunk-card header,
+.chunk-card dl,
+.chunk-card pre {
+  margin: 0;
+  padding: 14px;
+}
+
+.chunk-card header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid #d6dde7;
+  background: #f8fafc;
+}
+
+.chunk-card h3 {
+  margin: 0;
+}
+
+.chunk-card dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+}
+
+.chunk-card dt {
+  color: #475569;
+  font-size: 0.8rem;
+}
+
+.chunk-card dd {
+  margin: 3px 0 0;
+  overflow-wrap: anywhere;
+}
+
+.lab-hash {
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 0.8rem;
+}
+
+.chunk-card pre {
+  overflow-x: auto;
+  border-top: 1px solid #d6dde7;
+  background: #f8fafc;
+  font: 0.9rem/1.5 Consolas, "Cascadia Mono", monospace;
+  white-space: pre-wrap;
+}

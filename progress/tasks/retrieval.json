@@ -476,10 +476,39 @@
       "order": 1,
       "title": "结构优先分块与 contextual prefix",
       "priority": "P0",
-      "status": "未开始",
+      "status": "已完成",
       "dependsOn": [
         "RET-02-03"
       ],
+      "executionBoundary": {
+        "inScope": [
+          "为耐久 DocumentGraph projection 增加分块所需的最小结构快照，并以向后兼容读取保证删除 import task 后仍可重建；缺失结构的历史 projection 不猜测标题层级或表头。",
+          "实现原生 Markdown 标题栈和投影块的确定性分块：300 至 500 字目标、800 字硬上限、列表按项、表格按带重复表头的行组、超长段落按句切分。",
+          "生成不改变正文、文档哈希或用户 excerpt 的 heading_path、contextual_prefix、token estimate 和稳定 block_content_sha256。",
+          "提供一个仅本机测试/开发入口可用、与生产工作台模块隔离的分块验证 UI 及其最小安全读取合同，并覆盖其前端和浏览器流程。"
+        ],
+        "outOfScope": [
+          "不实现路径或标题元数据归一化、subject/grade_volume/unit_no/material_type；这些归 RET-03-02。",
+          "不新增 index_block_meta、BlockFilter、filter_blocks 或范围枚举；这些归 RET-03-03。",
+          "不接入 FTS、Embedding、Provider 出网、检索排序、生产功能 UI 或公开 API。",
+          "不重写或删除历史 projection；历史缺少结构字段时保守保持平面读取。"
+        ],
+        "followup": [
+          "RET-03-02 复用 heading_path 实现路径与标题元数据归一化及 unknown scope 的失败关闭。",
+          "RET-03-03 持久化块级元数据并实现只返回 current、allowed、in-scope 块的 filter_blocks。",
+          "在 RET-03-01 验收后决定保留、迁移或移除独立测试 UI，不将其扩展为生产工作台功能。"
+        ],
+        "verification": [
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_index_chunking.py tests/unit/test_graph_projection.py tests/unit/test_index_graph_projection_rebuild.py tests/unit/test_index_service.py",
+          "uv run --directory apps/service ruff check domain/graph_projection.py application/indexing.py tests/unit/test_index_chunking.py tests/unit/test_graph_projection.py tests/unit/test_index_graph_projection_rebuild.py",
+          "npm run unit",
+          "npm run build",
+          "npm run browser-test",
+          "npm run progress:build",
+          "npm run progress:check",
+          "git diff --check"
+        ]
+      },
       "deliverables": [
         "DocumentGraph 投影分块",
         "原生 Markdown 标题栈分块",
@@ -497,11 +526,35 @@
       "order": 2,
       "title": "路径与标题元数据归一化",
       "priority": "P0",
-      "status": "未开始",
+      "status": "已完成",
       "dependsOn": [
         "RET-00-03",
         "RET-03-01"
       ],
+      "executionBoundary": {
+        "inScope": [
+          "新增供索引侧与未来查询侧共同调用的纯领域归一化器，消费规范化 vault 相对路径和 RET-03-01 的 heading_path。",
+          "以严格、显式的学科、册次、单元与资料类型语法归一 subject、grade_volume、unit_no 和 material_type，并以参数化测试固定规则。",
+          "覆盖 RET-00-02 的根级、四级 derived 路径和 line locator 样本；缺少完整 scope 信号时返回可恢复结果，不伪造范围。"
+        ],
+        "outOfScope": [
+          "不新增 index_block_meta、SQLite migration、元数据回填、filter_blocks 或范围枚举；这些属于 RET-03-03。",
+          "不新增查询 API、会话检索改造、LLM 元数据抽取、Embedding 或 Provider 出网。",
+          "不从真实 vault 读取、保存或上传正文、标题、绝对路径、vault ID 或可逆路径映射。"
+        ],
+        "followup": [
+          "RET-03-03 持久化已归一化的块级元数据，并以 current、policy、stale 和 scope 条件实现 filter_blocks。",
+          "RET-05-01 在查询理解中调用同一归一化器解析用户范围，避免索引侧与查询侧规则分叉。",
+          "RET-R004 在更多已审阅、不可逆脱敏目录样本覆盖规则前保持开放。"
+        ],
+        "verification": [
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_retrieval_metadata.py",
+          "uv run --directory apps/service ruff check domain/retrieval_metadata.py tests/unit/test_retrieval_metadata.py",
+          "npm run progress:build",
+          "npm run progress:check",
+          "git diff --check"
+        ]
+      },
       "deliverables": [
         "查询侧与索引侧共享 normalizer",
         "subject、grade_volume、unit_no、material_type 规则",
@@ -519,10 +572,36 @@
       "order": 3,
       "title": "块级元数据持久化与 filter_blocks",
       "priority": "P0",
-      "status": "未开始",
+      "status": "已完成",
       "dependsOn": [
         "RET-03-02"
       ],
+      "executionBoundary": {
+        "inScope": [
+          "新增 index_block_meta 的显式、幂等 SQLite migration 及 locator 复合索引；只增加表和索引，不删除、重建或迁移既有索引记录。",
+          "定义块级规则元数据、BlockFilter 和 IndexBlockRef 的最小领域及 port 合同，并在索引文档写入时与 index_blocks 保持同一事务。",
+          "实现只枚举 current、verifiable、非 stale、非 pending 且由调用方声明允许路径内完整 scope 块的 SQL filter_blocks。",
+          "覆盖空库、旧库升级、重复初始化、迁移失败回滚、范围全量、跨 vault、stale/current 和拒绝路径隔离。"
+        ],
+        "outOfScope": [
+          "不新增查询 API、会话行为、汇总生成、FTS、Embedding、LLM 元数据、concept_keys 或 UI。",
+          "不把规则外或低置信度数据伪装为 accepted scope；未知和 recoverable metadata 不进入 filter_blocks 结果。",
+          "不读取、保存或发送真实 vault 正文、绝对路径、Provider 密钥或授权 token。"
+        ],
+        "followup": [
+          "RET-04-01 在一致的块生命周期上实现 FTS5 migration 与同步。",
+          "RET-05-01 使用同一 BlockFilter 和 RET-03-02 normalizer 解析查询范围。",
+          "RET-07-01 再为规则未解析字段补 LLM 元数据与审核；本步只保存 rule origin。"
+        ],
+        "verification": [
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_sqlite_index_block_metadata.py tests/unit/test_index_service.py",
+          "uv run --directory apps/service ruff check domain/indexing.py domain/retrieval_metadata.py adapters/sqlite_index_repository.py ports/index_repository.py tests/unit/test_sqlite_index_block_metadata.py",
+          "npm run unit",
+          "npm run progress:build",
+          "npm run progress:check",
+          "git diff --check"
+        ]
+      },
       "deliverables": [
         "index_block_meta migration",
         "BlockFilter 与 IndexBlockRef 合同",
@@ -540,10 +619,35 @@
       "order": 1,
       "title": "FTS5 schema 与生命周期同步",
       "priority": "P0",
-      "status": "未开始",
+      "status": "已完成",
       "dependsOn": [
         "RET-03-03"
       ],
+      "executionBoundary": {
+        "inScope": [
+          "新增幂等、可回滚的 FTS5 与 rowid map migration，并只回填 eligible 的 current 文档块。",
+          "将保存、路径失效、重建及事务失败时的 FTS/map 生命周期与现有 document、block、metadata 写入保持同步。",
+          "覆盖旧库升级、重复初始化、失败回滚与 current/stale 孤儿行隔离。"
+        ],
+        "outOfScope": [
+          "不实现中英文分词策略、BM25 查询、search_lexical、会话 API、feature flag 或 UI。",
+          "不新增 Embedding、向量、LLM 元数据或 Provider 出网行为。",
+          "不改变既有 BlockFilter、检索排序或公网和本机 loopback 边界。"
+        ],
+        "followup": [
+          "RET-04-02 实现中英文索引文本、heading 加权与 search_lexical。",
+          "RET-04-03 用 golden set 完成 FTS 与旧检索 A/B 报告及点查接入。"
+        ],
+        "verification": [
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_sqlite_index_fts_lifecycle.py tests/unit/test_sqlite_index_block_metadata.py",
+          "uv run --directory apps/service ruff check adapters/sqlite_index_repository.py tests/unit/test_sqlite_index_fts_lifecycle.py",
+          "npm run unit",
+          "npm run integration",
+          "npm run progress:build",
+          "npm run progress:check",
+          "git diff --check"
+        ]
+      },
       "deliverables": [
         "FTS 与 map migration",
         "save、invalidate、rebuild、rollback 同步",
@@ -551,8 +655,12 @@
       ],
       "acceptance": "任何索引生命周期操作后都不存在可检索的孤儿或 stale 行。",
       "verification": [
-        "事务失败注入测试",
-        "孤儿行检查"
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_sqlite_index_fts_lifecycle.py tests/unit/test_sqlite_index_block_metadata.py tests/unit/test_sqlite_index_rich_blocks.py tests/unit/test_index_service.py（37 passed）",
+        "npm run unit（前端 21 passed；服务端 398 passed，3 skipped）",
+        "npm run integration（空闲 loopback 测试端口；11 passed，2 skipped）",
+        "uv run --directory apps/service ruff check .（All checks passed）",
+        "npm run progress:build && npm run progress:check",
+        "git diff --check"
       ]
     },
     {
@@ -561,19 +669,50 @@
       "order": 2,
       "title": "中英分词与 search_lexical",
       "priority": "P0",
-      "status": "未开始",
+      "status": "已完成",
       "dependsOn": [
         "RET-04-01"
       ],
+      "executionBoundary": {
+        "inScope": [
+          "以纯领域合同实现英文 Porter 检索文本、由 heading、tags 与 links 构成的中文领域词典及未命中部分的 bigram fallback。",
+          "为既有 FTS 行增加可回滚的内容回填 migration，并在保存与回填时写入中英检索文本、heading 与 tag。",
+          "定义 LexicalQuery、BlockHit 与 search_lexical port；SQLite 查询只返回同 vault、current、verifiable、非 stale、非 pending 且处于调用方允许路径内的块，并以 BM25 对 heading 加权排序。",
+          "以 tokenizer、migration、隔离和排序单元测试验证行为，并以 macro recall 不低于 0.6569、macro precision 不低于 0.2813 作为 synthetic golden 最低门槛。"
+        ],
+        "outOfScope": [
+          "不接入会话 API、feature flag、UI 或移除既有手写检索；这些归 RET-04-03。",
+          "不实现向量检索、Embedding、LLM 元数据或任何 Provider 出网。",
+          "不改变 BlockFilter 的枚举语义、公开 API 或本机 loopback 边界。"
+        ],
+        "followup": [
+          "RET-04-03 以版本化 golden set 完成词法 A/B、会话切换和手写打分退役决策。",
+          "RET-05-01 消费同一范围合同实现查询理解与枚举型汇总。"
+        ],
+        "verification": [
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_retrieval_lexical.py tests/unit/test_sqlite_index_fts_lifecycle.py",
+          "uv run --directory apps/service ruff check domain/retrieval_lexical.py domain/indexing.py ports/index_repository.py adapters/sqlite_index_repository.py tests/unit/test_retrieval_lexical.py",
+          "npm run unit",
+          "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6242'; npm run integration",
+          "npm run progress:build",
+          "npm run progress:check",
+          "git diff --check"
+        ]
+      },
       "deliverables": [
         "英文 porter 列",
         "中文领域词典与 bigram fallback",
         "heading 加权与 BlockHit 合同"
       ],
-      "acceptance": "golden set 的词法 recall 与 precision 达到 RET-00 确定的目标。",
+      "acceptance": "synthetic golden set 的词法 macro recall 不低于 0.6569，macro precision 不低于 0.2813。",
       "verification": [
-        "tokenizer 单元测试",
-        "repository 排序测试"
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_retrieval_lexical.py tests/unit/test_sqlite_index_fts_lifecycle.py tests/unit/test_sqlite_index_block_metadata.py tests/unit/test_index_service.py（31 passed）",
+        "synthetic golden lexical eval（macro recall 0.6875 >= 0.6569；macro precision 0.302083 >= 0.2813）",
+        "npm run unit（前端 21 passed；服务端 404 passed，3 skipped）",
+        "npm run lint（All checks passed）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6242'; npm run integration（11 passed，2 skipped）",
+        "npm run progress:build && npm run progress:check",
+        "git diff --check"
       ]
     },
     {
@@ -582,10 +721,38 @@
       "order": 3,
       "title": "词法 A/B、切换与退役手写打分",
       "priority": "P0",
-      "status": "未开始",
+      "status": "已完成",
       "dependsOn": [
         "RET-04-02"
       ],
+      "executionBoundary": {
+        "inScope": [
+          "用 RET-00-03 的同一 synthetic golden fixture 生成旧手写评分与 FTS5 词法检索的版本化 A/B 报告，并以旧基线 macro recall 0.6569444444444444、macro precision 0.28125 作为不回退门槛。",
+          "在会话点查型 source-lookup 中接入已实现的 search_lexical，保持任务快照、scope、policy、current/stale、pending 和证据引用合同。",
+          "加入仅本机 runtime 的词法检索开关，用于验证启用路径；A/B 通过后将 FTS5 设为唯一点查路径并移除 _retrieval_score 及其手写分词辅助函数。",
+          "覆盖 A/B、source-lookup 的 FTS 接入、排除/范围隔离、引用兼容、runtime 配置、API、integration 与 browser 回归。"
+        ],
+        "outOfScope": [
+          "不接入 Embedding、向量、RRF、rerank、结构检索或 LLM 元数据。",
+          "不改变 completeness、knowledge-organization、deep-creation 的枚举和生成路径；这些归 RET-05 及后续任务。",
+          "不改变公开 HTTP 合同、Provider 出网边界、vault 范围语义或前端界面。"
+        ],
+        "followup": [
+          "RET-05-01 解析查询 scope；RET-05-02 使用 BlockFilter 实现枚举型全量汇总。",
+          "RET-06-04 在向量与结构通道到位后校准 RRF 和混合候选参数。"
+        ],
+        "verification": [
+          "npm run retrieval:lexical-ab（docs/ret-04-03-lexical-ab-v1.json：macro recall +0.030555555555555558；macro precision +0.020833333333333315；passesGate=true）",
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_retrieval_lexical_ab.py tests/unit/test_sessions.py tests/unit/test_sessions_api.py tests/unit/test_runtime.py（84 passed）",
+          "npm run unit（前端 21 passed；服务端 415 passed，3 skipped）",
+          "npm run lint（All checks passed）",
+          "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6242'; npm run integration（11 passed，2 skipped）",
+          "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6242'; npm run browser-test（27 passed）",
+          "npm run progress:build",
+          "npm run progress:check",
+          "git diff --check"
+        ]
+      },
       "deliverables": [
         "旧检索与 FTS A/B 报告",
         "会话检索接入开关",

@@ -1,9 +1,11 @@
 import pytest
 
 from api.runtime import (
+    LEXICAL_RETRIEVAL_ENVIRONMENT_VARIABLE,
     RICH_BLOCK_READS_ENVIRONMENT_VARIABLE,
     UnsupportedSQLiteVersion,
     ensure_sqlite_version,
+    lexical_retrieval_enabled,
     rich_block_reads_enabled,
 )
 
@@ -35,3 +37,24 @@ def test_rich_block_read_feature_flag_parses_supported_boolean_values(value: str
 def test_rich_block_read_feature_flag_rejects_an_invalid_value() -> None:
     with pytest.raises(ValueError, match=RICH_BLOCK_READS_ENVIRONMENT_VARIABLE):
         rich_block_reads_enabled("maybe")
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, True),
+        ("1", True),
+        ("true", True),
+        ("off", False),
+        ("0", False),
+    ],
+)
+def test_lexical_retrieval_feature_flag_parses_supported_boolean_values(
+    value: str | None, expected: bool
+) -> None:
+    assert lexical_retrieval_enabled(value) is expected
+
+
+def test_lexical_retrieval_feature_flag_rejects_an_invalid_value() -> None:
+    with pytest.raises(ValueError, match=LEXICAL_RETRIEVAL_ENVIRONMENT_VARIABLE):
+        lexical_retrieval_enabled("maybe")

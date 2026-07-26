@@ -15,7 +15,18 @@ from domain.graph_projection import (
     GraphProjectionKey,
     GraphProjectionLocatorSummary,
 )
-from domain.indexing import IndexBlock, IndexBlockBackfillReport, IndexHealth, IndexJob, IndexedDocument
+from domain.indexing import (
+    BlockFilter,
+    IndexBlock,
+    IndexBlockBackfillReport,
+    IndexBlockMetadata,
+    IndexBlockRef,
+    IndexHealth,
+    IndexJob,
+    IndexedDocument,
+)
+from domain.retrieval_metadata import normalize_index_metadata
+from domain.retrieval_chunking import chunk_native_markdown, chunk_projection_blocks
 from domain.review_commits import CommitUnit
 from domain.tasks import utc_now
 from ports.index_repository import IndexRepository
@@ -49,6 +60,17 @@ class IndexingService:
     def health(self, vault_id: str) -> IndexHealth:
         self.vault_service.get(vault_id)
         return self._sync_health(vault_id)
+
+    def filter_blocks(self, vault_id: str, filters: BlockFilter) -> list[IndexBlockRef]:
+        self.vault_service.get(vault_id)
+        allowed_paths = tuple(
+            document.relative_path
+            for document in self.repository.current_documents(vault_id)
+            if self._retrieval_allowed(vault_id, document)
+        )
+        return self.repository.filter_blocks(
+            vault_id, replace(filters, allowed_relative_paths=allowed_paths)
+        )
 
     def backfill_current_blocks(self, vault_id: str) -> IndexBlockBackfillReport:
         self.vault_service.get(vault_id)
@@ -336,7 +358,7 @@ class IndexingService:
                     stale_reason = "source-content-changed"
                 elif not _has_top_source_link(markdown, source_path):
                     stale_reason = "source-link-broken"
-        blocks = _blocks(markdown)
+        blocks = chunk_native_markdown(markdown)
         if provenance is not None:
             projection_key = _graph_projection_key(provenance)
             if projection_key is not None:
@@ -370,6 +392,7 @@ class IndexingService:
             source_observed_mtime_ns=source_stat.st_mtime_ns if source_stat else None,
             source_observed_size=source_stat.st_size if source_stat else None,
             policy_revision=self._policy_revision(vault_id),
+            block_metadata=_rule_block_metadata(relative_path, blocks),
         )
 
     def _index_allowed(self, vault_id: str, document: IndexedDocument) -> bool:
@@ -378,6 +401,14 @@ class IndexingService:
         source_path = document.source_path or document.relative_path
         return self.policy_service.preview(
             vault_id, source_path, document.relative_path, "index"
+        ).allowed
+
+    def _retrieval_allowed(self, vault_id: str, document: IndexedDocument) -> bool:
+        if self.policy_service is None:
+            return True
+        source_path = document.source_path or document.relative_path
+        return self.policy_service.preview(
+            vault_id, source_path, document.relative_path, "retrieval"
         ).allowed
 
     def _available_vault(self, vault_id: str):
@@ -550,35 +581,30 @@ def _projection_blocks(
             for locator in block.locators
         )
     ]
-    retrievable_blocks = [block for block in matched_blocks if block.is_retrievable]
-    if not retrievable_blocks:
+    if not any(block.is_retrievable for block in matched_blocks):
         raise IndexingError("No retrievable durable graph projection blocks match the Markdown provenance.")
-    return tuple(
-        IndexBlock(
-            sequence,
-            f"graph:{projection.graph_id}:{projection.graph_revision}:{block.block_id}",
-            block.retrieval_projection,
-            block_kind=block.kind,
-            source_locators=block.locators,
-            graph_block_id=block.block_id,
-            reading_order=block.reading_order,
-            confidence=block.confidence,
-            retrieval_text=block.retrieval_projection,
+    return chunk_projection_blocks(projection, tuple(matched_blocks))
+
+
+def _rule_block_metadata(
+    relative_path: str, blocks: tuple[IndexBlock, ...]
+) -> tuple[IndexBlockMetadata, ...]:
+    metadata: list[IndexBlockMetadata] = []
+    for block in blocks:
+        normalized = normalize_index_metadata(relative_path, block.heading_path)
+        metadata.append(
+            IndexBlockMetadata(
+                sequence=block.sequence,
+                subject=normalized.subject,
+                grade_volume=normalized.grade_volume,
+                unit_no=normalized.unit_no,
+                material_type=normalized.material_type,
+                meta_origin="rule",
+                meta_confidence=0.95 if normalized.is_resolved else None,
+                meta_status="accepted" if normalized.is_resolved else "required-check",
+            )
         )
-        for sequence, block in enumerate(retrievable_blocks, start=1)
-    )
-
-
-def _blocks(markdown: str) -> tuple[IndexBlock, ...]:
-    lines = markdown.splitlines()
-    starts = [index for index, line in enumerate(lines) if _HEADING.match(line)] or [0]
-    blocks: list[IndexBlock] = []
-    for sequence, start in enumerate(starts, start=1):
-        end = starts[sequence] if sequence < len(starts) else len(lines)
-        text = "\n".join(lines[start:end]).strip()
-        if text:
-            blocks.append(IndexBlock(sequence, f"line:{start + 1}", text))
-    return tuple(blocks) or (IndexBlock(1, "line:1", markdown.strip() or "(empty markdown)"),)
+    return tuple(metadata)
 
 
 def _tags(markdown: str) -> tuple[str, ...]:

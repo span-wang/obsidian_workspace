@@ -7,18 +7,34 @@ from pathlib import Path
 from domain.evidence import document_locator_from_dict
 from domain.graph_projection import DurableGraphProjection, GraphProjectionKey
 from domain.indexing import (
+    BlockFilter,
+    BlockHit,
     IndexBlock,
     IndexBlockBackfillReport,
     IndexBlockConsistencyIssue,
+    IndexBlockMetadata,
+    IndexBlockRef,
     IndexHealth,
     IndexJob,
     IndexedDocument,
+    LexicalQuery,
+)
+from domain.retrieval_lexical import (
+    build_cjk_vocabulary,
+    english_fts_text,
+    english_terms,
+    tokenize_cjk,
 )
 from domain.tasks import utc_now
 
 
 _GRAPH_PROJECTION_MIGRATION_ID = "ret-01-02-graph-projection-v1"
+_GRAPH_PROJECTION_CHUNKING_STRUCTURE_MIGRATION_ID = "ret-03-01-graph-projection-chunking-v1"
 _RICH_INDEX_BLOCK_MIGRATION_ID = "ret-02-01-rich-index-block-v1"
+_INDEX_BLOCK_METADATA_MIGRATION_ID = "ret-03-03-index-block-meta-v1"
+_INDEX_BLOCK_FTS_MIGRATION_ID = "ret-04-01-index-block-fts-v1"
+_INDEX_BLOCK_LEXICAL_MIGRATION_ID = "ret-04-02-index-block-lexical-v1"
+_LEXICAL_BM25_ARGUMENTS = "1.0, 1.0, 10.0, 1.0"
 _RICH_INDEX_BLOCK_COLUMNS = (
     ("block_content_sha256", "TEXT NOT NULL DEFAULT ''"),
     ("block_kind", "TEXT NOT NULL DEFAULT 'paragraph'"),
@@ -123,7 +139,11 @@ class SqliteIndexRepository:
                 if name not in columns:
                     connection.execute(f"ALTER TABLE index_documents ADD COLUMN {name} {definition}")
             self._apply_graph_projection_migration(connection)
+            self._apply_graph_projection_chunking_structure_migration(connection)
             self._apply_rich_index_block_migration(connection)
+            self._apply_index_block_metadata_migration(connection)
+            self._apply_index_block_fts_migration(connection)
+            self._apply_index_block_lexical_migration(connection)
 
     @staticmethod
     def _apply_graph_projection_migration(connection: sqlite3.Connection) -> None:
@@ -168,6 +188,7 @@ class SqliteIndexRepository:
                         locators_json TEXT NOT NULL,
                         confidence REAL NOT NULL,
                         retrieval_projection TEXT NOT NULL,
+                        chunking_structure_json TEXT,
                         PRIMARY KEY (vault_id, graph_id, graph_revision, block_id),
                         FOREIGN KEY (vault_id, graph_id, graph_revision)
                             REFERENCES graph_projections(vault_id, graph_id, graph_revision)
@@ -186,6 +207,43 @@ class SqliteIndexRepository:
             connection.execute("RELEASE SAVEPOINT graph_projection_migration")
             raise
         connection.execute("RELEASE SAVEPOINT graph_projection_migration")
+
+    @staticmethod
+    def _apply_graph_projection_chunking_structure_migration(
+        connection: sqlite3.Connection,
+    ) -> None:
+        connection.execute("SAVEPOINT graph_projection_chunking_structure_migration")
+        try:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS index_schema_migrations (
+                    migration_id TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                )
+                """
+            )
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(graph_projection_blocks)").fetchall()
+            }
+            if "chunking_structure_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE graph_projection_blocks ADD COLUMN chunking_structure_json TEXT"
+                )
+            existing = connection.execute(
+                "SELECT 1 FROM index_schema_migrations WHERE migration_id = ?",
+                (_GRAPH_PROJECTION_CHUNKING_STRUCTURE_MIGRATION_ID,),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    "INSERT INTO index_schema_migrations (migration_id, applied_at) VALUES (?, ?)",
+                    (_GRAPH_PROJECTION_CHUNKING_STRUCTURE_MIGRATION_ID, utc_now()),
+                )
+        except Exception:
+            connection.execute("ROLLBACK TO SAVEPOINT graph_projection_chunking_structure_migration")
+            connection.execute("RELEASE SAVEPOINT graph_projection_chunking_structure_migration")
+            raise
+        connection.execute("RELEASE SAVEPOINT graph_projection_chunking_structure_migration")
 
     @staticmethod
     def _add_index_block_column(connection: sqlite3.Connection, name: str, definition: str) -> None:
@@ -223,6 +281,146 @@ class SqliteIndexRepository:
             connection.execute("RELEASE SAVEPOINT rich_index_block_migration")
             raise
         connection.execute("RELEASE SAVEPOINT rich_index_block_migration")
+
+    @staticmethod
+    def _create_index_block_metadata_schema(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS index_block_meta (
+                document_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                subject TEXT,
+                grade_volume TEXT,
+                unit_no INTEGER,
+                material_type TEXT,
+                meta_origin TEXT NOT NULL,
+                meta_confidence REAL,
+                meta_status TEXT NOT NULL,
+                PRIMARY KEY (document_id, sequence),
+                FOREIGN KEY (document_id, sequence)
+                    REFERENCES index_blocks(document_id, sequence) ON DELETE CASCADE
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_block_meta_locator
+            ON index_block_meta(subject, grade_volume, unit_no, material_type, document_id, sequence)
+            """
+        )
+
+    @classmethod
+    def _apply_index_block_metadata_migration(cls, connection: sqlite3.Connection) -> None:
+        connection.execute("SAVEPOINT index_block_metadata_migration")
+        try:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS index_repository_migrations (
+                    migration_id TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                )
+                """
+            )
+            existing = connection.execute(
+                "SELECT 1 FROM index_repository_migrations WHERE migration_id = ?",
+                (_INDEX_BLOCK_METADATA_MIGRATION_ID,),
+            ).fetchone()
+            if existing is None:
+                cls._create_index_block_metadata_schema(connection)
+                connection.execute(
+                    "INSERT INTO index_repository_migrations (migration_id, applied_at) VALUES (?, ?)",
+                    (_INDEX_BLOCK_METADATA_MIGRATION_ID, utc_now()),
+                )
+        except Exception:
+            connection.execute("ROLLBACK TO SAVEPOINT index_block_metadata_migration")
+            connection.execute("RELEASE SAVEPOINT index_block_metadata_migration")
+            raise
+        connection.execute("RELEASE SAVEPOINT index_block_metadata_migration")
+
+    @staticmethod
+    def _create_index_block_fts_schema(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS index_block_fts USING fts5(
+                en_text,
+                cjk_text,
+                heading_text,
+                tag_text,
+                tokenize = 'porter unicode61 remove_diacritics 2',
+                prefix = '2 3'
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS index_block_fts_map (
+                rowid INTEGER PRIMARY KEY,
+                document_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                UNIQUE(document_id, sequence),
+                FOREIGN KEY (document_id) REFERENCES index_documents(document_id) ON DELETE CASCADE
+            )
+            """
+        )
+
+    @classmethod
+    def _apply_index_block_fts_migration(cls, connection: sqlite3.Connection) -> None:
+        connection.execute("SAVEPOINT index_block_fts_migration")
+        try:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS index_repository_migrations (
+                    migration_id TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                )
+                """
+            )
+            existing = connection.execute(
+                "SELECT 1 FROM index_repository_migrations WHERE migration_id = ?",
+                (_INDEX_BLOCK_FTS_MIGRATION_ID,),
+            ).fetchone()
+            if existing is None:
+                cls._create_index_block_fts_schema(connection)
+                connection.execute("DELETE FROM index_block_fts_map")
+                connection.execute("DELETE FROM index_block_fts")
+                cls._backfill_eligible_fts_rows(connection)
+                connection.execute(
+                    "INSERT INTO index_repository_migrations (migration_id, applied_at) VALUES (?, ?)",
+                    (_INDEX_BLOCK_FTS_MIGRATION_ID, utc_now()),
+                )
+        except Exception:
+            connection.execute("ROLLBACK TO SAVEPOINT index_block_fts_migration")
+            connection.execute("RELEASE SAVEPOINT index_block_fts_migration")
+            raise
+        connection.execute("RELEASE SAVEPOINT index_block_fts_migration")
+
+    @classmethod
+    def _apply_index_block_lexical_migration(cls, connection: sqlite3.Connection) -> None:
+        connection.execute("SAVEPOINT index_block_lexical_migration")
+        try:
+            fts_table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'index_block_fts'"
+            ).fetchone()
+            if fts_table is None:
+                connection.execute("RELEASE SAVEPOINT index_block_lexical_migration")
+                return
+            existing = connection.execute(
+                "SELECT 1 FROM index_repository_migrations WHERE migration_id = ?",
+                (_INDEX_BLOCK_LEXICAL_MIGRATION_ID,),
+            ).fetchone()
+            if existing is None:
+                connection.execute("DELETE FROM index_block_fts_map")
+                connection.execute("DELETE FROM index_block_fts")
+                cls._backfill_eligible_fts_rows(connection)
+                connection.execute(
+                    "INSERT INTO index_repository_migrations (migration_id, applied_at) VALUES (?, ?)",
+                    (_INDEX_BLOCK_LEXICAL_MIGRATION_ID, utc_now()),
+                )
+        except Exception:
+            connection.execute("ROLLBACK TO SAVEPOINT index_block_lexical_migration")
+            connection.execute("RELEASE SAVEPOINT index_block_lexical_migration")
+            raise
+        connection.execute("RELEASE SAVEPOINT index_block_lexical_migration")
 
     def enqueue(self, job: IndexJob) -> None:
         with self._connect() as connection:
@@ -323,6 +521,146 @@ class SqliteIndexRepository:
 
     def documents(self, vault_id: str) -> list[IndexedDocument]:
         return self._documents(vault_id, current_only=False)
+
+    def filter_blocks(self, vault_id: str, filters: BlockFilter) -> list[IndexBlockRef]:
+        if not filters.allowed_relative_paths:
+            return []
+        path_placeholders = ", ".join("?" for _ in filters.allowed_relative_paths)
+        conditions = [
+            "documents.vault_id = ?",
+            "documents.is_current = 1",
+            "documents.verifiable = 1",
+            "documents.stale_reason IS NULL",
+            "documents.pending_association = 0",
+            "metadata.meta_status = 'accepted'",
+            "metadata.subject = ?",
+            "metadata.grade_volume = ?",
+            "metadata.unit_no = ?",
+        ]
+        parameters: list[object] = [
+            vault_id,
+            filters.subject,
+            filters.grade_volume,
+            filters.unit_no,
+        ]
+        if filters.material_type is not None:
+            conditions.append("metadata.material_type = ?")
+            parameters.append(filters.material_type)
+        conditions.append(f"documents.relative_path IN ({path_placeholders})")
+        parameters.extend(filters.allowed_relative_paths)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT documents.document_id, documents.relative_path,
+                       blocks.sequence, blocks.location, blocks.text, blocks.block_content_sha256,
+                       blocks.block_kind, blocks.heading_path_json, blocks.heading_level,
+                       blocks.source_locators_json, blocks.graph_block_id, blocks.reading_order,
+                       blocks.confidence, blocks.retrieval_text, blocks.contextual_prefix,
+                       blocks.token_estimate, metadata.subject, metadata.grade_volume, metadata.unit_no,
+                       metadata.material_type, metadata.meta_origin, metadata.meta_confidence,
+                       metadata.meta_status
+                FROM index_block_meta AS metadata
+                JOIN index_documents AS documents ON documents.document_id = metadata.document_id
+                JOIN index_blocks AS blocks
+                    ON blocks.document_id = metadata.document_id AND blocks.sequence = metadata.sequence
+                WHERE {' AND '.join(conditions)}
+                ORDER BY documents.relative_path, blocks.sequence
+                """,
+                parameters,
+            ).fetchall()
+        return [self._block_ref_from_row(row) for row in rows]
+
+    def search_lexical(self, vault_id: str, query: LexicalQuery) -> list[BlockHit]:
+        if not query.allowed_relative_paths:
+            return []
+        path_placeholders = ", ".join("?" for _ in query.allowed_relative_paths)
+        with self._connect() as connection:
+            vocabulary = self._lexical_cjk_vocabulary(
+                connection, vault_id, query.allowed_relative_paths
+            )
+            match_expression = self._lexical_match_expression(query.text, vocabulary)
+            if not match_expression:
+                return []
+            rows = connection.execute(
+                f"""
+                SELECT documents.document_id, documents.relative_path,
+                       blocks.sequence, blocks.location, blocks.text, blocks.block_content_sha256,
+                       blocks.block_kind, blocks.heading_path_json, blocks.heading_level,
+                       blocks.source_locators_json, blocks.graph_block_id, blocks.reading_order,
+                       blocks.confidence, blocks.retrieval_text, blocks.contextual_prefix,
+                       blocks.token_estimate,
+                       -bm25(index_block_fts, {_LEXICAL_BM25_ARGUMENTS}) AS score
+                FROM index_block_fts
+                JOIN index_block_fts_map AS mappings ON mappings.rowid = index_block_fts.rowid
+                JOIN index_documents AS documents ON documents.document_id = mappings.document_id
+                JOIN index_blocks AS blocks
+                  ON blocks.document_id = mappings.document_id AND blocks.sequence = mappings.sequence
+                WHERE index_block_fts MATCH ?
+                  AND documents.vault_id = ?
+                  AND documents.is_current = 1
+                  AND documents.verifiable = 1
+                  AND documents.stale_reason IS NULL
+                  AND documents.pending_association = 0
+                  AND documents.relative_path IN ({path_placeholders})
+                ORDER BY score DESC, documents.relative_path, blocks.sequence
+                LIMIT ?
+                """,
+                (match_expression, vault_id, *query.allowed_relative_paths, query.limit),
+            ).fetchall()
+        hits: list[BlockHit] = []
+        for row in rows:
+            block = self._rich_block_from_row(row)
+            if block is None:
+                raise ValueError("Lexical index block is invalid.")
+            hits.append(
+                BlockHit(
+                    document_id=str(row["document_id"]),
+                    relative_path=str(row["relative_path"]),
+                    block=block,
+                    score=float(row["score"]),
+                )
+            )
+        return hits
+
+    @classmethod
+    def _lexical_cjk_vocabulary(
+        cls, connection: sqlite3.Connection, vault_id: str, allowed_relative_paths: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        path_placeholders = ", ".join("?" for _ in allowed_relative_paths)
+        rows = connection.execute(
+            f"""
+            SELECT documents.tags_json, documents.links_json, blocks.heading_path_json
+            FROM index_documents AS documents
+            JOIN index_blocks AS blocks ON blocks.document_id = documents.document_id
+            WHERE documents.vault_id = ?
+              AND documents.is_current = 1
+              AND documents.verifiable = 1
+              AND documents.stale_reason IS NULL
+              AND documents.pending_association = 0
+              AND documents.relative_path IN ({path_placeholders})
+            """,
+            (vault_id, *allowed_relative_paths),
+        ).fetchall()
+        values = tuple(
+            value
+            for row in rows
+            for value in (
+                *cls._fts_string_values(row["heading_path_json"]),
+                *cls._fts_string_values(row["tags_json"]),
+                *cls._fts_string_values(row["links_json"]),
+            )
+        )
+        return build_cjk_vocabulary(values)
+
+    @staticmethod
+    def _lexical_match_expression(query_text: str, vocabulary: tuple[str, ...]) -> str:
+        english = english_terms(query_text)
+        cjk = tuple(dict.fromkeys(tokenize_cjk(query_text, vocabulary)))
+        clauses = [f'{column} : "{term}"' for term in english for column in ("en_text", "heading_text", "tag_text")]
+        clauses.extend(
+            f'{column} : "{term}"' for term in cjk for column in ("cjk_text", "heading_text", "tag_text")
+        )
+        return " OR ".join(clauses)
 
     def _documents(self, vault_id: str, *, current_only: bool) -> list[IndexedDocument]:
         query = "SELECT * FROM index_documents WHERE vault_id = ?"
@@ -445,6 +783,11 @@ class SqliteIndexRepository:
         location = row["location"]
         if not isinstance(location, str) or not location.startswith("graph:"):
             return None, None
+        projection_location, chunk_separator, chunk_suffix = location.partition("#chunk:")
+        if chunk_separator and (
+            not chunk_suffix.isascii() or not chunk_suffix.isdecimal() or int(chunk_suffix) < 1
+        ):
+            return None, "graph-projection-invalid"
         projection_rows = connection.execute(
             """
             SELECT projections.source_id, projections.source_sha256, projections.source_path,
@@ -459,7 +802,7 @@ class SqliteIndexRepository:
               AND ? = 'graph:' || projections.graph_id || ':' || projections.graph_revision || ':' || blocks.block_id
             LIMIT 2
             """,
-            (row["vault_id"], location),
+            (row["vault_id"], projection_location),
         ).fetchall()
         if not projection_rows:
             return None, "graph-projection-missing"
@@ -471,6 +814,8 @@ class SqliteIndexRepository:
             for field in ("source_id", "source_sha256", "source_path")
         ):
             return None, "graph-projection-provenance-mismatch"
+        if chunk_separator:
+            return None, None
         if row["text"] != projection_block["retrieval_projection"]:
             return None, "graph-projection-text-mismatch"
         legacy_block = cls._legacy_block_from_row(row)
@@ -584,6 +929,33 @@ class SqliteIndexRepository:
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             return None
 
+    @classmethod
+    def _block_ref_from_row(cls, row: sqlite3.Row) -> IndexBlockRef:
+        block = cls._rich_block_from_row(row)
+        if block is None:
+            raise ValueError("Filtered index block is invalid.")
+        return IndexBlockRef(
+            document_id=str(row["document_id"]),
+            relative_path=str(row["relative_path"]),
+            block=block,
+            metadata=cls._metadata_from_row(row),
+        )
+
+    @staticmethod
+    def _metadata_from_row(row: sqlite3.Row) -> IndexBlockMetadata:
+        return IndexBlockMetadata(
+            sequence=int(row["sequence"]),
+            subject=str(row["subject"]) if row["subject"] is not None else None,
+            grade_volume=str(row["grade_volume"]) if row["grade_volume"] is not None else None,
+            unit_no=int(row["unit_no"]) if row["unit_no"] is not None else None,
+            material_type=str(row["material_type"]) if row["material_type"] is not None else None,
+            meta_origin=str(row["meta_origin"]),
+            meta_confidence=float(row["meta_confidence"])
+            if row["meta_confidence"] is not None
+            else None,
+            meta_status=str(row["meta_status"]),
+        )
+
     @staticmethod
     def _matches_graph_structure(block: IndexBlock, values: dict[str, object]) -> bool:
         try:
@@ -620,13 +992,7 @@ class SqliteIndexRepository:
     ) -> None:
         with self._connect() as connection:
             for vault_id, relative_path, reason in invalidations:
-                connection.execute(
-                    """
-                    UPDATE index_documents SET is_current = 0, stale_reason = ?
-                    WHERE vault_id = ? AND relative_path = ? AND is_current = 1
-                    """,
-                    (reason, vault_id, relative_path),
-                )
+                self._invalidate_current_path(connection, vault_id, relative_path, reason)
             for document in documents:
                 self._save_document(connection, document)
             if projection is not None:
@@ -657,7 +1023,8 @@ class SqliteIndexRepository:
     ) -> DurableGraphProjection:
         blocks = connection.execute(
             """
-            SELECT block_id, kind, reading_order, locators_json, confidence, retrieval_projection
+            SELECT block_id, kind, reading_order, locators_json, confidence, retrieval_projection,
+                   chunking_structure_json
             FROM graph_projection_blocks
             WHERE vault_id = ? AND graph_id = ? AND graph_revision = ?
             ORDER BY reading_order, block_id
@@ -682,14 +1049,18 @@ class SqliteIndexRepository:
                         "locators": json.loads(block["locators_json"]),
                         "confidence": block["confidence"],
                         "retrieval_projection": block["retrieval_projection"],
+                        **(
+                            {"chunking_structure": json.loads(block["chunking_structure_json"])}
+                            if block["chunking_structure_json"] is not None
+                            else {}
+                        ),
                     }
                     for block in blocks
                 ],
             }
         )
 
-    @staticmethod
-    def _save_document(connection: sqlite3.Connection, document: IndexedDocument) -> None:
+    def _save_document(self, connection: sqlite3.Connection, document: IndexedDocument) -> None:
         connection.execute(
             """
             INSERT INTO index_documents (
@@ -753,6 +1124,204 @@ class SqliteIndexRepository:
                 for block in document.blocks
             ],
         )
+        self._save_block_metadata(connection, document)
+        self._save_fts_rows(connection, document)
+
+    @staticmethod
+    def _save_block_metadata(connection: sqlite3.Connection, document: IndexedDocument) -> None:
+        if not document.block_metadata:
+            return
+        connection.executemany(
+            """
+            INSERT INTO index_block_meta (
+                document_id, sequence, subject, grade_volume, unit_no, material_type,
+                meta_origin, meta_confidence, meta_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    document.document_id,
+                    metadata.sequence,
+                    metadata.subject,
+                    metadata.grade_volume,
+                    metadata.unit_no,
+                    metadata.material_type,
+                    metadata.meta_origin,
+                    metadata.meta_confidence,
+                    metadata.meta_status,
+                )
+                for metadata in document.block_metadata
+            ],
+        )
+
+    @staticmethod
+    def _fts_eligible(document: IndexedDocument) -> bool:
+        return (
+            document.is_current
+            and document.verifiable
+            and document.stale_reason is None
+            and not document.pending_association
+        )
+
+    @classmethod
+    def _save_fts_rows(cls, connection: sqlite3.Connection, document: IndexedDocument) -> None:
+        if not cls._fts_eligible(document):
+            return
+        for block in document.blocks:
+            cls._insert_fts_row(
+                connection,
+                document.document_id,
+                block.sequence,
+                retrieval_text=block.retrieval_text,
+                contextual_prefix=block.contextual_prefix,
+                heading_path=block.heading_path,
+                tags=document.tags,
+                links=document.links,
+            )
+
+    @classmethod
+    def _backfill_eligible_fts_rows(
+        cls, connection: sqlite3.Connection, document_ids: tuple[str, ...] | None = None
+    ) -> None:
+        conditions = [
+            "documents.is_current = 1",
+            "documents.verifiable = 1",
+            "documents.stale_reason IS NULL",
+            "documents.pending_association = 0",
+        ]
+        parameters: list[object] = []
+        if document_ids is not None:
+            if not document_ids:
+                return
+            placeholders = ", ".join("?" for _ in document_ids)
+            conditions.append(f"documents.document_id IN ({placeholders})")
+            parameters.extend(document_ids)
+        rows = connection.execute(
+            f"""
+            SELECT documents.document_id, documents.tags_json, documents.links_json, blocks.sequence,
+                   blocks.retrieval_text, blocks.contextual_prefix, blocks.heading_path_json
+            FROM index_documents AS documents
+            JOIN index_blocks AS blocks ON blocks.document_id = documents.document_id
+            WHERE {' AND '.join(conditions)}
+            ORDER BY documents.document_id, blocks.sequence
+            """,
+            parameters,
+        ).fetchall()
+        for row in rows:
+            cls._insert_fts_row(
+                connection,
+                str(row["document_id"]),
+                int(row["sequence"]),
+                retrieval_text=str(row["retrieval_text"]),
+                contextual_prefix=str(row["contextual_prefix"]),
+                heading_path=cls._fts_string_values(row["heading_path_json"]),
+                tags=cls._fts_string_values(row["tags_json"]),
+                links=cls._fts_string_values(row["links_json"]),
+            )
+
+    @staticmethod
+    def _fts_string_values(value: object) -> tuple[str, ...]:
+        if not isinstance(value, str):
+            return ()
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            return ()
+        if not isinstance(decoded, list) or not all(isinstance(item, str) for item in decoded):
+            return ()
+        return tuple(item for item in decoded if item.strip())
+
+    @staticmethod
+    def _insert_fts_row(
+        connection: sqlite3.Connection,
+        document_id: str,
+        sequence: int,
+        *,
+        retrieval_text: str,
+        contextual_prefix: str,
+        heading_path: tuple[str, ...],
+        tags: tuple[str, ...],
+        links: tuple[str, ...],
+    ) -> None:
+        vocabulary = build_cjk_vocabulary((*heading_path, *tags, *links))
+        indexed_text = "\n".join(value for value in (contextual_prefix, retrieval_text) if value.strip())
+        en_text = english_fts_text(indexed_text)
+        cjk_text = " ".join(tokenize_cjk(indexed_text, vocabulary))
+        cursor = connection.execute(
+            """
+            INSERT INTO index_block_fts (en_text, cjk_text, heading_text, tag_text)
+            VALUES (?, ?, ?, ?)
+            """,
+            (en_text, cjk_text, " / ".join(heading_path), " ".join(tags)),
+        )
+        connection.execute(
+            "INSERT INTO index_block_fts_map (rowid, document_id, sequence) VALUES (?, ?, ?)",
+            (cursor.lastrowid, document_id, sequence),
+        )
+
+    @classmethod
+    def _delete_fts_rows_for_current_path(
+        cls,
+        connection: sqlite3.Connection,
+        vault_id: str,
+        relative_path: str,
+        *,
+        pending_association: bool | None = None,
+    ) -> None:
+        conditions = [
+            "documents.vault_id = ?",
+            "documents.relative_path = ?",
+            "documents.is_current = 1",
+        ]
+        parameters: list[object] = [vault_id, relative_path]
+        if pending_association is not None:
+            conditions.append("documents.pending_association = ?")
+            parameters.append(int(pending_association))
+        rows = connection.execute(
+            f"""
+            SELECT mappings.rowid
+            FROM index_block_fts_map AS mappings
+            JOIN index_documents AS documents ON documents.document_id = mappings.document_id
+            WHERE {' AND '.join(conditions)}
+            """,
+            parameters,
+        ).fetchall()
+        cls._delete_fts_rows(connection, tuple(int(row["rowid"]) for row in rows))
+
+    @classmethod
+    def _replace_fts_rows_for_documents(
+        cls, connection: sqlite3.Connection, document_ids: tuple[str, ...]
+    ) -> None:
+        if not document_ids:
+            return
+        placeholders = ", ".join("?" for _ in document_ids)
+        rows = connection.execute(
+            f"SELECT rowid FROM index_block_fts_map WHERE document_id IN ({placeholders})",
+            document_ids,
+        ).fetchall()
+        cls._delete_fts_rows(connection, tuple(int(row["rowid"]) for row in rows))
+        cls._backfill_eligible_fts_rows(connection, document_ids)
+
+    @staticmethod
+    def _delete_fts_rows(connection: sqlite3.Connection, rowids: tuple[int, ...]) -> None:
+        if not rowids:
+            return
+        connection.executemany("DELETE FROM index_block_fts WHERE rowid = ?", ((rowid,) for rowid in rowids))
+        connection.executemany(
+            "DELETE FROM index_block_fts_map WHERE rowid = ?", ((rowid,) for rowid in rowids)
+        )
+
+    def _invalidate_current_path(
+        self, connection: sqlite3.Connection, vault_id: str, relative_path: str, reason: str
+    ) -> None:
+        self._delete_fts_rows_for_current_path(connection, vault_id, relative_path)
+        connection.execute(
+            """
+            UPDATE index_documents SET is_current = 0, stale_reason = ?
+            WHERE vault_id = ? AND relative_path = ? AND is_current = 1
+            """,
+            (reason, vault_id, relative_path),
+        )
 
     def _save_graph_projection(
         self, connection: sqlite3.Connection, projection: DurableGraphProjection
@@ -791,8 +1360,8 @@ class SqliteIndexRepository:
             """
             INSERT INTO graph_projection_blocks (
                 vault_id, graph_id, graph_revision, block_id, kind, reading_order, locators_json,
-                confidence, retrieval_projection
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                confidence, retrieval_projection, chunking_structure_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -805,6 +1374,16 @@ class SqliteIndexRepository:
                     json.dumps([locator.to_dict() for locator in block.locators], sort_keys=True),
                     block.confidence,
                     block.retrieval_projection,
+                    (
+                        json.dumps(
+                            block.chunking_structure.to_dict(),
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        if block.chunking_structure is not None
+                        else None
+                    ),
                 )
                 for block in projection.blocks
             ],
@@ -812,17 +1391,17 @@ class SqliteIndexRepository:
 
     def invalidate_current_path(self, vault_id: str, relative_path: str, reason: str) -> None:
         with self._connect() as connection:
-            connection.execute(
-                """
-                UPDATE index_documents SET is_current = 0, stale_reason = ?
-                WHERE vault_id = ? AND relative_path = ? AND is_current = 1
-                """,
-                (reason, vault_id, relative_path),
-            )
+            self._invalidate_current_path(connection, vault_id, relative_path, reason)
 
     def resolve_pending_association(self, vault_id: str, relative_path: str, resolution: str) -> None:
         with self._connect() as connection:
             if resolution == "confirm-delete":
+                self._delete_fts_rows_for_current_path(
+                    connection,
+                    vault_id,
+                    relative_path,
+                    pending_association=True,
+                )
                 connection.execute(
                     """
                     UPDATE index_documents SET is_current = 0, stale_reason = 'deleted-confirmed'
@@ -831,12 +1410,24 @@ class SqliteIndexRepository:
                     (vault_id, relative_path),
                 )
                 return
+            rows = connection.execute(
+                """
+                SELECT document_id FROM index_documents
+                WHERE vault_id = ? AND relative_path = ? AND is_current = 1
+                      AND pending_association = 1
+                """,
+                (vault_id, relative_path),
+            ).fetchall()
             connection.execute(
                 """
                 UPDATE index_documents SET pending_association = 0
                 WHERE vault_id = ? AND relative_path = ? AND is_current = 1 AND pending_association = 1
                 """,
                 (vault_id, relative_path),
+            )
+            self._replace_fts_rows_for_documents(
+                connection,
+                tuple(str(row["document_id"]) for row in rows),
             )
 
     def health(self, vault_id: str) -> IndexHealth:
@@ -965,6 +1556,14 @@ class SqliteIndexRepository:
             """,
             (row["document_id"],),
         ).fetchall()
+        metadata_rows = connection.execute(
+            """
+            SELECT sequence, subject, grade_volume, unit_no, material_type, meta_origin,
+                   meta_confidence, meta_status
+            FROM index_block_meta WHERE document_id = ? ORDER BY sequence
+            """,
+            (row["document_id"],),
+        ).fetchall()
         blocks: list[IndexBlock] = []
         for block_row in block_rows:
             block = (
@@ -999,4 +1598,5 @@ class SqliteIndexRepository:
             source_observed_mtime_ns=row["source_observed_mtime_ns"],
             source_observed_size=row["source_observed_size"],
             policy_revision=row["policy_revision"],
+            block_metadata=tuple(cls._metadata_from_row(metadata_row) for metadata_row in metadata_rows),
         )

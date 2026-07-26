@@ -12,7 +12,9 @@ from domain.policies import normalize_vault_relative_path
 
 MAX_SESSION_PAGE = 10_000_000
 TASK_INTENTS = frozenset({"source-lookup", "completeness", "knowledge-organization", "deep-creation"})
-RETRIEVAL_CHANNELS = frozenset({"keyword", "semantic", "structure", "metadata", "tag", "link"})
+RETRIEVAL_CHANNELS = frozenset(
+    {"keyword", "semantic", "structure", "metadata", "tag", "link", "lexical"}
+)
 RETRIEVAL_RESULT_STATUSES = frozenset(
     {"completed", "no-evidence", "excluded", "index-unavailable", "provider-model-unavailable"}
 )

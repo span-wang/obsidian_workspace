@@ -20,7 +20,7 @@ from api.main import (
 )
 from api.runtime import RuntimeState
 from domain.providers import Provider, ProviderModel, ProviderProbeResults, ProbeResult, ResolvedProviderModel
-from domain.indexing import IndexHealth
+from domain.indexing import BlockHit, IndexBlock, IndexedDocument, IndexHealth, LexicalQuery
 from domain.sessions import (
     SessionCompletenessCoverageItem,
     SessionCompletenessResult,
@@ -518,18 +518,33 @@ def test_session_task_preview_and_confirmation_use_strict_private_snapshot_contr
 
     class Indexes:
         def health(self, vault_id: str) -> IndexHealth:
-            return IndexHealth(vault_id, "healthy", "2026-07-23T00:00:00+00:00", 0, 0, 0, "unavailable")
+            return IndexHealth(
+                vault_id, "healthy", "2026-07-23T00:00:00+00:00", len(self.current), 0, 0, "unavailable"
+            )
 
         def current_documents(self, vault_id: str) -> list:
             assert vault_id == vault.vault_id
-            return []
+            return self.current
 
+        def search_lexical(self, vault_id: str, query: LexicalQuery) -> list[BlockHit]:
+            assert vault_id == vault.vault_id
+            return [
+                BlockHit(document.document_id, document.relative_path, block, 1.0)
+                for document in self.current
+                if document.relative_path in query.allowed_relative_paths
+                for block in document.blocks
+            ]
+
+        def __init__(self) -> None:
+            self.current: list[IndexedDocument] = []
+
+    indexes = Indexes()
     session_service = SessionService(
         SqliteSessionRepository(runtime.data_directory / "sessions.sqlite3"),
         vault_service=vault_service,
         provider_service=Providers(),
         policy_service=policy_service,
-        index_repository=Indexes(),
+        index_repository=indexes,
     )
     app = create_app(
         runtime=runtime,
@@ -581,6 +596,12 @@ def test_session_task_preview_and_confirmation_use_strict_private_snapshot_contr
         body={},
         cookie=cookie,
     )
+    indexes.current = [
+        IndexedDocument(
+            "native-1", vault.vault_id, "notes/unit.md", "a" * 64, "native", ("Unit",), (), (),
+            (IndexBlock(1, "heading: Unit", "first unit evidence"),), "2026-07-23T00:00:00+00:00",
+        )
+    ]
     source_task_status, _, source_task_body = asgi_request(
         app,
         "POST",
@@ -656,8 +677,9 @@ def test_session_task_preview_and_confirmation_use_strict_private_snapshot_contr
     assert execute_invalid_status == 422
     assert execute_status == 200
     execution = json.loads(execute_body)["result"]
-    assert execution["status"] == "no-evidence"
-    assert execution["evidences"] == []
+    assert execution["status"] == "completed"
+    assert execution["evidences"][0]["relative_path"] == "notes/unit.md"
+    assert execution["evidences"][0]["matched_channels"] == ["lexical"]
     assert execution["generation_duration_ms"] == 0
     assert execution["vault_id"] == vault.vault_id
     assert execution["snapshot_status"] == "completed"
@@ -674,3 +696,15 @@ def test_session_task_preview_and_confirmation_use_strict_private_snapshot_contr
     assert unavailable_preview["is_ready"] is False
     assert unavailable_preview["index_status"] == "provider-model-unavailable"
     assert unavailable_preview["recovery_action"] == "选择已验证的 chat Model 后重试。"
+
+
+def test_default_session_service_receives_lexical_runtime_switch(tmp_path: Path) -> None:
+    app = create_app(
+        runtime=RuntimeState(
+            data_directory=tmp_path / "app-data",
+            sqlite_version="3.45.1",
+            lexical_retrieval_enabled=False,
+        )
+    )
+
+    assert app.state.session_service.lexical_retrieval_enabled is False

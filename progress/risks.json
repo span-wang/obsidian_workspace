@@ -25,8 +25,8 @@
       "status": "开放",
       "title": "SQLite 新旧 schema 与派生索引不同步",
       "impact": "升级失败、stale FTS 行或向量孤儿会造成错误召回和难以恢复的索引状态。",
-    "mitigation": "RET-02-01 已为富 IndexBlock 建立显式、可重试的结构列 migration，旧行以兼容默认值读取，失败注入会回滚富列且可在同一旧库重试；graph migration 也已独立事务化，避免后续 migration 失败留下无标记表。RET-02-02 已保持旧三字段与富字段同事务写入，并以 current-only、可重试回填补全哈希及可精确核验的 durable graph 结构；原始行的 legacy/rich 报告会拒绝静默覆盖不匹配或损坏投影。RET-02-03 已以 `OBSIDIAN_PLATFORM_RICH_BLOCK_READS` 保留 legacy 默认和显式 rich 切换；rich 模式遇到一致性问题会失败关闭，健康状态仅返回模式、状态和问题码。RET-04 继续负责 FTS 生命周期同步。",
-    "ownerTaskId": "RET-04-01"
+    "mitigation": "RET-02-01 已为富 IndexBlock 建立显式、可重试的结构列 migration，旧行以兼容默认值读取，失败注入会回滚富列且可在同一旧库重试；graph migration 也已独立事务化，避免后续 migration 失败留下无标记表。RET-02-02 已保持旧三字段与富字段同事务写入，并以 current-only、可重试回填补全哈希及可精确核验的 durable graph 结构；原始行的 legacy/rich 报告会拒绝静默覆盖不匹配或损坏投影。RET-02-03 已以 `OBSIDIAN_PLATFORM_RICH_BLOCK_READS` 保留 legacy 默认和显式 rich 切换；rich 模式遇到一致性问题会失败关闭，健康状态仅返回模式、状态和问题码。RET-03-03 已为块级规则元数据增加独立、可回滚的 migration，并将 document、block 与 metadata 写入保持在同一事务；filter_blocks 显式排除 stale、非 current、pending 与不允许路径。RET-04-01 已为 FTS5 与 map 完成可回滚 migration、eligible current 回填，以及 save、invalidate、rebuild 与失败回滚的同事务同步。RET-04-02 已以独立、可回滚内容回填 migration 将中英文词法文本同步到同一 FTS/map 生命周期；search_lexical 只读取 vault 内 current、verifiable、非 stale、非 pending 且由调用方允许的路径。RET-06-02 仍须将同一生命周期约束扩展至向量与缓存。",
+    "ownerTaskId": "RET-06-02"
     },
     {
       "id": "RET-R004",
@@ -34,8 +34,8 @@
       "status": "开放",
       "title": "目录规则只覆盖示例命名",
       "impact": "真实资料无法解析册次和单元，枚举型检索会返回 recoverable 或错误 scope。",
-      "mitigation": "RET-00-02 已收集不可逆脱敏真实结构样本；RET-03 由参数化 fixture 驱动规则，不强制用户先重命名 vault。",
-      "ownerTaskId": "RET-03-02"
+      "mitigation": "RET-00-02 已收集不可逆脱敏真实结构样本；RET-03-02 已以同一 fixture 固定严格的路径/标题归一化，并对根级、仅资料信号和仅位置标题分别返回 unknown 或 recoverable，绝不伪造 scope。仍须在更多已审阅、不可逆脱敏样本上扩展规则；RET-05-01 消费同一合同解析查询范围。",
+      "ownerTaskId": "RET-05-01"
     },
     {
       "id": "RET-R005",
@@ -43,8 +43,8 @@
       "status": "开放",
       "title": "固定阈值导致误去重或漏召回",
       "impact": "0.92 相似度、top-k、RRF 参数和批预算若未经评测会直接固化样本偏差。",
-      "mitigation": "RET-00-03 已建立脱敏合成 golden set，RET-00-04 已记录当前手写检索、Windows FTS5/BM25 与 float32 KNN 的原始基线；所有阈值仍仅登记为候选值，RET-04-03 必须以该集完成词法 A/B，RET-06-04 再校准 RRF 与混合候选参数。",
-      "ownerTaskId": "RET-04-03"
+      "mitigation": "RET-00-03 已建立脱敏合成 golden set，RET-00-04 已记录当前手写检索、Windows FTS5/BM25 与 float32 KNN 的原始基线。用户确认 RET-04-02 的词法最低门槛为 macro recall 0.6569、macro precision 0.2813；实现结果为 0.6875、0.302083。RET-04-03 已在同一 fixture 完成版本化 A/B：相对旧手写评分，FTS macro recall +0.030555555555555558、macro precision +0.020833333333333315，passesGate=true；生产 source-lookup 已仅使用 FTS，关闭本机开关时失败关闭，不回退旧打分。该门槛不校准 top-k、RRF 或去重参数，RET-06-04 再校准 RRF 与混合候选参数。",
+      "ownerTaskId": "RET-06-04"
     },
     {
       "id": "RET-R006",

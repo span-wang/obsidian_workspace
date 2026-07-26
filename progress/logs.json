@@ -1,6 +1,60 @@
 {
   "logs": [
     {
+      "date": "2026-07-26",
+      "taskId": "RET-04-03",
+      "action": "完成词法 A/B、会话切换与手写评分退役",
+      "result": "新增版本化 docs/ret-04-03-lexical-ab-v1.json：在同一 synthetic golden fixture 上，FTS 相对旧手写评分的 macro recall +0.030555555555555558、macro precision +0.020833333333333315，passesGate=true。source-lookup 在冻结快照、scope、policy 与 manifest 过滤后只调用 search_lexical，并保留证据身份、定位和引用合同；matched_channels 标记为 lexical。OBSIDIAN_PLATFORM_LEXICAL_RETRIEVAL 默认启用；关闭时失败关闭且不回退旧评分。生产 SessionService 已移除 _retrieval_score、_retrieval_terms 和 _semantic_similarity；历史实现仅保留在 benchmark helper 中以复现实验。浏览器 mock 同步至既有 execute/stream SSE 合同。",
+      "verification": [
+        "npm run retrieval:lexical-ab（passesGate=true；macro recall +0.030555555555555558；macro precision +0.020833333333333315）",
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_retrieval_lexical_ab.py tests/unit/test_sessions.py tests/unit/test_sessions_api.py tests/unit/test_runtime.py（84 passed）",
+        "npm run unit（前端 21 passed；服务端 415 passed，3 skipped）",
+        "npm run lint（All checks passed）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6242'; npm run integration（11 passed，2 skipped）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6242'; npm run browser-test（27 passed）"
+      ],
+      "files": [
+        "apps/service/application/retrieval_lexical_ab.py",
+        "apps/service/application/retrieval_baseline.py",
+        "apps/service/application/sessions.py",
+        "apps/service/domain/sessions.py",
+        "apps/service/api/runtime.py",
+        "apps/service/api/main.py",
+        "apps/service/tests/unit/test_retrieval_lexical_ab.py",
+        "apps/service/tests/unit/test_sessions.py",
+        "apps/service/tests/unit/test_sessions_api.py",
+        "apps/service/tests/unit/test_runtime.py",
+        "browser-tests/loopback.spec.mjs",
+        "docs/ret-04-03-lexical-ab-v1.json",
+        "progress/"
+      ],
+      "next": "实施 RET-05-01：解析查询 scope；随后 RET-05-02 以 BlockFilter 实现枚举型全量汇总。"
+    },
+    {
+      "date": "2026-07-26",
+      "taskId": "RET-04-02",
+      "action": "完成中英分词、heading 加权与 search_lexical",
+      "result": "新增纯领域中文分词器：使用 heading、tags、links 的本地域词典做最长匹配，未命中 CJK 退回 overlapping bigram；英文保留原文并由 FTS5 Porter tokenizer 归一。新增 LexicalQuery/BlockHit port 合同和 SQLite search_lexical，查询显式限制 vault、current、verifiable、stale、pending 与调用方允许路径，并以 heading 10 倍 BM25 权重排序。新增 RET-04-02 可回滚内容回填 migration，使既有 FTS 行重建 en/cjk/heading/tag 文本。用户确认的 synthetic golden 下，macro recall 0.6875、macro precision 0.302083，均超过 0.6569/0.2813 最低门槛。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_retrieval_lexical.py tests/unit/test_sqlite_index_fts_lifecycle.py tests/unit/test_sqlite_index_block_metadata.py tests/unit/test_index_service.py (31 passed)",
+        "synthetic golden lexical eval (macro recall 0.6875; macro precision 0.302083)",
+        "npm run unit (前端 21 passed；服务端 404 passed，3 skipped)",
+        "npm run lint (All checks passed)",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6242'; npm run integration (11 passed, 2 skipped；6240 被现有本机进程占用，未停止该进程)",
+        "npm run progress:build && npm run progress:check",
+        "git diff --check"
+      ],
+      "files": [
+        "apps/service/domain/retrieval_lexical.py",
+        "apps/service/domain/indexing.py",
+        "apps/service/ports/index_repository.py",
+        "apps/service/adapters/sqlite_index_repository.py",
+        "apps/service/tests/unit/test_retrieval_lexical.py",
+        "progress/"
+      ],
+      "next": "实施 RET-04-03：完成旧手写检索与 FTS 的 A/B 报告、会话切换和退役判断。"
+    },
+    {
       "date": "2026-07-25",
       "taskId": "RET-00-01",
       "action": "审核并重构检索改造开发基线",
@@ -269,6 +323,103 @@
         "progress/"
       ],
       "next": "实施 RET-03-01：在可回退的 rich 读取路径上实现结构优先分块与 contextual prefix。"
+    },
+    {
+      "date": "2026-07-26",
+      "taskId": "RET-03-01",
+      "action": "完成结构优先分块、耐久结构快照与隔离验证实验台",
+      "result": "耐久 graph projection 现保存 atomic、heading、list、table 的最小分块结构，旧 projection 缺字段时保持一对一平面读取。原生 Markdown 与新 projection 块按标题栈、列表、表格和句界确定性分块，正文和用户 excerpt 均从原 projection 原文切片而非结构快照重渲染；表头仅作为受限的 retrieval_text 上下文。实验台位于独立 Vite 目录，默认不构建、不注册；开启标志后仅接受无转发头的 127.0.0.1 Host，且只处理粘贴的合成 Markdown，不读取 vault、SQLite、Provider 或访问外网。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_retrieval_chunking_lab_api.py tests/unit/test_index_chunking.py tests/unit/test_sqlite_index_graph_projection.py -q (32 passed)",
+        "npm run unit (前端 21 passed；服务 381 passed, 3 skipped)",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6241'; npm run integration (11 passed, 2 skipped)",
+        "npm run lint",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6241'; npm run browser-test（新增实验台流程通过；总计 23 passed，4 个既有会话/知识整理流程失败，未修改其实现，且与 RET-01-04 已记录的失败类别一致）",
+        "npm run progress:build",
+        "npm run progress:check",
+        "git diff --check"
+      ],
+      "files": [
+        "apps/service/domain/graph_projection.py",
+        "apps/service/domain/retrieval_chunking.py",
+        "apps/service/application/indexing.py",
+        "apps/service/adapters/sqlite_index_repository.py",
+        "apps/service/api/main.py",
+        "apps/service/api/runtime.py",
+        "apps/service/tests/unit/",
+        "apps/web/retrieval-chunking-lab/",
+        "apps/web/package.json",
+        "browser-tests/loopback.spec.mjs",
+        "package.json",
+        "progress/"
+      ],
+      "next": "实施 RET-03-02：复用 heading_path 完成路径与标题元数据归一化，并对 unknown scope 失败关闭。"
+    },
+    {
+      "date": "2026-07-26",
+      "taskId": "RET-03-02",
+      "action": "完成路径与标题元数据归一化",
+      "result": "新增索引侧与查询侧共用的纯领域归一化合同：仅接受显式的学科、册次、单元和资料类型语法，并规范化为 subject、grade_volume、unit_no 和 material_type。完整 scope 才标记 resolved；根级无信号返回 unknown，部分、冲突或仅标题/目录上下文返回 recoverable，均不产生可过滤 scope。参数化回归直接读取 RET-00-02 的不可逆脱敏样本，确保规则和治理夹具一致。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_retrieval_metadata.py (6 passed)",
+        "uv run --directory apps/service ruff check domain/retrieval_metadata.py tests/unit/test_retrieval_metadata.py (All checks passed)",
+        "npm run unit (前端 21 passed；服务 387 passed, 3 skipped)",
+        "npm run progress:build",
+        "npm run progress:check",
+        "git diff --check"
+      ],
+      "files": [
+        "apps/service/domain/retrieval_metadata.py",
+        "apps/service/tests/unit/test_retrieval_metadata.py",
+        "progress/"
+      ],
+      "next": "实施 RET-03-03：持久化块级元数据并实现 current、policy、stale 与 scope 均失败关闭的 filter_blocks。"
+    },
+    {
+      "date": "2026-07-26",
+      "taskId": "RET-04-01",
+      "action": "完成 FTS5 schema migration 与索引生命周期同步",
+      "result": "index.sqlite 新增带显式 migration ID 的 FTS5 四列索引和 rowid map；升级时仅回填 current、verifiable、非 stale、非 pending 的块。保存、路径失效、提交期重建和 pending 关联恢复均与 FTS/map 保持同一事务；迁移或写入失败时会回滚，不留下 FTS/map 孤儿或 stale 行。本步仅写入既有 contextual prefix 与 retrieval text，未实现中文预分词、BM25 查询、会话 API 或 UI。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_sqlite_index_fts_lifecycle.py tests/unit/test_sqlite_index_block_metadata.py tests/unit/test_sqlite_index_rich_blocks.py tests/unit/test_index_service.py (37 passed)",
+        "npm run unit (前端 21 passed；服务端 398 passed，3 skipped)",
+        "npm run integration (空闲 loopback 测试端口；11 passed，2 skipped)",
+        "uv run --directory apps/service ruff check . (All checks passed)",
+        "npm run progress:build",
+        "npm run progress:check",
+        "git diff --check"
+      ],
+      "files": [
+        "apps/service/adapters/sqlite_index_repository.py",
+        "apps/service/tests/unit/test_sqlite_index_fts_lifecycle.py",
+        "progress/"
+      ],
+      "next": "实施 RET-04-02：在已同步的 FTS 生命周期上加入中英文分词、heading 加权与 search_lexical。"
+    },
+    {
+      "date": "2026-07-26",
+      "taskId": "RET-03-03",
+      "action": "完成块级元数据持久化与 filter_blocks",
+      "result": "index.sqlite 新增可重试的 index_block_meta migration 和 scope 索引；规则归一化结果随 IndexBlock 在同一事务写入。BlockFilter 需要完整 subject、grade_volume 与 unit_no，repository SQL 仅返回 current、verifiable、非 stale、非 pending、accepted metadata 且处于允许路径内的块；应用层在每次读取时按 retrieval policy 重算允许路径，因此规则变更不必重建索引即可立即失败关闭。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_sqlite_index_block_metadata.py (6 passed)",
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_index_service.py tests/unit/test_sqlite_index_rich_blocks.py tests/unit/test_index_graph_projection_rebuild.py tests/unit/test_retrieval_metadata.py tests/unit/test_sqlite_index_block_metadata.py (42 passed)",
+        "uv run --directory apps/service ruff check . (All checks passed)",
+        "npm run unit (前端 21 passed；服务 393 passed, 3 skipped)",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6242'; npm run integration (11 passed, 2 skipped；6240 与 6241 已被本机既有进程占用)",
+        "npm run progress:build",
+        "npm run progress:check",
+        "git diff --check"
+      ],
+      "files": [
+        "apps/service/domain/indexing.py",
+        "apps/service/application/indexing.py",
+        "apps/service/ports/index_repository.py",
+        "apps/service/adapters/sqlite_index_repository.py",
+        "apps/service/tests/unit/test_sqlite_index_block_metadata.py",
+        "progress/"
+      ],
+      "next": "实施 RET-04-01：为 FTS5 增加 migration 与和 index document/block 生命周期一致的同步。"
     }
   ]
 }

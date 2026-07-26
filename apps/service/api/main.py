@@ -74,7 +74,7 @@ from domain.classification import ClassificationSuggestion
 from domain.candidate_links import CandidateLinkProposal
 from domain.metadata_tags import MetadataTagProposal, TagChangePreview, TagDefinition
 from domain.evidence import EvidenceLocator
-from domain.indexing import IndexHealth
+from domain.indexing import IndexBlock, IndexHealth
 from domain.review_commits import CommitJournal, ReviewSnapshot
 from domain.tasks import ImportTask, ImportTaskEvent, ImportTaskItem
 from domain.sessions import (
@@ -100,6 +100,20 @@ COMPLETENESS_COVERAGE_PAGE_SIZE = 100
 DEFAULT_PORT = 6240
 SERVICE_NAME = "obsidian-personal-knowledge-platform"
 WEB_BUILD_DIRECTORY = Path(__file__).resolve().parents[2] / "web" / "dist"
+RETRIEVAL_CHUNKING_LAB_BUILD_DIRECTORY = (
+    Path(__file__).resolve().parents[2] / "web" / "retrieval-chunking-lab" / "dist"
+)
+RETRIEVAL_CHUNKING_LAB_ROUTE = "/_test/retrieval-chunking"
+RETRIEVAL_CHUNKING_LAB_FORWARDED_HEADERS = frozenset(
+    {
+        "forwarded",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "cf-connecting-ip",
+        "cf-ray",
+    }
+)
 LOCAL_SESSION_COOKIE_NAME = "obsidian_platform_session"
 DEFAULT_BROWSER_URL = f"http://{DEFAULT_HOST}:{DEFAULT_PORT}/"
 IMPORT_TASK_SSE_EVENT_NAMES = frozenset(
@@ -436,6 +450,14 @@ class OcrDecisionCommand(BaseModel):
     corrected_text: str | None = None
 
 
+class RetrievalChunkPreviewCommand(BaseModel):
+    """Local-only input for the disposable retrieval chunking test UI."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    markdown: str = Field(min_length=1, max_length=100_000)
+
+
 class PortInUseError(RuntimeError):
     """Raised when the fixed loopback endpoint belongs to another process."""
 
@@ -480,6 +502,14 @@ def require_web_build() -> Path:
     return WEB_BUILD_DIRECTORY
 
 
+def require_retrieval_chunking_lab_build(build_directory: Path) -> Path:
+    if not (build_directory / "index.html").is_file():
+        raise WebBuildMissingError(
+            "Retrieval chunking test UI build is missing. Run npm run build:retrieval-chunking-lab."
+        )
+    return build_directory
+
+
 def workbench_response(local_session: LocalSession) -> FileResponse:
     response = FileResponse(WEB_BUILD_DIRECTORY / "index.html")
     response.set_cookie(
@@ -490,6 +520,53 @@ def workbench_response(local_session: LocalSession) -> FileResponse:
         path="/",
     )
     return response
+
+
+def retrieval_chunking_lab_response(local_session: LocalSession, build_directory: Path) -> FileResponse:
+    response = FileResponse(build_directory / "index.html")
+    response.set_cookie(
+        key=LOCAL_SESSION_COOKIE_NAME,
+        value=local_session.secret,
+        httponly=True,
+        samesite="strict",
+        path="/",
+    )
+    return response
+
+
+def retrieval_chunking_lab_asset_response(build_directory: Path, asset_path: str) -> FileResponse:
+    asset_directory = (build_directory / "assets").resolve()
+    candidate = (asset_directory / asset_path).resolve()
+    try:
+        candidate.relative_to(asset_directory)
+    except ValueError as error:
+        raise HTTPException(status_code=404) from error
+    if not candidate.is_file():
+        raise HTTPException(status_code=404)
+    return FileResponse(candidate)
+
+
+def retrieval_chunk_preview_payload(block: IndexBlock) -> dict[str, object]:
+    return {
+        "sequence": block.sequence,
+        "block_kind": block.block_kind,
+        "location": block.location,
+        "heading_path": list(block.heading_path),
+        "heading_level": block.heading_level,
+        "contextual_prefix": block.contextual_prefix,
+        "text": block.text,
+        "retrieval_text": block.retrieval_text,
+        "token_estimate": block.token_estimate,
+        "block_content_sha256": block.block_content_sha256,
+    }
+
+
+def chunk_native_markdown_for_preview(markdown: str) -> tuple[IndexBlock, ...]:
+    """Load the experimental pure domain chunker only when its local test route is used."""
+
+    from domain.retrieval_chunking import chunk_native_markdown
+
+    return chunk_native_markdown(markdown)
 
 
 def local_session_status(local_session: LocalSession, candidate: str | None) -> dict[str, str]:
@@ -1809,6 +1886,25 @@ def require_local_session(app: FastAPI, request: Request) -> str:
     return candidate
 
 
+def is_retrieval_chunking_lab_local_request(request: Request) -> bool:
+    """Allow the disposable lab only from the fixed direct loopback origin."""
+
+    host, separator, port = request.headers.get("host", "").lower().partition(":")
+    return (
+        host == DEFAULT_HOST
+        and (
+            not separator
+            or (port.isascii() and port.isdecimal() and 1 <= int(port) <= 65535)
+        )
+        and not any(header in request.headers for header in RETRIEVAL_CHUNKING_LAB_FORWARDED_HEADERS)
+    )
+
+
+def require_retrieval_chunking_lab_local_request(request: Request) -> None:
+    if not is_retrieval_chunking_lab_local_request(request):
+        raise HTTPException(status_code=404)
+
+
 def publish_graph_refresh(app: FastAPI, vault_id: str) -> None:
     with app.state.graph_subscribers_lock:
         subscribers = tuple(app.state.graph_subscribers.get(vault_id, ()))
@@ -1842,9 +1938,14 @@ def create_app(
     import_picker: WindowsImportPicker | None = None,
     import_selections: ImportSelectionStore | None = None,
     converter_profiles: ProvisionedProfiles | None = None,
+    retrieval_chunking_lab_build_directory: Path | None = None,
 ) -> FastAPI:
     web_build_directory = require_web_build()
     runtime = runtime or initialize_runtime()
+    if runtime.retrieval_test_ui_enabled:
+        retrieval_chunking_lab_build_directory = require_retrieval_chunking_lab_build(
+            retrieval_chunking_lab_build_directory or RETRIEVAL_CHUNKING_LAB_BUILD_DIRECTORY
+        )
     app = FastAPI(title="Obsidian Personal Knowledge Platform")
     app.state.runtime = runtime
     app.state.local_session = create_local_session()
@@ -1886,6 +1987,7 @@ def create_app(
         provider_service=app.state.provider_service,
         policy_service=app.state.policy_service,
         index_repository=app.state.indexing_service.repository,
+        lexical_retrieval_enabled=runtime.lexical_retrieval_enabled,
     )
     app.state.directory_picker = directory_picker or WindowsDirectoryPicker()
     app.state.directory_selections = directory_selections or DirectorySelectionStore()
@@ -1983,6 +2085,38 @@ def create_app(
             app.state.local_session,
             request.cookies.get(LOCAL_SESSION_COOKIE_NAME),
         )
+
+    if runtime.retrieval_test_ui_enabled:
+        assert retrieval_chunking_lab_build_directory is not None
+
+        @app.get(RETRIEVAL_CHUNKING_LAB_ROUTE, include_in_schema=False)
+        def retrieval_chunking_lab(request: Request) -> FileResponse:
+            require_retrieval_chunking_lab_local_request(request)
+            return retrieval_chunking_lab_response(
+                app.state.local_session, retrieval_chunking_lab_build_directory
+            )
+
+        @app.get(
+            f"{RETRIEVAL_CHUNKING_LAB_ROUTE}/assets/{{asset_path:path}}",
+            include_in_schema=False,
+        )
+        def retrieval_chunking_lab_asset(request: Request, asset_path: str) -> FileResponse:
+            require_retrieval_chunking_lab_local_request(request)
+            return retrieval_chunking_lab_asset_response(retrieval_chunking_lab_build_directory, asset_path)
+
+        @app.post("/api/_test/retrieval/chunk-preview", include_in_schema=False)
+        def preview_retrieval_chunks(
+            request: Request, command: RetrievalChunkPreviewCommand
+        ) -> dict[str, object]:
+            require_retrieval_chunking_lab_local_request(request)
+            require_local_session(app, request)
+            # Keep this disposable preview independent from vault, SQLite, and Provider services.
+            return {
+                "chunks": [
+                    retrieval_chunk_preview_payload(block)
+                    for block in chunk_native_markdown_for_preview(command.markdown)
+                ]
+            }
 
     @app.post("/api/sessions", dependencies=[Depends(require_current_local_session)])
     def create_persistent_session(

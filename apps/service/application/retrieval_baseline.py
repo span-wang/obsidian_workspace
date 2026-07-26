@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
 import statistics
 import sys
@@ -17,7 +18,7 @@ from application.retrieval_golden import (
     evaluate_predictions,
     load_golden_set,
 )
-from application.sessions import MAX_RETRIEVAL_EVIDENCES, SessionService
+from application.sessions import MAX_RETRIEVAL_EVIDENCES
 
 
 REPORT_SCHEMA_VERSION = 1
@@ -94,7 +95,7 @@ def _handwritten_retrieval_baseline(golden_set: RetrievalGoldenSet) -> dict[str,
     for query in golden_set.queries:
         ranked: list[tuple[float, SimpleNamespace, SimpleNamespace, tuple[str, ...], str]] = []
         for block_id, document, block in records:
-            score, channels = SessionService._retrieval_score(query.query_text, document, block)
+            score, channels = _handwritten_retrieval_score(query.query_text, document, block)
             if score > 0:
                 ranked.append((score, document, block, channels, block_id))
         ranked.sort(key=lambda item: (-item[0], item[1].relative_path, item[2].sequence))
@@ -148,6 +149,57 @@ def _handwritten_retrieval_baseline(golden_set: RetrievalGoldenSet) -> dict[str,
         },
         "queries": raw_queries,
     }
+
+
+def _handwritten_retrieval_score(content, document, block) -> tuple[float, tuple[str, ...]]:
+    """Preserve the retired source-lookup scorer solely for historical A/B reports."""
+
+    query_terms = _handwritten_retrieval_terms(content)
+    if not query_terms:
+        return 0.0, ()
+    block_terms = _handwritten_retrieval_terms(block.text)
+    location_terms = _handwritten_retrieval_terms(" ".join((*document.heading_locations, block.location)))
+    metadata_terms = _handwritten_retrieval_terms(f"{document.relative_path} {document.document_kind}")
+    tag_terms = _handwritten_retrieval_terms(" ".join(document.tags))
+    link_terms = _handwritten_retrieval_terms(" ".join(document.links))
+    query_set = set(query_terms)
+
+    def overlap(terms: tuple[str, ...]) -> float:
+        return len(query_set.intersection(terms)) / len(query_set)
+
+    keyword = overlap(block_terms)
+    semantic = _handwritten_semantic_similarity(query_terms, block_terms)
+    structure = overlap(location_terms)
+    metadata = overlap(metadata_terms)
+    tag = overlap(tag_terms)
+    link = overlap(link_terms)
+    scores = {
+        "keyword": keyword,
+        "semantic": semantic,
+        "structure": structure,
+        "metadata": metadata,
+        "tag": tag,
+        "link": link,
+    }
+    channels = tuple(name for name, score in scores.items() if score > 0)
+    return keyword * 4 + semantic * 2 + structure * 2 + metadata + tag * 1.5 + link, channels
+
+
+def _handwritten_retrieval_terms(value: str) -> tuple[str, ...]:
+    lowered = value.lower()
+    words = re.findall(r"[a-z0-9]+", lowered)
+    chinese = re.findall(r"[\u4e00-\u9fff]", lowered)
+    bigrams = ["".join(chinese[index:index + 2]) for index in range(len(chinese) - 1)]
+    return tuple(dict.fromkeys((*words, *chinese, *bigrams)))
+
+
+def _handwritten_semantic_similarity(
+    query_terms: tuple[str, ...], block_terms: tuple[str, ...]
+) -> float:
+    if not query_terms or not block_terms:
+        return 0.0
+    query_set, block_set = set(query_terms), set(block_terms)
+    return len(query_set.intersection(block_set)) / len(query_set.union(block_set))
 
 
 def _golden_block_records(

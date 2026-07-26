@@ -80,6 +80,31 @@ def _projection() -> DurableGraphProjection:
     )
 
 
+def _typed_block(
+    block_id: str,
+    kind: str,
+    reading_order: int,
+    payload: dict[str, object],
+    retrieval_projection: str,
+) -> DocumentBlock:
+    return DocumentBlock(
+        block_id=block_id,
+        kind=kind,
+        reading_order=reading_order,
+        locators=(PdfRegionLocator(page=1, bounds=(1.0, 2.0, 30.0, 40.0)),),
+        confidence=0.93,
+        payload=BlockPayload.from_dict(kind, payload),
+        evidence_refs=(
+            EvidenceRef(
+                artifact_id="converter-artifact",
+                artifact_sha256="c" * 64,
+                producer_object_id=f"source-object-{reading_order}",
+            ),
+        ),
+        retrieval_projection=retrieval_projection,
+    )
+
+
 def test_projection_keeps_only_rebuild_and_citation_fields_from_a_selected_graph() -> None:
     projection = _projection()
     stored = projection.to_dict()
@@ -105,6 +130,102 @@ def test_projection_keeps_only_rebuild_and_citation_fields_from_a_selected_graph
     assert "input_snapshot_hash" not in stored
     assert "task_id" not in stored
     assert "processing_task_id" not in stored
+
+
+def test_projection_derives_minimal_typed_chunking_structure_from_document_payloads() -> None:
+    graph = DocumentGraph(
+        graph_id="graph-structured",
+        graph_revision=1,
+        source_sha256="a" * 64,
+        input_snapshot_hash="a" * 64,
+        selected_attempt_id="attempt-1",
+        blocks=(
+            _typed_block(
+                "heading-1",
+                "heading",
+                0,
+                {"level": 2, "inline_runs": [{"kind": "text", "text": "Grammar Focus"}]},
+                "Grammar Focus",
+            ),
+            _typed_block(
+                "list-1",
+                "list",
+                1,
+                {
+                    "ordered": False,
+                    "items": [
+                        {"inline_runs": [{"kind": "text", "text": "am / is / are"}]},
+                        "肯定句",
+                    ],
+                    "nesting": [0, 1],
+                },
+                "am / is / are\n肯定句",
+            ),
+            _typed_block(
+                "table-1",
+                "table",
+                2,
+                {
+                    "rows": [["Term", "Meaning"], ["am", "be 动词"]],
+                    "cells": [["Term", "Meaning"], ["am", "be 动词"]],
+                    "rowspan": [],
+                    "colspan": [],
+                    "header": True,
+                },
+                "Term | Meaning\nam | be 动词",
+            ),
+            _typed_block(
+                "paragraph-1",
+                "paragraph",
+                3,
+                {"inline_runs": [{"kind": "text", "text": "A sentence."}]},
+                "A sentence.",
+            ),
+        ),
+        assets=(),
+        issues=(),
+    )
+
+    projection = DurableGraphProjection.from_document_graph(
+        vault_id="vault-1",
+        source_id="source-1",
+        source_path="platform/sources/book.pdf",
+        graph=graph,
+    )
+
+    assert [block.chunking_structure.to_dict() for block in projection.blocks] == [
+        {"kind": "heading", "level": 2, "text": "Grammar Focus"},
+        {
+            "kind": "list",
+            "ordered": False,
+            "items": [
+                {"text": "am / is / are", "nesting": 0},
+                {"text": "肯定句", "nesting": 1},
+            ],
+        },
+        {
+            "kind": "table",
+            "header": ["Term", "Meaning"],
+            "rows": [["am", "be 动词"]],
+        },
+        {"kind": "atomic"},
+    ]
+    stored = projection.to_dict()
+    assert "payload" not in stored["blocks"][0]
+    assert "cells" not in stored["blocks"][2]["chunking_structure"]
+    assert "rowspan" not in stored["blocks"][2]["chunking_structure"]
+    assert "colspan" not in stored["blocks"][2]["chunking_structure"]
+    assert DurableGraphProjection.from_dict(stored) == projection
+
+
+def test_projection_reads_historical_blocks_without_chunking_structure_as_unknown() -> None:
+    serialized = _projection().to_dict()
+    for block in serialized["blocks"]:
+        block.pop("chunking_structure")
+
+    restored = DurableGraphProjection.from_dict(serialized)
+
+    assert [block.chunking_structure for block in restored.blocks] == [None, None]
 
 
 def test_projection_serialization_round_trip_preserves_block_locators() -> None:

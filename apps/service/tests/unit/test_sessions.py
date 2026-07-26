@@ -26,7 +26,7 @@ from domain.sessions import (
     group_retrieval_evidence,
     new_session,
 )
-from domain.indexing import IndexBlock, IndexHealth, IndexedDocument
+from domain.indexing import BlockHit, IndexBlock, IndexHealth, IndexedDocument, LexicalQuery
 from domain.policies import OutboundAuthorization, OutboundScope, PolicyEvaluation
 from domain.providers import Provider, ProviderModel, ProviderProbeResults, ProbeResult, ResolvedProviderModel
 from domain.vaults import Vault
@@ -122,13 +122,26 @@ def task_service_fixture(tmp_path, documents=()):
             return replace(authorization, actual_scope_summary=f"{len(scopes)} scoped item(s)", actual_scope_digest="b" * 64)
 
     class Indexes:
-        current = list(documents)
+        def __init__(self) -> None:
+            self.current = list(documents)
+            self.lexical_queries = []
 
         def health(self, vault_id):
             return IndexHealth(vault_id, "healthy", "now", len(self.current), 0, 0, "unavailable")
 
         def current_documents(self, _vault_id):
             return self.current
+
+        def search_lexical(self, vault_id, query):
+            assert vault_id == vault.vault_id
+            assert isinstance(query, LexicalQuery)
+            self.lexical_queries.append(query)
+            return [
+                BlockHit(document.document_id, document.relative_path, block, 1.0)
+                for document in self.current
+                if document.relative_path in query.allowed_relative_paths
+                for block in document.blocks
+            ]
 
     repository = SqliteSessionRepository(tmp_path / "sessions.sqlite3")
     vaults, providers, policies, indexes = Vaults(), Providers(), Policies(), Indexes()
@@ -650,12 +663,47 @@ def test_execute_prepared_task_persists_bounded_local_evidence_and_timings(tmp_p
     assert evidence.source_content_hash is None
     assert evidence.heading == "力和运动"
     assert evidence.page == 12
-    assert {"keyword", "semantic", "structure"}.issubset(
-        evidence.matched_channels
-    )
+    assert evidence.matched_channels == ("lexical",)
     assert restarted.task_states[0].status == "completed"
     assert restarted.task_snapshots[0].status == "completed"
     assert restarted.retrieval_results[0].evidences[0].excerpt == evidence.excerpt
+
+
+def test_source_lookup_limits_lexical_hits_to_snapshot_scope_and_policy(tmp_path) -> None:
+    allowed = IndexedDocument(
+        "allowed", "vault-1", "notes/visible.md", "a" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Visible", "visible evidence"),), "now",
+    )
+    excluded = IndexedDocument(
+        "excluded", "vault-1", "notes/private.md", "b" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Private", "private evidence"),), "now",
+    )
+    service, _, session, _, _, policies, indexes = task_service_fixture(tmp_path, (allowed, excluded))
+    policies.preview = lambda _vault_id, _source_path, derived_path, stage: PolicyEvaluation(
+        derived_path != "notes/private.md", stage, (), (), "fixture"
+    )
+    snapshot = service.create_task(session.session_id, "visible evidence", intent="source-lookup")
+
+    result = service.execute_task(session.session_id, snapshot.task_id)
+
+    assert result.status == "completed"
+    assert [evidence.relative_path for evidence in result.evidences] == ["notes/visible.md"]
+    assert indexes.lexical_queries[-1].allowed_relative_paths == ("notes/visible.md",)
+
+
+def test_source_lookup_fails_closed_when_lexical_retrieval_is_disabled(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1", "vault-1", "notes/unit.md", "a" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Unit", "keyword evidence"),), "now",
+    )
+    service, _, session, *_ = task_service_fixture(tmp_path, (document,))
+    service.lexical_retrieval_enabled = False
+    snapshot = service.create_task(session.session_id, "keyword evidence", intent="source-lookup")
+
+    result = service.execute_task(session.session_id, snapshot.task_id)
+
+    assert result.status == "no-evidence"
+    assert result.recovery_action == "启用本机词法检索后重新准备任务。"
 
 
 def test_completed_turn_keeps_its_snapshot_and_requires_reverification_after_edit(tmp_path) -> None:

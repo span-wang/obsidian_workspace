@@ -5,8 +5,9 @@
   "type": "module",
   "scripts": {
     "build": "vite build",
+    "build:retrieval-chunking-lab": "vite build --config retrieval-chunking-lab/vite.config.js",
     "lint": "eslint src tests",
-    "test": "node --test tests/app.test.js"
+    "test": "node --test tests/app.test.js retrieval-chunking-lab/tests/app.test.js"
   },
   "dependencies": {
     "react": "19.2.7",

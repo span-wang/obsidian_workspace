@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from hashlib import sha256
+from math import isfinite
 from pathlib import PurePosixPath
 
 from domain.evidence import DocxOoxmlLocator, DocumentLocator, PdfRegionLocator, SourceScopeLocator
 
 
 _DOCUMENT_LOCATOR_TYPES = (PdfRegionLocator, DocxOoxmlLocator, SourceScopeLocator)
+_META_ORIGINS = frozenset({"rule", "llm", "human"})
+_META_STATUSES = frozenset({"pending", "required-check", "accepted"})
 _INDEX_BLOCK_CONSISTENCY_CODES = frozenset(
     {
         "block-content-sha256-missing",
@@ -105,6 +108,133 @@ class IndexBlock:
 
 
 @dataclass(frozen=True)
+class IndexBlockMetadata:
+    """Rule or review metadata for one block, without duplicating block structure."""
+
+    sequence: int
+    subject: str | None
+    grade_volume: str | None
+    unit_no: int | None
+    material_type: str | None
+    meta_origin: str
+    meta_confidence: float | None
+    meta_status: str
+
+    def __post_init__(self) -> None:
+        if type(self.sequence) is not int or self.sequence < 1:
+            raise ValueError("Index block metadata sequence is invalid.")
+        for field in (self.subject, self.grade_volume, self.material_type):
+            if field is not None and (not isinstance(field, str) or not field.strip()):
+                raise ValueError("Index block metadata text fields must be non-empty when present.")
+        if self.unit_no is not None and (type(self.unit_no) is not int or self.unit_no < 1):
+            raise ValueError("Index block metadata unit number is invalid.")
+        if self.meta_origin not in _META_ORIGINS or self.meta_status not in _META_STATUSES:
+            raise ValueError("Index block metadata origin or status is invalid.")
+        if self.meta_confidence is not None and (
+            type(self.meta_confidence) not in {int, float}
+            or not 0.0 <= self.meta_confidence <= 1.0
+        ):
+            raise ValueError("Index block metadata confidence must be between zero and one.")
+        if self.meta_status == "accepted" and self.scope_key is None:
+            raise ValueError("Accepted index block metadata needs a complete scope.")
+
+    @property
+    def scope_key(self) -> tuple[str, str, int] | None:
+        if self.subject is None or self.grade_volume is None or self.unit_no is None:
+            return None
+        return self.subject, self.grade_volume, self.unit_no
+
+
+@dataclass(frozen=True)
+class BlockFilter:
+    """A complete enumeration scope plus the paths currently allowed by policy."""
+
+    subject: str
+    grade_volume: str
+    unit_no: int
+    material_type: str | None
+    allowed_relative_paths: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.subject, str)
+            or not self.subject.strip()
+            or not isinstance(self.grade_volume, str)
+            or not self.grade_volume.strip()
+            or type(self.unit_no) is not int
+            or self.unit_no < 1
+        ):
+            raise ValueError("Block filters need a complete scope.")
+        if self.material_type is not None and (
+            not isinstance(self.material_type, str) or not self.material_type.strip()
+        ):
+            raise ValueError("Block filter material type must be non-empty when present.")
+        if not isinstance(self.allowed_relative_paths, tuple):
+            raise ValueError("Block filter allowed paths must be immutable.")
+        for relative_path in self.allowed_relative_paths:
+            _validate_relative_path(relative_path)
+
+
+@dataclass(frozen=True)
+class IndexBlockRef:
+    """A vault-scoped reference returned by an exact metadata enumeration."""
+
+    document_id: str
+    relative_path: str
+    block: IndexBlock
+    metadata: IndexBlockMetadata
+
+    def __post_init__(self) -> None:
+        if not self.document_id:
+            raise ValueError("Index block references need a document identity.")
+        _validate_relative_path(self.relative_path)
+        if self.block.sequence != self.metadata.sequence:
+            raise ValueError("Index block reference metadata must match its block sequence.")
+
+    @property
+    def sequence(self) -> int:
+        return self.block.sequence
+
+
+@dataclass(frozen=True)
+class LexicalQuery:
+    """A bounded point-lookup query constrained to policy-approved paths."""
+
+    text: str
+    limit: int
+    allowed_relative_paths: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.text, str) or not self.text.strip():
+            raise ValueError("Lexical queries need text.")
+        if type(self.limit) is not int or self.limit < 1:
+            raise ValueError("Lexical query limits must be positive integers.")
+        if not isinstance(self.allowed_relative_paths, tuple):
+            raise ValueError("Lexical query allowed paths must be immutable.")
+        for relative_path in self.allowed_relative_paths:
+            _validate_relative_path(relative_path)
+
+
+@dataclass(frozen=True)
+class BlockHit:
+    """One lexical candidate without leaking SQLite row details across the port."""
+
+    document_id: str
+    relative_path: str
+    block: IndexBlock
+    score: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.document_id, str) or not self.document_id:
+            raise ValueError("Block hits need a document identity.")
+        _validate_relative_path(self.relative_path)
+        if not isinstance(self.block, IndexBlock):
+            raise ValueError("Block hits need an index block.")
+        if type(self.score) not in {int, float} or not isfinite(self.score):
+            raise ValueError("Block hit scores must be finite numbers.")
+
+
+@dataclass(frozen=True)
 class IndexBlockConsistencyIssue:
     """Content-free explanation of one legacy and rich block read discrepancy."""
 
@@ -179,6 +309,7 @@ class IndexedDocument:
     source_observed_mtime_ns: int | None = None
     source_observed_size: int | None = None
     policy_revision: int | None = None
+    block_metadata: tuple[IndexBlockMetadata, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.document_id or not self.vault_id or not self.indexed_at:
@@ -200,6 +331,14 @@ class IndexedDocument:
             _validate_relative_path(self.source_path)
         if not self.blocks:
             raise ValueError("Indexed documents need at least one private block.")
+        if not isinstance(self.block_metadata, tuple) or not all(
+            isinstance(metadata, IndexBlockMetadata) for metadata in self.block_metadata
+        ):
+            raise ValueError("Indexed document block metadata must be immutable metadata.")
+        if self.block_metadata and {
+            metadata.sequence for metadata in self.block_metadata
+        } != {block.sequence for block in self.blocks}:
+            raise ValueError("Indexed document metadata must cover every block exactly once.")
 
 
 @dataclass(frozen=True)

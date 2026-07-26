@@ -41,6 +41,7 @@ from domain.sessions import (
     utc_now,
 )
 from domain.policies import OutboundScope
+from domain.indexing import LexicalQuery
 from ports.session_repository import SessionRepository
 
 
@@ -97,13 +98,14 @@ class TaskPreview:
 class SessionService:
     def __init__(
         self, repository: SessionRepository, *, vault_service=None, provider_service=None,
-        policy_service=None, index_repository=None,
+        policy_service=None, index_repository=None, lexical_retrieval_enabled: bool = True,
     ) -> None:
         self.repository = repository
         self.vault_service = vault_service
         self.provider_service = provider_service
         self.policy_service = policy_service
         self.index_repository = index_repository
+        self.lexical_retrieval_enabled = lexical_retrieval_enabled
         self._preparing_snapshot_counts: dict[str, int] = {}
         self._preparing_snapshot_guard = RLock()
         self._deep_creation_snapshot_counts: dict[str, int] = {}
@@ -1599,17 +1601,35 @@ class SessionService:
                 continue
             allowed_documents.append(document)
 
-        ranked: list[tuple[float, object, object, tuple[str, ...]]] = []
-        for document in allowed_documents:
-            for block in document.blocks:
-                score, channels = self._retrieval_score(content, document, block)
-                if score > 0:
-                    ranked.append((score, document, block, channels))
-        ranked.sort(key=lambda item: (-item[0], item[1].relative_path, item[2].sequence))
+        duration = int((perf_counter() - started) * 1000)
+        if eligible_document_count and excluded_count == eligible_document_count:
+            return SessionRetrievalResult(
+                str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id,
+                "excluded", "确认范围内的内容当前均被排除，未执行检索。",
+                "检查排除规则后重新准备任务。", duration, 0, utc_now(),
+            )
+        if allowed_documents and not self.lexical_retrieval_enabled:
+            return SessionRetrievalResult(
+                str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id,
+                "no-evidence", "本机词法检索已关闭，未执行检索。",
+                "启用本机词法检索后重新准备任务。", duration, 0, utc_now(),
+            )
+
+        allowed_paths = tuple(document.relative_path for document in allowed_documents)
+        allowed_documents_by_id = {document.document_id: document for document in allowed_documents}
+        ranked: list[tuple[float, object, object]] = []
+        if allowed_paths:
+            for hit in self.index_repository.search_lexical(
+                snapshot.vault_id,
+                LexicalQuery(content, limit=MAX_RETRIEVAL_EVIDENCES, allowed_relative_paths=allowed_paths),
+            ):
+                document = allowed_documents_by_id.get(hit.document_id)
+                if document is not None and document.relative_path == hit.relative_path:
+                    ranked.append((hit.score, document, hit.block))
 
         evidences: list[SessionRetrievalEvidence] = []
         remaining_characters = MAX_RETRIEVAL_CONTEXT_CHARS
-        for score, document, block, channels in ranked:
+        for score, document, block in ranked:
             if len(evidences) >= MAX_RETRIEVAL_EVIDENCES or remaining_characters <= 0:
                 break
             excerpt = self._bounded_excerpt(block.text, min(MAX_RETRIEVAL_BLOCK_CHARS, remaining_characters))
@@ -1630,12 +1650,11 @@ class SessionService:
                     page,
                     excerpt,
                     round(score, 6),
-                    channels,
+                    ("lexical",),
                 )
             )
             remaining_characters -= len(excerpt)
 
-        duration = int((perf_counter() - started) * 1000)
         if evidences:
             return SessionRetrievalResult(
                 str(uuid4()),
@@ -1649,12 +1668,6 @@ class SessionService:
                 0,
                 utc_now(),
                 tuple(evidences),
-            )
-        if eligible_document_count and excluded_count == eligible_document_count:
-            return SessionRetrievalResult(
-                str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id,
-                "excluded", "确认范围内的内容当前均被排除，未执行检索。",
-                "检查排除规则后重新准备任务。", duration, 0, utc_now(),
             )
         return SessionRetrievalResult(
             str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id,
@@ -1861,60 +1874,6 @@ class SessionService:
         if existing is not None:
             return existing
         raise SessionValidationError("The selected task is no longer ready. Prepare a new task.")
-
-    @staticmethod
-    def _retrieval_score(content, document, block) -> tuple[float, tuple[str, ...]]:
-        query_terms = SessionService._retrieval_terms(content)
-        if not query_terms:
-            return 0.0, ()
-        block_terms = SessionService._retrieval_terms(block.text)
-        location_terms = SessionService._retrieval_terms(
-            " ".join((*document.heading_locations, block.location))
-        )
-        metadata_terms = SessionService._retrieval_terms(
-            f"{document.relative_path} {document.document_kind}"
-        )
-        tag_terms = SessionService._retrieval_terms(" ".join(document.tags))
-        link_terms = SessionService._retrieval_terms(" ".join(document.links))
-        query_set = set(query_terms)
-
-        def overlap(terms: tuple[str, ...]) -> float:
-            return len(query_set.intersection(terms)) / len(query_set)
-
-        keyword = overlap(block_terms)
-        semantic = SessionService._semantic_similarity(query_terms, block_terms)
-        structure = overlap(location_terms)
-        metadata = overlap(metadata_terms)
-        tag = overlap(tag_terms)
-        link = overlap(link_terms)
-        scores = {
-            "keyword": keyword,
-            "semantic": semantic,
-            "structure": structure,
-            "metadata": metadata,
-            "tag": tag,
-            "link": link,
-        }
-        channels = tuple(name for name, score in scores.items() if score > 0)
-        return (
-            keyword * 4 + semantic * 2 + structure * 2 + metadata + tag * 1.5 + link,
-            channels,
-        )
-
-    @staticmethod
-    def _retrieval_terms(value: str) -> tuple[str, ...]:
-        lowered = value.lower()
-        words = re.findall(r"[a-z0-9]+", lowered)
-        chinese = re.findall(r"[\u4e00-\u9fff]", lowered)
-        bigrams = ["".join(chinese[index:index + 2]) for index in range(len(chinese) - 1)]
-        return tuple(dict.fromkeys((*words, *chinese, *bigrams)))
-
-    @staticmethod
-    def _semantic_similarity(query_terms: tuple[str, ...], block_terms: tuple[str, ...]) -> float:
-        if not query_terms or not block_terms:
-            return 0.0
-        query_set, block_set = set(query_terms), set(block_terms)
-        return len(query_set.intersection(block_set)) / len(query_set.union(block_set))
 
     @staticmethod
     def _bounded_excerpt(value: str, limit: int) -> str:

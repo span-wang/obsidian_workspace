@@ -1,7 +1,16 @@
 from typing import Protocol
 
 from domain.graph_projection import DurableGraphProjection, GraphProjectionKey
-from domain.indexing import IndexBlockBackfillReport, IndexHealth, IndexJob, IndexedDocument
+from domain.indexing import (
+    BlockFilter,
+    BlockHit,
+    IndexBlockBackfillReport,
+    IndexBlockRef,
+    IndexHealth,
+    IndexJob,
+    IndexedDocument,
+    LexicalQuery,
+)
 
 
 class IndexRepository(Protocol):
@@ -18,6 +27,10 @@ class IndexRepository(Protocol):
     def current_documents(self, vault_id: str) -> list[IndexedDocument]: ...
 
     def documents(self, vault_id: str) -> list[IndexedDocument]: ...
+
+    def filter_blocks(self, vault_id: str, filters: BlockFilter) -> list[IndexBlockRef]: ...
+
+    def search_lexical(self, vault_id: str, query: LexicalQuery) -> list[BlockHit]: ...
 
     def backfill_current_blocks(self, vault_id: str) -> IndexBlockBackfillReport: ...
 
