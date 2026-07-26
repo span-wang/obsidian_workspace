@@ -123,18 +123,20 @@ def wait_for_health(process: subprocess.Popen[str]) -> None:
                 and payload["service"] == SERVICE_NAME
             ):
                 return
-        except URLError:
+        except (TimeoutError, URLError):
             time.sleep(0.1)
     raise AssertionError("Service did not become healthy within 10 seconds.")
 
 
 @pytest.fixture
-def running_service(tmp_path: Path) -> subprocess.Popen[str]:
+def running_service(tmp_path: Path, request: pytest.FixtureRequest) -> subprocess.Popen[str]:
+    rich_block_reads_enabled = getattr(request, "param", True)
     environment = os.environ | {
         "OBSIDIAN_PLATFORM_DATA_DIR": str(tmp_path),
         "OBSIDIAN_PLATFORM_TEST_PORT": str(TEST_PORT),
         "OBSIDIAN_PLATFORM_TEST_VAULT_PATH": str(tmp_path / "selected-vault"),
         "OBSIDIAN_PLATFORM_TEST_IMPORT_PATH": str(tmp_path / "selected-import.pdf"),
+        "OBSIDIAN_PLATFORM_RICH_BLOCK_READS": "1" if rich_block_reads_enabled else "0",
         "PYTHONPATH": str(SERVICE_ROOT),
     }
     process = subprocess.Popen(
@@ -295,6 +297,38 @@ def test_authorized_vault_lifecycle_is_persistent_and_never_modifies_existing_fi
     assert existing_note.read_text(encoding="utf-8") == "keep me"
 
 
+@pytest.mark.parametrize(
+    ("running_service", "expected_mode", "expected_status"),
+    [(True, "rich", "enabled"), (False, "legacy", "disabled")],
+    indirect=["running_service"],
+)
+def test_index_read_feature_flag_is_reported_by_the_loopback_health_contract(
+    local_browser,
+    tmp_path: Path,
+    expected_mode: str,
+    expected_status: str,
+) -> None:
+    vault_path = tmp_path / "selected-vault"
+    vault_path.mkdir()
+    (vault_path / "note.md").write_text("# Note\n", encoding="utf-8")
+    status, created = request_json(
+        local_browser,
+        "/api/vaults",
+        method="POST",
+        payload={"selection_id": select_vault_directory(local_browser), "managed_root": "platform"},
+    )
+    vault_id = created["vault"]["vault_id"]
+    reconcile_status, reconciled = request_json(
+        local_browser, f"/api/vaults/{vault_id}/index/reconcile", method="POST"
+    )
+
+    assert status == 200
+    assert reconcile_status == 200
+    assert reconciled["index"]["rich_block_read_mode"] == expected_mode
+    assert reconciled["index"]["rich_block_status"] == expected_status
+    assert reconciled["index"]["rich_block_issue_codes"] == []
+
+
 def test_vault_validation_uses_the_standard_error_contract(local_browser, tmp_path: Path) -> None:
     status, payload = request_json(
         local_browser,
@@ -378,11 +412,11 @@ def test_vault_policy_persists_default_mode_and_blocks_stale_outbound_authorizat
     )
 
     assert policy_status == 200
-    assert policy["policy"]["outbound_mode"] == "ask-each-task"
+    assert policy["policy"]["outbound_mode"] == "always-allow"
     assert pending_status == 200
-    assert pending["authorization"]["status"] == "pending"
-    assert confirmed_status == 200
-    assert confirmed["authorization"]["status"] == "approved"
+    assert pending["authorization"]["status"] == "approved"
+    assert confirmed_status == 403
+    assert confirmed["code"] == "outbound_authorization_denied"
     assert "scope_paths" not in pending["authorization"]
     assert checked_status == 200
     assert checked["authorization"]["actual_scope_summary"] == "1 scoped item(s)"
@@ -481,6 +515,7 @@ def test_second_start_reuses_the_verified_running_instance(
         pytest.skip("Startup conflict behavior is covered on the default fixed port only.")
     environment = os.environ | {
         "OBSIDIAN_PLATFORM_DATA_DIR": str(tmp_path),
+        "OBSIDIAN_PLATFORM_RICH_BLOCK_READS": "1",
         "PYTHONPATH": str(SERVICE_ROOT),
     }
     result = subprocess.run(

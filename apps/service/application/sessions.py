@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from hashlib import sha256
 import json
@@ -15,6 +16,9 @@ from domain.sessions import (
     SessionCompletenessCoverageItem,
     SessionCompletenessItemOutcome,
     SessionCompletenessResult,
+    SessionDeepCreationPlanSection,
+    SessionDeepCreationResult,
+    SessionDeepCreationSectionOutcome,
     SessionAttachment,
     SessionCitation,
     SessionDetail,
@@ -54,6 +58,8 @@ COMPLETENESS_BATCH_SIZE = 32
 MAX_RETRIEVAL_CONTEXT_CHARS = 4_000
 MAX_KNOWLEDGE_ORGANIZATION_SOURCES = 128
 MAX_KNOWLEDGE_ORGANIZATION_EVIDENCES = 256
+MAX_DEEP_CREATION_SOURCES = 128
+MAX_DEEP_CREATION_EVIDENCES = 256
 
 
 @dataclass(frozen=True)
@@ -83,6 +89,9 @@ class TaskPreview:
     organization_sections: tuple[SessionKnowledgeOrganizationPlanSection, ...] = ()
     organization_evidence_count: int = 0
     organization_budget_exceeded: bool = False
+    deep_creation_sections: tuple[SessionDeepCreationPlanSection, ...] = ()
+    deep_creation_evidence_count: int = 0
+    deep_creation_budget_exceeded: bool = False
 
 
 class SessionService:
@@ -97,6 +106,8 @@ class SessionService:
         self.index_repository = index_repository
         self._preparing_snapshot_counts: dict[str, int] = {}
         self._preparing_snapshot_guard = RLock()
+        self._deep_creation_snapshot_counts: dict[str, int] = {}
+        self._deep_creation_snapshot_guard = RLock()
 
     def create(self, title: str | None = None) -> PersistentSession:
         session = new_session(self._normalize_title(title, default="未命名会话"))
@@ -301,6 +312,7 @@ class SessionService:
             preview.source_count, preview.source_digest, "prepared", timestamp, timestamp,
             sources=preview.sources, coverage_items=preview.coverage_items,
             organization_sections=preview.organization_sections,
+            deep_creation_sections=preview.deep_creation_sections,
         )
         self.repository.persist_task(
             message,
@@ -309,7 +321,12 @@ class SessionService:
         )
         return snapshot
 
-    def execute_task(self, session_id: str, task_id: str):
+    def execute_task(
+        self,
+        session_id: str,
+        task_id: str,
+        on_stream_chunk: Callable[[int, str], None] | None = None,
+    ):
         started = perf_counter()
         try:
             detail = self.repository.get_detail(session_id)
@@ -319,8 +336,123 @@ class SessionService:
         snapshot = next((item for item in detail.task_snapshots if item.task_id == task_id), None)
         if task_state is None or snapshot is None or task_state.snapshot_id != snapshot.snapshot_id:
             raise SessionValidationError("The selected task is unavailable. Prepare a new task.")
-        if snapshot.intent not in {"source-lookup", "knowledge-organization", "completeness"}:
+        if snapshot.intent not in {"source-lookup", "knowledge-organization", "completeness", "deep-creation"}:
             raise SessionValidationError("The selected task type is handled by a later workflow.")
+
+        if snapshot.intent == "deep-creation":
+            existing = next(
+                (
+                    item
+                    for item in detail.deep_creation_results
+                    if item.task_id == snapshot.task_id and item.snapshot_id == snapshot.snapshot_id
+                ),
+                None,
+            )
+            if existing is not None and snapshot.status in {"completed", "recoverable", "failed"}:
+                return existing
+            if task_state.status not in {"prepared", "waiting-authorization"} or snapshot.status not in {
+                "prepared", "waiting-authorization"
+            }:
+                raise SessionValidationError("The selected task is no longer ready. Prepare a new task.")
+            if self._context_changed(
+                detail.session,
+                vault_id=snapshot.vault_id,
+                scope_kind=snapshot.scope_kind,
+                scope_path=snapshot.scope_path,
+                provider_id=snapshot.provider_id,
+                model_id=snapshot.model_id,
+            ):
+                reason = "会话语境已改变。"
+                self._invalidate_active_snapshots(session_id, reason, snapshot_ids={snapshot.snapshot_id})
+                raise SessionValidationError(f"{reason} 请重新准备任务。")
+            try:
+                health = self.index_repository.health(snapshot.vault_id)
+            except Exception:
+                health = None
+            if health is None:
+                return self._persist_unavailable_deep_creation_execution(
+                    snapshot, task_state, started, "索引不可用：unavailable。",
+                    self._index_recovery_action("unavailable"),
+                )
+            if health.status != "healthy":
+                return self._persist_unavailable_deep_creation_execution(
+                    snapshot, task_state, started, f"索引不可用：{health.status}。",
+                    self._index_recovery_action(health.status),
+                )
+            policy = self.policy_service.get(snapshot.vault_id)
+            if (
+                health.updated_at != snapshot.index_updated_at
+                or policy.policy_revision != snapshot.policy_revision
+                or policy.outbound_mode != snapshot.outbound_mode
+            ):
+                reason = "来源、索引或授权策略已改变。"
+                self._invalidate_active_snapshots(session_id, reason, snapshot_ids={snapshot.snapshot_id})
+                raise SessionValidationError(f"{reason} 请重新准备任务。")
+            content = next(
+                (message.content for message in detail.messages if message.message_id == snapshot.message_id),
+                "基于已确认资料进行深度创作。",
+            )
+            scopes = self._deep_creation_outbound_scopes(snapshot)
+            if snapshot.status == "waiting-authorization":
+                if existing is None or not existing.authorization_id:
+                    raise SessionValidationError("The selected task authorization is unavailable. Prepare a new task.")
+                authorization_id = existing.authorization_id
+            else:
+                try:
+                    authorization = self.policy_service.request_outbound_authorization(
+                        snapshot.vault_id,
+                        provider_id=snapshot.provider_id,
+                        model_id=snapshot.model_id,
+                        operation="deep-creation",
+                        task_id=snapshot.task_id,
+                        scopes=scopes,
+                    )
+                except Exception as error:
+                    return self._persist_unavailable_deep_creation_execution(
+                        snapshot, task_state, started, str(error) or "无法请求深度创作授权。",
+                        "检查外发授权和排除规则后重新准备任务。",
+                    )
+                authorization_id = authorization.authorization_id
+                if authorization.status == "pending":
+                    waiting = SessionDeepCreationResult(
+                        str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id,
+                        "waiting-authorization", "深度创作将发送本次请求和冻结本地证据摘要，等待本次授权。",
+                        None, (), int((perf_counter() - started) * 1000), utc_now(), (),
+                        authorization_id, "pending",
+                    )
+                    return self._persist_deep_creation_execution(
+                        replace(snapshot, status="waiting-authorization", updated_at=utc_now()),
+                        replace(task_state, status="waiting-authorization", updated_at=utc_now()),
+                        waiting,
+                        expected_status="prepared",
+                    )
+            try:
+                self.policy_service.check_outbound_authorization(
+                    snapshot.vault_id,
+                    authorization_id,
+                    provider_id=snapshot.provider_id,
+                    model_id=snapshot.model_id,
+                    operation="deep-creation",
+                    task_id=snapshot.task_id,
+                    scopes=scopes,
+                )
+            except Exception as error:
+                return self._persist_unavailable_deep_creation_execution(
+                    snapshot, task_state, started, str(error) or "深度创作授权不可用。",
+                    "确认本次授权后重试。",
+                )
+            self._begin_deep_creation_execution(snapshot.snapshot_id)
+            try:
+                return self._execute_deep_creation(
+                    snapshot,
+                    task_state,
+                    started,
+                    content,
+                    authorization_id,
+                    on_stream_chunk=on_stream_chunk,
+                )
+            finally:
+                self._end_deep_creation_execution(snapshot.snapshot_id)
 
         if snapshot.intent == "knowledge-organization":
             existing = next(
@@ -567,6 +699,52 @@ class SessionService:
             )
         return self.execute_task(session_id, task_id)
 
+    def confirm_deep_creation_authorization(
+        self, session_id: str, task_id: str, authorization_id: str, *, approved: bool
+    ) -> SessionDeepCreationResult:
+        try:
+            detail = self.repository.get_detail(session_id)
+        except KeyError as error:
+            raise SessionNotFoundError(session_id) from error
+        snapshot = next((item for item in detail.task_snapshots if item.task_id == task_id), None)
+        task_state = next((item for item in detail.task_states if item.task_id == task_id), None)
+        result = next(
+            (
+                item
+                for item in detail.deep_creation_results
+                if item.task_id == task_id and item.snapshot_id == (snapshot.snapshot_id if snapshot else None)
+            ),
+            None,
+        )
+        if (
+            snapshot is None
+            or task_state is None
+            or result is None
+            or snapshot.status != "waiting-authorization"
+            or result.status != "waiting-authorization"
+            or result.authorization_id != authorization_id
+        ):
+            raise SessionValidationError("The selected task authorization is unavailable. Prepare a new task.")
+        authorization = self.policy_service.confirm_outbound_authorization(
+            snapshot.vault_id, authorization_id, approved=approved
+        )
+        if authorization.status != "approved":
+            failed = replace(
+                result,
+                status="failed",
+                summary="本次深度创作授权被拒绝，未发送任何资料或执行互联网检索。",
+                recovery_action="重新准备任务并确认外发授权。",
+                authorization_status=authorization.status,
+            )
+            timestamp = utc_now()
+            return self._persist_deep_creation_execution(
+                replace(snapshot, status="failed", updated_at=timestamp),
+                replace(task_state, status="failed", updated_at=timestamp),
+                failed,
+                expected_status="waiting-authorization",
+            )
+        return self.execute_task(session_id, task_id)
+
     def edit_generation_result(
         self, session_id: str, result_id: str, content: str, content_origin: str = "user-content"
     ) -> SessionGenerationResult:
@@ -781,6 +959,11 @@ class SessionService:
             if resolved_intent == "knowledge-organization"
             else ((), 0, False)
         )
+        deep_creation_sections, deep_creation_evidence_count, deep_creation_budget_exceeded = (
+            self._deep_creation_sections(session, vault.vault_id, normalized_content, sources)
+            if resolved_intent == "deep-creation"
+            else ((), 0, False)
+        )
         source_digest = self._digest([
             {
                 "kind": source.identity_kind,
@@ -802,7 +985,11 @@ class SessionService:
             "source_digest": source_digest,
         })
         exclusion_summary = self._exclusion_summary(rules, session.scope_kind, session.scope_path)
-        is_ready = health.status == "healthy" and not organization_budget_exceeded
+        is_ready = (
+            health.status == "healthy"
+            and not organization_budget_exceeded
+            and not deep_creation_budget_exceeded
+        )
         blocking_reason = (
             f"索引不可用：{health.status}。"
             if health.status != "healthy"
@@ -810,13 +997,20 @@ class SessionService:
                 f"知识整理范围超出固定上限（{MAX_KNOWLEDGE_ORGANIZATION_SOURCES} 项来源或 "
                 f"{MAX_KNOWLEDGE_ORGANIZATION_EVIDENCES} 条证据）。"
                 if organization_budget_exceeded
-                else None
+                else (
+                    f"深度创作范围超出固定上限（{MAX_DEEP_CREATION_SOURCES} 项来源或 "
+                    f"{MAX_DEEP_CREATION_EVIDENCES} 条证据）。"
+                    if deep_creation_budget_exceeded
+                    else None
+                )
             )
         )
         recovery_action = (
             self._index_recovery_action(health.status)
             if health.status != "healthy"
-            else "缩小资料范围后重新准备任务。" if organization_budget_exceeded else None
+            else "缩小资料范围后重新准备任务。"
+            if organization_budget_exceeded or deep_creation_budget_exceeded
+            else None
         )
         return TaskPreview(
             normalized_content, resolved_intent, intent_source, vault.vault_id,
@@ -826,6 +1020,7 @@ class SessionService:
             "尚未发送；实际检索块将在执行前按任务快照申请或核验授权。",
             len(sources), source_digest, sources, coverage_items, is_ready, blocking_reason, recovery_action,
             organization_sections, organization_evidence_count, organization_budget_exceeded,
+            deep_creation_sections, deep_creation_evidence_count, deep_creation_budget_exceeded,
         )
 
     def _execute_knowledge_organization(
@@ -1017,6 +1212,183 @@ class SessionService:
             expected_status=snapshot.status,
         )
 
+    @staticmethod
+    def _deep_creation_outbound_scopes(
+        snapshot: SessionTaskSnapshot,
+    ) -> list[OutboundScope]:
+        scopes: list[OutboundScope] = []
+        for section in snapshot.deep_creation_sections:
+            for evidence in section.local_evidence:
+                candidate = OutboundScope(evidence.source_path or evidence.relative_path, evidence.relative_path)
+                if candidate not in scopes:
+                    scopes.append(candidate)
+        return scopes
+
+    @staticmethod
+    def _deep_creation_prompt(
+        snapshot: SessionTaskSnapshot,
+        section: SessionDeepCreationPlanSection,
+        request: str,
+    ) -> str:
+        local = "\n\n".join(
+            f"[知识库证据 {item.ordinal}] 文件：{item.relative_path}；位置：{item.location}\n{item.excerpt}"
+            for item in section.local_evidence
+        )
+        return (
+            "请生成一个中文深度创作段落。必须清楚区分：知识库证据和模型判断。"
+            "事实性内容优先依据冻结知识库证据；可以补充模型知识或推断，"
+            "但无法由证据支持的内容必须标为模型判断，不得伪装成引用事实。\n"
+            f"用户请求：{request[:2_000]}\n快照：{snapshot.snapshot_id}\n段目标：{section.goal}\n\n"
+            f"{local}"
+        )
+
+    def _execute_deep_creation(
+        self,
+        snapshot: SessionTaskSnapshot,
+        task_state: SessionTaskState,
+        started: float,
+        content: str,
+        authorization_id: str,
+        *,
+        on_stream_chunk: Callable[[int, str], None] | None = None,
+    ) -> SessionDeepCreationResult:
+        timestamp = utc_now()
+        expected_status = snapshot.status
+        executing_snapshot = replace(snapshot, status="preparing", updated_at=timestamp)
+        executing_state = replace(task_state, status="preparing", updated_at=timestamp)
+        result = SessionDeepCreationResult(
+            str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id, "preparing",
+            "正在按冻结计划段进行深度创作并保留模型判断。",
+            "若生成中断，请恢复任务以保留已完成段。", (),
+            0, timestamp, (), authorization_id, "approved",
+        )
+        persisted = self._persist_deep_creation_execution(
+            executing_snapshot, executing_state, result, expected_status=expected_status
+        )
+        if persisted is not result:
+            return persisted
+
+        outcomes: list[SessionDeepCreationSectionOutcome] = []
+        for section in snapshot.deep_creation_sections:
+            if not section.local_evidence:
+                outcomes.append(
+                    SessionDeepCreationSectionOutcome(
+                        section.ordinal, "recoverable", 0, "计划范围内没有可用的冻结知识库证据。"
+                    )
+                )
+                break
+            try:
+                prompt = self._deep_creation_prompt(snapshot, section, content)
+                if on_stream_chunk is None:
+                    generated = self.provider_service.generate_chat(
+                        snapshot.provider_id, snapshot.model_id, prompt
+                    )
+                else:
+                    chunks = []
+                    for chunk in self.provider_service.stream_chat(
+                        snapshot.provider_id, snapshot.model_id, prompt
+                    ):
+                        chunks.append(chunk)
+                        on_stream_chunk(section.ordinal, chunk)
+                    generated = "".join(chunks).strip()
+                    if not generated:
+                        raise SessionValidationError("The selected Provider returned no generated content.")
+                outcome = SessionDeepCreationSectionOutcome(
+                    section.ordinal,
+                    "completed",
+                    len(section.local_evidence),
+                    content=generated,
+                    model_judgement=(
+                        f"模型判断：本段基于 {len(section.local_evidence)} 条冻结知识库证据"
+                        "生成；无法由知识库证据支持的内容已作为模型判断保留。"
+                    ),
+                )
+            except Exception as error:
+                outcomes.append(
+                    SessionDeepCreationSectionOutcome(
+                        section.ordinal, "recoverable", 0, str(error) or "深度创作段生成失败。"
+                    )
+                )
+                break
+            outcomes.append(outcome)
+            progress = replace(
+                result,
+                duration_ms=int((perf_counter() - started) * 1000),
+                outcomes=tuple(outcomes),
+                completed_ordinals=tuple(item.ordinal for item in outcomes if item.status == "completed"),
+            )
+            persisted = self._persist_deep_creation_execution(
+                replace(executing_snapshot, updated_at=utc_now()),
+                replace(executing_state, updated_at=utc_now()),
+                progress,
+                expected_status="preparing",
+            )
+            if persisted is not progress:
+                return persisted
+            result = progress
+
+        completed = tuple(item.ordinal for item in outcomes if item.status == "completed")
+        recoverable = [item for item in outcomes if item.status == "recoverable"]
+        duration = int((perf_counter() - started) * 1000)
+        if recoverable:
+            final_status = "recoverable"
+            summary = f"已生成 {len(completed)} 段；{len(recoverable)} 个深度创作段需要恢复。"
+            recovery_action = "修复 Provider 或失败段后重新准备任务。"
+        elif not outcomes:
+            final_status = "recoverable"
+            summary = "计划范围内缺少可用证据，未生成深度创作结果。"
+            recovery_action = "确认范围并修复索引后重新准备任务。"
+        else:
+            final_status = "completed"
+            summary = f"已按冻结证据和模型判断生成 {len(completed)} 个深度创作段。"
+            recovery_action = None
+        final_result = replace(
+            result,
+            status=final_status,
+            summary=summary,
+            recovery_action=recovery_action,
+            duration_ms=duration,
+            outcomes=tuple(outcomes),
+            completed_ordinals=completed,
+        )
+        timestamp = utc_now()
+        return self._persist_deep_creation_execution(
+            replace(executing_snapshot, status=final_status, updated_at=timestamp),
+            replace(executing_state, status=final_status, updated_at=timestamp),
+            final_result,
+            expected_status="preparing",
+        )
+
+    def _persist_unavailable_deep_creation_execution(
+        self,
+        snapshot: SessionTaskSnapshot,
+        task_state: SessionTaskState,
+        started: float,
+        reason: str | None,
+        recovery_action: str | None,
+    ) -> SessionDeepCreationResult:
+        normalized_reason = reason or "执行条件不可用，未进行深度创作。"
+        result = SessionDeepCreationResult(
+            str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id, "recoverable",
+            normalized_reason,
+            recovery_action or "恢复索引、授权或外部服务后重新准备任务。", (),
+            int((perf_counter() - started) * 1000),
+            utc_now(),
+            tuple(
+                SessionDeepCreationSectionOutcome(
+                    section.ordinal, "recoverable", 0, normalized_reason
+                )
+                for section in snapshot.deep_creation_sections
+            ),
+        )
+        timestamp = utc_now()
+        return self._persist_deep_creation_execution(
+            replace(snapshot, status="recoverable", updated_at=timestamp),
+            replace(task_state, status="recoverable", updated_at=timestamp),
+            result,
+            expected_status=snapshot.status,
+        )
+
     def _recover_interrupted_knowledge_organization_preparation(
         self,
         detail: SessionDetail,
@@ -1084,6 +1456,24 @@ class SessionService:
     def _knowledge_organization_preparation_is_active(self, snapshot_id: str) -> bool:
         with self._preparing_snapshot_guard:
             return self._preparing_snapshot_counts.get(snapshot_id, 0) > 0
+
+    def _begin_deep_creation_execution(self, snapshot_id: str) -> None:
+        with self._deep_creation_snapshot_guard:
+            self._deep_creation_snapshot_counts[snapshot_id] = (
+                self._deep_creation_snapshot_counts.get(snapshot_id, 0) + 1
+            )
+
+    def _end_deep_creation_execution(self, snapshot_id: str) -> None:
+        with self._deep_creation_snapshot_guard:
+            remaining = self._deep_creation_snapshot_counts.get(snapshot_id, 0) - 1
+            if remaining > 0:
+                self._deep_creation_snapshot_counts[snapshot_id] = remaining
+            else:
+                self._deep_creation_snapshot_counts.pop(snapshot_id, None)
+
+    def _deep_creation_execution_is_active(self, snapshot_id: str) -> bool:
+        with self._deep_creation_snapshot_guard:
+            return self._deep_creation_snapshot_counts.get(snapshot_id, 0) > 0
 
     def _execute_completeness(
         self, snapshot: SessionTaskSnapshot, task_state: SessionTaskState, started: float
@@ -1320,6 +1710,34 @@ class SessionService:
             (
                 item
                 for item in detail.knowledge_organization_results
+                if item.task_id == snapshot.task_id and item.snapshot_id == snapshot.snapshot_id
+            ),
+            None,
+        )
+        if existing is not None:
+            return existing
+        raise SessionValidationError("The selected task is no longer ready. Prepare a new task.")
+
+    def _persist_deep_creation_execution(
+        self,
+        snapshot: SessionTaskSnapshot,
+        task_state: SessionTaskState,
+        result: SessionDeepCreationResult,
+        *,
+        expected_status: str,
+    ) -> SessionDeepCreationResult:
+        if self.repository.persist_deep_creation_execution(
+            snapshot, task_state, result, expected_status=expected_status
+        ):
+            return result
+        try:
+            detail = self.repository.get_detail(snapshot.session_id)
+        except KeyError as error:
+            raise SessionNotFoundError(snapshot.session_id) from error
+        existing = next(
+            (
+                item
+                for item in detail.deep_creation_results
                 if item.task_id == snapshot.task_id and item.snapshot_id == snapshot.snapshot_id
             ),
             None,
@@ -1706,6 +2124,34 @@ class SessionService:
             len(sources) > MAX_KNOWLEDGE_ORGANIZATION_SOURCES or evidence_budget_exceeded,
         )
 
+    def _deep_creation_sections(
+        self,
+        session: PersistentSession,
+        vault_id: str,
+        content: str,
+        sources: tuple[SessionTaskSnapshotSource, ...],
+    ) -> tuple[tuple[SessionDeepCreationPlanSection, ...], int, bool]:
+        sections, evidence_count, budget_exceeded = self._knowledge_organization_sections(
+            session, vault_id, content, sources
+        )
+        deep_sections = tuple(
+            SessionDeepCreationPlanSection(
+                section.ordinal,
+                section.title,
+                f"基于冻结知识库证据和显式模型判断进行深度创作：{content[:200]}",
+                section.scope_path,
+                section.evidence,
+            )
+            for section in sections
+        )
+        return (
+            deep_sections,
+            evidence_count,
+            len(sources) > MAX_DEEP_CREATION_SOURCES
+            or evidence_count > MAX_DEEP_CREATION_EVIDENCES
+            or budget_exceeded,
+        )
+
     @staticmethod
     def _is_snapshot_source_eligible(document) -> bool:
         return document.document_kind != "derived" or (
@@ -1820,6 +2266,18 @@ class SessionService:
                     detail, snapshot, task_states.get(snapshot.snapshot_id)
                 )
                 continue
+            if snapshot.intent == "deep-creation" and snapshot.status == "preparing":
+                if self._deep_creation_execution_is_active(snapshot.snapshot_id):
+                    continue
+                self._persist_unavailable_deep_creation_execution(
+                    snapshot,
+                    task_states.get(snapshot.snapshot_id)
+                    or SessionTaskState.new(snapshot.session_id, snapshot.task_id, "preparing", snapshot.snapshot_id),
+                    perf_counter(),
+                    "深度创作在完成前中断，已保留已知段进度。",
+                    "确认互联网检索、Provider 和授权后重新准备任务。",
+                )
+                continue
             if snapshot.status != "completed" and self._context_changed(
                 detail.session, vault_id=snapshot.vault_id, scope_kind=snapshot.scope_kind,
                 scope_path=snapshot.scope_path, provider_id=snapshot.provider_id, model_id=snapshot.model_id,
@@ -1836,6 +2294,22 @@ class SessionService:
                 if health is None or health.status != "healthy":
                     status = health.status if health is not None else "unavailable"
                     self._persist_unavailable_knowledge_organization_execution(
+                        snapshot,
+                        task_states.get(snapshot.snapshot_id)
+                        or SessionTaskState.new(snapshot.session_id, snapshot.task_id, "prepared", snapshot.snapshot_id),
+                        perf_counter(),
+                        f"索引不可用：{status}。",
+                        self._index_recovery_action(status),
+                    )
+                    continue
+            if snapshot.intent == "deep-creation" and snapshot.status == "prepared":
+                try:
+                    health = self.index_repository.health(snapshot.vault_id)
+                except Exception:
+                    health = None
+                if health is None or health.status != "healthy":
+                    status = health.status if health is not None else "unavailable"
+                    self._persist_unavailable_deep_creation_execution(
                         snapshot,
                         task_states.get(snapshot.snapshot_id)
                         or SessionTaskState.new(snapshot.session_id, snapshot.task_id, "prepared", snapshot.snapshot_id),
@@ -1883,6 +2357,7 @@ class SessionService:
                 or preview.outbound_mode != snapshot.outbound_mode
                 or preview.coverage_items != snapshot.coverage_items
                 or preview.organization_sections != snapshot.organization_sections
+                or preview.deep_creation_sections != snapshot.deep_creation_sections
             ):
                 reason = preview.blocking_reason or "来源、索引或授权策略已改变。"
                 self._invalidate_active_snapshots(

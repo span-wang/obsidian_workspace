@@ -17,6 +17,7 @@ import {
   KnowledgeGraphWorkbench,
   LOCAL_SESSION_ENDPOINT,
   NAVIGATION_DESTINATIONS,
+  ProjectionRebuildVerificationPanel,
   PROVIDERS_ENDPOINT,
   SESSIONS_ENDPOINT,
   SessionManagement,
@@ -342,6 +343,32 @@ test("renders an evidence-bound knowledge organization conclusion with expandabl
   assert.match(evidenceMarkup, /在 Obsidian 中打开/);
   assert.match(evidenceMarkup, /notes\/unit\/vocabulary\.md/);
   assert.match(evidenceMarkup, /word evidence/);
+});
+
+test("renders deep creation result with local evidence and model judgement", () => {
+  const markup = renderToStaticMarkup(React.createElement(SessionManagement, {
+    sessionPage: { sessions: [{ session_id: "session-1", title: "英语", message_count: 0 }], page: 1, page_size: 25, total: 1, total_pages: 1 },
+    filters: { query: "", sort: "updated_at", order: "desc" }, isLoading: false, error: "", selectedSessionId: "session-1",
+    selectedDetail: {
+      session: { session_id: "session-1", title: "英语" },
+      messages: [], citations: [], retrieval_results: [], completeness_results: [], knowledge_organization_results: [],
+      task_snapshots: [{
+        snapshot_id: "snapshot-1", task_id: "task-1", vault_id: "vault-1", intent: "deep-creation", status: "completed", scope_kind: "directory", scope_path: "notes/unit", source_count: 1, source_digest: "a".repeat(64), index_status: "healthy", outbound_scope_summary: "本次深度创作会发送冻结本地证据。",
+        deep_creation_plan: { section_count: 1, local_evidence_count: 1, sections: [{ ordinal: 1, title: "notes/unit", goal: "写学习笔记", scope_path: "notes/unit", local_evidence_count: 1, local_evidence: [{ ordinal: 1, relative_path: "notes/unit/vocabulary.md", heading: "Vocabulary", location: "heading: Vocabulary", excerpt: "word evidence", identity_kind: "native", content_sha256: "a".repeat(64) }] }] }
+      }],
+      deep_creation_results: [{
+        result_id: "result-1", task_id: "task-1", snapshot_id: "snapshot-1", vault_id: "vault-1", status: "completed", summary: "已按冻结证据和模型判断生成 1 个深度创作段。", section_counts: { planned: 1, completed: 1, failed: 0, recoverable: 0 },
+        sections: [{ ordinal: 1, title: "notes/unit", goal: "写学习笔记", scope_path: "notes/unit", status: "completed", content: "深度创作段落。", model_judgement: "模型判断：保留未解决的不确定性。", local_evidence: [{ ordinal: 1, relative_path: "notes/unit/vocabulary.md", heading: "Vocabulary", location: "heading: Vocabulary", excerpt: "word evidence", identity_kind: "native", content_sha256: "a".repeat(64) }]}]
+      }]
+    },
+    vaults: [{ vault_id: "vault-1", display_name: "英语资料", authorization_status: "active", access_status: "available" }]
+  }));
+
+  assert.match(markup, /深度创作/);
+  assert.match(markup, /知识库证据/);
+  assert.match(markup, /word evidence/);
+  assert.match(markup, /模型判断/);
+  assert.doesNotMatch(markup, /互联网证据/);
 });
 
 test("renders restored knowledge-organization bindings and recoverable progress truthfully", () => {
@@ -670,6 +697,21 @@ test("offers an accessible deletion action only for non-running import tasks", (
   assert.match(markup, /aria-label="删除任务 book\.pdf"/);
   assert.match(markup, />删除<\/button>/);
   assert.doesNotMatch(runningMarkup, /删除任务 book\.pdf/);
+});
+
+test("renders the projection rebuild verification panel without projection content", () => {
+  const markup = renderToStaticMarkup(
+    React.createElement(ProjectionRebuildVerificationPanel, {
+      task: { task_id: "task-1", vault_id: "vault-1" },
+      conversionGraphs: [{ item_id: 1, graph_id: "graph-1", graph_revision: 2, blocks: [] }],
+      onTaskDeleted: () => {}
+    })
+  );
+
+  assert.match(markup, /投影重建验证/);
+  assert.match(markup, /读取投影摘要/);
+  assert.doesNotMatch(markup, /删除并重建验证/);
+  assert.doesNotMatch(markup, /retrieval_projection/);
 });
 
 test("offers a private tag deletion flow without a target tag field", () => {

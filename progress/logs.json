@@ -1,0 +1,274 @@
+{
+  "logs": [
+    {
+      "date": "2026-07-25",
+      "taskId": "RET-00-01",
+      "action": "审核并重构检索改造开发基线",
+      "result": "修正块哈希、Embedding 指纹、graph 生命周期、结构字段归属和迁移策略；建立 RET-00 至 RET-07 开发路径、结构化进度源与 AGENT 规范。",
+      "verification": [
+        "npm run progress:check",
+        "git diff --check"
+      ],
+      "files": [
+        "docs/retrieval-redesign.md",
+        "progress/",
+        "scripts/generate-progress.mjs",
+        "AGENT.md",
+        "AGENTS.md",
+        "package.json"
+      ],
+      "next": "完成 RET-00-02：确认出网边界、graph 投影删除语义并收集真实 vault 样本。"
+    },
+    {
+      "date": "2026-07-25",
+      "taskId": "RET-00-02",
+      "action": "核查 Embedding 出网、graph 删除链路并生成脱敏目录样本",
+      "result": "D-001 已确认：import task 删除不应删除索引侧最小、不可变 graph 投影；D-003 已确认：不强制重命名，样本覆盖根级 Markdown、四级派生路径与无可解析 scope 的 line 位置。D-002 已形成最小权限提案，但正文批量出网仍待用户明确确认；本步未调用 Provider，也未读取或保存正文。",
+      "verification": [
+        "uv run --project apps/service pytest -p no:cacheprovider apps/service/tests/unit/test_import_tasks.py::test_delete_import_task_removes_only_task_scoped_records apps/service/tests/unit/test_import_tasks.py::test_import_task_service_rejects_running_task_deletion apps/service/tests/unit/test_index_service.py::test_path_and_content_change_invalidates_old_evidence_without_auto_merging apps/service/tests/unit/test_index_service.py::test_reconcile_reports_a_unique_source_move_without_rewriting_the_note",
+        "npm run progress:check",
+        "git diff --check"
+      ],
+      "files": [
+        "docs/ret-00-02-decisions.md",
+        "docs/fixtures/ret-00-02-vault-directory-samples.json",
+        "progress/tasks/retrieval.json",
+        "progress/risks.json",
+        "progress/logs.json"
+      ],
+      "next": "取得 D-002 的明确确认后完成 RET-00-02；随后按 RET-01-01 落地耐久 graph 投影合同。"
+    },
+    {
+      "date": "2026-07-25",
+      "taskId": "RET-00-02",
+      "action": "确认 D-002 的最小权限 Embedding 出网边界",
+      "result": "用户接受按选定目录默认、whole vault 仅显式选择、每批次独立范围预览与授权的正文 Embedding 边界。该确认只固定产品合同，不批准任何具体批次；实际执行仍须通过 Provider、文件数、块数、逐文件排除及 revision 核验。D-001 至 D-003 已全部明确，RET-00-02 完成。",
+      "verification": [
+        "npm run progress:build",
+        "npm run progress:check",
+        "git diff --check"
+      ],
+      "files": [
+        "docs/ret-00-02-decisions.md",
+        "progress/tasks/retrieval.json",
+        "progress/risks.json",
+        "progress/logs.json"
+      ],
+      "next": "按 RET-01-01 定义耐久 graph projection 合同；RET-06 仅在其前置任务完成后实现 D-002 的实际授权与执行闸门。"
+    },
+    {
+      "date": "2026-07-26",
+      "taskId": "RET-01-01",
+      "action": "定义耐久 graph projection 的领域合同与索引侧读写端口",
+      "result": "新增最小、不可变 projection；稳定身份为 vault、graph、revision、block，保留 source identity、selected attempt、block kind、reading order、locator、confidence 与 retrieval projection。合同序列化不保存 import task、原始 payload、artifact、issue 或 input snapshot。",
+      "verification": [
+        "uv run --project apps/service pytest -p no:cacheprovider apps/service/tests/unit/test_graph_projection.py apps/service/tests/unit/test_derived_notes.py apps/service/tests/unit/test_index_service.py apps/service/tests/unit/test_import_tasks.py (45 passed)",
+        "uv run --project apps/service ruff check apps/service/domain/graph_projection.py apps/service/ports/graph_projection_repository.py apps/service/tests/unit/test_graph_projection.py",
+        "npm run progress:build",
+        "npm run progress:check",
+        "git diff --check"
+      ],
+      "files": [
+        "apps/service/domain/graph_projection.py",
+        "apps/service/ports/graph_projection_repository.py",
+        "apps/service/tests/unit/test_graph_projection.py",
+        "progress/"
+      ],
+      "next": "完成 RET-00-03 与 RET-00-04 的评测闸门后，实施 RET-01-02 的 SQLite migration 与派生文档/投影原子写入。"
+    },
+    {
+      "date": "2026-07-26",
+      "taskId": "RET-00-03",
+      "action": "建立版本化、脱敏的检索 golden set",
+      "result": "新增 18 个合成教学块与 24 条查询，覆盖点查、枚举、知识整理、重复簇和无 scope 的 recoverable 返回；fixture 校验器可对每条查询计算 recall、precision、scope coverage 与 duplicate precision，未读取或保存真实 vault 正文、路径、Provider 凭据或授权 token。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_retrieval_golden.py (5 passed)",
+        "uv run --directory apps/service ruff check application/retrieval_golden.py tests/unit/test_retrieval_golden.py",
+        "uv run --directory apps/service python -m application.retrieval_golden --fixture tests/fixtures/retrieval-golden-v1.json --validate-only",
+        "抽查 q-01、q-09、q-17、q-21：点查、枚举、知识整理与 recoverable 标注的范围、证据和重复簇一致",
+        "npm run progress:build",
+        "npm run progress:check",
+        "git diff --check"
+      ],
+      "files": [
+        "apps/service/application/retrieval_golden.py",
+        "apps/service/tests/fixtures/retrieval-golden-v1.json",
+        "apps/service/tests/unit/test_retrieval_golden.py",
+        "progress/"
+      ],
+      "next": "RET-00-04 基于该 fixture 运行当前手写检索基线与 Windows FTS5/BM25、float32 KNN smoke，并记录原始指标；不把本次合成集结果直接写成生产阈值。"
+    },
+    {
+      "date": "2026-07-26",
+      "taskId": "RET-00-04",
+      "action": "运行当前手写检索基线、Windows FTS5/BM25 与 float32 KNN 能力 smoke",
+      "result": "新增一条命令可重复执行的评测工具与原始 JSON 报告。synthetic golden set 上的当前手写打分宏平均为 recall 0.6569444444444444、precision 0.28125、scope coverage 0.0、duplicate precision 0.125；scope 和重复聚合明确记录为当前实现不支持。SQLite 3.53.1 可创建 unicode61、porter unicode61 与 trigram FTS5 表，heading 权重 10 的 BM25 smoke 返回 greeting 教材块为首项。固定种子 20000 x 1024 float32 精确 KNN 的首轮中位延迟为 1477600 ns、矩阵 81920000 bytes、工作集 82004096 bytes，双轮中位延迟差 0.02524363833243097，排名完全一致。",
+      "verification": [
+        "npm run retrieval:baseline",
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_retrieval_baseline.py tests/unit/test_retrieval_golden.py (9 passed)",
+        "uv run --directory apps/service ruff check application/retrieval_baseline.py tests/unit/test_retrieval_baseline.py application/retrieval_golden.py tests/unit/test_retrieval_golden.py",
+        "npm run progress:build",
+        "npm run progress:check",
+        "git diff --check"
+      ],
+      "files": [
+        "apps/service/application/retrieval_baseline.py",
+        "apps/service/tests/unit/test_retrieval_baseline.py",
+        "apps/service/pyproject.toml",
+        "apps/service/uv.lock",
+        "package.json",
+        "docs/ret-00-04-baseline-v1.json",
+        "progress/"
+      ],
+      "next": "实施 RET-01-02：在同一 index.sqlite 事务中完成耐久 graph projection migration 与派生文档/投影原子写入；FTS 和向量能力仅作为后续 RET-04、RET-06 的评测前置，不在本步改变生产检索。"
+    },
+    {
+      "date": "2026-07-26",
+      "taskId": "RET-01-03",
+      "action": "实现 graph identity 投影读取、任务删除后重建与 locator 核验",
+      "result": "IndexingService 对带 graph provenance 的派生 Markdown 按 vault_id、graph_id、graph_revision 从 index.sqlite 读取耐久投影，并按 frontmatter locator 选择 retrievable block；首次原子提交使用同一提交内的投影，后续重建只读取耐久存储。投影缺失、source/attempt 身份不一致或 locator 不匹配时作业失败关闭，不退回 Markdown 切块。回归覆盖删除完成态 import task 后 PDF 与 DOCX locator 的投影正文和定位信息均可恢复。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_index_graph_projection_rebuild.py tests/unit/test_sqlite_index_graph_projection.py tests/unit/test_review_commit_service.py tests/unit/test_index_service.py tests/unit/test_import_tasks.py (44 passed)",
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit",
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/integration (11 passed)",
+        "uv run --directory apps/service ruff check application/indexing.py tests/unit/test_index_graph_projection_rebuild.py",
+        "npm run progress:build",
+        "npm run progress:check",
+        "git diff --check"
+      ],
+      "files": [
+        "apps/service/application/indexing.py",
+        "apps/service/tests/unit/test_index_graph_projection_rebuild.py",
+        "progress/"
+      ],
+      "next": "实施 RET-02-01：在已验证的 projection 读取链路上扩展富 IndexBlock 与显式 schema migration。"
+    },
+    {
+      "date": "2026-07-26",
+      "taskId": "RET-01-02",
+      "action": "实现耐久 graph projection migration 与提交期原子写入",
+      "result": "index.sqlite 新增版本化 graph projection migration、不可变 identity 读写和 block locator 持久化。带 selected DocumentGraph 的 source commit unit 会将派生 Markdown 索引文档与 projection 放在同一 SQLite 事务中；重复相同 projection 安全重试，不同内容复用相同 key 会拒绝。若该索引事务失败，提交服务恢复本单元的 vault 文件备份、记录 failed journal 并保留 retry-commit，而不会把笔记标为已提交。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_sqlite_index_graph_projection.py tests/unit/test_review_commit_service.py tests/unit/test_index_service.py tests/unit/test_graph_projection.py (32 passed)",
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit (329 passed)",
+        "uv run --directory apps/service ruff check adapters/sqlite_index_repository.py application/indexing.py application/ingest.py ports/index_repository.py tests/unit/test_sqlite_index_graph_projection.py tests/unit/test_review_commit_service.py",
+        "npm run progress:build",
+        "npm run progress:check",
+        "git diff --check"
+      ],
+      "files": [
+        "apps/service/adapters/sqlite_index_repository.py",
+        "apps/service/application/indexing.py",
+        "apps/service/application/ingest.py",
+        "apps/service/ports/index_repository.py",
+        "apps/service/tests/unit/test_sqlite_index_graph_projection.py",
+        "apps/service/tests/unit/test_review_commit_service.py",
+        "progress/"
+      ],
+      "next": "实施 RET-01-03：以 graph identity 从 index.sqlite 读取 projection，覆盖删除完成态 import task 后的索引重建与 PDF/DOCX locator 引用核验。"
+    },
+    {
+      "date": "2026-07-26",
+      "taskId": "RET-01-04",
+      "action": "新增投影重建验证测试面板",
+      "result": "新增本机会话保护的 durable projection 摘要接口，只返回 graph identity、块计数、PDF/DOCX locator 类型统计、PDF 页摘要、DOCX 部件计数和稳定 locator digest；不返回正文、来源路径、source identity 或转换工件。完成态任务详情中的测试面板按读取摘要、显式确认删除、重建索引、重读摘要顺序执行，并以 locator digest 与索引健康状态显示结果。",
+      "verification": [
+        "npm run unit (335 passed, 3 skipped)",
+        "npm run build",
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_vault_api.py::test_graph_projection_summary_api_is_session_protected_and_content_free -vv (1 passed)",
+        "npx playwright test --config browser-tests/playwright.config.mjs --grep \"verifies a durable projection\" (1 passed)",
+        "npm run browser-test (22 passed; 4 existing session-flow failures: lines 1526, 1986, 2090, 2378 expect the prior non-stream execute endpoint/results and are outside RET-01-04)",
+        "npm run lint",
+        "git diff --check"
+      ],
+      "files": [
+        "apps/service/domain/graph_projection.py",
+        "apps/service/application/indexing.py",
+        "apps/service/api/main.py",
+        "apps/service/tests/unit/test_vault_api.py",
+        "apps/web/src/app.js",
+        "apps/web/src/style.css",
+        "apps/web/tests/app.test.js",
+        "browser-tests/loopback.spec.mjs",
+        "progress/"
+      ],
+      "next": "实施 RET-02-01：在已验证的 durable projection 读取链路上扩展富 IndexBlock 与显式 schema migration。"
+    },
+    {
+      "date": "2026-07-26",
+      "taskId": "RET-02-01",
+      "action": "扩展富 IndexBlock 并实现可恢复的 schema migration",
+      "result": "IndexBlock 现持久化块正文哈希、类型、标题路径、locator、graph block identity、阅读顺序、置信度和检索加工字段，同时保持既有三参数构造调用兼容。派生 Markdown 会保留 durable graph projection 的结构字段；原生 Markdown 保持默认结构值。index.sqlite 新增带 migration ID 的 index_repository_migrations 和幂等结构列，旧行仍可原地读取且正文与文档 identity 不变。rich migration 失败会回滚，随后可在同一旧库重试；graph migration 也独立使用 savepoint，避免无标记半完成状态。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_sqlite_index_rich_blocks.py tests/unit/test_sqlite_index_graph_projection.py tests/unit/test_index_graph_projection_rebuild.py tests/unit/test_index_service.py (24 passed)",
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit -q (335 passed, 3 skipped)",
+        "npm run integration (11 passed)",
+        "uv run --directory apps/service ruff check domain/indexing.py adapters/sqlite_index_repository.py application/indexing.py tests/unit/test_sqlite_index_rich_blocks.py tests/unit/test_sqlite_index_graph_projection.py tests/unit/test_index_graph_projection_rebuild.py",
+        "npm run progress:build",
+        "npm run progress:check",
+        "git diff --check"
+      ],
+      "files": [
+        "apps/service/domain/indexing.py",
+        "apps/service/application/indexing.py",
+        "apps/service/adapters/sqlite_index_repository.py",
+        "apps/service/tests/unit/test_sqlite_index_rich_blocks.py",
+        "apps/service/tests/unit/test_index_graph_projection_rebuild.py",
+        "progress/"
+      ],
+      "next": "实施 RET-02-02：以富字段双写回填既有 current documents，并输出新旧正文、sequence 与 document identity 一致性报告。"
+    },
+    {
+      "date": "2026-07-26",
+      "taskId": "RET-02-02",
+      "action": "实现结构双写、current-only 回填与新旧读取一致性报告",
+      "result": "index_blocks 继续在同一写入事务保留 sequence、location、text 与富字段。内部回填仅处理 is_current=1 行：原生块只补确定性哈希和默认结构；带完整 graph location、来源身份和正文均匹配的块从耐久 projection 恢复结构。报告按原始 SQLite 行独立校验 legacy 与 rich 读取，不包含正文；哈希、rich 正文、投影 provenance 或投影 payload 不一致时保持原行并返回稳定 issue。覆盖幂等、stale 行不变、带冒号 graph identity、损坏投影拒绝写入和写入失败整体回滚。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_sqlite_index_rich_blocks.py tests/unit/test_index_service.py tests/unit/test_index_graph_projection_rebuild.py -q (28 passed)",
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit -q (342 passed, 3 skipped)",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6241'; npm run integration (9 passed, 2 skipped; fixed-default-port assertions skipped because 6240 was occupied by the running local service)",
+        "uv run --directory apps/service ruff check domain/indexing.py ports/index_repository.py application/indexing.py adapters/sqlite_index_repository.py tests/unit/test_sqlite_index_rich_blocks.py tests/unit/test_index_service.py tests/unit/test_index_graph_projection_rebuild.py",
+        "npm run progress:build",
+        "npm run progress:check",
+        "git diff --check"
+      ],
+      "files": [
+        "apps/service/domain/indexing.py",
+        "apps/service/ports/index_repository.py",
+        "apps/service/application/indexing.py",
+        "apps/service/adapters/sqlite_index_repository.py",
+        "apps/service/tests/unit/test_sqlite_index_rich_blocks.py",
+        "apps/service/tests/unit/test_index_service.py",
+        "progress/"
+      ],
+      "next": "实施 RET-02-03：以 feature flag 切换富块读取，保留 legacy 回退并将一致性报告接入健康状态。"
+    },
+    {
+      "date": "2026-07-26",
+      "taskId": "RET-02-03",
+      "action": "切换富块读取并保留 legacy 回退",
+      "result": "新增运行时开关 `OBSIDIAN_PLATFORM_RICH_BLOCK_READS`，默认 legacy；显式启用 rich 时，current block 的一致性问题会阻断 rich 读取而不静默混用。索引健康状态增加读取模式、rich 状态和不含正文的问题码；关闭开关立即恢复 legacy 读取。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_sqlite_index_rich_blocks.py (12 passed)",
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_runtime.py tests/unit/test_vault_api.py tests/unit/test_index_service.py -q (31 passed)",
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_index_graph_projection_rebuild.py -q (4 passed)",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6242'; npm run integration (11 passed, 2 skipped; fixed-default-port assertions skipped because 6240 was occupied by the running local service)",
+        "npm run lint",
+        "git diff --check"
+      ],
+      "files": [
+        "apps/service/domain/indexing.py",
+        "apps/service/adapters/sqlite_index_repository.py",
+        "apps/service/api/runtime.py",
+        "apps/service/api/main.py",
+        "apps/service/tests/unit/test_sqlite_index_rich_blocks.py",
+        "apps/service/tests/unit/test_runtime.py",
+        "apps/service/tests/unit/test_vault_api.py",
+        "apps/service/tests/unit/test_index_graph_projection_rebuild.py",
+        "apps/service/tests/integration/test_loopback_server.py",
+        "progress/"
+      ],
+      "next": "实施 RET-03-01：在可回退的 rich 读取路径上实现结构优先分块与 contextual prefix。"
+    }
+  ]
+}

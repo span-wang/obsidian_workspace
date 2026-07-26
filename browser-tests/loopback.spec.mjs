@@ -806,6 +806,134 @@ test("creates an import task from materials and shows its persistent scan snapsh
   await expect(classificationFolder).toBeFocused();
 });
 
+test("verifies a durable projection after deleting its completed import task", async ({ page }) => {
+  const vault = {
+    vault_id: "vault-projection",
+    path: "C:\\fixture\\Projection Vault",
+    managed_root_relative_path: "platform",
+    managed_root: "C:\\fixture\\Projection Vault\\platform",
+    source_directory: "C:\\fixture\\Projection Vault\\platform\\sources",
+    note_directory: "C:\\fixture\\Projection Vault\\platform\\notes",
+    authorization_status: "active",
+    access_status: "available",
+    index_status: "healthy",
+    created_at: "2026-07-26T00:00:00+00:00",
+    updated_at: "2026-07-26T00:00:00+00:00",
+    is_current: true,
+    recovery_actions: []
+  };
+  const task = {
+    task_id: "task-projection",
+    vault_id: vault.vault_id,
+    vault_label: "Projection Vault",
+    scope_label: "verified-book.pdf",
+    lifecycle: "complete",
+    phase: "complete",
+    current_item_label: null,
+    counts: {
+      discovered: 1,
+      supported: 1,
+      skipped: 0,
+      unsupported: 0,
+      failed: 0,
+      new: 1,
+      duplicate: 0,
+      possible_version: 0,
+      identity_failed: 0,
+      parsed: 1,
+      parse_failed: 0,
+      ocr_completed: 0,
+      ocr_failed: 0,
+      confirmed_gaps: 0,
+      required_check: 0,
+      derived_notes: 1
+    },
+    recovery_actions: [],
+    failure_reason: null,
+    parent_task_id: null,
+    created_at: "2026-07-26T00:00:00+00:00",
+    updated_at: "2026-07-26T00:00:00+00:00"
+  };
+  const projection = {
+    vault_id: vault.vault_id,
+    graph_id: "graph-projection",
+    graph_revision: 7,
+    block_count: 2,
+    retrievable_block_count: 1,
+    locator_summary: {
+      type_counts: { "pdf-region": 1, "docx-ooxml": 1 },
+      pdf_pages: [4],
+      docx_part_count: 1
+    },
+    locator_digest: "d".repeat(64)
+  };
+  const detail = {
+    task,
+    items: [],
+    note_proposals: [],
+    classification_suggestions: [],
+    metadata_tag_proposals: [],
+    candidate_link_proposals: [],
+    conversion_graphs: [{ item_id: 1, graph_id: "graph-projection", graph_revision: 7, blocks: [] }],
+    review_snapshot: null,
+    commit_journals: [],
+    index: { status: "healthy", current_count: 1, stale_count: 0, failure_count: 0 },
+    event_cursor: 1
+  };
+  let deleted = false;
+  let rebuilt = false;
+
+  await page.route("**/api/vaults/vault-projection/graph**", async (route) => {
+    if (route.request().url().includes("/events")) {
+      await route.fulfill({ contentType: "text/event-stream", body: ": connected\n\n" });
+      return;
+    }
+    await route.fulfill({ json: { graph: { vault_id: vault.vault_id, nodes: [], edges: [], directories: [], tags: [], index: { status: "healthy", current_count: 0, stale_count: 0, failure_count: 0, pending_count: 0, failed_paths: [], stale_paths: [], semantic_status: "unavailable" } } } });
+  });
+  await page.route("**/api/vaults/vault-projection/graph-projections/graph-projection/7", async (route) => {
+    await route.fulfill({ json: { projection } });
+  });
+  await page.route("**/api/vaults/vault-projection/index/rebuild", async (route) => {
+    expect(deleted).toBe(true);
+    rebuilt = true;
+    await route.fulfill({ json: { vault, index: { status: "healthy" } } });
+  });
+  await page.route("**/api/import-tasks/task-projection/events?after=1", async (route) => {
+    await route.fulfill({ contentType: "text/event-stream", body: ": connected\n\n" });
+  });
+  await page.route("**/api/import-tasks/task-projection", async (route) => {
+    if (route.request().method() === "DELETE") {
+      deleted = true;
+      await route.fulfill({ status: 204 });
+      return;
+    }
+    await route.fulfill({ json: detail });
+  });
+  await page.route("**/api/import-tasks", async (route) => {
+    await route.fulfill({ json: { tasks: deleted ? [] : [task] } });
+  });
+  await page.route("**/api/vaults", async (route) => {
+    await route.fulfill({ json: { vaults: [vault] } });
+  });
+
+  await page.goto("/");
+  await page.getByRole("link", { name: "任务", exact: true }).click();
+  await page.locator(".import-task-open").click();
+  await expect(page.getByRole("heading", { name: "投影重建验证" })).toBeVisible();
+  await page.getByRole("button", { name: "读取投影摘要" }).click();
+  await expect(page.getByTestId("projection-before-summary")).toContainText("PDF 页 4");
+  const verifyButton = page.getByRole("button", { name: "删除并重建验证" });
+  await expect(verifyButton).toBeDisabled();
+  await page.getByRole("checkbox", { name: "我确认删除此导入任务并执行索引重建验证" }).check();
+  await verifyButton.click();
+
+  await expect.poll(() => deleted).toBe(true);
+  await expect.poll(() => rebuilt).toBe(true);
+  await expect(page.getByText("验证通过：任务已删除，索引重建成功，投影 locator 摘要保持一致。")).toBeVisible();
+  await expect(page.getByTestId("projection-after-summary")).toContainText("DOCX 部件 1");
+  await expect(page.getByRole("heading", { name: "导入任务 task-projection" })).toBeVisible();
+});
+
 test("filters commit review units and submits only the explicitly selectable units", async ({ page }) => {
   const vault = {
     vault_id: "vault-review",
@@ -2115,7 +2243,7 @@ test("blocks an oversized knowledge-organization preview before it can create a 
   await page.getByRole("button", { name: "准备任务", exact: true }).click();
 
   await expect(page.getByText("计划证据超出 128 条预算；请缩小范围后重新准备任务。", { exact: true })).toBeVisible();
-  await expect(page.getByText("第 1 段：notes/large", { exact: true })).toBeVisible();
+  await expect(page.getByText("第 1 段：已计划；目标：整理大范围资料", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "固定快照", exact: true })).toHaveCount(0);
   expect(snapshotCreateRequests).toBe(0);
 });
@@ -2183,14 +2311,13 @@ test("shows restored frozen bindings and never calls an interrupted plan prepare
   await page.getByRole("link", { name: "会话", exact: true }).click();
 
   await expect(page.getByText("冻结 vault：Frozen Vault", { exact: true })).toBeVisible();
-  await expect(page.getByText("来源：2 项；来源摘要：ssssssssssss", { exact: true })).toBeVisible();
-  await expect(page.getByText("索引：healthy；版本：2026-07-23T00:00:00+00:00；索引摘要：iiiiiiiiiiii", { exact: true })).toBeVisible();
-  await expect(page.getByText("策略修订：9；排除项：排除规则 1 项：never-send-cloud: notes/private", { exact: true })).toBeVisible();
+  await expect(page.getByText("范围：已冻结资料范围；来源 2 项；详细依据见右侧“引用证据”。", { exact: true })).toBeVisible();
+  await expect(page.getByText("索引版本：2026-07-23T00:00:00+00:00；策略修订：9", { exact: true })).toBeVisible();
+  await expect(page.getByText("排除项：排除规则 1 项：never-send-cloud: notes/private", { exact: true })).toBeVisible();
   await expect(page.getByLabel("计划待恢复")).toContainText("准备被中断，已知段落已保留。");
   await expect(page.getByLabel("知识整理计划进度")).toHaveText("计划 2 段；已准备 1 段；已完成 0 段；进行中 0 段失败 0 段；待恢复 1 段");
-  const interruptedSection = page.getByLabel("计划待恢复").locator(".organization-plan-section").nth(1);
-  await expect(interruptedSection).toContainText("状态：待恢复");
-  await expect(interruptedSection).toContainText("服务在准备此段前中断。");
+  await expect(page.getByLabel("计划待恢复")).toContainText("第 2 段：待恢复");
+  await expect(page.getByLabel("计划待恢复")).toContainText("服务在准备此段前中断。");
   await expect(page.getByRole("button", { name: "准备计划段", exact: true })).toHaveCount(0);
 });
 

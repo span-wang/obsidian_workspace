@@ -1,0 +1,674 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>导入结果 - 静态示例</title>
+  <link rel="icon" href="data:,">
+  <!--
+    展示假设：这是已完成导入后的结果页，不是任务运行监控页。
+    首屏只保留用户可据此行动或判断质量的信息；内部编号、摘要和哈希按需展开。
+  -->
+  <style>
+    :root {
+      color: #111111;
+      background: #ffffff;
+      font-family: ui-sans-serif, "Segoe UI Variable", "Segoe UI", "Microsoft YaHei", sans-serif;
+      font-synthesis: none;
+    }
+
+    * { box-sizing: border-box; }
+
+    body { margin: 0; background: #ffffff; }
+
+    button,
+    a { font: inherit; }
+
+    button { cursor: pointer; }
+
+    button:focus-visible,
+    a:focus-visible,
+    summary:focus-visible {
+      outline: 3px solid #111111;
+      outline-offset: 3px;
+    }
+
+    .app-shell {
+      display: grid;
+      min-height: 100vh;
+      grid-template-columns: 224px minmax(0, 1fr);
+    }
+
+    .navigation-rail {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      padding: 22px 12px 14px;
+      border-right: 1px solid #d7d7d2;
+    }
+
+    .brand {
+      margin: 0;
+      padding: 0 10px 24px;
+      font-size: 14px;
+      font-weight: 600;
+    }
+
+    .nav-list {
+      display: grid;
+      gap: 3px;
+      padding: 0;
+      margin: 0;
+      list-style: none;
+    }
+
+    .nav-link {
+      display: flex;
+      min-height: 40px;
+      align-items: center;
+      padding: 0 10px;
+      border-radius: 4px;
+      color: #545454;
+      text-decoration: none;
+    }
+
+    .nav-link[aria-current="page"] {
+      background: #e9e9e4;
+      color: #111111;
+      font-weight: 600;
+    }
+
+    .rail-status {
+      margin: auto 10px 0;
+      padding-top: 14px;
+      border-top: 1px solid #d7d7d2;
+      color: #72726e;
+      font-size: 12px;
+    }
+
+    .application-content { min-width: 0; }
+
+    .context-bar {
+      display: flex;
+      min-height: 48px;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 0 32px;
+      border-bottom: 1px solid #d7d7d2;
+      color: #545454;
+      font-size: 13px;
+    }
+
+    .context-status { white-space: nowrap; }
+
+    .context-status::before {
+      content: "";
+      display: inline-block;
+      width: 7px;
+      height: 7px;
+      margin-right: 7px;
+      border-radius: 50%;
+      background: #1f5139;
+      vertical-align: 1px;
+    }
+
+    main {
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 34px 32px 72px;
+    }
+
+    .eyebrow {
+      margin: 0;
+      color: #72726e;
+      font-size: 13px;
+    }
+
+    h1,
+    h2,
+    h3,
+    p { margin-top: 0; }
+
+    h1 {
+      margin-bottom: 6px;
+      font-size: 26px;
+      font-weight: 650;
+      line-height: 1.32;
+      letter-spacing: 0;
+      text-wrap: pretty;
+    }
+
+    h2 {
+      margin-bottom: 0;
+      font-size: 18px;
+      font-weight: 650;
+      line-height: 1.4;
+    }
+
+    h3 {
+      margin-bottom: 0;
+      font-size: 15px;
+      font-weight: 650;
+      line-height: 1.45;
+    }
+
+    .page-lead {
+      margin-bottom: 0;
+      color: #545454;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    .result-summary {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 24px;
+      align-items: end;
+      margin-top: 28px;
+      padding: 24px 0;
+      border-top: 1px solid #111111;
+      border-bottom: 1px solid #d7d7d2;
+    }
+
+    .status-line {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+      margin: 0 0 8px;
+      color: #1f5139;
+      font-size: 14px;
+      font-weight: 650;
+    }
+
+    .status-dot {
+      display: inline-block;
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: #1f5139;
+    }
+
+    .summary-name {
+      margin: 0;
+      color: #111111;
+      font-size: 20px;
+      font-weight: 650;
+      line-height: 1.38;
+      text-wrap: pretty;
+    }
+
+    .summary-subtext {
+      margin: 8px 0 0;
+      color: #545454;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    .primary-button,
+    .secondary-button,
+    .text-button {
+      min-height: 40px;
+      border: 1px solid #8a8a84;
+      border-radius: 5px;
+      background: #ffffff;
+      color: #111111;
+      font-size: 14px;
+      font-weight: 600;
+    }
+
+    .primary-button {
+      padding: 0 14px;
+      border-color: #111111;
+      background: #111111;
+      color: #ffffff;
+    }
+
+    .secondary-button { padding: 0 12px; }
+
+    .text-button {
+      min-height: auto;
+      padding: 0;
+      border: 0;
+      border-radius: 0;
+      color: #245f42;
+      text-decoration: underline;
+      text-underline-offset: 3px;
+    }
+
+    .outcome-metrics {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(110px, 1fr));
+      gap: 0;
+      margin: 0;
+      padding: 0;
+    }
+
+    .metric {
+      min-width: 0;
+      padding: 0 20px;
+      border-left: 1px solid #d7d7d2;
+    }
+
+    .metric:first-child { border-left: 0; }
+
+    .metric dt {
+      margin-bottom: 7px;
+      color: #72726e;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
+    .metric dd {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 650;
+      line-height: 1.25;
+      white-space: nowrap;
+    }
+
+    .section {
+      margin-top: 34px;
+      padding-top: 18px;
+      border-top: 1px solid #8a8a84;
+    }
+
+    .section-heading {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 8px;
+    }
+
+    .section-caption {
+      margin: 0;
+      color: #72726e;
+      font-size: 13px;
+      line-height: 1.5;
+      text-align: right;
+    }
+
+    .result-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 16px 32px;
+      align-items: start;
+      padding: 18px 0;
+      border-top: 1px solid #d7d7d2;
+    }
+
+    .result-row:first-of-type { border-top: 0; }
+
+    .file-kind {
+      margin: 0 0 8px;
+      color: #72726e;
+      font-size: 12px;
+      font-weight: 650;
+      letter-spacing: 0;
+      line-height: 1.4;
+    }
+
+    .row-title {
+      margin: 0;
+      font-size: 16px;
+      font-weight: 650;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+    }
+
+    .row-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px 14px;
+      margin: 9px 0 0;
+      color: #545454;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .row-meta span + span::before {
+      content: "";
+      display: inline-block;
+      width: 3px;
+      height: 3px;
+      margin: 0 14px 2px 0;
+      border-radius: 50%;
+      background: #8a8a84;
+    }
+
+    .parser-note {
+      margin: 12px 0 0;
+      color: #245f42;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .parser-note strong { color: #1d4f37; }
+
+    .row-action {
+      padding-top: 4px;
+      white-space: nowrap;
+    }
+
+    .note-count {
+      color: #545454;
+      font-size: 13px;
+      white-space: nowrap;
+    }
+
+    .note-preview {
+      display: none;
+      grid-column: 1 / -1;
+      margin-top: 2px;
+      padding: 16px 18px;
+      border: 1px solid #d7d7d2;
+      background: #f6f6f4;
+    }
+
+    .note-preview[data-open="true"] { display: block; }
+
+    .note-preview h4 {
+      margin: 0 0 10px;
+      font-size: 14px;
+      line-height: 1.45;
+    }
+
+    .note-preview p {
+      margin-bottom: 0;
+      color: #333333;
+      font-size: 14px;
+      line-height: 1.75;
+    }
+
+    .note-preview code {
+      padding: 2px 4px;
+      background: #e9e9e4;
+      color: #333333;
+      font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+      font-size: 0.9em;
+    }
+
+    .details-section { margin-top: 34px; }
+
+    details {
+      border-top: 1px solid #8a8a84;
+      border-bottom: 1px solid #d7d7d2;
+    }
+
+    summary {
+      display: flex;
+      min-height: 60px;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      cursor: pointer;
+      list-style: none;
+      font-size: 15px;
+      font-weight: 650;
+    }
+
+    summary::-webkit-details-marker { display: none; }
+
+    summary::after {
+      content: "+";
+      color: #545454;
+      font-size: 22px;
+      font-weight: 400;
+    }
+
+    details[open] summary::after { content: "-"; }
+
+    .diagnostics {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 0 32px;
+      padding: 0 0 20px;
+    }
+
+    .diagnostic-row {
+      display: grid;
+      grid-template-columns: minmax(100px, 0.35fr) minmax(0, 1fr);
+      gap: 12px;
+      padding: 11px 0;
+      border-top: 1px solid #e9e9e4;
+      color: #545454;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .diagnostic-row:nth-child(-n + 2) { border-top: 0; }
+
+    .diagnostic-label { color: #72726e; }
+
+    .diagnostic-value {
+      min-width: 0;
+      color: #222222;
+      overflow-wrap: anywhere;
+    }
+
+    .inline-copy {
+      margin-left: 8px;
+      color: #245f42;
+      font-size: 12px;
+      text-decoration: underline;
+      text-underline-offset: 3px;
+    }
+
+    .toast {
+      position: fixed;
+      right: 24px;
+      bottom: 24px;
+      z-index: 10;
+      max-width: min(360px, calc(100vw - 48px));
+      padding: 12px 14px;
+      border: 1px solid #111111;
+      background: #111111;
+      color: #ffffff;
+      font-size: 13px;
+      line-height: 1.45;
+      opacity: 0;
+      pointer-events: none;
+      transform: translateY(10px);
+      transition: opacity 160ms ease, transform 160ms ease;
+    }
+
+    .toast[data-visible="true"] {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    @media (max-width: 840px) {
+      .app-shell { grid-template-columns: 1fr; }
+      .navigation-rail { display: none; }
+      .context-bar { padding: 0 20px; }
+      main { padding: 28px 20px 56px; }
+      .result-summary { grid-template-columns: 1fr; }
+      .outcome-metrics { width: 100%; }
+      .metric { padding: 0 14px; }
+      .metric:first-child { padding-left: 0; }
+      .diagnostics { grid-template-columns: 1fr; }
+      .diagnostic-row:nth-child(2) { border-top: 1px solid #e9e9e4; }
+    }
+
+    @media (max-width: 560px) {
+      .context-bar { align-items: flex-start; flex-direction: column; gap: 2px; padding-top: 12px; padding-bottom: 12px; }
+      .result-summary { gap: 20px; padding: 20px 0; }
+      .summary-name { font-size: 18px; }
+      .outcome-metrics { grid-template-columns: 1fr; gap: 12px; }
+      .metric { padding: 0; border-left: 0; }
+      .metric + .metric { padding-top: 12px; border-top: 1px solid #d7d7d2; }
+      .section-heading { align-items: flex-start; flex-direction: column; gap: 4px; }
+      .section-caption { text-align: left; }
+      .result-row { grid-template-columns: 1fr; gap: 14px; }
+      .row-action { padding-top: 0; }
+      .diagnostic-row { grid-template-columns: 1fr; gap: 2px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="navigation-rail" aria-label="主导航">
+      <p class="brand">本机工作区</p>
+      <nav>
+        <ul class="nav-list">
+          <li><a class="nav-link" href="#workbench">工作台</a></li>
+          <li><a class="nav-link" href="#materials">资料</a></li>
+          <li><a class="nav-link" aria-current="page" href="#import-results">任务</a></li>
+          <li><a class="nav-link" href="#settings">设置</a></li>
+        </ul>
+      </nav>
+      <p class="rail-status">本机服务正在运行</p>
+    </aside>
+
+    <div class="application-content">
+      <header class="context-bar">
+        <span>任务 / 导入结果</span>
+        <span class="context-status">索引可用</span>
+      </header>
+
+      <main id="import-results">
+        <p class="eyebrow">导入结果</p>
+        <h1>考前教案！700个四六级教你高频词.pdf</h1>
+        <p class="page-lead">已导入到 Obsidian_test。以下是可阅读、检索和继续使用的结果。</p>
+
+        <section class="result-summary" aria-label="导入完成摘要">
+          <div>
+            <p class="status-line"><span class="status-dot" aria-hidden="true"></span>导入完成</p>
+            <p class="summary-name">资料已准备就绪</p>
+            <p class="summary-subtext">所有可处理内容已进入索引，已生成一篇派生笔记。</p>
+          </div>
+          <dl class="outcome-metrics" aria-label="导入结果统计">
+            <div class="metric">
+              <dt>已索引</dt>
+              <dd>35 页</dd>
+            </div>
+            <div class="metric">
+              <dt>派生笔记</dt>
+              <dd>1 篇</dd>
+            </div>
+            <div class="metric">
+              <dt>待处理</dt>
+              <dd>无</dd>
+            </div>
+          </dl>
+        </section>
+
+        <section class="section" aria-labelledby="materials-heading">
+          <div class="section-heading">
+            <h2 id="materials-heading">导入内容</h2>
+            <p class="section-caption">1 份资料已完成处理</p>
+          </div>
+
+          <article class="result-row" aria-label="已导入资料">
+            <div>
+              <p class="file-kind">PDF</p>
+              <h3 class="row-title">考前教案！700个四六级教你高频词.pdf</h3>
+              <p class="row-meta">
+                <span>已索引 35 页</span>
+                <span>已生成 1 篇笔记</span>
+                <span>无需 OCR</span>
+              </p>
+              <p class="parser-note"><strong>处理方式：</strong>MinerU（PDF 版式解析）</p>
+            </div>
+            <div class="row-action"><button class="secondary-button" type="button" data-open-note>查看笔记</button></div>
+          </article>
+        </section>
+
+        <section class="section" aria-labelledby="notes-heading">
+          <div class="section-heading">
+            <h2 id="notes-heading">派生笔记</h2>
+            <p class="section-caption">可继续编辑并保留来源关联</p>
+          </div>
+
+          <article class="result-row" aria-label="已生成笔记">
+            <div>
+              <p class="file-kind">MARKDOWN</p>
+              <h3 class="row-title">考前教案！700个四六级教你高频词</h3>
+              <p class="row-meta">
+                <span>来自上述 PDF</span>
+                <span>已提交到 vault</span>
+              </p>
+            </div>
+            <div class="row-action">
+              <span class="note-count">1 个版本</span>
+            </div>
+            <div class="note-preview" data-note-preview data-open="false">
+              <h4># 考前教案！700个四六级教你高频词</h4>
+              <p>本笔记由原始资料整理生成，保留了与来源 PDF 的关联。继续编辑时，原始资料可通过 <code>[[原始资料]]</code> 回溯。</p>
+            </div>
+          </article>
+        </section>
+
+        <section class="details-section" aria-label="导入诊断信息">
+          <details>
+            <summary>导入详情</summary>
+            <div class="diagnostics">
+              <div class="diagnostic-row">
+                <span class="diagnostic-label">解析器</span>
+                <span class="diagnostic-value">MinerU（PDF 版式解析）</span>
+              </div>
+              <div class="diagnostic-row">
+                <span class="diagnostic-label">处理阶段</span>
+                <span class="diagnostic-value">扫描、解析、生成笔记、提交与索引均已完成</span>
+              </div>
+              <div class="diagnostic-row">
+                <span class="diagnostic-label">任务编号</span>
+                <span class="diagnostic-value"><span data-task-id>2835e1d7-0a4c-4bd5-8a31-33a2dff58830</span><button class="inline-copy" type="button" data-copy-task>复制</button></span>
+              </div>
+              <div class="diagnostic-row">
+                <span class="diagnostic-label">审核快照</span>
+                <span class="diagnostic-value">已提交，无待审核项</span>
+              </div>
+              <div class="diagnostic-row">
+                <span class="diagnostic-label">来源校验</span>
+                <span class="diagnostic-value">863647de-3d7c-418d-ba6d-d96d243bdf0f</span>
+              </div>
+              <div class="diagnostic-row">
+                <span class="diagnostic-label">内容哈希</span>
+                <span class="diagnostic-value">7233ab1e9f2ad4f944cb0f3654f81765e7b9f294f4815e23d6eec9da0060958a</span>
+              </div>
+            </div>
+          </details>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <div class="toast" role="status" aria-live="polite" data-toast data-visible="false"></div>
+
+  <script>
+    const preview = document.querySelector("[data-note-preview]");
+    const noteButton = document.querySelector("[data-open-note]");
+    const toast = document.querySelector("[data-toast]");
+    let toastTimer;
+
+    function showToast(message) {
+      toast.textContent = message;
+      toast.dataset.visible = "true";
+      window.clearTimeout(toastTimer);
+      toastTimer = window.setTimeout(() => {
+        toast.dataset.visible = "false";
+      }, 2400);
+    }
+
+    noteButton.addEventListener("click", () => {
+      const isOpen = preview.dataset.open === "true";
+      preview.dataset.open = String(!isOpen);
+      noteButton.textContent = isOpen ? "查看笔记" : "收起笔记";
+      if (!isOpen) preview.querySelector("h4").focus?.();
+    });
+
+    document.querySelector("[data-copy-task]").addEventListener("click", async () => {
+      const taskId = document.querySelector("[data-task-id]").textContent;
+      try {
+        await navigator.clipboard.writeText(taskId);
+        showToast("任务编号已复制");
+      } catch {
+        showToast("任务编号：" + taskId);
+      }
+    });
+  </script>
+</body>
+</html>

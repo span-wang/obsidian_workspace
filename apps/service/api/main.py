@@ -6,6 +6,7 @@ import threading
 import time
 import webbrowser
 from pathlib import Path
+from queue import Queue
 from typing import Annotated, Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
@@ -81,6 +82,7 @@ from domain.sessions import (
     PersistentSession,
     SessionCitation,
     SessionCompletenessResult,
+    SessionDeepCreationResult,
     SessionDetail,
     SessionGenerationResult,
     SessionKnowledgeOrganizationResult,
@@ -668,6 +670,9 @@ def session_task_snapshot_payload(snapshot) -> dict[str, object]:
         "knowledge_organization_plan": knowledge_organization_plan_payload(
             snapshot.organization_sections
         ) if snapshot.intent == "knowledge-organization" else None,
+        "deep_creation_plan": deep_creation_plan_payload(
+            snapshot.deep_creation_sections
+        ) if snapshot.intent == "deep-creation" else None,
         "status": snapshot.status,
         "invalidation_reason": snapshot.invalidation_reason,
         "created_at": snapshot.created_at,
@@ -711,6 +716,11 @@ def session_task_preview_payload(preview) -> dict[str, object]:
             evidence_count=preview.organization_evidence_count,
             is_bounded_preview=preview.organization_budget_exceeded,
         ) if preview.intent == "knowledge-organization" else None,
+        "deep_creation_plan": deep_creation_plan_payload(
+            preview.deep_creation_sections,
+            evidence_count=preview.deep_creation_evidence_count,
+            is_bounded_preview=preview.deep_creation_budget_exceeded,
+        ) if preview.intent == "deep-creation" else None,
         "is_ready": preview.is_ready,
         "blocking_reason": preview.blocking_reason,
         "recovery_action": preview.recovery_action,
@@ -926,6 +936,45 @@ def knowledge_organization_plan_payload(
     }
 
 
+def deep_creation_plan_payload(
+    sections, *, evidence_count: int | None = None, is_bounded_preview: bool = False
+) -> dict[str, object]:
+    return {
+        "section_count": len(sections),
+        "local_evidence_count": evidence_count if evidence_count is not None else sum(
+            len(section.local_evidence) for section in sections
+        ),
+        "is_bounded_preview": is_bounded_preview,
+        "sections": [
+            {
+                "ordinal": section.ordinal,
+                "title": section.title,
+                "goal": section.goal,
+                "scope_path": section.scope_path,
+                "local_evidence_count": len(section.local_evidence),
+                "local_evidence": [
+                    {
+                        "ordinal": item.ordinal,
+                        "source_ordinal": item.source_ordinal,
+                        "identity_kind": item.identity_kind,
+                        "relative_path": item.relative_path,
+                        "content_sha256": item.content_sha256,
+                        "source_id": item.source_id,
+                        "source_content_hash": item.source_content_hash,
+                        "source_path": item.source_path,
+                        "heading": item.heading,
+                        "location": item.location,
+                        "page": item.page,
+                        "excerpt": item.excerpt,
+                    }
+                    for item in section.local_evidence
+                ],
+            }
+            for section in sections
+        ],
+    }
+
+
 def session_knowledge_organization_result_payload(
     result: SessionKnowledgeOrganizationResult, snapshot=None
 ) -> dict[str, object]:
@@ -1002,6 +1051,60 @@ def session_knowledge_organization_result_payload(
     }
 
 
+def session_deep_creation_result_payload(
+    result: SessionDeepCreationResult, snapshot=None
+) -> dict[str, object]:
+    sections = snapshot.deep_creation_sections if snapshot is not None else ()
+    outcomes = {outcome.ordinal: outcome for outcome in result.outcomes}
+    stale = snapshot is not None and snapshot.status == "invalidated"
+    plan = deep_creation_plan_payload(sections)
+    rendered_sections = []
+    for section in plan["sections"]:
+        outcome = outcomes.get(section["ordinal"])
+        rendered_sections.append({
+            **section,
+            "status": outcome.status if outcome is not None else "planned",
+            "reason": outcome.reason if outcome is not None else None,
+            "content": outcome.content if outcome is not None else None,
+            "model_judgement": outcome.model_judgement if outcome is not None else None,
+        })
+    return {
+        "result_id": result.result_id,
+        "task_id": result.task_id,
+        "snapshot_id": result.snapshot_id,
+        "status": "source-changed" if stale else result.status,
+        "summary": result.summary,
+        "recovery_action": result.recovery_action,
+        "duration_ms": result.duration_ms,
+        "created_at": result.created_at,
+        "authorization_id": result.authorization_id,
+        "authorization_status": result.authorization_status,
+        "vault_id": snapshot.vault_id if snapshot is not None else None,
+        "snapshot_status": snapshot.status if snapshot is not None else None,
+        "is_stale": stale,
+        "invalidation_reason": snapshot.invalidation_reason if snapshot is not None else None,
+        "frozen_context": {
+            "vault_id": snapshot.vault_id,
+            "scope_kind": snapshot.scope_kind,
+            "scope_path": snapshot.scope_path,
+            "source_count": snapshot.source_count,
+            "source_digest": snapshot.source_digest,
+            "index_status": snapshot.index_status,
+            "index_updated_at": snapshot.index_updated_at,
+            "index_digest": snapshot.index_digest,
+            "policy_revision": snapshot.policy_revision,
+            "exclusion_summary": snapshot.exclusion_summary,
+        } if snapshot is not None else None,
+        "section_counts": {
+            "planned": len(sections),
+            "completed": sum(section["status"] == "completed" for section in rendered_sections),
+            "failed": sum(section["status"] == "failed" for section in rendered_sections),
+            "recoverable": sum(section["status"] == "recoverable" for section in rendered_sections),
+        },
+        "sections": rendered_sections,
+    }
+
+
 def session_attachment_payload(attachment) -> dict[str, object]:
     return {
         "attachment_id": attachment.attachment_id,
@@ -1042,6 +1145,10 @@ def session_detail_payload(
                 result, snapshots.get(result.snapshot_id)
             )
             for result in detail.knowledge_organization_results
+        ],
+        "deep_creation_results": [
+            session_deep_creation_result_payload(result, snapshots.get(result.snapshot_id))
+            for result in detail.deep_creation_results
         ],
     }
 
@@ -1121,6 +1228,25 @@ def index_health_payload(health: IndexHealth) -> dict[str, object]:
         "stale_details": list(health.stale_details),
         "pending_count": health.pending_count,
         "pending_paths": list(health.pending_paths),
+        "rich_block_read_mode": health.rich_block_read_mode,
+        "rich_block_status": health.rich_block_status,
+        "rich_block_issue_codes": list(health.rich_block_issue_codes),
+    }
+
+
+def graph_projection_summary_payload(summary) -> dict[str, object]:
+    return {
+        "vault_id": summary.vault_id,
+        "graph_id": summary.graph_id,
+        "graph_revision": summary.graph_revision,
+        "block_count": summary.block_count,
+        "retrievable_block_count": summary.retrievable_block_count,
+        "locator_summary": {
+            "type_counts": dict(summary.locator_type_counts),
+            "pdf_pages": list(summary.pdf_pages),
+            "docx_part_count": summary.docx_part_count,
+        },
+        "locator_digest": summary.locator_digest,
     }
 
 
@@ -1741,7 +1867,10 @@ def create_app(
     )
     app.state.indexing_service = indexing_service or IndexingService(
         app.state.vault_service,
-        SqliteIndexRepository(runtime.data_directory / "indexes.sqlite3"),
+        SqliteIndexRepository(
+            runtime.data_directory / "indexes.sqlite3",
+            rich_block_reads_enabled=runtime.rich_block_reads_enabled,
+        ),
         LocalVaultFilesystem(),
         app.state.policy_service,
     )
@@ -2063,11 +2192,75 @@ def create_app(
                 if isinstance(result, SessionCompletenessResult)
                 else session_knowledge_organization_result_payload(result, snapshot)
                 if isinstance(result, SessionKnowledgeOrganizationResult)
+                else session_deep_creation_result_payload(result, snapshot)
+                if isinstance(result, SessionDeepCreationResult)
                 else session_retrieval_result_payload(result, snapshot)
             )
             return {"result": payload}
         except Exception as error:
             raise session_error(error) from error
+
+    @app.post(
+        "/api/sessions/{session_id}/tasks/{task_id}/execute/stream",
+        dependencies=[Depends(require_current_local_session)],
+    )
+    def stream_persistent_session_task(
+        request: Request,
+        session_id: str,
+        task_id: str,
+        command: SessionTaskExecutionCommand,
+    ) -> StreamingResponse:
+        events: Queue[tuple[str, dict[str, object] | None]] = Queue()
+
+        def run_execution() -> None:
+            try:
+                result = app.state.session_service.execute_task(
+                    session_id,
+                    task_id,
+                    on_stream_chunk=lambda ordinal, content: events.put(
+                        ("chunk", {"ordinal": ordinal, "content": content})
+                    ),
+                )
+                detail = app.state.session_service.detail(session_id)
+                snapshot = next(
+                    (item for item in detail.task_snapshots if item.snapshot_id == result.snapshot_id),
+                    None,
+                )
+                payload = (
+                    session_completeness_result_payload(result, snapshot)
+                    if isinstance(result, SessionCompletenessResult)
+                    else session_knowledge_organization_result_payload(result, snapshot)
+                    if isinstance(result, SessionKnowledgeOrganizationResult)
+                    else session_deep_creation_result_payload(result, snapshot)
+                    if isinstance(result, SessionDeepCreationResult)
+                    else session_retrieval_result_payload(result, snapshot)
+                )
+                events.put(("result", {"result": payload}))
+            except Exception as error:
+                message = (
+                    str(error)
+                    if isinstance(error, (SessionNotFoundError, SessionValidationError))
+                    else "The session task could not be completed."
+                )
+                events.put(("error", {"message": message}))
+            finally:
+                events.put(("done", None))
+
+        threading.Thread(target=run_execution, daemon=True).start()
+
+        def event_stream():
+            while True:
+                event, payload = events.get()
+                if event == "done":
+                    return
+                encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                yield f"event: {event}\ndata: {encoded}\n\n"
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @app.patch(
         "/api/sessions/{session_id}/generation-results/{result_id}",
@@ -2909,6 +3102,29 @@ def create_app(
             return {"index": index_health_payload(app.state.indexing_service.health(vault_id))}
         except Exception as error:
             raise vault_error(error) from error
+
+    @app.get("/api/vaults/{vault_id}/graph-projections/{graph_id}/{graph_revision}")
+    def get_graph_projection_summary(
+        request: Request, vault_id: str, graph_id: str, graph_revision: int
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            summary = app.state.indexing_service.graph_projection_summary(
+                vault_id, graph_id, graph_revision
+            )
+        except Exception as error:
+            raise vault_error(error) from error
+        if summary is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "graph_projection_not_found",
+                    "message": "Durable graph projection was not found.",
+                    "details": {},
+                    "retryable": False,
+                },
+            )
+        return {"projection": graph_projection_summary_payload(summary)}
 
     @app.get("/api/vaults/{vault_id}/graph/events")
     async def stream_vault_graph_events(request: Request, vault_id: str):

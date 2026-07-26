@@ -18,7 +18,10 @@
     "unit": "npm --prefix apps/web run test && uv run --directory apps/service pytest tests/unit",
     "integration": "npm run build && uv run --directory apps/service pytest tests/integration",
     "browser-test": "npm run build && playwright test --config browser-tests/playwright.config.mjs",
-    "test": "npm run unit && npm run integration && npm run browser-test"
+    "test": "npm run unit && npm run integration && npm run browser-test",
+    "retrieval:baseline": "uv run --directory apps/service python -m application.retrieval_baseline --fixture tests/fixtures/retrieval-golden-v1.json --output ../../docs/ret-00-04-baseline-v1.json",
+    "progress:build": "node scripts/generate-progress.mjs",
+    "progress:check": "node scripts/generate-progress.mjs --check"
   },
   "devDependencies": {
     "@playwright/test": "1.61.1"

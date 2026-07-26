@@ -65,6 +65,14 @@ def task_service_fixture(tmp_path, documents=()):
             self.generated_prompts.append(prompt)
             return "基于已冻结证据的结构化结论。"
 
+        def stream_chat(self, provider_id, model_id, prompt):
+            if not self.available:
+                raise ValueError("Model unavailable")
+            assert (provider_id, model_id) == ("provider-1", "chat-1")
+            self.generated_prompts.append(prompt)
+            yield "基于已冻结"
+            yield "证据的结构化结论。"
+
     class Policies:
         policy_revision = 1
         outbound_mode = "always-allow"
@@ -1528,3 +1536,100 @@ def test_knowledge_organization_invalidates_when_frozen_index_blocks_change(tmp_
     with pytest.raises(SessionValidationError, match="no longer ready"):
         service.execute_task(session.session_id, snapshot.task_id)
     assert repository.get_detail(session.session_id).task_snapshots[0].status == "invalidated"
+
+
+def test_deep_creation_waits_for_authorization_then_generates_model_judgement(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1", "vault-1", "notes/unit/vocabulary.md", "a" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Vocabulary", "word evidence"),), "now",
+    )
+    service, repository, session, _, providers, policies, _ = task_service_fixture(tmp_path, (document,))
+
+    policies.outbound_mode = "ask-each-task"
+    snapshot = service.create_task(
+        session.session_id, "根据资料写一段学习笔记", intent="deep-creation"
+    )
+
+    waiting = service.execute_task(session.session_id, snapshot.task_id)
+
+    assert waiting.status == "waiting-authorization"
+    assert providers.generated_prompts == []
+
+    completed = service.confirm_deep_creation_authorization(
+        session.session_id, snapshot.task_id, waiting.authorization_id, approved=True
+    )
+    restarted = SqliteSessionRepository(repository.database_path).get_detail(session.session_id)
+
+    assert completed.status == "completed"
+    assert completed.completed_ordinals == (1,)
+    assert completed.outcomes[0].local_evidence_count == 1
+    assert completed.outcomes[0].model_judgement.startswith("模型判断：")
+    assert "word evidence" in providers.generated_prompts[0]
+    assert "互联网证据" not in providers.generated_prompts[0]
+    assert restarted.task_snapshots[0].deep_creation_sections == snapshot.deep_creation_sections
+    assert restarted.deep_creation_results[0] == completed
+
+
+def test_deep_creation_streams_chunks_while_persisting_its_completed_section(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1", "vault-1", "notes/unit/vocabulary.md", "a" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Vocabulary", "word evidence"),), "now",
+    )
+    service, repository, session, _, _, _, _ = task_service_fixture(tmp_path, (document,))
+    snapshot = service.create_task(
+        session.session_id, "根据资料写一段学习笔记", intent="deep-creation"
+    )
+    chunks: list[tuple[int, str]] = []
+
+    result = service.execute_task(
+        session.session_id,
+        snapshot.task_id,
+        on_stream_chunk=lambda ordinal, chunk: chunks.append((ordinal, chunk)),
+    )
+
+    assert chunks == [(1, "基于已冻结"), (1, "证据的结构化结论。")]
+    assert result.status == "completed"
+    assert result.outcomes[0].content == "基于已冻结证据的结构化结论。"
+    assert repository.get_detail(session.session_id).deep_creation_results[0] == result
+
+
+def test_deep_creation_detail_keeps_an_active_stream_execution_in_progress(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1", "vault-1", "notes/unit/vocabulary.md", "a" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Vocabulary", "word evidence"),), "now",
+    )
+    service, repository, session, _, providers, _, _ = task_service_fixture(tmp_path, (document,))
+    snapshot = service.create_task(
+        session.session_id, "根据资料写一段学习笔记", intent="deep-creation"
+    )
+    started = Event()
+    proceed = Event()
+
+    def block_stream(provider_id, model_id, prompt):
+        assert (provider_id, model_id) == ("provider-1", "chat-1")
+        providers.generated_prompts.append(prompt)
+        yield "基于已冻结"
+        started.set()
+        assert proceed.wait(2)
+        yield "证据的结构化结论。"
+
+    providers.stream_chat = block_stream
+    execution: dict[str, object] = {}
+    worker = Thread(
+        target=lambda: execution.setdefault(
+            "result",
+            service.execute_task(session.session_id, snapshot.task_id, on_stream_chunk=lambda *_: None),
+        )
+    )
+    worker.start()
+    assert started.wait(2)
+
+    active = service.detail(session.session_id)
+
+    assert active.task_snapshots[0].status == "preparing"
+    assert active.deep_creation_results[0].status == "preparing"
+    proceed.set()
+    worker.join(2)
+    assert not worker.is_alive()
+    assert execution["result"].status == "completed"
+    assert repository.get_detail(session.session_id).task_snapshots[0].status == "completed"

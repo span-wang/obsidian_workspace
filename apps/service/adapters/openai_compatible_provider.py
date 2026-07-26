@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import json
+import socket
+import ssl
 import time
 from threading import Event
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-
-class ProviderClientError(RuntimeError):
-    """Raised without forwarding a provider response body to callers."""
+from ports.provider_client import ProviderClientError
 
 
 class _RejectRedirects(HTTPRedirectHandler):
@@ -18,9 +18,8 @@ class _RejectRedirects(HTTPRedirectHandler):
 
 class OpenAiCompatibleProviderClient:
     _MAX_RESPONSE_BYTES = 1_000_000
-    _READ_TIMEOUT_SECONDS = 1
 
-    def __init__(self, timeout_seconds: float = 10) -> None:
+    def __init__(self, timeout_seconds: float = 60) -> None:
         self.timeout_seconds = timeout_seconds
         self._opener = build_opener(_RejectRedirects())
 
@@ -110,28 +109,52 @@ class OpenAiCompatibleProviderClient:
         prompt: str,
         cancel_event: Event | None = None,
     ) -> str:
+        return "".join(self.stream_chat(endpoint, secret, model_id, prompt, cancel_event)).strip()
+
+    def stream_chat(
+        self,
+        endpoint: str,
+        secret: str,
+        model_id: str,
+        prompt: str,
+        cancel_event: Event | None = None,
+    ):
         normalized_prompt = prompt.strip()
         if not normalized_prompt or len(normalized_prompt) > 200_000:
             raise ProviderClientError("Generation prompt is invalid.")
-        payload = self._json_request(
+        request = self._request(
             endpoint,
             "/chat/completions",
             secret,
             {
                 "model": model_id,
                 "messages": [{"role": "user", "content": normalized_prompt}],
-                "stream": False,
+                "stream": True,
             },
-            cancel_event,
         )
-        choices = payload.get("choices")
-        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
-            raise ProviderClientError("Generation returned no usable choices.")
-        message = choices[0].get("message")
-        content = message.get("content") if isinstance(message, dict) else None
-        if not isinstance(content, str) or not content.strip() or len(content) > self._MAX_RESPONSE_BYTES:
+        deadline = self._deadline()
+        saw_chunk = False
+        try:
+            with self._open(request, cancel_event, deadline) as response:
+                for event in self._stream_events(response, cancel_event, deadline):
+                    if event == "[DONE]":
+                        continue
+                    try:
+                        payload = json.loads(event)
+                    except json.JSONDecodeError:
+                        continue
+                    choices = payload.get("choices") if isinstance(payload, dict) else None
+                    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+                        continue
+                    delta = choices[0].get("delta")
+                    content = delta.get("content") if isinstance(delta, dict) else None
+                    if isinstance(content, str) and content:
+                        saw_chunk = True
+                        yield content
+        except (HTTPError, URLError, TimeoutError, ProviderClientError) as error:
+            raise self._request_error(error) from error
+        if not saw_chunk:
             raise ProviderClientError("Generation returned no usable content.")
-        return content.strip()
 
     def _json_request(
         self,
@@ -154,7 +177,7 @@ class OpenAiCompatibleProviderClient:
 
     def _open(self, request: Request, cancel_event: Event | None, deadline: float):
         self._ensure_active(cancel_event, deadline)
-        timeout = min(self._READ_TIMEOUT_SECONDS, max(deadline - time.monotonic(), 0.001))
+        timeout = max(deadline - time.monotonic(), 0.001)
         return self._opener.open(request, timeout=timeout)
 
     def _read_response(self, response, cancel_event: Event | None, deadline: float) -> bytes:  # noqa: ANN001
@@ -183,6 +206,7 @@ class OpenAiCompatibleProviderClient:
             if total > self._MAX_RESPONSE_BYTES:
                 raise ProviderClientError("Provider response exceeded the size limit.")
             buffered += chunk
+            deadline = self._deadline()
             while b"\n" in buffered:
                 raw_line, buffered = buffered.split(b"\n", 1)
                 line = raw_line.decode("utf-8", errors="replace").strip()
@@ -226,4 +250,13 @@ class OpenAiCompatibleProviderClient:
             return ProviderClientError(f"Provider request failed with HTTP {error.code}.")
         if isinstance(error, ProviderClientError):
             return error
+        reason = error.reason if isinstance(error, URLError) else error
+        if isinstance(reason, TimeoutError):
+            return ProviderClientError("Provider request timed out.")
+        if isinstance(reason, socket.gaierror):
+            return ProviderClientError("Provider hostname could not be resolved.")
+        if isinstance(reason, ConnectionRefusedError):
+            return ProviderClientError("Provider connection was refused.")
+        if isinstance(reason, ssl.SSLError):
+            return ProviderClientError("Provider TLS connection failed.")
         return ProviderClientError("Provider request could not be completed.")

@@ -6,6 +6,7 @@ from domain.sessions import (
     PersistentSession,
     SessionCitation,
     SessionCompletenessResult,
+    SessionDeepCreationResult,
     SessionAttachment,
     SessionDetail,
     SessionGenerationResult,
@@ -112,6 +113,15 @@ class SessionRepository(Protocol):
         snapshot: SessionTaskSnapshot,
         task_state: SessionTaskState,
         result: SessionKnowledgeOrganizationResult,
+        *,
+        expected_status: str = "prepared",
+    ) -> bool: ...
+
+    def persist_deep_creation_execution(
+        self,
+        snapshot: SessionTaskSnapshot,
+        task_state: SessionTaskState,
+        result: SessionDeepCreationResult,
         *,
         expected_status: str = "prepared",
     ) -> bool: ...

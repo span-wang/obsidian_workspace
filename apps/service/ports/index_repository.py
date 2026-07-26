@@ -1,6 +1,7 @@
 from typing import Protocol
 
-from domain.indexing import IndexHealth, IndexJob, IndexedDocument
+from domain.graph_projection import DurableGraphProjection, GraphProjectionKey
+from domain.indexing import IndexBlockBackfillReport, IndexHealth, IndexJob, IndexedDocument
 
 
 class IndexRepository(Protocol):
@@ -18,7 +19,18 @@ class IndexRepository(Protocol):
 
     def documents(self, vault_id: str) -> list[IndexedDocument]: ...
 
+    def backfill_current_blocks(self, vault_id: str) -> IndexBlockBackfillReport: ...
+
     def save_document(self, document: IndexedDocument) -> None: ...
+
+    def save_committed_unit(
+        self,
+        documents: tuple[IndexedDocument, ...],
+        invalidations: tuple[tuple[str, str, str], ...],
+        projection: DurableGraphProjection | None,
+    ) -> None: ...
+
+    def get_graph_projection(self, key: GraphProjectionKey) -> DurableGraphProjection | None: ...
 
     def invalidate_current_path(self, vault_id: str, relative_path: str, reason: str) -> None: ...
 

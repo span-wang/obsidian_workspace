@@ -5,6 +5,7 @@ from pathlib import Path
 
 
 MINIMUM_SQLITE_VERSION = "3.45.1"
+RICH_BLOCK_READS_ENVIRONMENT_VARIABLE = "OBSIDIAN_PLATFORM_RICH_BLOCK_READS"
 
 
 class UnsupportedSQLiteVersion(RuntimeError):
@@ -15,6 +16,7 @@ class UnsupportedSQLiteVersion(RuntimeError):
 class RuntimeState:
     data_directory: Path
     sqlite_version: str
+    rich_block_reads_enabled: bool = False
 
 
 def version_parts(version: str) -> tuple[int, ...]:
@@ -29,6 +31,17 @@ def ensure_sqlite_version(version: str) -> str:
     return version
 
 
+def rich_block_reads_enabled(value: str | None) -> bool:
+    if value is None:
+        return False
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{RICH_BLOCK_READS_ENVIRONMENT_VARIABLE} must be a boolean value.")
+
+
 def initialize_runtime() -> RuntimeState:
     sqlite_version = ensure_sqlite_version(sqlite3.sqlite_version)
     configured_directory = os.environ.get("OBSIDIAN_PLATFORM_DATA_DIR")
@@ -38,4 +51,10 @@ def initialize_runtime() -> RuntimeState:
         else Path(os.environ["LOCALAPPDATA"]) / "ObsidianPersonalKnowledgePlatform"
     )
     data_directory.mkdir(parents=True, exist_ok=True)
-    return RuntimeState(data_directory=data_directory, sqlite_version=sqlite_version)
+    return RuntimeState(
+        data_directory=data_directory,
+        sqlite_version=sqlite_version,
+        rich_block_reads_enabled=rich_block_reads_enabled(
+            os.environ.get(RICH_BLOCK_READS_ENVIRONMENT_VARIABLE)
+        ),
+    )

@@ -13,6 +13,10 @@ from domain.sessions import (
     SessionCompletenessItemOutcome,
     SessionCompletenessResult,
     SessionDetail,
+    SessionDeepCreationPlanSection,
+    SessionDeepCreationResult,
+    SessionDeepCreationSectionOutcome,
+    SessionDeepCreationWebEvidence,
     SessionGenerationResult,
     SessionKnowledgeOrganizationEvidence,
     SessionKnowledgeOrganizationConclusion,
@@ -224,6 +228,38 @@ class SqliteSessionRepository:
                 )"""
             )
             connection.execute(
+                """CREATE TABLE IF NOT EXISTS session_task_snapshot_deep_creation_sections (
+                    snapshot_id TEXT NOT NULL REFERENCES session_task_snapshots(snapshot_id) ON DELETE CASCADE,
+                    ordinal INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    goal TEXT NOT NULL,
+                    scope_path TEXT,
+                    PRIMARY KEY (snapshot_id, ordinal)
+                )"""
+            )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS session_task_snapshot_deep_creation_evidence (
+                    snapshot_id TEXT NOT NULL REFERENCES session_task_snapshots(snapshot_id) ON DELETE CASCADE,
+                    section_ordinal INTEGER NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    source_ordinal INTEGER NOT NULL,
+                    identity_kind TEXT NOT NULL,
+                    relative_path TEXT NOT NULL,
+                    content_sha256 TEXT NOT NULL,
+                    source_id TEXT,
+                    source_content_hash TEXT,
+                    source_path TEXT,
+                    heading TEXT,
+                    location TEXT NOT NULL,
+                    page INTEGER,
+                    excerpt TEXT NOT NULL,
+                    PRIMARY KEY (snapshot_id, section_ordinal, ordinal),
+                    FOREIGN KEY (snapshot_id, section_ordinal)
+                        REFERENCES session_task_snapshot_deep_creation_sections(snapshot_id, ordinal)
+                        ON DELETE CASCADE
+                )"""
+            )
+            connection.execute(
                 """CREATE TABLE IF NOT EXISTS session_task_snapshot_coverage_items (
                     snapshot_id TEXT NOT NULL REFERENCES session_task_snapshots(snapshot_id) ON DELETE CASCADE,
                     ordinal INTEGER NOT NULL,
@@ -335,6 +371,28 @@ class SqliteSessionRepository:
             self._ensure_table_column(
                 connection, "session_knowledge_organization_results", "authorization_status", "TEXT",
             )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS session_deep_creation_results (
+                    result_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                    task_id TEXT NOT NULL,
+                    snapshot_id TEXT NOT NULL REFERENCES session_task_snapshots(snapshot_id) ON DELETE CASCADE,
+                    status TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    recovery_action TEXT,
+                    completed_ordinals_json TEXT NOT NULL,
+                    outcomes_json TEXT NOT NULL DEFAULT '[]',
+                    duration_ms INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    authorization_id TEXT,
+                    authorization_status TEXT,
+                    UNIQUE(session_id, task_id)
+                )"""
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS session_deep_creation_result_session_idx "
+                "ON session_deep_creation_results(session_id, created_at)"
+            )
 
     @staticmethod
     def _ensure_session_column(connection: sqlite3.Connection, name: str, declaration: str) -> None:
@@ -443,6 +501,22 @@ class SqliteSessionRepository:
                 ).fetchall()
                 for row in snapshots
             }
+            deep_creation_sections = {
+                row["snapshot_id"]: connection.execute(
+                    "SELECT * FROM session_task_snapshot_deep_creation_sections "
+                    "WHERE snapshot_id = ? ORDER BY ordinal",
+                    (row["snapshot_id"],),
+                ).fetchall()
+                for row in snapshots
+            }
+            deep_creation_evidence = {
+                row["snapshot_id"]: connection.execute(
+                    "SELECT * FROM session_task_snapshot_deep_creation_evidence "
+                    "WHERE snapshot_id = ? ORDER BY section_ordinal, ordinal",
+                    (row["snapshot_id"],),
+                ).fetchall()
+                for row in snapshots
+            }
             retrieval_results = connection.execute(
                 "SELECT * FROM session_retrieval_results WHERE session_id = ? ORDER BY created_at, result_id",
                 (session_id,),
@@ -463,6 +537,11 @@ class SqliteSessionRepository:
                 "WHERE session_id = ? ORDER BY created_at, result_id",
                 (session_id,),
             ).fetchall()
+            deep_creation_results = connection.execute(
+                "SELECT * FROM session_deep_creation_results "
+                "WHERE session_id = ? ORDER BY created_at, result_id",
+                (session_id,),
+            ).fetchall()
         return SessionDetail(
             self._session_from_row(session_row),
             tuple(self._message_from_row(row) for row in messages),
@@ -477,6 +556,8 @@ class SqliteSessionRepository:
                     coverage_items[row["snapshot_id"]],
                     organization_sections[row["snapshot_id"]],
                     organization_evidence[row["snapshot_id"]],
+                    deep_creation_sections[row["snapshot_id"]],
+                    deep_creation_evidence[row["snapshot_id"]],
                 )
                 for row in snapshots
             ),
@@ -486,6 +567,7 @@ class SqliteSessionRepository:
             ),
             tuple(self._completeness_result_from_row(row) for row in completeness_results),
             tuple(self._knowledge_organization_result_from_row(row) for row in organization_results),
+            tuple(self._deep_creation_result_from_row(row) for row in deep_creation_results),
         )
 
     def list_page(
@@ -873,6 +955,70 @@ class SqliteSessionRepository:
             self._touch_session(connection, snapshot.session_id, task_state.updated_at)
         return True
 
+    def persist_deep_creation_execution(
+        self,
+        snapshot: SessionTaskSnapshot,
+        task_state: SessionTaskState,
+        result: SessionDeepCreationResult,
+        *,
+        expected_status: str = "prepared",
+    ) -> bool:
+        with self._connect() as connection:
+            if self._update_task_snapshot(
+                connection, snapshot, expected_status=expected_status
+            ).rowcount != 1:
+                return False
+            self._upsert_task_state(connection, task_state)
+            connection.execute(
+                """INSERT INTO session_deep_creation_results (
+                    result_id, session_id, task_id, snapshot_id, status, summary, recovery_action,
+                    completed_ordinals_json, outcomes_json, duration_ms, created_at,
+                    authorization_id, authorization_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id, task_id) DO UPDATE SET
+                    result_id = excluded.result_id,
+                    snapshot_id = excluded.snapshot_id,
+                    status = excluded.status,
+                    summary = excluded.summary,
+                    recovery_action = excluded.recovery_action,
+                    completed_ordinals_json = excluded.completed_ordinals_json,
+                    outcomes_json = excluded.outcomes_json,
+                    duration_ms = excluded.duration_ms,
+                    created_at = excluded.created_at,
+                    authorization_id = excluded.authorization_id,
+                    authorization_status = excluded.authorization_status""",
+                (
+                    result.result_id, result.session_id, result.task_id, result.snapshot_id,
+                    result.status, result.summary, result.recovery_action,
+                    json.dumps(result.completed_ordinals),
+                    json.dumps([
+                        {
+                            "ordinal": outcome.ordinal,
+                            "status": outcome.status,
+                            "local_evidence_count": outcome.local_evidence_count,
+                            "reason": outcome.reason,
+                            "content": outcome.content,
+                            "model_judgement": outcome.model_judgement,
+                            "web_evidence": [
+                                {
+                                    "ordinal": item.ordinal,
+                                    "title": item.title,
+                                    "url": item.url,
+                                    "accessed_at": item.accessed_at,
+                                    "snippet": item.snippet,
+                                }
+                                for item in outcome.web_evidence
+                            ],
+                        }
+                        for outcome in result.outcomes
+                    ]),
+                    result.duration_ms, result.created_at,
+                    result.authorization_id, result.authorization_status,
+                ),
+            )
+            self._touch_session(connection, snapshot.session_id, task_state.updated_at)
+        return True
+
     @staticmethod
     def _session_select(where: str) -> str:
         return """SELECT sessions.*, (
@@ -1036,6 +1182,48 @@ class SqliteSessionRepository:
                 )
                 for section in snapshot.organization_sections
                 for item in section.evidence
+            ],
+        )
+        connection.executemany(
+            """INSERT INTO session_task_snapshot_deep_creation_sections (
+                snapshot_id, ordinal, title, goal, scope_path
+            ) VALUES (?, ?, ?, ?, ?)""",
+            [
+                (
+                    snapshot.snapshot_id,
+                    section.ordinal,
+                    section.title,
+                    section.goal,
+                    section.scope_path,
+                )
+                for section in snapshot.deep_creation_sections
+            ],
+        )
+        connection.executemany(
+            """INSERT INTO session_task_snapshot_deep_creation_evidence (
+                snapshot_id, section_ordinal, ordinal, source_ordinal, identity_kind,
+                relative_path, content_sha256, source_id, source_content_hash, source_path,
+                heading, location, page, excerpt
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    snapshot.snapshot_id,
+                    section.ordinal,
+                    item.ordinal,
+                    item.source_ordinal,
+                    item.identity_kind,
+                    item.relative_path,
+                    item.content_sha256,
+                    item.source_id,
+                    item.source_content_hash,
+                    item.source_path,
+                    item.heading,
+                    item.location,
+                    item.page,
+                    item.excerpt,
+                )
+                for section in snapshot.deep_creation_sections
+                for item in section.local_evidence
             ],
         )
 
@@ -1210,6 +1398,8 @@ class SqliteSessionRepository:
         coverage_rows: list[sqlite3.Row],
         organization_section_rows: list[sqlite3.Row],
         organization_evidence_rows: list[sqlite3.Row],
+        deep_creation_section_rows: list[sqlite3.Row],
+        deep_creation_evidence_rows: list[sqlite3.Row],
     ) -> SessionTaskSnapshot:
         return SessionTaskSnapshot(
             row["snapshot_id"],
@@ -1283,6 +1473,33 @@ class SqliteSessionRepository:
                     ),
                 )
                 for section in organization_section_rows
+            ),
+            tuple(
+                SessionDeepCreationPlanSection(
+                    section["ordinal"],
+                    section["title"],
+                    section["goal"],
+                    section["scope_path"],
+                    tuple(
+                        SessionKnowledgeOrganizationEvidence(
+                            evidence["ordinal"],
+                            evidence["source_ordinal"],
+                            evidence["identity_kind"],
+                            evidence["relative_path"],
+                            evidence["content_sha256"],
+                            evidence["source_id"],
+                            evidence["source_content_hash"],
+                            evidence["source_path"],
+                            evidence["heading"],
+                            evidence["location"],
+                            evidence["page"],
+                            evidence["excerpt"],
+                        )
+                        for evidence in deep_creation_evidence_rows
+                        if evidence["section_ordinal"] == section["ordinal"]
+                    ),
+                )
+                for section in deep_creation_section_rows
             ),
         )
 
@@ -1377,6 +1594,37 @@ class SqliteSessionRepository:
             ),
             row["structure_kind"], tuple(json.loads(row["completed_ordinals_json"])),
             row["authorization_id"], row["authorization_status"],
+        )
+
+    @staticmethod
+    def _deep_creation_result_from_row(row: sqlite3.Row) -> SessionDeepCreationResult:
+        return SessionDeepCreationResult(
+            row["result_id"], row["session_id"], row["task_id"], row["snapshot_id"],
+            row["status"], row["summary"], row["recovery_action"],
+            tuple(json.loads(row["completed_ordinals_json"])), int(row["duration_ms"]), row["created_at"],
+            tuple(
+                SessionDeepCreationSectionOutcome(
+                    outcome["ordinal"],
+                    outcome["status"],
+                    outcome["local_evidence_count"],
+                    outcome.get("reason"),
+                    outcome.get("content"),
+                    outcome.get("model_judgement"),
+                    tuple(
+                        SessionDeepCreationWebEvidence(
+                            item["ordinal"],
+                            item["title"],
+                            item["url"],
+                            item["accessed_at"],
+                            item["snippet"],
+                        )
+                        for item in outcome.get("web_evidence", ())
+                    ),
+                )
+                for outcome in json.loads(row["outcomes_json"])
+            ),
+            row["authorization_id"],
+            row["authorization_status"],
         )
 
     @staticmethod

@@ -70,14 +70,64 @@ def test_exclusion_rules_accumulate_with_boundary_matching_and_source_propagatio
     assert derived.matched_rule_ids == ("r-index",)
 
 
-def test_new_vault_uses_persisted_ask_each_task_policy(tmp_path: Path) -> None:
+def test_new_vault_uses_persisted_always_allow_policy(tmp_path: Path) -> None:
     policy_service, vault_id = authorize_vault(tmp_path)
 
     policy = policy_service.get(vault_id)
 
-    assert policy.outbound_mode == "ask-each-task"
+    assert policy.outbound_mode == "always-allow"
     assert policy.policy_revision == 1
     assert PolicyService(create_services(tmp_path)[0], SqliteVaultRepository(tmp_path / "vaults.sqlite3")).get(vault_id) == policy
+
+
+def test_always_allow_accepts_large_outbound_scope_sets(tmp_path: Path) -> None:
+    policy_service, vault_id = authorize_vault(tmp_path)
+    scopes = [
+        OutboundScope(f"research/source-{index}.pdf", f"notes/source-{index}.md")
+        for index in range(PolicyService.MAX_SCOPE_COUNT + 1)
+    ]
+
+    authorization = policy_service.request_outbound_authorization(
+        vault_id,
+        provider_id="provider-a",
+        model_id="model-a",
+        operation="model",
+        task_id="task-large-scope",
+        scopes=scopes,
+    )
+
+    assert authorization.status == "approved"
+    checked = policy_service.check_outbound_authorization(
+        vault_id,
+        authorization.authorization_id,
+        provider_id="provider-a",
+        model_id="model-a",
+        operation="model",
+        task_id="task-large-scope",
+        scopes=scopes,
+    )
+    assert checked.actual_scope_summary == "33 scoped item(s)"
+
+
+def test_ask_each_task_still_limits_large_human_authorization_scope_sets(
+    tmp_path: Path,
+) -> None:
+    policy_service, vault_id = authorize_vault(tmp_path)
+    policy_service.set_outbound_mode(vault_id, "ask-each-task")
+    scopes = [
+        OutboundScope(f"research/source-{index}.pdf", None)
+        for index in range(PolicyService.MAX_SCOPE_COUNT + 1)
+    ]
+
+    with pytest.raises(PolicyValidationError, match="too many scoped items"):
+        policy_service.request_outbound_authorization(
+            vault_id,
+            provider_id="provider-a",
+            model_id="model-a",
+            operation="model",
+            task_id="task-large-scope",
+            scopes=scopes,
+        )
 
 
 def test_never_send_cloud_overrides_always_allow_and_invalidates_existing_snapshots(
@@ -129,6 +179,7 @@ def test_never_send_cloud_overrides_always_allow_and_invalidates_existing_snapsh
 
 def test_ask_each_task_requires_confirmation_for_current_policy_revision(tmp_path: Path) -> None:
     policy_service, vault_id = authorize_vault(tmp_path)
+    policy_service.set_outbound_mode(vault_id, "ask-each-task")
 
     pending = policy_service.request_outbound_authorization(
         vault_id,

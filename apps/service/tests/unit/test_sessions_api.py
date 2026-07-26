@@ -14,6 +14,7 @@ from api.main import (
     session_citation_payload,
     session_completeness_result_payload,
     session_generation_result_payload,
+    session_deep_creation_result_payload,
     session_knowledge_organization_result_payload,
     session_retrieval_result_payload,
 )
@@ -23,6 +24,9 @@ from domain.indexing import IndexHealth
 from domain.sessions import (
     SessionCompletenessCoverageItem,
     SessionCompletenessResult,
+    SessionDeepCreationPlanSection,
+    SessionDeepCreationResult,
+    SessionDeepCreationSectionOutcome,
     SessionRetrievalEvidence,
     SessionRetrievalResult,
     SessionCitation,
@@ -229,6 +233,38 @@ def test_knowledge_organization_payload_binds_every_conclusion_to_section_eviden
     assert payload["section_counts"]["completed"] == 1
     assert payload["sections"][0]["conclusions"][0]["evidence"][0]["excerpt"] == "word evidence"
     assert payload["sections"][0]["independent_source_count"] == 1
+
+
+def test_deep_creation_payload_keeps_local_evidence_and_model_judgement_distinct() -> None:
+    evidence = SessionKnowledgeOrganizationEvidence(
+        1, 1, "native", "notes/unit/vocabulary.md", "a" * 64, None, None, None,
+        "Vocabulary", "heading: Vocabulary", None, "word evidence",
+    )
+    section = SessionDeepCreationPlanSection(
+        1, "notes/unit", "写一段学习笔记", "notes/unit", (evidence,)
+    )
+    result = SessionDeepCreationResult(
+        "result-1", "session-1", "task-1", "snapshot-1", "completed", "已生成 1 段。",
+        None, (1,), 1, "2026-07-23T00:00:00+00:00",
+        (SessionDeepCreationSectionOutcome(
+            1, "completed", 1, content="深度创作段落。",
+            model_judgement="模型判断：本段保留了未解决的不确定性。",
+        ),),
+        "authorization-1", "approved",
+    )
+    snapshot = type("Snapshot", (), {
+        "vault_id": "vault-1", "scope_kind": "directory", "scope_path": "notes/unit",
+        "source_count": 1, "source_digest": "a" * 64, "index_status": "healthy",
+        "index_updated_at": "2026-07-23T00:00:00+00:00", "index_digest": "b" * 64,
+        "policy_revision": 3, "exclusion_summary": "无排除项", "status": "completed",
+        "invalidation_reason": None, "deep_creation_sections": (section,),
+    })()
+
+    payload = session_deep_creation_result_payload(result, snapshot)
+
+    assert payload["section_counts"]["completed"] == 1
+    assert payload["sections"][0]["local_evidence"][0]["excerpt"] == "word evidence"
+    assert payload["sections"][0]["model_judgement"].startswith("模型判断：")
 
 
 def test_answer_and_citation_payload_preserve_turn_identity_and_verification_state() -> None:
@@ -583,7 +619,7 @@ def test_session_task_preview_and_confirmation_use_strict_private_snapshot_contr
         f"/api/vaults/{vault.vault_id}/open?file=notes%2Funit.md",
         cookie=cookie,
     )
-    policy_service.set_outbound_mode(vault.vault_id, "always-allow")
+    policy_service.set_outbound_mode(vault.vault_id, "ask-each-task")
     stale_detail_status, _, stale_detail_body = asgi_request(
         app, "GET", f"/api/sessions/{session_id}", cookie=cookie
     )

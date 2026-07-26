@@ -10,6 +10,8 @@ from adapters.windows_directory_picker import WindowsDirectoryPicker
 from application.providers import utc_now
 from api.main import create_app, publish_graph_refresh
 from api.runtime import RuntimeState
+from domain.evidence import DocxOoxmlLocator, PdfRegionLocator
+from domain.graph_projection import DurableGraphProjection, GraphProjectionBlock
 from domain.providers import ModelSelection, ProbeResult, Provider, ProviderModel, ProviderProbeResults, ResolvedProviderModel
 
 
@@ -260,6 +262,9 @@ def test_vault_index_api_requires_the_local_session_and_returns_safe_health(tmp_
     assert health_status == 200
     assert health["status"] == "healthy"
     assert health["semantic_status"] == "unavailable"
+    assert health["rich_block_read_mode"] == "legacy"
+    assert health["rich_block_status"] == "disabled"
+    assert health["rich_block_issue_codes"] == []
     assert all(str(vault_path) not in path for path in health["failed_paths"] + health["stale_paths"])
 
     existing = vault_path / "existing.md"
@@ -281,6 +286,84 @@ def test_vault_index_api_requires_the_local_session_and_returns_safe_health(tmp_
     assert json.loads(pending_body)["index"]["pending_count"] == 1
     assert resolution_status == 200
     assert json.loads(resolution_body)["index"]["pending_count"] == 0
+
+
+def test_graph_projection_summary_api_is_session_protected_and_content_free(tmp_path: Path) -> None:
+    vault_path = tmp_path / "vault"
+    vault_path.mkdir()
+    app = create_app_for_test(tmp_path, FakeDirectoryPicker(vault_path))
+    _, root_headers, _ = asgi_request(app, "GET", "/")
+    cookie = root_headers["set-cookie"].split(";", maxsplit=1)[0]
+    selection_id = select_directory(app, cookie)
+    _, _, created_body = asgi_request(
+        app,
+        "POST",
+        "/api/vaults",
+        body={"selection_id": selection_id, "managed_root": "platform"},
+        cookie=cookie,
+    )
+    vault_id = json.loads(created_body)["vault"]["vault_id"]
+    projection = DurableGraphProjection(
+        vault_id=vault_id,
+        graph_id="graph-verification",
+        graph_revision=7,
+        selected_attempt_id="attempt-1",
+        source_id="source-private",
+        source_sha256="a" * 64,
+        source_path="platform/sources/private-book.pdf",
+        blocks=(
+            GraphProjectionBlock(
+                block_id="pdf-block",
+                kind="paragraph",
+                reading_order=0,
+                locators=(PdfRegionLocator(page=4, bounds=(1.0, 2.0, 30.0, 40.0)),),
+                confidence=0.94,
+                retrieval_projection="Private PDF projection text.",
+            ),
+            GraphProjectionBlock(
+                block_id="docx-block",
+                kind="table",
+                reading_order=1,
+                locators=(DocxOoxmlLocator("/word/document.xml", "body/tbl[2]"),),
+                confidence=0.88,
+                retrieval_projection="",
+            ),
+        ),
+    )
+    app.state.indexing_service.repository.save_graph_projection(projection)
+
+    endpoint = f"/api/vaults/{vault_id}/graph-projections/graph-verification/7"
+    denied, _, _ = asgi_request(app, "GET", endpoint)
+    status, _, body = asgi_request(app, "GET", endpoint, cookie=cookie)
+    missing_status, _, _ = asgi_request(
+        app,
+        "GET",
+        f"/api/vaults/{vault_id}/graph-projections/missing/1",
+        cookie=cookie,
+    )
+    payload = json.loads(body)["projection"]
+
+    assert denied == 403
+    assert status == 200
+    assert missing_status == 404
+    assert payload == {
+        "vault_id": vault_id,
+        "graph_id": "graph-verification",
+        "graph_revision": 7,
+        "block_count": 2,
+        "retrievable_block_count": 1,
+        "locator_summary": {
+            "type_counts": {"docx-ooxml": 1, "pdf-region": 1},
+            "pdf_pages": [4],
+            "docx_part_count": 1,
+        },
+        "locator_digest": payload["locator_digest"],
+    }
+    assert len(payload["locator_digest"]) == 64
+    assert "Private PDF projection text." not in body.decode()
+    assert "platform/sources/private-book.pdf" not in body.decode()
+    assert str(vault_path) not in body.decode()
+    assert "source-private" not in body.decode()
 
 
 def test_vault_graph_api_is_session_protected_and_never_exposes_absolute_paths(tmp_path: Path) -> None:
@@ -412,7 +495,7 @@ def test_vault_policy_api_requires_the_local_session_and_previews_normalized_rul
     assert unauthenticated_status == 403
     assert json.loads(unauthenticated_body)["code"] == "local_session_required"
     assert policy_status == 200
-    assert json.loads(policy_body)["policy"]["outbound_mode"] == "ask-each-task"
+    assert json.loads(policy_body)["policy"]["outbound_mode"] == "always-allow"
     assert rule_status == 200
     assert json.loads(rule_body)["rule"]["relative_path"] == "private/plans"
     assert preview_status == 200

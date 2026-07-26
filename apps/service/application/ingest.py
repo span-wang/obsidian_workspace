@@ -56,6 +56,7 @@ from domain.evidence import (
     resolve_document_issue,
     StructuredContentUnit,
 )
+from domain.graph_projection import DurableGraphProjection
 from domain.review_commits import (
     CommitBackup,
     CommitFile,
@@ -1541,10 +1542,15 @@ class ImportTaskService:
                 eligibility = snapshot.commit_eligibility(unit.unit_id)
                 if eligibility:
                     raise ImportTaskError(f"{unit.source_label}: {eligibility}")
-            prepared_work: list[tuple[CommitUnit, tuple[VaultWrite, ...], tuple[CommitBackup, ...]]] = []
+            prepared_work: list[
+                tuple[CommitUnit, tuple[VaultWrite, ...], tuple[CommitBackup, ...], DurableGraphProjection | None]
+            ] = []
             for unit in selected:
                 try:
                     writes = self._writes_for_unit(task, unit)
+                    projection = self._graph_projection_for_unit(task, unit)
+                    if projection is not None and self.index_service is None:
+                        raise ImportTaskError("Index service is unavailable for a durable graph projection commit.")
                     backups = self._capture_commit_backups(
                         vault.path,
                         writes,
@@ -1553,7 +1559,7 @@ class ImportTaskService:
                 except (ImportTaskError, VaultCommitError, OSError) as error:
                     self._record_stale_snapshot(task, snapshot, str(error))
                     raise ImportTaskError(str(error)) from error
-                prepared_work.append((unit, writes, backups))
+                prepared_work.append((unit, writes, backups, projection))
             committing_task = replace(
                 task,
                 lifecycle="running",
@@ -1567,7 +1573,7 @@ class ImportTaskService:
             failures: list[str] = []
             committed = 0
             stale_failure_reason: str | None = None
-            for unit, writes, backups in prepared_work:
+            for unit, writes, backups, projection in prepared_work:
                 prepared = CommitJournal(
                     task_id=task.task_id,
                     vault_id=task.vault_id,
@@ -1586,7 +1592,9 @@ class ImportTaskService:
                             writes,
                             None if unit.kind == "existing-note" else vault.managed_root_relative_path,
                         )
-                except (ImportTaskError, VaultCommitError, OSError) as error:
+                    if projection is not None:
+                        self._index_committed_projection_unit(task_id, vault, unit, projection)
+                except Exception as error:
                     recovery_error = self._restore_commit_backups(
                         vault.path,
                         backups,
@@ -1603,7 +1611,7 @@ class ImportTaskService:
                 committed += 1
                 completed = replace(prepared, status="committed", created_at=utc_now())
                 self.repository.record_commit_journal(completed, "commit-unit-committed")
-                if self.index_service is not None:
+                if self.index_service is not None and projection is None:
                     indexing_task = replace(
                         self.get(task_id),
                         lifecycle="running",
@@ -1699,6 +1707,30 @@ class ImportTaskService:
         except (VaultCommitError, OSError) as error:
             return str(error)
         return None
+
+    def _index_committed_projection_unit(
+        self, task_id: str, vault, unit: CommitUnit, projection: DurableGraphProjection
+    ) -> None:
+        indexing_task = replace(
+            self.get(task_id),
+            lifecycle="running",
+            phase="indexing",
+            current_item_label=unit.source_label,
+            updated_at=utc_now(),
+        )
+        self.repository.save(indexing_task, "indexing-started")
+        try:
+            self.index_service.index_committed_unit(vault, unit, projection)
+        except Exception as error:
+            report_failure = getattr(self.index_service, "report_failure", None)
+            if report_failure is not None:
+                try:
+                    report_failure(vault.vault_id, "committed-graph-projection", error)
+                except Exception:
+                    pass
+            self.repository.save(self.get(task_id), "indexing-failed")
+            raise
+        self.repository.save(self.get(task_id), "indexing-completed")
 
     def _record_stale_snapshot(
         self, task: ImportTask, previous: ReviewSnapshot, fallback_reason: str
@@ -2130,6 +2162,37 @@ class ImportTaskService:
             if link not in rendered:
                 rendered = rendered.rstrip() + f"\n\n{link}\n"
         return rendered
+
+    def _graph_projection_for_unit(
+        self, task: ImportTask, unit: CommitUnit
+    ) -> DurableGraphProjection | None:
+        if unit.kind != "source":
+            return None
+        proposal = self.repository.get_note_proposal(unit.source_item_id)
+        if not isinstance(proposal, DerivedMarkdownProposal) or proposal.graph_id is None:
+            return None
+        evidence = self.repository.get_conversion_evidence(unit.source_item_id)
+        if (
+            evidence is None
+            or evidence.graph.graph_id != proposal.graph_id
+            or evidence.graph.graph_revision != proposal.graph_revision
+            or evidence.graph.selected_attempt_id != proposal.graph_selected_attempt_id
+            or evidence.graph.source_sha256 != proposal.source_sha256
+            or proposal.vault_id != task.vault_id
+            or proposal.source_id == ""
+        ):
+            raise ImportTaskError("The selected conversion graph is unavailable for durable projection commit.")
+        if not any(
+            file.kind == "source" and file.relative_path == proposal.source_relative_path
+            for file in unit.files
+        ):
+            raise ImportTaskError("The durable graph projection source is not part of this commit unit.")
+        return DurableGraphProjection.from_document_graph(
+            vault_id=task.vault_id,
+            source_id=proposal.source_id,
+            source_path=proposal.source_relative_path,
+            graph=evidence.graph,
+        )
 
     def _writes_for_unit(self, task: ImportTask, unit: CommitUnit) -> tuple[VaultWrite, ...]:
         items = {item.item_id: item for item in self.repository.list_items(task.task_id)}

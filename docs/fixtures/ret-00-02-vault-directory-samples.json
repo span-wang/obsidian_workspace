@@ -1,0 +1,96 @@
+{
+  "schemaVersion": 1,
+  "captureDate": "2026-07-25",
+  "source": {
+    "kind": "authorized-local-vault-relative-paths-and-current-index-locations",
+    "bodyRead": false,
+    "absolutePathsStored": false,
+    "vaultNamesStored": false,
+    "vaultIdsStored": false,
+    "mappingPersisted": false
+  },
+  "anonymization": {
+    "directoryAlias": "DIR-##",
+    "fileAlias": "FILE-##.md",
+    "titleAlias": "TITLE-##",
+    "retainedSignals": [
+      "relative hierarchy depth",
+      "Markdown extension",
+      "line location marker",
+      "generic material naming signal"
+    ],
+    "removed": [
+      "all original directory and file names",
+      "all title text",
+      "absolute paths",
+      "vault identifiers",
+      "hashes",
+      "Markdown body"
+    ]
+  },
+  "cases": [
+    {
+      "caseId": "RV-LIVE-01",
+      "sourceKind": "current-authorized-vault-non-managed-markdown",
+      "markdownFileCount": 2,
+      "pathDepthCounts": {
+        "1": 2
+      },
+      "representativeRelativePaths": [
+        "FILE-01.md",
+        "FILE-02.md"
+      ],
+      "expected": {
+        "scopeStatus": "unknown",
+        "reason": "root-level path has no directory-derived scope"
+      }
+    },
+    {
+      "caseId": "RV-INDEX-01",
+      "sourceKind": "current-index-relative-paths",
+      "documentKind": "derived",
+      "documentCount": 35,
+      "pathDepthCounts": {
+        "4": 35
+      },
+      "relativePathTemplate": "DIR-01/MATERIAL-01/DIR-02/FILE-01.md",
+      "representativeRelativePaths": [
+        "DIR-01/MATERIAL-01/DIR-02/FILE-01.md",
+        "DIR-01/MATERIAL-01/DIR-03/FILE-02.md",
+        "DIR-01/MATERIAL-01/DIR-04/FILE-03.md",
+        "DIR-01/MATERIAL-01/DIR-05/FILE-04.md",
+        "DIR-01/MATERIAL-01/DIR-06/FILE-05.md"
+      ],
+      "pathSignals": [
+        "material"
+      ],
+      "absentScopeSignals": [
+        "subject",
+        "grade_volume",
+        "unit_no"
+      ],
+      "expected": {
+        "scopeStatus": "recoverable",
+        "reason": "material signal alone must not infer subject, grade_volume, or unit_no"
+      }
+    },
+    {
+      "caseId": "RV-LOCATION-01",
+      "sourceKind": "current-index-block-locations",
+      "distinctLocationCount": 52,
+      "locationMarkerCounts": {
+        "line": 52
+      },
+      "representativeLocations": [
+        "line: TITLE-01",
+        "line: TITLE-02",
+        "line: TITLE-03"
+      ],
+      "scopeSignals": [],
+      "expected": {
+        "scopeStatus": "recoverable",
+        "reason": "line location with redacted free text cannot establish a scope"
+      }
+    }
+  ]
+}

@@ -460,29 +460,131 @@ def _pandoc_blocks(payload: object, request: ConversionRequest, attempt_id: str,
     anchors = [str(anchor) for anchor in inventory.get("required_anchors", [])]
     if not isinstance(ast_blocks, list):
         return blocks, [DocumentGraphIssue("pandoc-json-invalid", "Pandoc AST is invalid.", SourceScopeLocator("document", "invalid AST"))]
-    for index, value in enumerate(ast_blocks):
-        if index >= len(anchors) or not isinstance(value, dict):
-            issues.append(DocumentGraphIssue("pandoc-anchor-missing", "Pandoc output cannot be aligned to OOXML.", SourceScopeLocator("document", "AST alignment failed")))
+    anchor_index = 0
+    for value in ast_blocks:
+        aligned_blocks = _pandoc_alignment_blocks(value)
+        if not aligned_blocks:
+            issues.append(
+                DocumentGraphIssue(
+                    "pandoc-json-invalid",
+                    "Pandoc AST contains an invalid block.",
+                    SourceScopeLocator("document", "invalid AST block"),
+                )
+            )
             continue
-        locator = DocxOoxmlLocator("/word/document.xml", anchors[index])
-        tag = value.get("t")
-        content = value.get("c")
-        text = _text(content)
-        stable = f"{anchors[index]}:{index}"
-        if tag == "Header" and isinstance(content, list):
-            level = int(content[0]) if content and isinstance(content[0], int) else 1
-            blocks.append(_block("heading", text, locator, attempt_id, raw, stable, len(blocks), {"level": min(6, max(1, level)), "inline_runs": _runs(text)}))
-        elif tag in {"Para", "Plain"}:
-            blocks.append(_block("paragraph", text, locator, attempt_id, raw, stable, len(blocks), {"inline_runs": _runs(text)}))
-        elif tag in {"BulletList", "OrderedList"}:
-            blocks.append(_block("list", text, locator, attempt_id, raw, stable, len(blocks), {"ordered": tag == "OrderedList", "items": [{"text": text}], "nesting": 0}))
-        elif tag == "Table":
-            blocks.append(_block("table", text, locator, attempt_id, raw, stable, len(blocks), {"rows": [[text]], "cells": [{"row": 0, "column": 0, "text": text}], "rowspan": [], "colspan": [], "header": False}))
-        elif tag == "CodeBlock":
-            blocks.append(_block("code", text, locator, attempt_id, raw, stable, len(blocks), {"text": text}))
-        else:
-            issues.append(DocumentGraphIssue("pandoc-block-unsupported", f"Unsupported Pandoc node: {tag}.", SourceScopeLocator(anchors[index], "converter node needs review")))
+        for aligned_block in aligned_blocks:
+            if anchor_index >= len(anchors):
+                issues.append(
+                    DocumentGraphIssue(
+                        "pandoc-anchor-missing",
+                        "Pandoc output cannot be aligned to OOXML.",
+                        SourceScopeLocator("document", "AST alignment failed"),
+                    )
+                )
+                continue
+            anchor = anchors[anchor_index]
+            locator = DocxOoxmlLocator("/word/document.xml", anchor)
+            tag = aligned_block.get("t")
+            content = aligned_block.get("c")
+            text = _text(content)
+            stable = f"{anchor}:{anchor_index}"
+            anchor_index += 1
+            if tag == "Header" and isinstance(content, list):
+                level = int(content[0]) if content and isinstance(content[0], int) else 1
+                blocks.append(
+                    _block(
+                        "heading",
+                        text,
+                        locator,
+                        attempt_id,
+                        raw,
+                        stable,
+                        len(blocks),
+                        {"level": min(6, max(1, level)), "inline_runs": _runs(text)},
+                    )
+                )
+            elif tag in {"Para", "Plain"}:
+                blocks.append(
+                    _block(
+                        "paragraph",
+                        text,
+                        locator,
+                        attempt_id,
+                        raw,
+                        stable,
+                        len(blocks),
+                        {"inline_runs": _runs(text)},
+                    )
+                )
+            elif tag in {"BulletList", "OrderedList"}:
+                blocks.append(
+                    _block(
+                        "list",
+                        text,
+                        locator,
+                        attempt_id,
+                        raw,
+                        stable,
+                        len(blocks),
+                        {
+                            "ordered": tag == "OrderedList",
+                            "items": [{"text": text}],
+                            "nesting": 0,
+                        },
+                    )
+                )
+            elif tag == "Table":
+                blocks.append(
+                    _block(
+                        "table",
+                        text,
+                        locator,
+                        attempt_id,
+                        raw,
+                        stable,
+                        len(blocks),
+                        {
+                            "rows": [[text]],
+                            "cells": [{"row": 0, "column": 0, "text": text}],
+                            "rowspan": [],
+                            "colspan": [],
+                            "header": False,
+                        },
+                    )
+                )
+            elif tag == "CodeBlock":
+                blocks.append(
+                    _block(
+                        "code", text, locator, attempt_id, raw, stable, len(blocks), {"text": text}
+                    )
+                )
+            else:
+                issues.append(
+                    DocumentGraphIssue(
+                        "pandoc-block-unsupported",
+                        f"Unsupported Pandoc node: {tag}.",
+                        SourceScopeLocator(anchor, "converter node needs review"),
+                    )
+                )
     return blocks, issues
+
+
+def _pandoc_alignment_blocks(value: object) -> tuple[dict[str, object], ...]:
+    """Expand Pandoc block quotes back into their DOCX paragraph-level units."""
+
+    if not isinstance(value, dict):
+        return ()
+    if value.get("t") != "BlockQuote":
+        return (value,)
+    nested = value.get("c")
+    if not isinstance(nested, list):
+        return (value,)
+    expanded = tuple(
+        child_block
+        for child in nested
+        for child_block in _pandoc_alignment_blocks(child)
+    )
+    return expanded or (value,)
 
 
 def _docling_blocks(payload: object, document_kind: str, attempt_id: str, raw: ArtifactRef):

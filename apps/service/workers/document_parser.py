@@ -126,6 +126,7 @@ def _docx_preflight(source_bytes: bytes) -> dict[str, object]:
         raise DocumentParseError("The DOCX could not be preflighted.") from error
     root = ElementTree.fromstring(document_xml)
     namespace = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    math_namespace = "{http://schemas.openxmlformats.org/officeDocument/2006/math}"
     body = root.find(f"{namespace}body")
     if body is None:
         raise DocumentParseError("The DOCX main body is missing.")
@@ -136,6 +137,8 @@ def _docx_preflight(source_bytes: bytes) -> dict[str, object]:
         if child.tag == f"{namespace}p":
             paragraph += 1
             anchor = f"body/p[{paragraph}]"
+            if not _docx_paragraph_has_content(child, namespace, math_namespace):
+                continue
             required_anchors.append(anchor)
             classifications.append({"anchor": anchor, "kind": "paragraph"})
         elif child.tag == f"{namespace}tbl":
@@ -148,6 +151,25 @@ def _docx_preflight(source_bytes: bytes) -> dict[str, object]:
         "required_anchors": required_anchors,
         "classifications": classifications,
     }
+
+
+def _docx_paragraph_has_content(
+    paragraph: ElementTree.Element, namespace: str, math_namespace: str
+) -> bool:
+    """Ignore layout-only paragraphs that Pandoc correctly omits from its AST."""
+
+    if "".join(paragraph.itertext()).strip():
+        return True
+    return any(
+        paragraph.find(f".//{tag}") is not None
+        for tag in (
+            f"{namespace}drawing",
+            f"{namespace}pict",
+            f"{namespace}object",
+            f"{math_namespace}oMath",
+            f"{math_namespace}oMathPara",
+        )
+    )
 
 
 def _parse_document_bytes(

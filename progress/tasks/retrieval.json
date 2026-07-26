@@ -1,0 +1,835 @@
+{
+  "initiativeId": "RET",
+  "updatedOn": "2026-07-26",
+  "tasks": [
+    {
+      "id": "RET-00-01",
+      "phaseId": "RET-00",
+      "order": 1,
+      "title": "方案审核、开发路径与治理基线",
+      "priority": "P0",
+      "status": "已完成",
+      "dependsOn": [],
+      "deliverables": [
+        "审核并修订 docs/retrieval-redesign.md",
+        "建立结构化进度源与自动生成看板",
+        "建立项目级 AGENT.md 与 AGENTS.md 入口"
+      ],
+      "acceptance": "关键事实错误已修正，阶段可独立验收，进度检查命令可重复通过。",
+      "verification": [
+        "npm run progress:check",
+        "git diff --check"
+      ]
+    },
+    {
+      "id": "RET-00-02",
+      "phaseId": "RET-00",
+      "order": 2,
+      "title": "确认产品决策与真实 vault 样本",
+      "priority": "P0",
+      "status": "已完成",
+      "dependsOn": [
+        "RET-00-01"
+      ],
+      "executionBoundary": {
+        "inScope": [
+          "记录 D-001 的耐久 graph 投影保留、失效与删除语义。",
+          "确认 D-002 的最小权限 Embedding 授权合同；本任务不发送任何正文。",
+          "从已授权本机 vault 的相对路径和当前索引位置生成不可逆脱敏样本。"
+        ],
+        "outOfScope": [
+          "不实现 graph projection schema、port、迁移、GC 或索引重建。",
+          "不实现批量 Embedding、Provider 调用、向量缓存或向量检索。",
+          "不保存正文、真实标题、vault 名称、绝对路径、vault ID 或可逆路径映射。"
+        ],
+        "followup": [
+          "RET-01-01 至 RET-01-03 定义并实现投影、原子写入及任务删除后的重建。",
+          "RET-03-02 以脱敏 fixture 实现路径与标题归一化及未知 scope 的失败关闭。",
+          "RET-06-01 至 RET-06-03 在用户确认后实现授权预览、Embedding 指纹、缓存与向量检索。"
+        ],
+        "verification": [
+          "apps/service/tests/unit/test_import_tasks.py 与 test_index_service.py 定向回归",
+          "npm run progress:check",
+          "git diff --check"
+        ]
+      },
+      "deliverables": [
+        "确认 Embedding 出网粒度",
+        "确认耐久 graph 投影保留与删除语义",
+        "收集脱敏后的真实目录和标题样本"
+      ],
+      "acceptance": "D-001 至 D-003 有明确选择，目录规则有可测试样本。",
+      "verification": [
+        "决策写入 progress/logs.json",
+        "相关风险状态同步更新"
+      ]
+    },
+    {
+      "id": "RET-00-03",
+      "phaseId": "RET-00",
+      "order": 3,
+      "title": "建立检索 golden set",
+      "priority": "P0",
+  "status": "已完成",
+      "dependsOn": [
+        "RET-00-02"
+      ],
+      "executionBoundary": {
+        "inScope": [
+          "建立版本化、脱敏的合成教学语料与 20 至 30 条点查、枚举、重复和无 scope 查询标注。",
+          "为每条查询声明期望块、范围块和重复簇，并定义 recall、precision、scope coverage、duplicate precision 的可重复计算。",
+          "增加 fixture schema 与标注一致性单元测试。"
+        ],
+        "outOfScope": [
+          "不读取、保存或发送真实 vault 正文、绝对路径、vault ID、Provider 密钥或授权 token。",
+          "不修改当前手写检索算法、会话检索行为、FTS、Embedding、SQLite schema 或阈值。",
+          "不把合成语料的单次结果作为生产检索参数或质量闸门。"
+        ],
+        "followup": [
+          "RET-00-04 用本 golden set 运行当前手写检索基线、Windows FTS5/BM25 smoke 与 float32 KNN 基线，并记录原始指标。",
+          "RET-03 至 RET-07 以该 fixture 扩展真实已审阅样本和版本化质量闸门。"
+        ],
+    "verification": [
+      "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_retrieval_golden.py",
+      "uv run --directory apps/service ruff check application/retrieval_golden.py tests/unit/test_retrieval_golden.py",
+      "uv run --directory apps/service python -m application.retrieval_golden --fixture tests/fixtures/retrieval-golden-v1.json --validate-only",
+      "npm run progress:check",
+      "git diff --check"
+    ]
+      },
+      "deliverables": [
+        "20 至 30 条覆盖枚举型与点查型的查询",
+        "块级期望证据、scope 和重复簇标注",
+        "不含 Provider 密钥与未脱敏绝对路径的测试夹具"
+      ],
+      "acceptance": "每条查询都能计算 recall、precision、scope coverage 和 duplicate precision。",
+      "verification": [
+        "评测夹具 schema 校验",
+        "人工抽查标注一致性"
+      ]
+    },
+    {
+      "id": "RET-00-04",
+      "phaseId": "RET-00",
+      "order": 4,
+      "title": "基线评测与 Windows 能力 smoke",
+      "priority": "P0",
+      "status": "已完成",
+      "dependsOn": [
+        "RET-00-03"
+      ],
+      "executionBoundary": {
+        "inScope": [
+          "以版本化 synthetic golden fixture 运行当前 SessionService 手写检索打分，记录逐查询排序、recall、precision、scope coverage 和 duplicate precision。",
+          "验证本机 SQLite 的 unicode61、porter unicode61、trigram tokenizer 与 bm25 heading 加权能力。",
+          "将 numpy 明确锁定为服务依赖，测量固定种子 float32 精确 KNN 的排名一致性、延迟分布和矩阵工作集内存。"
+        ],
+        "outOfScope": [
+          "不修改生产检索排序、会话行为、IndexBlock、SQLite 索引 schema 或 FTS 生命周期。",
+          "不调用 Embedding Provider、不读取真实 vault 内容，也不改变出网授权边界。",
+          "不把本次合成基线指标或延迟直接固化为生产检索阈值。"
+        ],
+        "followup": [
+          "RET-01-02 在基线闸门完成后实现 SQLite projection migration 与派生文档/投影原子写入。",
+          "RET-04-01 至 RET-04-03 使用本步结果校准 FTS 实现和词法 A/B，而非直接切换生产检索。",
+          "RET-06-03 使用本步 float32 基线校验向量存储与常驻矩阵实现。"
+        ],
+        "verification": [
+          "npm run retrieval:baseline",
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_retrieval_baseline.py tests/unit/test_retrieval_golden.py",
+          "uv run --directory apps/service ruff check application/retrieval_baseline.py tests/unit/test_retrieval_baseline.py",
+          "npm run progress:build",
+          "npm run progress:check",
+          "git diff --check"
+        ]
+      },
+      "deliverables": [
+        "当前手写检索基线报告",
+        "Windows FTS5 tokenizer 和 bm25 smoke",
+        "float32 numpy KNN 延迟与内存基线"
+      ],
+      "acceptance": "评测可一条命令重复执行，结果写入日志且保留原始指标。",
+      "verification": [
+        "重复运行结果差异在允许范围内",
+        "失败时返回非零退出码"
+      ]
+    },
+    {
+      "id": "RET-01-01",
+      "phaseId": "RET-01",
+      "order": 1,
+      "title": "定义耐久 graph 投影合同",
+      "priority": "P0",
+      "status": "已完成",
+      "dependsOn": [
+        "RET-00-02"
+      ],
+      "executionBoundary": {
+        "inScope": [
+          "定义索引侧最小、不可变的 graph projection 领域对象，固定 vault、graph、revision、block 身份及 source identity、selected attempt、locator、confidence 和 retrieval projection 字段。",
+          "定义 projection 的稳定序列化/反序列化合同与输入校验。",
+          "定义索引侧 projection 读写 port，供后续同一索引数据库事务实现。",
+          "补充领域与 port 合同的定向单元测试。"
+        ],
+        "outOfScope": [
+          "不新增 SQLite schema、migration 或 adapter 实现。",
+          "不修改派生笔记提交、索引重建、任务删除或引用 API 的运行链路。",
+          "不扩展 IndexBlock、FTS、Embedding、向量或检索排序。"
+        ],
+        "followup": [
+          "RET-01-02 在同一 index.sqlite 事务中实现 projection 与派生文档的原子写入、幂等重试和回滚。",
+          "RET-01-03 让索引侧读取 projection，并覆盖删除 import task 后的重建和 locator 引用核验。"
+        ],
+        "verification": [
+          "uv run --project apps/service pytest -p no:cacheprovider apps/service/tests/unit/test_graph_projection.py",
+          "npm run progress:check",
+          "git diff --check"
+        ]
+      },
+      "deliverables": [
+        "投影字段、身份、版本和删除语义",
+        "写入与读取端口",
+        "与 import task 生命周期解耦的设计测试"
+      ],
+      "acceptance": "合同足以重建 IndexBlock 和核验引用，不复制无关转换工件。",
+      "verification": [
+        "领域模型单元测试",
+        "端口类型与序列化 round-trip 测试"
+      ]
+    },
+    {
+      "id": "RET-01-02",
+      "phaseId": "RET-01",
+      "order": 2,
+      "title": "提交时原子写入耐久投影",
+      "priority": "P0",
+      "status": "已完成",
+      "dependsOn": [
+        "RET-01-01"
+      ],
+      "executionBoundary": {
+        "inScope": [
+          "为 index.sqlite 增加版本化的 durable graph projection migration，并实现基于 immutable key 的读取与幂等写入。",
+          "让同一 source commit unit 的派生 Markdown 索引文档与选定 DocumentGraph projection 在一个 SQLite 事务中提交。",
+          "当该索引事务失败时，恢复当前 commit unit 的文件备份并保留可重试 journal。",
+          "覆盖成功、幂等重试、SQL 写入失败回滚与旧库升级测试。"
+        ],
+        "outOfScope": [
+          "不实现 import task 删除后的 projection 读取、索引重建和 locator 引用回归；这些属于 RET-01-03。",
+          "不变更 IndexBlock schema、FTS、Embedding、检索排序、API 或前端。",
+          "不复制 DocumentGraph 的原始 payload、artifact、issue 或 input snapshot 到 index.sqlite。"
+        ],
+        "followup": [
+          "RET-01-03 以 projection identity 读取已保存结构，并覆盖删除 import task 后的索引重建和 locator 核验。",
+          "RET-02-01 在 projection migration 基础上引入 IndexBlock 富字段和通用 schema migration 路径。"
+        ],
+        "verification": [
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_sqlite_index_graph_projection.py tests/unit/test_review_commit_service.py tests/unit/test_index_service.py",
+          "uv run --directory apps/service ruff check adapters/sqlite_index_repository.py application/indexing.py application/ingest.py tests/unit/test_sqlite_index_graph_projection.py",
+          "npm run progress:build",
+          "npm run progress:check",
+          "git diff --check"
+        ]
+      },
+      "deliverables": [
+        "SQLite projection migration",
+        "派生笔记提交与投影写入的一致性边界",
+        "幂等重试和失败回滚"
+      ],
+      "acceptance": "笔记与投影不会出现一方成功、一方缺失的不可恢复状态。",
+      "verification": [
+        "提交成功、重复提交、注入失败测试",
+        "旧数据库升级测试"
+      ]
+    },
+    {
+      "id": "RET-01-03",
+      "phaseId": "RET-01",
+      "order": 3,
+      "title": "删除任务后的结构重建与引用核验",
+      "priority": "P0",
+      "status": "已完成",
+      "dependsOn": [
+        "RET-01-02"
+      ],
+      "executionBoundary": {
+        "inScope": [
+          "按 vault_id、graph_id 和 graph_revision 从 index.sqlite 读取已提交的耐久 graph projection，并将其用于派生 Markdown 索引重建。",
+          "覆盖删除完成态 import task 后，索引仍可从耐久 projection 重建派生文档。",
+          "覆盖 PDF 与 DOCX projection locator 在任务删除和索引重建后的引用核验。"
+        ],
+        "outOfScope": [
+          "不扩展 IndexBlock schema、FTS、Embedding、检索排序、API 或前端。",
+          "不从已删除的 import task 数据库恢复完整 DocumentGraph、转换工件或私有候选。",
+          "不实现 projection GC；保留与失效语义继续遵循 D-001。"
+        ],
+        "followup": [
+          "RET-02-01 在已验证的 projection 读取链路上扩展富 IndexBlock 与显式 schema migration。",
+          "RET-03-01 消费 projection 的结构字段实现确定性分块。"
+        ],
+        "verification": [
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_index_graph_projection_rebuild.py tests/unit/test_sqlite_index_graph_projection.py tests/unit/test_review_commit_service.py tests/unit/test_index_service.py tests/unit/test_import_tasks.py (44 passed)",
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit",
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/integration (11 passed)",
+          "uv run --directory apps/service ruff check application/indexing.py tests/unit/test_index_graph_projection_rebuild.py",
+          "npm run progress:build",
+          "npm run progress:check",
+          "git diff --check"
+        ]
+      },
+      "deliverables": [
+        "索引侧按 graph identity 读取投影",
+        "任务删除后重建索引",
+        "PDF 与 DOCX locator 引用回归"
+      ],
+      "acceptance": "删除完成态 import task 后，索引重建与引用定位仍成功。",
+      "verification": [
+        "删除完成态 import task 后的 PDF/DOCX durable projection 重建回归",
+        "服务集成测试与任务删除生命周期回归"
+      ]
+    },
+    {
+      "id": "RET-01-04",
+      "phaseId": "RET-01",
+      "order": 4,
+      "title": "投影重建验证测试面板",
+      "priority": "P1",
+      "status": "已完成",
+      "dependsOn": [
+        "RET-01-03"
+      ],
+      "executionBoundary": {
+        "inScope": [
+          "新增仅限本机工作台会话的 durable projection 摘要读取合同，返回 graph identity、块计数与 PDF/DOCX locator 摘要，不返回正文或转换工件。",
+          "在现有 React 工作台中提供测试面板，支持选择完成态 import task、检查投影、删除任务、重建索引并比较删除前后的 locator 摘要。",
+          "覆盖 API 合同、前端渲染状态与浏览器关键流程。"
+        ],
+        "outOfScope": [
+          "不新增远程访问、公开 API、Provider 调用、正文展示或绝对路径暴露。",
+          "不修改 durable projection 表、IndexBlock schema、FTS、Embedding、检索排序或任务删除语义。",
+          "不把测试面板扩展为常规导入审核或引用浏览器。"
+        ],
+        "followup": [
+          "RET-02-01 继续扩展富 IndexBlock 与 schema migration。",
+          "后续引用 UI 在富 IndexBlock 合同稳定后复用 locator 摘要，不在本任务提前定义引用展示模型。"
+        ],
+        "verification": [
+          "npm run unit",
+          "npm run build",
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_vault_api.py tests/unit/test_review_commit_api.py",
+          "npm run browser-test",
+          "npm run progress:build",
+          "npm run progress:check",
+          "git diff --check"
+        ]
+      },
+      "deliverables": [
+        "受本机会话保护的 projection locator 摘要接口",
+        "任务删除和索引重建的可视化测试面板",
+        "前端与浏览器回归"
+      ],
+      "acceptance": "用户可在前端验证完成态任务删除后，耐久 projection 与 PDF/DOCX locator 摘要仍存在且索引重建成功。",
+      "verification": [
+        "前端 unit、build 与浏览器流程",
+        "API 合同与进度检查"
+      ]
+    },
+    {
+      "id": "RET-02-01",
+      "phaseId": "RET-02",
+      "order": 1,
+      "title": "富 IndexBlock 与显式 schema migration",
+      "priority": "P0",
+      "status": "已完成",
+      "dependsOn": [
+        "RET-01-03"
+      ],
+      "executionBoundary": {
+        "inScope": [
+          "为 IndexBlock 增加结构字段和独立的 block_content_sha256，并保持现有三参数构造调用兼容。",
+          "在 index.sqlite 中以显式、幂等的 migration 增加 index_blocks 结构列和 index_repository_migrations 记录。",
+          "覆盖空库、新库、旧库原地升级、重复初始化及迁移失败回滚的 repository 单元测试。"
+        ],
+        "outOfScope": [
+          "不实现结构双写回填、旧新读取一致性对比或 feature flag；这些归 RET-02-02 和 RET-02-03。",
+          "不接入 FTS、Embedding、块级元数据、检索排序、API 或前端。",
+          "不删除、重建或迁移用户现有索引数据。"
+        ],
+        "followup": [
+          "RET-02-02 负责将既有 current documents 回填富字段并比较新旧读取。",
+          "RET-02-03 负责读取切换、回退开关与健康状态。",
+          "RET-03-01 负责结构优先分块、标题栈和 contextual prefix 的实际生成策略。"
+        ],
+        "verification": [
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_sqlite_index_rich_blocks.py tests/unit/test_sqlite_index_graph_projection.py tests/unit/test_index_graph_projection_rebuild.py tests/unit/test_index_service.py",
+          "uv run --directory apps/service ruff check domain/indexing.py adapters/sqlite_index_repository.py application/indexing.py tests/unit/test_sqlite_index_rich_blocks.py tests/unit/test_sqlite_index_graph_projection.py",
+          "npm run progress:build",
+          "npm run progress:check",
+          "git diff --check"
+        ]
+      },
+      "deliverables": [
+        "结构字段与 block_content_sha256",
+        "index_repository_migrations",
+        "旧行默认值和序列化合同"
+      ],
+      "acceptance": "旧索引库原地升级，现有文档身份与正文不丢失。",
+      "verification": [
+        "migration 单元测试",
+        "旧库 fixture 升级测试"
+      ]
+    },
+    {
+      "id": "RET-02-02",
+      "phaseId": "RET-02",
+      "order": 2,
+      "title": "结构双写、回填与一致性对比",
+      "priority": "P0",
+      "status": "已完成",
+      "dependsOn": [
+        "RET-02-01"
+      ],
+      "executionBoundary": {
+        "inScope": [
+          "保持 index_blocks 的 sequence、location、text 旧字段与富字段在同一写入事务内双写。",
+          "仅为 is_current=1 的既有块回填空的 block_content_sha256；可从 graph location 精确定位的块恢复 durable projection 结构字段。",
+          "基于原始 SQLite 行比较 legacy 与 rich 读取的 document identity、sequence、location、正文和块哈希，并输出不含正文的内部一致性报告。"
+        ],
+        "outOfScope": [
+          "不改变 document_id、sequence、location、text、is_current 或任何 stale 历史，也不重新读取 Markdown 或重分块。",
+          "不接入 FTS、Embedding、块级元数据、检索排序、API、前端或公开 feature flag。",
+          "不切换生产读取路径；富读取开关与旧读取回退归 RET-02-03。"
+        ],
+        "followup": [
+          "RET-02-03 负责富块读取切换、回退开关与健康状态。",
+          "RET-03-01 负责原生 Markdown 的标题栈、contextual prefix 与实际结构分块策略。",
+          "RET-04 至 RET-06 分别负责 FTS、Embedding、向量和混合检索生命周期。"
+        ],
+        "verification": [
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_sqlite_index_rich_blocks.py tests/unit/test_index_service.py tests/unit/test_index_graph_projection_rebuild.py",
+          "uv run --directory apps/service ruff check domain/indexing.py ports/index_repository.py application/indexing.py adapters/sqlite_index_repository.py tests/unit/test_sqlite_index_rich_blocks.py tests/unit/test_index_service.py",
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit",
+          "npm run integration",
+          "npm run progress:build",
+          "npm run progress:check",
+          "git diff --check"
+        ]
+      },
+      "deliverables": [
+        "旧字段与新结构双写",
+        "现有 current documents 回填",
+        "差异报告"
+      ],
+      "acceptance": "新旧读取的正文、sequence、document identity 一致，结构差异可解释。",
+      "verification": [
+        "回填幂等测试",
+        "差异报告为零或有批准例外"
+      ]
+    },
+    {
+      "id": "RET-02-03",
+      "phaseId": "RET-02",
+      "order": 3,
+      "title": "切换富块读取并保留回退",
+      "priority": "P0",
+      "status": "已完成",
+      "dependsOn": [
+        "RET-02-02"
+      ],
+      "executionBoundary": {
+        "inScope": [
+          "为 current index document 的读取引入受控的 rich-block feature flag，并保留独立的 legacy 读取路径。",
+          "仅在 current block 的 legacy/rich 一致性报告无问题时启用 rich 读取；不一致时失败关闭并在健康状态返回无正文的稳定提示。",
+          "在现有 index health 本地响应中增加读取模式、状态和无正文问题码，并覆盖 rich 默认、显式 legacy 回退和不一致失败关闭的 repository、application 与 loopback integration 回归。"
+        ],
+        "outOfScope": [
+          "不新增或修改 SQLite schema、migration、回填策略、IndexBlock 字段或既有块正文。",
+          "不实现 RET-03 的结构分块、标题元数据、范围过滤、FTS、Embedding、向量或检索排序。",
+          "不修改既有 API URL、既有字段语义或前端交互。"
+        ],
+        "followup": [
+          "RET-03-01 在已可回退的 rich 读取路径上实现结构优先分块与 contextual prefix。",
+          "RET-04-01 至 RET-04-03 在富块读取稳定后接入并验证 FTS5 词法检索生命周期。"
+        ],
+        "verification": [
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_sqlite_index_rich_blocks.py tests/unit/test_index_service.py",
+          "npm run integration",
+          "uv run --directory apps/service ruff check domain/indexing.py ports/index_repository.py application/indexing.py adapters/sqlite_index_repository.py tests/unit/test_sqlite_index_rich_blocks.py tests/unit/test_index_service.py",
+          "npm run progress:build",
+          "npm run progress:check",
+          "git diff --check"
+        ]
+      },
+      "deliverables": [
+        "新读取路径 feature flag",
+        "旧读取回退路径",
+        "健康状态与失败提示"
+      ],
+      "acceptance": "新路径通过测试，关闭开关可恢复旧行为。",
+      "verification": [
+        "双模式 unit 与 integration 测试"
+      ]
+    },
+    {
+      "id": "RET-03-01",
+      "phaseId": "RET-03",
+      "order": 1,
+      "title": "结构优先分块与 contextual prefix",
+      "priority": "P0",
+      "status": "未开始",
+      "dependsOn": [
+        "RET-02-03"
+      ],
+      "deliverables": [
+        "DocumentGraph 投影分块",
+        "原生 Markdown 标题栈分块",
+        "表格、列表和超长段落边界测试"
+      ],
+      "acceptance": "块不静默截断，标题路径和表头上下文可复原。",
+      "verification": [
+        "分块 golden fixtures",
+        "block_content_sha256 稳定性测试"
+      ]
+    },
+    {
+      "id": "RET-03-02",
+      "phaseId": "RET-03",
+      "order": 2,
+      "title": "路径与标题元数据归一化",
+      "priority": "P0",
+      "status": "未开始",
+      "dependsOn": [
+        "RET-00-03",
+        "RET-03-01"
+      ],
+      "deliverables": [
+        "查询侧与索引侧共享 normalizer",
+        "subject、grade_volume、unit_no、material_type 规则",
+        "低置信度与无 scope 行为"
+      ],
+      "acceptance": "真实目录样本有稳定归一结果，索引侧与查询侧不分叉。",
+      "verification": [
+        "参数化规则测试",
+        "未知格式失败关闭测试"
+      ]
+    },
+    {
+      "id": "RET-03-03",
+      "phaseId": "RET-03",
+      "order": 3,
+      "title": "块级元数据持久化与 filter_blocks",
+      "priority": "P0",
+      "status": "未开始",
+      "dependsOn": [
+        "RET-03-02"
+      ],
+      "deliverables": [
+        "index_block_meta migration",
+        "BlockFilter 与 IndexBlockRef 合同",
+        "只返回 current、allowed、in-scope 块的 SQL"
+      ],
+      "acceptance": "第一单元全量过滤结果与人工块清单一致且无跨范围泄漏。",
+      "verification": [
+        "repository unit 测试",
+        "policy 与 stale/current 集成测试"
+      ]
+    },
+    {
+      "id": "RET-04-01",
+      "phaseId": "RET-04",
+      "order": 1,
+      "title": "FTS5 schema 与生命周期同步",
+      "priority": "P0",
+      "status": "未开始",
+      "dependsOn": [
+        "RET-03-03"
+      ],
+      "deliverables": [
+        "FTS 与 map migration",
+        "save、invalidate、rebuild、rollback 同步",
+        "current/stale 过滤"
+      ],
+      "acceptance": "任何索引生命周期操作后都不存在可检索的孤儿或 stale 行。",
+      "verification": [
+        "事务失败注入测试",
+        "孤儿行检查"
+      ]
+    },
+    {
+      "id": "RET-04-02",
+      "phaseId": "RET-04",
+      "order": 2,
+      "title": "中英分词与 search_lexical",
+      "priority": "P0",
+      "status": "未开始",
+      "dependsOn": [
+        "RET-04-01"
+      ],
+      "deliverables": [
+        "英文 porter 列",
+        "中文领域词典与 bigram fallback",
+        "heading 加权与 BlockHit 合同"
+      ],
+      "acceptance": "golden set 的词法 recall 与 precision 达到 RET-00 确定的目标。",
+      "verification": [
+        "tokenizer 单元测试",
+        "repository 排序测试"
+      ]
+    },
+    {
+      "id": "RET-04-03",
+      "phaseId": "RET-04",
+      "order": 3,
+      "title": "词法 A/B、切换与退役手写打分",
+      "priority": "P0",
+      "status": "未开始",
+      "dependsOn": [
+        "RET-04-02"
+      ],
+      "deliverables": [
+        "旧检索与 FTS A/B 报告",
+        "会话检索接入开关",
+        "达到闸门后移除手写打分"
+      ],
+      "acceptance": "FTS 无指标回退，点查证据合同和引用保持兼容。",
+      "verification": [
+        "golden eval",
+        "session unit、integration 与 browser 回归"
+      ]
+    },
+    {
+      "id": "RET-05-01",
+      "phaseId": "RET-05",
+      "order": 1,
+      "title": "共享查询范围解析",
+      "priority": "P0",
+      "status": "未开始",
+      "dependsOn": [
+        "RET-03-02"
+      ],
+      "deliverables": [
+        "intent、scope_filter、query_terms 合同",
+        "查询侧复用元数据 normalizer",
+        "置信度与 recoverable 行为"
+      ],
+      "acceptance": "同一册次、单元和资料类型在查询与索引侧归一一致。",
+      "verification": [
+        "查询理解参数化测试"
+      ]
+    },
+    {
+      "id": "RET-05-02",
+      "phaseId": "RET-05",
+      "order": 2,
+      "title": "范围预览 API 与前端确认",
+      "priority": "P1",
+      "status": "未开始",
+      "dependsOn": [
+        "RET-05-01",
+        "RET-03-03"
+      ],
+      "deliverables": [
+        "可编辑 scope 预览合同",
+        "文件数、块数、资料类型和缺口显示",
+        "中文前端状态与错误提示"
+      ],
+      "acceptance": "用户在执行前能看到并修正实际检索范围。",
+      "verification": [
+        "API contract 测试",
+        "前端 unit 与 Playwright 流程"
+      ]
+    },
+    {
+      "id": "RET-05-03",
+      "phaseId": "RET-05",
+      "order": 3,
+      "title": "枚举型全量过滤与分桶",
+      "priority": "P0",
+      "status": "未开始",
+      "dependsOn": [
+        "RET-05-01",
+        "RET-03-03"
+      ],
+      "deliverables": [
+        "按 scope 全量枚举",
+        "knowledge_kind 分桶",
+        "未覆盖块与 confirmed gaps 明细"
+      ],
+      "acceptance": "枚举范围由元数据决定，不受相似度 top-k 截断。",
+      "verification": [
+        "单元汇总 coverage 测试",
+        "超预算 gaps 测试"
+      ]
+    },
+    {
+      "id": "RET-05-04",
+      "phaseId": "RET-05",
+      "order": 4,
+      "title": "原子条目去重与分层生成",
+      "priority": "P0",
+      "status": "未开始",
+      "dependsOn": [
+        "RET-05-03"
+      ],
+      "deliverables": [
+        "块精确哈希去重",
+        "原子 concept item 归一与候选重复",
+        "按模型窗口计算的 map-reduce 与引用合并"
+      ],
+      "acceptance": "跨资料重复条目正确合并，每个合并结果保留全部来源，非重复项不误并。",
+      "verification": [
+        "duplicate precision/recall 评测",
+        "引用完整性测试"
+      ]
+    },
+    {
+      "id": "RET-06-01",
+      "phaseId": "RET-06",
+      "order": 1,
+      "title": "Embedding 出网授权与范围预览",
+      "priority": "P0",
+      "status": "未开始",
+      "dependsOn": [
+        "RET-00-02",
+        "RET-05-02"
+      ],
+      "deliverables": [
+        "vault/目录批量授权合同",
+        "Provider、文件数和块数预览",
+        "policy revision 失效与拒绝行为"
+      ],
+      "acceptance": "未授权正文不出网，授权范围变化后旧授权失效。",
+      "verification": [
+        "policy unit 测试",
+        "拒绝、撤销和 revision 集成测试"
+      ]
+    },
+    {
+      "id": "RET-06-02",
+      "phaseId": "RET-06",
+      "order": 2,
+      "title": "Embedding 客户端、指纹与缓存",
+      "priority": "P0",
+      "status": "未开始",
+      "dependsOn": [
+        "RET-06-01"
+      ],
+      "deliverables": [
+        "批量 create_embeddings",
+        "embedding_profile_fingerprint",
+        "缓存、维度校验和模型切换失效"
+      ],
+      "acceptance": "不同 endpoint/config revision 的同名模型绝不复用向量。",
+      "verification": [
+        "Provider adapter contract 测试",
+        "缓存命中与指纹隔离测试"
+      ]
+    },
+    {
+      "id": "RET-06-03",
+      "phaseId": "RET-06",
+      "order": 3,
+      "title": "float32 向量存储、内存矩阵与健康状态",
+      "priority": "P0",
+      "status": "未开始",
+      "dependsOn": [
+        "RET-06-02"
+      ],
+      "deliverables": [
+        "向量 migration",
+        "按 vault/profile 的内存缓存与失效",
+        "search_vector 和 semantic_status"
+      ],
+      "acceptance": "只搜索 current 且 profile 匹配的向量，重建和模型切换后缓存一致。",
+      "verification": [
+        "精确 KNN 排序测试",
+        "内存缓存失效与覆盖率测试"
+      ]
+    },
+    {
+      "id": "RET-06-04",
+      "phaseId": "RET-06",
+      "order": 4,
+      "title": "独立三路召回与 RRF",
+      "priority": "P0",
+      "status": "未开始",
+      "dependsOn": [
+        "RET-04-03",
+        "RET-06-03"
+      ],
+      "deliverables": [
+        "BM25、向量、heading 独立候选集",
+        "评测校准后的 RRF 与邻域扩展",
+        "混合检索 feature flag"
+      ],
+      "acceptance": "词法漏召回时向量可独立救回，任何通道都不作为另一通道的硬过滤器。",
+      "verification": [
+        "语义改写 recall@8",
+        "通道隔离回归测试"
+      ]
+    },
+    {
+      "id": "RET-07-01",
+      "phaseId": "RET-07",
+      "order": 1,
+      "title": "LLM 元数据抽取与审核",
+      "priority": "P1",
+      "status": "未开始",
+      "dependsOn": [
+        "RET-06-02",
+        "RET-03-03"
+      ],
+      "deliverables": [
+        "index-metadata 独立授权",
+        "knowledge_kinds 与 concept_keys 批量抽取",
+        "required-check 审核接入"
+      ],
+      "acceptance": "低置信度和新概念进入审核，未审核数据不直接触发不可逆合并。",
+      "verification": [
+        "抽取合同测试",
+        "人工审核通过率报告"
+      ]
+    },
+    {
+      "id": "RET-07-02",
+      "phaseId": "RET-07",
+      "order": 2,
+      "title": "单元卡片生成与失效",
+      "priority": "P2",
+      "status": "未开始",
+      "dependsOn": [
+        "RET-05-04",
+        "RET-06-03"
+      ],
+      "deliverables": [
+        "单元摘要卡片",
+        "源块变化后的失效与重建",
+        "FTS 与向量索引接入"
+      ],
+      "acceptance": "卡片不替代原始证据，粗粒度查询增益达到评测阈值。",
+      "verification": [
+        "卡片覆盖率与引用回归"
+      ]
+    },
+    {
+      "id": "RET-07-03",
+      "phaseId": "RET-07",
+      "order": 3,
+      "title": "点查 rerank 增益验证",
+      "priority": "P2",
+      "status": "未开始",
+      "dependsOn": [
+        "RET-06-04"
+      ],
+      "deliverables": [
+        "可选 rerank adapter",
+        "延迟、成本与 recall/precision 对比",
+        "无增益时保持关闭"
+      ],
+      "acceptance": "只有质量增益覆盖延迟和成本代价时才进入默认点查路径。",
+      "verification": [
+        "A/B 评测报告"
+      ]
+    }
+  ]
+}

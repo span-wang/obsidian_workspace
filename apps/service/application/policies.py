@@ -177,7 +177,9 @@ class PolicyService:
         normalized_model_id = self._normalize_identifier(model_id, "Model")
         normalized_operation = self._normalize_identifier(operation, "Operation", required=True)
         normalized_task_id = self._normalize_identifier(task_id, "Task", required=True)
-        normalized_scopes = self._normalize_scopes(scopes)
+        normalized_scopes = self._normalize_scopes(
+            scopes, enforce_count=policy.outbound_mode != "always-allow"
+        )
         for scope in normalized_scopes:
             evaluation = self.preview(
                 vault_id, scope.source_path, scope.derived_path, "outbound"
@@ -253,7 +255,7 @@ class PolicyService:
         normalized_model_id = self._normalize_identifier(model_id, "Model")
         normalized_operation = self._normalize_identifier(operation, "Operation", required=True)
         normalized_task_id = self._normalize_identifier(task_id, "Task", required=True)
-        normalized_scopes = self._normalize_scopes(scopes)
+        normalized_scopes = self._normalize_scopes(scopes, enforce_count=False)
         actual_digest = outbound_context_digest(
             provider_id=normalized_provider_id,
             model_id=normalized_model_id,
@@ -308,9 +310,11 @@ class PolicyService:
             )
 
     def _normalize_scopes(
-        self, scopes: list[OutboundScope]
+        self, scopes: list[OutboundScope], *, enforce_count: bool = True
     ) -> tuple[OutboundScope, ...]:
-        if not scopes or len(scopes) > self.MAX_SCOPE_COUNT:
+        if not scopes:
+            raise PolicyValidationError("Outbound authorization needs an operation, task, and scope.")
+        if enforce_count and len(scopes) > self.MAX_SCOPE_COUNT:
             raise PolicyValidationError("Outbound authorization has too many scoped items.")
         if any(
             len(scope.source_path) > self.MAX_IDENTIFIER_LENGTH * 4

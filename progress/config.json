@@ -1,0 +1,85 @@
+{
+  "projectName": "Obsidian Personal Knowledge Platform",
+  "initiativeName": "Retrieval Redesign",
+  "updatedOn": "2026-07-26",
+  "planDocument": "docs/retrieval-redesign.md",
+  "generatedFile": "docs/retrieval-progress.md",
+  "sourceFiles": [
+    "progress/config.json",
+    "progress/tasks/*.json",
+    "progress/risks.json",
+    "progress/tech-debts.json",
+    "progress/logs.json"
+  ],
+  "statuses": [
+    {
+      "id": "未开始",
+      "meaning": "任务已定义，但尚未产生实施产物。"
+    },
+    {
+      "id": "进行中",
+      "meaning": "已有实际推进，但尚未达到全部验收条件。"
+    },
+    {
+      "id": "阻塞",
+      "meaning": "存在无法绕过的决策、权限或外部依赖。"
+    },
+    {
+      "id": "已完成",
+      "meaning": "产物、验证和进度记录均已完成。"
+    },
+    {
+      "id": "暂缓",
+      "meaning": "已明确不在当前开发序列中推进。"
+    }
+  ],
+  "phases": [
+    {
+      "id": "RET-00",
+      "label": "决策与基线",
+      "goal": "冻结事实、范围、评测集和开发闸门。"
+    },
+    {
+      "id": "RET-01",
+      "label": "耐久结构投影",
+      "goal": "让索引在导入任务删除后仍能读取选定 DocumentGraph 的检索投影。"
+    },
+    {
+      "id": "RET-02",
+      "label": "富块模型与兼容迁移",
+      "goal": "扩展 IndexBlock，并通过双写、回填和可回退切读完成旧库升级。"
+    },
+    {
+      "id": "RET-03",
+      "label": "确定性分块与范围过滤",
+      "goal": "建立结构分块、标题路径、领域元数据和 SQL 范围枚举。"
+    },
+    {
+      "id": "RET-04",
+      "label": "FTS5 词法检索",
+      "goal": "以可迁移、可失效的 BM25 检索替换手写词项打分。"
+    },
+    {
+      "id": "RET-05",
+      "label": "查询范围与枚举型汇总",
+      "goal": "让范围决定覆盖，完成可预览、可核验的全量汇总。"
+    },
+    {
+      "id": "RET-06",
+      "label": "Embedding 与混合检索",
+      "goal": "在明确出网边界后接入精确向量检索与独立通道融合。"
+    },
+    {
+      "id": "RET-07",
+      "label": "受控增强",
+      "goal": "以独立开关验证 LLM 元数据、单元卡片和 rerank 的实际增益。"
+    }
+  ],
+  "trackingRules": [
+    "任务达到验收条件后才能标记为已完成。",
+    "每个进行中任务必须记录本步纳入、本步明确不纳入和后续归属。",
+    "阻塞、范围变化或验收回退必须同步更新 risks.json 和 logs.json。",
+    "展示文档只允许由 npm run progress:build 生成。",
+    "提交前运行 npm run progress:check 验证结构化源与展示文档一致。"
+  ]
+}

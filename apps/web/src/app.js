@@ -380,6 +380,45 @@ function requestJson(endpoint, options = {}) {
   });
 }
 
+async function requestEventStream(endpoint, options = {}, onEvent) {
+  const response = await fetch(endpoint, {
+    ...options,
+    headers: {
+      ...(options.body ? { "Content-Type": "application/json" } : {}),
+      Accept: "text/event-stream",
+      ...options.headers
+    }
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload.message || "请求未完成。");
+  }
+  if (!response.body) throw new Error("流式响应不可用。");
+
+  const reader = response.body.getReader();
+  const decoder = new globalThis.TextDecoder();
+  let buffered = "";
+  const consume = (frame) => {
+    const lines = frame.split(/\r?\n/);
+    const event = lines.find((line) => line.startsWith("event:"))?.slice(6).trim() || "message";
+    const data = lines
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trim())
+      .join("\n");
+    if (data) onEvent(event, JSON.parse(data));
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    buffered += decoder.decode(value || new Uint8Array(), { stream: !done });
+    const frames = buffered.split(/\r?\n\r?\n/);
+    buffered = frames.pop() || "";
+    frames.filter(Boolean).forEach(consume);
+    if (done) break;
+  }
+  if (buffered.trim()) consume(buffered);
+}
+
 function vaultName(vault) {
   return vault.display_name || vault.path?.replace(/\\/g, "/").split("/").at(-1) || vault.vault_id;
 }
@@ -653,6 +692,7 @@ export function SessionManagement({
   onCreateTask,
   onExecuteTask,
   onConfirmKnowledgeOrganizationAuthorization,
+  onConfirmDeepCreationAuthorization,
   onLoadCompletenessCoverage,
   onEditGenerationResult,
   onReverifyGenerationResult
@@ -666,6 +706,7 @@ export function SessionManagement({
   const [message, setMessage] = React.useState("");
   const [taskIntent, setTaskIntent] = React.useState("auto");
   const [taskPreview, setTaskPreview] = React.useState(null);
+  const [streamingDeepCreation, setStreamingDeepCreation] = React.useState(null);
   const [coveragePages, setCoveragePages] = React.useState({});
   const [editingGenerationResultId, setEditingGenerationResultId] = React.useState(null);
   const [editingGenerationContent, setEditingGenerationContent] = React.useState("");
@@ -682,6 +723,20 @@ export function SessionManagement({
   const retrievalResults = activeDetail?.retrieval_results || [];
   const completenessResults = activeDetail?.completeness_results || [];
   const knowledgeOrganizationResults = activeDetail?.knowledge_organization_results || [];
+  const deepCreationResults = activeDetail?.deep_creation_results || [];
+  const streamedDeepCreationResult = streamingDeepCreation?.session_id === selectedSessionId
+    ? {
+        result_id: "stream:" + streamingDeepCreation.task_id,
+        status: "preparing",
+        summary: "正在流式生成深度创作内容。",
+        is_streaming: true,
+        sections: Object.entries(streamingDeepCreation.sections).map(([ordinal, content]) => ({
+          ordinal: Number(ordinal),
+          status: "running",
+          content
+        }))
+      }
+    : null;
   const generationResults = activeDetail?.generation_results || [];
   const snapshotsById = new Map((activeDetail?.task_snapshots || []).map((snapshot) => [snapshot.snapshot_id, snapshot]));
   const vaultsById = new Map(vaults.map((vault) => [vault.vault_id, vault]));
@@ -704,6 +759,7 @@ export function SessionManagement({
     setMessage("");
     setTaskIntent("auto");
     setTaskPreview(null);
+    setStreamingDeepCreation(null);
   }, [selectedSession?.session_id]);
 
   function load(nextFilters) {
@@ -1262,6 +1318,113 @@ export function SessionManagement({
     );
   }
 
+  function deepCreationSectionStatusText(status) {
+    return {
+      completed: "已完成",
+      preparing: "正在生成",
+      running: "正在生成",
+      failed: "失败",
+      recoverable: "待恢复",
+      planned: "已计划"
+    }[status] || "已计划";
+  }
+
+  function deepCreationPlanView(plan, outcomeByOrdinal = new Map()) {
+    if (!plan?.sections?.length) {
+      return React.createElement("p", { className: "organization-plan-empty" }, "当前范围没有可准备的深度创作段。");
+    }
+    const localEvidenceCount = plan.local_evidence_count
+      ?? plan.sections.reduce((count, section) => count + (section.local_evidence_count || 0), 0);
+    return React.createElement(
+      "section",
+      { className: "knowledge-organization-plan deep-creation-plan", "aria-label": "深度创作计划" },
+      React.createElement("h3", null, "深度创作"),
+      React.createElement("p", { className: "organization-plan-note" }, "每段使用冻结的本地证据；超出证据的内容会明确标为模型判断。"),
+      React.createElement("p", { className: "organization-plan-meta" }, "计划 " + plan.sections.length + " 段；冻结知识库证据 " + localEvidenceCount + " 条。"),
+      plan.is_bounded_preview
+        ? React.createElement("p", { className: "form-error" }, "该计划仅为有界诊断预览，缩小范围后才能固定快照。")
+        : null,
+      plan.sections.map((section) => React.createElement(
+        "p",
+        { className: "organization-plan-meta", key: "deep-creation-section-summary:" + section.ordinal },
+        "第 " + section.ordinal + " 段：" + deepCreationSectionStatusText(outcomeByOrdinal.get(section.ordinal)?.status || "planned") + "；目标：" + section.goal
+      ))
+    );
+  }
+
+  function deepCreationLocalEvidenceView(section) {
+    const evidence = section.local_evidence || [];
+    return React.createElement(
+      "details",
+      { className: "evidence-row deep-creation-evidence" },
+      React.createElement("summary", null, "知识库证据（" + evidence.length + "）"),
+      evidence.length
+        ? evidence.map((item) => React.createElement(
+            "article",
+            { className: "deep-creation-evidence-item", key: "deep-local:" + section.ordinal + ":" + item.ordinal },
+            React.createElement("p", null, item.relative_path + " · " + (item.heading || item.location)),
+            React.createElement("p", null, item.excerpt),
+            React.createElement("p", null, "定位：" + item.location + (item.page ? "；第 " + item.page + " 页" : ""))
+          ))
+        : React.createElement("p", null, "本段没有可用的冻结知识库证据。")
+    );
+  }
+
+  function deepCreationResultView(result) {
+    const statusText = {
+      preparing: "正在准备深度创作",
+      "waiting-authorization": "等待本次授权",
+      completed: "深度创作已完成",
+      failed: "深度创作失败",
+      recoverable: "深度创作待恢复",
+      "source-changed": "来源已变化"
+    }[result.status] || "深度创作状态未知";
+    const statusIcon = result.status === "completed" ? "✓"
+      : result.status === "waiting-authorization" || result.status === "preparing" ? "?"
+        : "!";
+    return React.createElement(
+      "section",
+      { className: "session-retrieval-result deep-creation-result", key: result.result_id, "aria-label": statusText },
+      React.createElement("p", { className: "status-marker deep-creation-status status-" + result.status }, statusIcon + " " + statusText),
+      React.createElement("p", { className: "session-retrieval-summary" }, result.summary),
+      React.createElement("p", { className: "organization-plan-meta" }, "知识库证据与模型判断分别呈现。"),
+      result.invalidation_reason
+        ? React.createElement("p", { className: "form-error" }, "需重新准备：" + result.invalidation_reason)
+        : null,
+      result.recovery_action
+        ? React.createElement("p", { className: "form-error" }, "下一步：" + result.recovery_action)
+        : null,
+      result.status === "waiting-authorization" && result.authorization_id && onConfirmDeepCreationAuthorization
+        ? React.createElement("button", {
+          className: "primary-button",
+          type: "button",
+          disabled: isSubmitting,
+          onClick: () => confirmDeepCreationAuthorization(result)
+        }, "授权并创作")
+        : null,
+      (result.sections || []).map((section) => React.createElement(
+        "section",
+        { className: "organization-result-section deep-creation-result-section", key: "deep-result:" + result.result_id + ":" + section.ordinal },
+        React.createElement("p", { className: "organization-plan-heading" }, "第 " + section.ordinal + " 段：" + deepCreationSectionStatusText(section.status)),
+        section.reason
+          ? React.createElement("p", { className: "form-error" }, "原因：" + section.reason)
+          : null,
+        ["completed", "running"].includes(section.status)
+          ? React.createElement("p", { className: "organization-conclusion-content" }, section.content)
+          : null,
+        result.is_streaming ? null : deepCreationLocalEvidenceView(section),
+        section.model_judgement
+          ? React.createElement(
+              "section",
+              { className: "deep-creation-model-judgement", "aria-label": "模型判断" },
+              React.createElement("p", { className: "organization-plan-meta" }, "模型判断"),
+              React.createElement("p", { className: "organization-conclusion-content" }, section.model_judgement)
+            )
+          : null
+      ))
+    );
+  }
+
   async function prepareTask(event) {
     event?.preventDefault();
     if (!canPrepare || !selectedSession || contextIsDirty) return;
@@ -1299,14 +1462,33 @@ export function SessionManagement({
     if (!selectedSession || !onExecuteTask) return;
     setStatus("");
     setIsSubmitting(true);
+    const snapshot = activeDetail?.task_snapshots?.find((item) => item.task_id === taskId);
+    const isDeepCreation = snapshot?.intent === "deep-creation";
+    if (isDeepCreation) {
+      setStreamingDeepCreation({ session_id: selectedSession.session_id, task_id: taskId, sections: {} });
+    }
     try {
-      const execution = await onExecuteTask(selectedSession.session_id, taskId);
+      const execution = await onExecuteTask(
+        selectedSession.session_id,
+        taskId,
+        (chunk) => setStreamingDeepCreation((current) => {
+          if (!current || current.task_id !== taskId) return current;
+          return {
+            ...current,
+            sections: {
+              ...current.sections,
+              [chunk.ordinal]: (current.sections[chunk.ordinal] || "") + chunk.content
+            }
+          };
+        })
+      );
       if (execution?.isCurrent === false) return;
       const result = execution?.result || execution;
       setStatus(["completed", "complete"].includes(result.status) ? "任务已完成，证据已刷新。" : result.summary);
     } catch (requestError) {
       setStatus(requestError.message);
     } finally {
+      if (isDeepCreation) setStreamingDeepCreation(null);
       setIsSubmitting(false);
     }
   }
@@ -1317,6 +1499,23 @@ export function SessionManagement({
     setIsSubmitting(true);
     try {
       const execution = await onConfirmKnowledgeOrganizationAuthorization(
+        selectedSession.session_id, result.task_id, result.vault_id, result.authorization_id
+      );
+      const generated = execution?.result || execution;
+      setStatus(["completed", "complete"].includes(generated.status) ? "任务已完成，证据已刷新。" : generated.summary);
+    } catch (requestError) {
+      setStatus(requestError.message);
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  async function confirmDeepCreationAuthorization(result) {
+    if (!selectedSession || !onConfirmDeepCreationAuthorization) return;
+    setStatus("");
+    setIsSubmitting(true);
+    try {
+      const execution = await onConfirmDeepCreationAuthorization(
         selectedSession.session_id, result.task_id, result.vault_id, result.authorization_id
       );
       const generated = execution?.result || execution;
@@ -1619,7 +1818,7 @@ export function SessionManagement({
           ? React.createElement("p", { className: "empty-state", role: "status" }, "正在加载会话内容。")
           : detailError
             ? React.createElement("p", { className: "form-error", role: "alert" }, detailError)
-          : activeDetail?.messages?.length || generationResults.length || knowledgeOrganizationResults.length
+          : activeDetail?.messages?.length || generationResults.length || knowledgeOrganizationResults.length || deepCreationResults.length || streamedDeepCreationResult
               ? React.createElement(
                   React.Fragment,
                   null,
@@ -1627,13 +1826,16 @@ export function SessionManagement({
                     ...generationResults.map((result) => ({ kind: "generation", value: result })),
                     ...retrievalResults.map((result) => ({ kind: "retrieval", value: result })),
                     ...completenessResults.map((result) => ({ kind: "completeness", value: result })),
-                    ...knowledgeOrganizationResults.map((result) => ({ kind: "organization", value: result }))]
+                    ...knowledgeOrganizationResults.map((result) => ({ kind: "organization", value: result })),
+                    ...deepCreationResults.map((result) => ({ kind: "deep-creation", value: result })),
+                    ...(streamedDeepCreationResult ? [{ kind: "deep-creation", value: streamedDeepCreationResult }] : [])]
                     .sort((first, second) => (first.value.created_at || "").localeCompare(second.value.created_at || ""))
                     .map((entry) => {
                       if (entry.kind === "generation") return generationResultView(entry.value);
                       if (entry.kind === "retrieval") return retrievalResultView(entry.value);
                       if (entry.kind === "completeness") return completenessResultView(entry.value);
                       if (entry.kind === "organization") return knowledgeOrganizationResultView(entry.value);
+                      if (entry.kind === "deep-creation") return deepCreationResultView(entry.value);
                       return React.createElement(
                         "article",
                         { className: `session-message session-message-${entry.value.role}`, key: entry.value.message_id },
@@ -1642,12 +1844,13 @@ export function SessionManagement({
                       );
                     })
                 )
-              : retrievalResults.length || completenessResults.length || knowledgeOrganizationResults.length
+              : retrievalResults.length || completenessResults.length || knowledgeOrganizationResults.length || deepCreationResults.length
                 ? [
                     ...retrievalResults.map(retrievalResultView),
                     ...completenessResults.map(completenessResultView),
-                    ...knowledgeOrganizationResults.map(knowledgeOrganizationResultView)
-                  ]
+                    ...knowledgeOrganizationResults.map(knowledgeOrganizationResultView),
+                    ...deepCreationResults.map(deepCreationResultView)
+                 ]
               : selectedSession
                 ? React.createElement("p", { className: "empty-state" }, "该会话尚无已保存的消息。")
                 : React.createElement("p", { className: "empty-state" }, "从左侧选择一个会话以查看内容。")
@@ -1658,14 +1861,21 @@ export function SessionManagement({
             { className: "session-task-snapshot-list", "aria-label": "任务快照状态", "aria-live": "polite" },
             activeDetail.task_snapshots.map((snapshot) => {
               const canExecute = snapshot.status === "prepared"
-                && ["source-lookup", "knowledge-organization", "completeness"].includes(snapshot.intent);
+                && ["source-lookup", "knowledge-organization", "completeness", "deep-creation"].includes(snapshot.intent);
               const frozenVault = vaultsById.get(snapshot.vault_id);
               const isKnowledgeOrganization = snapshot.intent === "knowledge-organization";
+              const isDeepCreation = snapshot.intent === "deep-creation";
               const organizationResult = isKnowledgeOrganization
                 ? knowledgeOrganizationResults.find((result) => result.snapshot_id === snapshot.snapshot_id)
                 : null;
+              const deepCreationResult = isDeepCreation
+                ? deepCreationResults.find((result) => result.snapshot_id === snapshot.snapshot_id)
+                : null;
               const organizationOutcomes = new Map(
                 (organizationResult?.sections || []).map((section) => [section.ordinal, section])
+              );
+              const deepCreationOutcomes = new Map(
+                (deepCreationResult?.sections || []).map((section) => [section.ordinal, section])
               );
               return React.createElement(
                 "section",
@@ -1692,12 +1902,15 @@ export function SessionManagement({
                 snapshot.knowledge_organization_plan
                   ? knowledgeOrganizationPlanView(snapshot.knowledge_organization_plan, organizationOutcomes)
                   : null,
+                snapshot.deep_creation_plan
+                  ? deepCreationPlanView(snapshot.deep_creation_plan, deepCreationOutcomes)
+                  : null,
                 snapshot.invalidation_reason
                   ? React.createElement("span", { className: "form-error" }, `需重新准备：${snapshot.invalidation_reason}`)
                   : null,
                 canExecute
-                  ? React.createElement("button", { className: "secondary-button", type: "button", disabled: isSubmitting, onClick: () => executeTask(snapshot.task_id) }, snapshot.intent === "completeness" ? "执行完整性检索" : snapshot.intent === "knowledge-organization" ? "生成知识整理" : "执行检索")
-                  : null
+                  ? React.createElement("button", { className: "secondary-button", type: "button", disabled: isSubmitting, onClick: () => executeTask(snapshot.task_id) }, snapshot.intent === "completeness" ? "执行完整性检索" : snapshot.intent === "knowledge-organization" ? "生成知识整理" : snapshot.intent === "deep-creation" ? "生成深度创作" : "执行检索")
+                 : null
               );
             })
           )
@@ -1755,6 +1968,9 @@ export function SessionManagement({
                     : null,
                   taskPreview.knowledge_organization_plan
                     ? knowledgeOrganizationPlanView(taskPreview.knowledge_organization_plan)
+                    : null,
+                  taskPreview.deep_creation_plan
+                    ? deepCreationPlanView(taskPreview.deep_creation_plan)
                     : null,
                   !taskPreview.is_ready
                     ? React.createElement("span", { className: "form-error" }, `${taskPreview.blocking_reason} ${taskPreview.recovery_action}`)
@@ -3030,7 +3246,153 @@ function ImportTaskLauncher({ vault, onCreated }) {
   );
 }
 
-function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
+function projectionSummaryText(projection) {
+  const typeCounts = Object.entries(projection.locator_summary?.type_counts || {})
+    .map(([type, count]) => `${type} ${count}`)
+    .join("；");
+  const pdfPages = projection.locator_summary?.pdf_pages || [];
+  const docxPartCount = projection.locator_summary?.docx_part_count || 0;
+  return `投影块 ${projection.block_count}；可检索块 ${projection.retrievable_block_count}；定位器 ${typeCounts || "无"}；PDF 页 ${pdfPages.length ? pdfPages.join("、") : "无"}；DOCX 部件 ${docxPartCount}。`;
+}
+
+export function ProjectionRebuildVerificationPanel({ task, conversionGraphs, onTaskDeleted }) {
+  const graphOptions = conversionGraphs.filter((graph) => (
+    typeof graph.graph_id === "string" && Number.isInteger(graph.graph_revision)
+  ));
+  const [selectedGraphKey, setSelectedGraphKey] = React.useState(() => (
+    graphOptions.length ? `${graphOptions[0].graph_id}\u0000${graphOptions[0].graph_revision}` : ""
+  ));
+  const [beforeProjection, setBeforeProjection] = React.useState(null);
+  const [afterProjection, setAfterProjection] = React.useState(null);
+  const [rebuildIndex, setRebuildIndex] = React.useState(null);
+  const [confirmed, setConfirmed] = React.useState(false);
+  const [status, setStatus] = React.useState("");
+  const [isActing, setIsActing] = React.useState(false);
+  const selectedGraph = graphOptions.find(
+    (graph) => `${graph.graph_id}\u0000${graph.graph_revision}` === selectedGraphKey
+  ) || graphOptions[0];
+
+  function summaryEndpoint(graph) {
+    return `${VAULTS_ENDPOINT}/${encodeURIComponent(task.vault_id)}/graph-projections/${encodeURIComponent(graph.graph_id)}/${graph.graph_revision}`;
+  }
+
+  async function inspectProjection() {
+    if (!selectedGraph || isActing) return;
+    setStatus("");
+    setIsActing(true);
+    try {
+      const response = await requestJson(summaryEndpoint(selectedGraph));
+      setBeforeProjection(response.projection);
+      setAfterProjection(null);
+      setRebuildIndex(null);
+      setConfirmed(false);
+      setStatus("已读取删除前的耐久投影摘要。");
+    } catch (error) {
+      setStatus(error.message);
+    } finally {
+      setIsActing(false);
+    }
+  }
+
+  async function verifyRebuild() {
+    if (!selectedGraph || !beforeProjection || !confirmed || isActing) return;
+    setStatus("");
+    setIsActing(true);
+    try {
+      await onTaskDeleted(task.task_id, { keepSelected: true });
+      const rebuilt = await requestJson(`${VAULTS_ENDPOINT}/${encodeURIComponent(task.vault_id)}/index/rebuild`, {
+        method: "POST"
+      });
+      const response = await requestJson(summaryEndpoint(selectedGraph));
+      setAfterProjection(response.projection);
+      setRebuildIndex(rebuilt.index);
+      const locatorMatches = response.projection.locator_digest === beforeProjection.locator_digest;
+      const rebuildSucceeded = rebuilt.index?.status === "healthy";
+      setStatus(
+        locatorMatches && rebuildSucceeded
+          ? "验证通过：任务已删除，索引重建成功，投影 locator 摘要保持一致。"
+          : `验证未通过：索引状态 ${rebuilt.index?.status || "未知"}；locator 摘要${locatorMatches ? "一致" : "不一致"}。`
+      );
+    } catch (error) {
+      setStatus(error.message);
+    } finally {
+      setIsActing(false);
+    }
+  }
+
+  return React.createElement(
+    "section",
+    { className: "projection-rebuild-verification", "aria-label": "投影重建验证" },
+    React.createElement("h3", null, "投影重建验证"),
+    React.createElement("p", { className: "row-note" }, "只读取耐久投影的身份、计数和 locator 摘要；不会显示正文、路径或转换工件。"),
+    graphOptions.length > 1
+      ? React.createElement(
+        "label",
+        { className: "form-label" },
+        "转换图谱",
+        React.createElement(
+          "select",
+          {
+            value: selectedGraphKey,
+            disabled: isActing || Boolean(afterProjection),
+            onChange: (event) => setSelectedGraphKey(event.target.value),
+            "aria-label": "选择待验证的转换图谱"
+          },
+          graphOptions.map((graph) => React.createElement(
+            "option",
+            { key: `${graph.graph_id}:${graph.graph_revision}`, value: `${graph.graph_id}\u0000${graph.graph_revision}` },
+            `图谱 ${graph.graph_id} · 修订 ${graph.graph_revision}`
+          ))
+        )
+      )
+      : null,
+    React.createElement(
+      "div",
+      { className: "detail-actions" },
+      React.createElement("button", {
+        className: "secondary-button",
+        type: "button",
+        disabled: isActing || Boolean(afterProjection),
+        onClick: inspectProjection
+      }, beforeProjection ? "重新读取投影摘要" : "读取投影摘要"),
+      beforeProjection && !afterProjection
+        ? React.createElement(
+          "label",
+          { className: "projection-confirmation" },
+          React.createElement("input", {
+            type: "checkbox",
+            checked: confirmed,
+            disabled: isActing,
+            onChange: (event) => setConfirmed(event.target.checked)
+          }),
+          "我确认删除此导入任务并执行索引重建验证"
+        )
+        : null,
+      beforeProjection && !afterProjection
+        ? React.createElement("button", {
+          className: "primary-button",
+          type: "button",
+          disabled: isActing || !confirmed,
+          onClick: verifyRebuild
+        }, isActing ? "正在验证" : "删除并重建验证")
+        : null
+    ),
+    beforeProjection
+      ? React.createElement("p", { className: "row-note", "data-testid": "projection-before-summary" }, `删除前：${projectionSummaryText(beforeProjection)}`)
+      : null,
+    afterProjection
+      ? React.createElement("p", { className: "row-note", "data-testid": "projection-after-summary" }, `重建后：${projectionSummaryText(afterProjection)}`)
+      : null,
+    rebuildIndex
+      ? React.createElement("p", { className: "row-note" }, `重建索引状态：${rebuildIndex.status}。`)
+      : null,
+    status
+      ? React.createElement("p", { className: `status-line${afterProjection && status.startsWith("验证未通过") ? " status-danger" : ""}`, role: "status" }, status)
+      : null
+  );
+}
+
+function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskDeleted, onTaskSnapshot }) {
   const [detail, setDetail] = React.useState(null);
   const [status, setStatus] = React.useState("");
   const [isActing, setIsActing] = React.useState(false);
@@ -3504,6 +3866,8 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
   const conversionBlocksByItem = new Map(
     conversionGraphs.map((graph) => [graph.item_id, graph.blocks || []])
   );
+  const canVerifyProjectionRebuild = ["complete", "completed-with-confirmed-gaps"].includes(task.lifecycle)
+    && conversionGraphs.some((graph) => typeof graph.graph_id === "string" && Number.isInteger(graph.graph_revision));
   const unitRisk = (unit) => {
     const itemsForUnit = reviewItemsByUnit.get(unit.unit_id) || [];
     if (itemsForUnit.some((item) => item.risk === "blocking")) return "blocking";
@@ -3588,6 +3952,13 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskSnapshot }) {
         : null
     ),
     status ? React.createElement("p", { className: "status-line", role: "status" }, status) : null,
+    canVerifyProjectionRebuild
+      ? React.createElement(ProjectionRebuildVerificationPanel, {
+        task,
+        conversionGraphs,
+        onTaskDeleted
+      })
+      : null,
     React.createElement(
       "section",
       { className: "commit-review-list", "aria-label": "提交审核", "aria-live": "polite" },
@@ -4234,6 +4605,7 @@ export function ImportTaskCenter({ tasks, error, isLoading, selectedTaskId, onSe
       taskId: selectedTaskId,
       onBack: onSelect,
       onTaskChanged,
+      onTaskDeleted,
       onTaskSnapshot
     });
   }
@@ -4508,11 +4880,11 @@ export function App() {
     setActiveDestination("tasks");
   }, [syncTask]);
 
-  const deleteTask = React.useCallback(async (taskId) => {
+  const deleteTask = React.useCallback(async (taskId, { keepSelected = false } = {}) => {
     setTasksError("");
     try {
       await requestJson(`${IMPORT_TASKS_ENDPOINT}/${taskId}`, { method: "DELETE" });
-      setSelectedTaskId((current) => current === taskId ? null : current);
+      if (!keepSelected) setSelectedTaskId((current) => current === taskId ? null : current);
     } finally {
       await loadTasks();
     }
@@ -4614,18 +4986,38 @@ export function App() {
     return response.snapshot;
   }
 
-  async function executePersistentSessionTask(sessionId, taskId) {
-    const response = await requestJson(`${SESSIONS_ENDPOINT}/${sessionId}/tasks/${taskId}/execute`, {
+  async function executePersistentSessionTask(sessionId, taskId, onChunk) {
+    let result = null;
+    await requestEventStream(`${SESSIONS_ENDPOINT}/${sessionId}/tasks/${taskId}/execute/stream`, {
       method: "POST",
       body: JSON.stringify({})
+    }, (event, payload) => {
+      if (event === "chunk") {
+        onChunk?.(payload);
+      } else if (event === "result") {
+        result = payload.result;
+      } else if (event === "error") {
+        throw new Error(payload.message || "任务未完成。");
+      }
     });
+    if (!result) throw new Error("流式任务未返回结果。");
     const isCurrent = selectedSessionIdRef.current === sessionId;
     if (isCurrent) await loadSessionDetail(sessionId);
     await loadSessions(sessionFilters);
-    return { result: response.result, isCurrent };
+    return { result, isCurrent };
   }
 
   async function confirmPersistentKnowledgeOrganizationAuthorization(
+    sessionId, taskId, vaultId, authorizationId
+  ) {
+    await requestJson(
+      `${VAULTS_ENDPOINT}/${encodeURIComponent(vaultId)}/outbound-authorizations/${encodeURIComponent(authorizationId)}/confirm`,
+      { method: "POST", body: JSON.stringify({ approved: true }) }
+    );
+    return executePersistentSessionTask(sessionId, taskId);
+  }
+
+  async function confirmPersistentDeepCreationAuthorization(
     sessionId, taskId, vaultId, authorizationId
   ) {
     await requestJson(
@@ -4817,6 +5209,7 @@ export function App() {
       onCreateTask: createPersistentSessionTask,
       onExecuteTask: executePersistentSessionTask,
       onConfirmKnowledgeOrganizationAuthorization: confirmPersistentKnowledgeOrganizationAuthorization,
+      onConfirmDeepCreationAuthorization: confirmPersistentDeepCreationAuthorization,
       onLoadCompletenessCoverage: loadPersistentCompletenessCoverage,
       onEditGenerationResult: editPersistentSessionGenerationResult,
       onReverifyGenerationResult: reverifyPersistentSessionGenerationResult

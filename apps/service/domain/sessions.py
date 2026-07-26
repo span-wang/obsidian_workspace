@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import PurePosixPath, PureWindowsPath
+from urllib.parse import urlparse
 from uuid import uuid4
 
 from domain.policies import normalize_vault_relative_path
@@ -210,6 +211,35 @@ class SessionKnowledgeOrganizationPlanSection:
             for item in self.evidence
         ):
             raise ValueError("Knowledge organization plan evidence falls outside its scope.")
+
+
+@dataclass(frozen=True)
+class SessionDeepCreationPlanSection:
+    ordinal: int
+    title: str
+    goal: str
+    scope_path: str | None
+    local_evidence: tuple[SessionKnowledgeOrganizationEvidence, ...]
+
+    def __post_init__(self) -> None:
+        if self.ordinal < 1 or not self.title.strip() or not self.goal.strip():
+            raise ValueError("Deep creation plan section is invalid.")
+        if self.scope_path is not None:
+            _validate_relative_path(self.scope_path)
+            if not self.scope_path.strip():
+                raise ValueError("Deep creation plan section scope is invalid.")
+        if tuple(item.ordinal for item in self.local_evidence) != tuple(
+            range(1, len(self.local_evidence) + 1)
+        ):
+            raise ValueError("Deep creation plan evidence ordering is invalid.")
+        if self.scope_path is not None and any(
+            item.relative_path != self.scope_path
+            and not item.relative_path.startswith(f"{self.scope_path}/")
+            for item in self.local_evidence
+        ):
+            raise ValueError("Deep creation plan evidence falls outside its scope.")
+
+
 @dataclass(frozen=True)
 class SessionTaskSnapshot:
     snapshot_id: str
@@ -239,6 +269,7 @@ class SessionTaskSnapshot:
     sources: tuple[SessionTaskSnapshotSource, ...] = ()
     coverage_items: tuple[SessionCompletenessCoverageItem, ...] = ()
     organization_sections: tuple[SessionKnowledgeOrganizationPlanSection, ...] = ()
+    deep_creation_sections: tuple[SessionDeepCreationPlanSection, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -302,6 +333,35 @@ class SessionTaskSnapshot:
                         raise ValueError("Knowledge organization evidence source identity is invalid.")
         elif self.organization_sections:
             raise ValueError("Only knowledge organization task snapshots can have plan sections.")
+        if self.intent == "deep-creation":
+            if tuple(section.ordinal for section in self.deep_creation_sections) != tuple(
+                range(1, len(self.deep_creation_sections) + 1)
+            ):
+                raise ValueError("Deep creation task snapshots need ordered plan sections.")
+            sources_by_ordinal = {source.ordinal: source for source in self.sources}
+            for section in self.deep_creation_sections:
+                for item in section.local_evidence:
+                    source = sources_by_ordinal.get(item.source_ordinal)
+                    if source is None:
+                        raise ValueError("Deep creation evidence must belong to the task snapshot.")
+                    if (
+                        item.identity_kind,
+                        item.relative_path,
+                        item.content_sha256,
+                        item.source_id,
+                        item.source_content_hash,
+                        item.source_path,
+                    ) != (
+                        source.identity_kind,
+                        source.relative_path,
+                        source.content_sha256,
+                        source.source_id,
+                        source.source_content_hash,
+                        source.source_path,
+                    ):
+                        raise ValueError("Deep creation evidence source identity is invalid.")
+        elif self.deep_creation_sections:
+            raise ValueError("Only deep creation task snapshots can have plan sections.")
 
 
 @dataclass(frozen=True)
@@ -793,6 +853,142 @@ class SessionKnowledgeOrganizationResult:
                 raise ValueError("Completed knowledge organization results cannot retain incomplete sections.")
 
 
+DEEP_CREATION_RESULT_STATUSES = frozenset(
+    {"preparing", "waiting-authorization", "completed", "failed", "recoverable"}
+)
+
+
+@dataclass(frozen=True)
+class SessionDeepCreationWebEvidence:
+    ordinal: int
+    title: str
+    url: str
+    accessed_at: str
+    snippet: str
+
+    def __post_init__(self) -> None:
+        parsed = urlparse(self.url)
+        if (
+            self.ordinal < 1
+            or parsed.scheme != "https"
+            or not parsed.netloc
+            or parsed.username is not None
+            or parsed.password is not None
+            or not self.title.strip()
+            or not self.snippet.strip()
+            or len(self.snippet) > 1_000
+        ):
+            raise ValueError("Deep creation web evidence is invalid.")
+        try:
+            accessed = datetime.fromisoformat(self.accessed_at)
+        except ValueError as error:
+            raise ValueError("Deep creation web evidence access time is invalid.") from error
+        if accessed.tzinfo is None or accessed.utcoffset() != timezone.utc.utcoffset(accessed):
+            raise ValueError("Deep creation web evidence access time must be UTC.")
+
+
+@dataclass(frozen=True)
+class SessionDeepCreationSectionOutcome:
+    ordinal: int
+    status: str
+    local_evidence_count: int
+    reason: str | None = None
+    content: str | None = None
+    model_judgement: str | None = None
+    web_evidence: tuple[SessionDeepCreationWebEvidence, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.ordinal < 1 or self.status not in {"running", "completed", "failed", "recoverable"}:
+            raise ValueError("Deep creation section outcome is invalid.")
+        if self.local_evidence_count < 0:
+            raise ValueError("Deep creation local evidence count is invalid.")
+        if tuple(item.ordinal for item in self.web_evidence) != tuple(
+            range(1, len(self.web_evidence) + 1)
+        ):
+            raise ValueError("Deep creation web evidence ordering is invalid.")
+        if self.status == "completed":
+            if (
+                self.local_evidence_count < 1
+                or self.reason is not None
+                or not self.content
+                or not self.content.strip()
+                or len(self.content) > 20_000
+                or not self.model_judgement
+                or not self.model_judgement.strip()
+                or len(self.model_judgement) > 8_000
+            ):
+                raise ValueError("Completed deep creation sections need evidence, content, and judgement.")
+        elif self.status == "running":
+            if (
+                self.local_evidence_count != 0
+                or self.reason is not None
+                or self.content is not None
+                or self.model_judgement is not None
+                or self.web_evidence
+            ):
+                raise ValueError("Running deep creation sections cannot retain results.")
+        else:
+            if self.local_evidence_count != 0 or not self.reason:
+                raise ValueError("Incomplete deep creation sections need a reason.")
+            if self.content is not None or self.model_judgement is not None or self.web_evidence:
+                raise ValueError("Incomplete deep creation sections cannot retain new evidence.")
+
+
+@dataclass(frozen=True)
+class SessionDeepCreationResult:
+    result_id: str
+    session_id: str
+    task_id: str
+    snapshot_id: str
+    status: str
+    summary: str
+    recovery_action: str | None
+    completed_ordinals: tuple[int, ...]
+    duration_ms: int
+    created_at: str
+    outcomes: tuple[SessionDeepCreationSectionOutcome, ...] = ()
+    authorization_id: str | None = None
+    authorization_status: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not self.result_id
+            or not self.session_id
+            or not self.task_id
+            or not self.snapshot_id
+            or self.status not in DEEP_CREATION_RESULT_STATUSES
+            or not self.summary.strip()
+            or self.duration_ms < 0
+            or tuple(sorted(set(self.completed_ordinals))) != self.completed_ordinals
+            or any(ordinal < 1 for ordinal in self.completed_ordinals)
+        ):
+            raise ValueError("Deep creation result is invalid.")
+        if self.status == "completed":
+            if not self.completed_ordinals or self.recovery_action is not None:
+                raise ValueError("Completed deep creation results need completed sections and no recovery action.")
+        elif self.status == "waiting-authorization":
+            if not self.authorization_id or self.authorization_status != "pending" or self.recovery_action is not None:
+                raise ValueError("Waiting deep creation results need pending authorization.")
+        elif self.recovery_action is None:
+            raise ValueError("Incomplete deep creation results need a recovery action.")
+        if self.authorization_id is None and self.authorization_status is not None:
+            raise ValueError("Deep creation authorization status needs an identifier.")
+        if self.outcomes:
+            if tuple(outcome.ordinal for outcome in self.outcomes) != tuple(
+                sorted(outcome.ordinal for outcome in self.outcomes)
+            ) or len({outcome.ordinal for outcome in self.outcomes}) != len(self.outcomes):
+                raise ValueError("Deep creation section outcomes must be ordered and unique.")
+            completed = tuple(
+                outcome.ordinal for outcome in self.outcomes if outcome.status == "completed"
+            )
+            if completed != self.completed_ordinals:
+                raise ValueError("Completed deep creation sections must match outcomes.")
+            if self.status == "completed" and any(
+                outcome.status != "completed" for outcome in self.outcomes
+            ):
+                raise ValueError("Completed deep creation results cannot retain incomplete sections.")
+
+
 @dataclass(frozen=True)
 class SessionAttachment:
     attachment_id: str
@@ -834,6 +1030,7 @@ class SessionDetail:
     retrieval_results: tuple[SessionRetrievalResult, ...] = ()
     completeness_results: tuple[SessionCompletenessResult, ...] = ()
     knowledge_organization_results: tuple[SessionKnowledgeOrganizationResult, ...] = ()
+    deep_creation_results: tuple[SessionDeepCreationResult, ...] = ()
 
 
 @dataclass(frozen=True)

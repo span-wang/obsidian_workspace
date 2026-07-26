@@ -18,7 +18,7 @@ from domain.providers import (
 )
 from ports.credential_store import CredentialStore
 from ports.provider_authorization_invalidator import ProviderAuthorizationInvalidator
-from ports.provider_client import ProviderClient
+from ports.provider_client import ProviderClient, ProviderClientError
 from ports.provider_repository import ProviderRepository
 
 
@@ -291,6 +291,31 @@ class ProviderService:
                 return self.client.generate_chat(
                     resolved.provider.endpoint, secret, resolved.model.model_id, normalized_prompt
                 )
+            except ProviderClientError as error:
+                raise ProviderUnavailableError(
+                    f"The selected Provider could not generate this section: {error}"
+                ) from error
+            except Exception as error:
+                raise ProviderUnavailableError("The selected Provider could not generate this section.") from error
+
+    def stream_chat(self, provider_id: str, model_id: str, prompt: str):
+        normalized_prompt = prompt.strip()
+        if not normalized_prompt or len(normalized_prompt) > 200_000:
+            raise ProviderUnavailableError("The generation request is invalid.")
+        with self._provider_lock(provider_id):
+            resolved = self.resolve_specific_model("chat", provider_id, model_id)
+            try:
+                secret = self.credentials.read(resolved.provider.credential_reference)
+            except Exception as error:
+                raise ProviderUnavailableError("The selected Provider credential is unavailable.") from error
+            try:
+                yield from self.client.stream_chat(
+                    resolved.provider.endpoint, secret, resolved.model.model_id, normalized_prompt
+                )
+            except ProviderClientError as error:
+                raise ProviderUnavailableError(
+                    f"The selected Provider could not generate this section: {error}"
+                ) from error
             except Exception as error:
                 raise ProviderUnavailableError("The selected Provider could not generate this section.") from error
 

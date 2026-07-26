@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 from hashlib import sha256
 from pathlib import Path
+from types import SimpleNamespace
 
 import api.main as api_main
 from api.runtime import RuntimeState
+from docx import Document as WordDocument
 from domain.evidence import ArtifactRef, DocumentGraph, PdfRegionLocator
-from workers.converters.launcher import _docling_blocks, _mineru_blocks
+from workers.converters.launcher import _docling_blocks, _mineru_blocks, _pandoc_blocks
 from workers.converters.profiles import require_profile
 from workers.converters.provisioning import (
     ProvisionedProfiles,
@@ -15,6 +17,7 @@ from workers.converters.provisioning import (
     load_provisioned_profiles,
 )
 from workers.converters.quality_gate import StructuralQualityGate
+from workers.document_parser import preflight_document
 
 
 def test_loader_verifies_only_a_controlled_manifest_and_keeps_approval_gates_closed(
@@ -184,6 +187,75 @@ def test_loader_requires_a_hash_bound_local_approval_record(tmp_path: Path) -> N
     assert profile is not None
     assert profile.release_approved is True
     assert require_profile(profile, "pandoc").allowed is True
+
+
+def test_pandoc_adapter_skips_layout_only_docx_paragraphs_and_supports_quotes(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "quoted.docx"
+    document = WordDocument()
+    document.add_paragraph("Opening evidence")
+    document.add_paragraph()
+    document.add_paragraph("First quoted evidence")
+    document.add_paragraph("Second quoted evidence")
+    document.save(source)
+    inventory = preflight_document(source, "docx").inventory
+    raw = ArtifactRef(
+        artifact_id="raw-pandoc",
+        attempt_id="attempt-1",
+        sha256="a" * 64,
+        media_type="application/json",
+        role="converter-json",
+        private_relative_path="pending/raw-pandoc",
+        producer_object_id="pandoc.json",
+    )
+
+    blocks, issues = _pandoc_blocks(
+        {
+            "blocks": [
+                {"t": "Para", "c": [{"t": "Str", "c": "Opening evidence"}]},
+                {
+                    "t": "BlockQuote",
+                    "c": [
+                        {
+                            "t": "Para",
+                            "c": [{"t": "Str", "c": "First quoted evidence"}],
+                        },
+                        {
+                            "t": "Para",
+                            "c": [{"t": "Str", "c": "Second quoted evidence"}],
+                        },
+                    ],
+                },
+            ]
+        },
+        SimpleNamespace(input_snapshot_path=str(source)),
+        "attempt-1",
+        raw,
+    )
+
+    assert inventory["required_anchors"] == ["body/p[1]", "body/p[3]", "body/p[4]"]
+    assert not issues
+    assert [block.retrieval_projection for block in blocks] == [
+        "Opening evidence",
+        "First quoted evidence",
+        "Second quoted evidence",
+    ]
+    assert [block.locators[0].element_path for block in blocks] == inventory["required_anchors"]
+
+    graph = DocumentGraph(
+        graph_id="graph-pandoc",
+        source_sha256="a" * 64,
+        input_snapshot_hash="a" * 64,
+        selected_attempt_id="attempt-1",
+        blocks=tuple(blocks),
+        assets=(),
+        issues=(),
+    )
+
+    assert StructuralQualityGate().evaluate(
+        graph, {"document_kind": "docx", **inventory}
+    ).action == "accepted"
 
 
 def test_mineru_content_list_adapter_uses_real_regions_and_raw_json_evidence() -> None:

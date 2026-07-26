@@ -10,7 +10,12 @@ from uuid import uuid4
 
 from application.vaults import VaultService
 from domain.derived_notes import validate_platform_provenance
-from domain.indexing import IndexBlock, IndexHealth, IndexJob, IndexedDocument
+from domain.graph_projection import (
+    DurableGraphProjection,
+    GraphProjectionKey,
+    GraphProjectionLocatorSummary,
+)
+from domain.indexing import IndexBlock, IndexBlockBackfillReport, IndexHealth, IndexJob, IndexedDocument
 from domain.review_commits import CommitUnit
 from domain.tasks import utc_now
 from ports.index_repository import IndexRepository
@@ -44,6 +49,27 @@ class IndexingService:
     def health(self, vault_id: str) -> IndexHealth:
         self.vault_service.get(vault_id)
         return self._sync_health(vault_id)
+
+    def backfill_current_blocks(self, vault_id: str) -> IndexBlockBackfillReport:
+        self.vault_service.get(vault_id)
+        with self._vault_lock(vault_id):
+            return self.repository.backfill_current_blocks(vault_id)
+
+    def graph_projection_summary(
+        self, vault_id: str, graph_id: str, graph_revision: int
+    ) -> GraphProjectionLocatorSummary | None:
+        self.vault_service.get(vault_id)
+        try:
+            key = GraphProjectionKey(vault_id, graph_id, graph_revision)
+        except ValueError as error:
+            raise IndexingError(str(error)) from error
+        with self._vault_lock(vault_id):
+            projection = self.repository.get_graph_projection(key)
+        return (
+            GraphProjectionLocatorSummary.from_projection(projection)
+            if projection is not None
+            else None
+        )
 
     def reconcile_all(self) -> None:
         for vault in self.vault_service.stored_vaults():
@@ -103,12 +129,40 @@ class IndexingService:
                 return self._sync_health(vault_id)
             return self._process_pending(vault_id)
 
-    def index_committed_unit(self, vault, unit: CommitUnit) -> IndexHealth:
+    def index_committed_unit(
+        self, vault, unit: CommitUnit, projection: DurableGraphProjection | None = None
+    ) -> IndexHealth:
         paths = tuple(sorted(file.relative_path for file in unit.files if file.kind == "markdown"))
-        if not paths:
-            return self._sync_health(vault.vault_id)
         with self._vault_lock(vault.vault_id):
-            return self._enqueue_and_process(vault.vault_id, paths, "committed-unit")
+            files = self.filesystem.list_markdown_files(vault.path)
+            current = {
+                document.relative_path: document
+                for document in self.repository.current_documents(vault.vault_id)
+            }
+            documents: list[IndexedDocument] = []
+            invalidations: list[tuple[str, str, str]] = []
+            for relative_path in paths:
+                path = files.get(relative_path)
+                if path is None:
+                    invalidations.append((vault.vault_id, relative_path, "file-deleted"))
+                    continue
+                document = self._document_from_markdown(
+                    vault.vault_id, relative_path, path.read_text(encoding="utf-8"), path,
+                    pending_association=False,
+                    committed_projection=projection,
+                )
+                existing = current.get(relative_path)
+                if not self._index_allowed(vault.vault_id, document):
+                    invalidations.append((vault.vault_id, relative_path, "excluded-from-private-index"))
+                    continue
+                if self._document_matches(existing, document):
+                    continue
+                if existing is not None:
+                    invalidations.append((vault.vault_id, relative_path, "markdown-changed"))
+                documents.append(document)
+            if documents or invalidations or projection is not None:
+                self.repository.save_committed_unit(tuple(documents), tuple(invalidations), projection)
+            return self._sync_health(vault.vault_id)
 
     def resolve_pending_association(
         self, vault_id: str, relative_path: str, resolution: str
@@ -229,7 +283,15 @@ class IndexingService:
                 vault.vault_id, relative_path, "excluded-from-private-index"
             )
             return
-        if (
+        if self._document_matches(existing, document):
+            return
+        if existing is not None:
+            self.repository.invalidate_current_path(vault.vault_id, relative_path, "markdown-changed")
+        self.repository.save_document(document)
+
+    @staticmethod
+    def _document_matches(existing: IndexedDocument | None, document: IndexedDocument) -> bool:
+        return bool(
             existing is not None
             and existing.content_sha256 == document.content_sha256
             and existing.verifiable == document.verifiable
@@ -240,11 +302,7 @@ class IndexingService:
             and existing.observed_size == document.observed_size
             and existing.source_observed_mtime_ns == document.source_observed_mtime_ns
             and existing.source_observed_size == document.source_observed_size
-        ):
-            return
-        if existing is not None:
-            self.repository.invalidate_current_path(vault.vault_id, relative_path, "markdown-changed")
-        self.repository.save_document(document)
+        )
 
     def _document_from_markdown(
         self,
@@ -254,6 +312,7 @@ class IndexingService:
         path: Path,
         *,
         pending_association: bool,
+        committed_projection: DurableGraphProjection | None = None,
     ) -> IndexedDocument:
         content_sha256 = sha256(markdown.encode("utf-8")).hexdigest()
         provenance, provenance_reason = _platform_provenance(markdown)
@@ -277,6 +336,13 @@ class IndexingService:
                     stale_reason = "source-content-changed"
                 elif not _has_top_source_link(markdown, source_path):
                     stale_reason = "source-link-broken"
+        blocks = _blocks(markdown)
+        if provenance is not None:
+            projection_key = _graph_projection_key(provenance)
+            if projection_key is not None:
+                projection = self._projection_for_key(projection_key, committed_projection)
+                _validate_projection_provenance(projection, provenance)
+                blocks = _projection_blocks(projection, provenance["source_locators"])
         headings = tuple(
             f"line:{line_number}"
             for line_number, line in enumerate(markdown.splitlines(), start=1)
@@ -291,7 +357,7 @@ class IndexingService:
             heading_locations=headings,
             links=tuple(dict.fromkeys(match.strip() for match in _LINK.findall(markdown) if match.strip())),
             tags=_tags(markdown),
-            blocks=_blocks(markdown),
+            blocks=blocks,
             indexed_at=utc_now(),
             source_id=source_id,
             source_sha256=source_sha256,
@@ -352,6 +418,16 @@ class IndexingService:
 
     def _policy_revision(self, vault_id: str) -> int | None:
         return self.policy_service.get(vault_id).policy_revision if self.policy_service is not None else None
+
+    def _projection_for_key(
+        self, key: GraphProjectionKey, committed_projection: DurableGraphProjection | None
+    ) -> DurableGraphProjection:
+        if committed_projection is not None and committed_projection.key == key:
+            return committed_projection
+        projection = self.repository.get_graph_projection(key)
+        if projection is None:
+            raise IndexingError("The durable graph projection for this Markdown provenance is unavailable.")
+        return projection
 
     def _record_failure(self, vault_id: str, reason: str, error: Exception) -> None:
         now = utc_now()
@@ -428,6 +504,69 @@ def _yaml_pair(value: str) -> tuple[str, object]:
         if raw.isdigit():
             return key.strip(), int(raw)
         return key.strip(), raw
+
+
+def _graph_projection_key(provenance: dict[str, object]) -> GraphProjectionKey | None:
+    if "graph_id" not in provenance:
+        return None
+    graph_id = provenance.get("graph_id")
+    graph_revision = provenance.get("graph_revision")
+    vault_id = provenance.get("vault_id")
+    if not isinstance(vault_id, str) or not isinstance(graph_id, str) or type(graph_revision) is not int:
+        raise IndexingError("The Markdown graph provenance is invalid.")
+    return GraphProjectionKey(vault_id, graph_id, graph_revision)
+
+
+def _validate_projection_provenance(
+    projection: DurableGraphProjection, provenance: dict[str, object]
+) -> None:
+    expected = (
+        ("selected_attempt_id", projection.selected_attempt_id),
+        ("source_id", projection.source_id),
+        ("source_sha256", projection.source_sha256),
+        ("source_path", projection.source_path),
+    )
+    if any(provenance.get(field) != value for field, value in expected):
+        raise IndexingError("The durable graph projection does not match the Markdown provenance.")
+
+
+def _projection_blocks(
+    projection: DurableGraphProjection, raw_locators: object
+) -> tuple[IndexBlock, ...]:
+    if not isinstance(raw_locators, list) or not all(
+        isinstance(locator, dict) for locator in raw_locators
+    ):
+        raise IndexingError("The Markdown graph provenance locators are invalid.")
+    locator_keys = {
+        json.dumps(locator, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        for locator in raw_locators
+    }
+    matched_blocks = [
+        block
+        for block in projection.blocks
+        if any(
+            json.dumps(locator.to_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            in locator_keys
+            for locator in block.locators
+        )
+    ]
+    retrievable_blocks = [block for block in matched_blocks if block.is_retrievable]
+    if not retrievable_blocks:
+        raise IndexingError("No retrievable durable graph projection blocks match the Markdown provenance.")
+    return tuple(
+        IndexBlock(
+            sequence,
+            f"graph:{projection.graph_id}:{projection.graph_revision}:{block.block_id}",
+            block.retrieval_projection,
+            block_kind=block.kind,
+            source_locators=block.locators,
+            graph_block_id=block.block_id,
+            reading_order=block.reading_order,
+            confidence=block.confidence,
+            retrieval_text=block.retrieval_projection,
+        )
+        for sequence, block in enumerate(retrievable_blocks, start=1)
+    )
 
 
 def _blocks(markdown: str) -> tuple[IndexBlock, ...]:

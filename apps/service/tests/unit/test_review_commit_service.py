@@ -1,18 +1,22 @@
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
+import sqlite3
 
 import pytest
 
 from adapters.filesystem_vault_adapter import LocalVaultFilesystem
 from adapters.filesystem_vault_committer import LocalVaultCommitter
+from adapters.sqlite_index_repository import SqliteIndexRepository
 from adapters.sqlite_source_repository import SqliteSourceRepository
 from adapters.sqlite_task_repository import SqliteImportTaskRepository
 from adapters.sqlite_vault_repository import SqliteVaultRepository
 from application.import_selections import ImportSelection
 from application.ingest import ImportTaskError, ImportTaskService
+from application.indexing import IndexingService
 from application.vaults import VaultService
-from domain.evidence import EvidenceLocator, ParseEvidence, ParseIssue, StructuredContentUnit
+from domain.evidence import EvidenceLocator, ParseEvidence, ParseIssue, PdfRegionLocator, StructuredContentUnit
+from domain.graph_projection import DurableGraphProjection, GraphProjectionBlock
 from domain.review_commits import CommitJournal
 from workers.markdown_deriver import derive_items
 
@@ -108,6 +112,28 @@ def _reviewable_task(service: ImportTaskService, vault, source_file: Path):
     return task, snapshot
 
 
+def _projection(vault_id: str, source_id: str, source_sha256: str, source_path: str) -> DurableGraphProjection:
+    return DurableGraphProjection(
+        vault_id=vault_id,
+        graph_id="graph-1",
+        graph_revision=1,
+        selected_attempt_id="attempt-1",
+        source_id=source_id,
+        source_sha256=source_sha256,
+        source_path=source_path,
+        blocks=(
+            GraphProjectionBlock(
+                block_id="block-1",
+                kind="paragraph",
+                reading_order=0,
+                locators=(PdfRegionLocator(page=1, bounds=(0.0, 0.0, 10.0, 10.0)),),
+                confidence=0.9,
+                retrieval_projection="Projection text.",
+            ),
+        ),
+    )
+
+
 def test_commit_writes_source_and_derived_markdown_after_a_current_review_snapshot(tmp_path: Path) -> None:
     service, vault, source_file = _service(tmp_path, LocalVaultCommitter())
     task, snapshot = _reviewable_task(service, vault, source_file)
@@ -152,6 +178,61 @@ def test_only_a_committed_unit_triggers_private_indexing(tmp_path: Path) -> None
     failed_service.commit_review(failed_task.task_id)
 
     assert failed_index_service.committed_units == []
+
+
+def test_projection_backed_commit_writes_derived_documents_and_projection_together(
+    tmp_path: Path, monkeypatch
+) -> None:
+    service, vault, source_file = _service(tmp_path, LocalVaultCommitter())
+    index_repository = SqliteIndexRepository(tmp_path / "indexes.sqlite3")
+    service.index_service = IndexingService(service.vault_service, index_repository, LocalVaultFilesystem())
+    task, _ = _reviewable_task(service, vault, source_file)
+    proposal = service.list_note_proposals(task.task_id)[0]
+    projection = _projection(
+        vault.vault_id, proposal.source_id, proposal.source_sha256, proposal.source_relative_path
+    )
+    monkeypatch.setattr(service, "_graph_projection_for_unit", lambda *_args: projection)
+
+    completed = service.commit_review(task.task_id)
+
+    assert completed.lifecycle == "complete"
+    assert index_repository.get_graph_projection(projection.key) == projection
+    assert {document.relative_path for document in index_repository.current_documents(vault.vault_id)} == {
+        proposal.index_note.relative_path,
+        proposal.notes[0].relative_path,
+    }
+    assert [journal.status for journal in service.list_commit_journals(task.task_id)] == [
+        "prepared",
+        "committed",
+    ]
+
+
+def test_projection_index_failure_restores_the_committed_vault_files(tmp_path: Path, monkeypatch) -> None:
+    class FailingProjectionIndexService:
+        def index_committed_unit(self, vault, unit, projection) -> None:
+            raise sqlite3.IntegrityError("injected index transaction failure")
+
+        def report_failure(self, vault_id, reason, error) -> None:
+            return None
+
+    service, vault, source_file = _service(tmp_path, LocalVaultCommitter(), FailingProjectionIndexService())
+    task, _ = _reviewable_task(service, vault, source_file)
+    proposal = service.list_note_proposals(task.task_id)[0]
+    monkeypatch.setattr(
+        service,
+        "_graph_projection_for_unit",
+        lambda *_args: _projection(
+            vault.vault_id, proposal.source_id, proposal.source_sha256, proposal.source_relative_path
+        ),
+    )
+
+    failed = service.commit_review(task.task_id)
+
+    assert failed.lifecycle == "recoverable"
+    assert failed.recovery_actions == ("retry-commit",)
+    assert not (vault.path / proposal.source_relative_path).exists()
+    assert not (vault.path / proposal.notes[0].relative_path).exists()
+    assert [journal.status for journal in service.list_commit_journals(task.task_id)] == ["prepared", "failed"]
 
 
 def test_index_failure_does_not_leave_a_committed_review_task_in_committing(tmp_path: Path) -> None:

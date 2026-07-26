@@ -1,0 +1,722 @@
+{
+  "schemaVersion": 1,
+  "fixtureId": "retrieval-golden-v1",
+  "provenance": "synthetic-deidentified",
+  "scopes": [
+    {
+      "scopeId": "scope-eng-u1",
+      "label": "Synthetic English A Unit 1"
+    },
+    {
+      "scopeId": "scope-eng-u2",
+      "label": "Synthetic English A Unit 2"
+    },
+    {
+      "scopeId": "scope-math-u1",
+      "label": "Synthetic Mathematics A Unit 1"
+    }
+  ],
+  "blocks": [
+    {
+      "blockId": "eng-u1-text-greetings",
+      "scopeId": "scope-eng-u1",
+      "documentAlias": "DOC-ENG-U1-TEXT",
+      "materialType": "textbook",
+      "title": "Greetings and introductions",
+      "text": "Synthetic lesson on hello, goodbye, name, and short self-introductions."
+    },
+    {
+      "blockId": "eng-u1-text-be-forms",
+      "scopeId": "scope-eng-u1",
+      "documentAlias": "DOC-ENG-U1-TEXT",
+      "materialType": "textbook",
+      "title": "Forms of be",
+      "text": "Synthetic grammar note for am, is, and are in affirmative sentences."
+    },
+    {
+      "blockId": "eng-u1-guide-greetings",
+      "scopeId": "scope-eng-u1",
+      "documentAlias": "DOC-ENG-U1-GUIDE",
+      "materialType": "guide",
+      "title": "Greeting dialogue review",
+      "text": "Synthetic guide repeats hello, goodbye, and introducing a name in a dialogue."
+    },
+    {
+      "blockId": "eng-u1-guide-be-forms",
+      "scopeId": "scope-eng-u1",
+      "documentAlias": "DOC-ENG-U1-GUIDE",
+      "materialType": "guide",
+      "title": "Be verb check",
+      "text": "Synthetic guide practices am, is, and are with pronouns and short answers."
+    },
+    {
+      "blockId": "eng-u1-notes-practice",
+      "scopeId": "scope-eng-u1",
+      "documentAlias": "DOC-ENG-U1-NOTES",
+      "materialType": "notes",
+      "title": "Speaking practice",
+      "text": "Synthetic practice list: greet a partner, say a name, ask a name, and close politely."
+    },
+    {
+      "blockId": "eng-u1-notes-vocabulary",
+      "scopeId": "scope-eng-u1",
+      "documentAlias": "DOC-ENG-U1-NOTES",
+      "materialType": "notes",
+      "title": "Core vocabulary",
+      "text": "Synthetic vocabulary list for hello, goodbye, thanks, name, and friend."
+    },
+    {
+      "blockId": "eng-u2-text-family",
+      "scopeId": "scope-eng-u2",
+      "documentAlias": "DOC-ENG-U2-TEXT",
+      "materialType": "textbook",
+      "title": "Family members",
+      "text": "Synthetic lesson names mother, father, sister, brother, and family."
+    },
+    {
+      "blockId": "eng-u2-text-possessives",
+      "scopeId": "scope-eng-u2",
+      "documentAlias": "DOC-ENG-U2-TEXT",
+      "materialType": "textbook",
+      "title": "Possessive words",
+      "text": "Synthetic grammar note uses my, your, his, her, and their before family nouns."
+    },
+    {
+      "blockId": "eng-u2-guide-family",
+      "scopeId": "scope-eng-u2",
+      "documentAlias": "DOC-ENG-U2-GUIDE",
+      "materialType": "guide",
+      "title": "Family description review",
+      "text": "Synthetic guide repeats family member words and a simple family description."
+    },
+    {
+      "blockId": "eng-u2-guide-possessives",
+      "scopeId": "scope-eng-u2",
+      "documentAlias": "DOC-ENG-U2-GUIDE",
+      "materialType": "guide",
+      "title": "Possessive exercises",
+      "text": "Synthetic guide checks my, your, his, her, and their in short sentences."
+    },
+    {
+      "blockId": "eng-u2-notes-practice",
+      "scopeId": "scope-eng-u2",
+      "documentAlias": "DOC-ENG-U2-NOTES",
+      "materialType": "notes",
+      "title": "Family interview practice",
+      "text": "Synthetic speaking practice asks about family members and describes one relative."
+    },
+    {
+      "blockId": "eng-u2-notes-vocabulary",
+      "scopeId": "scope-eng-u2",
+      "documentAlias": "DOC-ENG-U2-NOTES",
+      "materialType": "notes",
+      "title": "Family vocabulary",
+      "text": "Synthetic vocabulary list for parent, child, cousin, uncle, and aunt."
+    },
+    {
+      "blockId": "math-u1-text-integers",
+      "scopeId": "scope-math-u1",
+      "documentAlias": "DOC-MATH-U1-TEXT",
+      "materialType": "textbook",
+      "title": "Positive and negative integers",
+      "text": "Synthetic mathematics lesson defines positive integers, negative integers, and zero."
+    },
+    {
+      "blockId": "math-u1-text-number-line",
+      "scopeId": "scope-math-u1",
+      "documentAlias": "DOC-MATH-U1-TEXT",
+      "materialType": "textbook",
+      "title": "Number line order",
+      "text": "Synthetic mathematics lesson places integers on a number line and compares their order."
+    },
+    {
+      "blockId": "math-u1-guide-integers",
+      "scopeId": "scope-math-u1",
+      "documentAlias": "DOC-MATH-U1-GUIDE",
+      "materialType": "guide",
+      "title": "Integer concept review",
+      "text": "Synthetic guide repeats positive integers, negative integers, and zero with examples."
+    },
+    {
+      "blockId": "math-u1-guide-number-line",
+      "scopeId": "scope-math-u1",
+      "documentAlias": "DOC-MATH-U1-GUIDE",
+      "materialType": "guide",
+      "title": "Number line exercises",
+      "text": "Synthetic guide practices integer order and distance on a number line."
+    },
+    {
+      "blockId": "math-u1-notes-practice",
+      "scopeId": "scope-math-u1",
+      "documentAlias": "DOC-MATH-U1-NOTES",
+      "materialType": "notes",
+      "title": "Integer drills",
+      "text": "Synthetic practice compares signed numbers and locates each integer on a number line."
+    },
+    {
+      "blockId": "math-u1-notes-vocabulary",
+      "scopeId": "scope-math-u1",
+      "documentAlias": "DOC-MATH-U1-NOTES",
+      "materialType": "notes",
+      "title": "Integer terminology",
+      "text": "Synthetic terminology list for integer, opposite, absolute value, and zero."
+    }
+  ],
+  "duplicateClusters": [
+    {
+      "clusterId": "dup-eng-u1-greetings",
+      "blockIds": [
+        "eng-u1-text-greetings",
+        "eng-u1-guide-greetings"
+      ]
+    },
+    {
+      "clusterId": "dup-eng-u1-be-forms",
+      "blockIds": [
+        "eng-u1-text-be-forms",
+        "eng-u1-guide-be-forms"
+      ]
+    },
+    {
+      "clusterId": "dup-eng-u2-family",
+      "blockIds": [
+        "eng-u2-text-family",
+        "eng-u2-guide-family"
+      ]
+    },
+    {
+      "clusterId": "dup-math-u1-integers",
+      "blockIds": [
+        "math-u1-text-integers",
+        "math-u1-guide-integers"
+      ]
+    },
+    {
+      "clusterId": "dup-math-u1-number-line",
+      "blockIds": [
+        "math-u1-text-number-line",
+        "math-u1-guide-number-line"
+      ]
+    }
+  ],
+  "queries": [
+    {
+      "queryId": "q-01",
+      "intent": "source-lookup",
+      "queryText": "Find the greeting and introduction lesson in synthetic English Unit 1.",
+      "expectedStatus": "resolved",
+      "scopeId": "scope-eng-u1",
+      "expectedBlockIds": [
+        "eng-u1-text-greetings",
+        "eng-u1-guide-greetings"
+      ],
+      "scopeBlockIds": [
+        "eng-u1-text-greetings",
+        "eng-u1-text-be-forms",
+        "eng-u1-guide-greetings",
+        "eng-u1-guide-be-forms",
+        "eng-u1-notes-practice",
+        "eng-u1-notes-vocabulary"
+      ],
+      "expectedDuplicateClusterIds": [
+        "dup-eng-u1-greetings"
+      ]
+    },
+    {
+      "queryId": "q-02",
+      "intent": "source-lookup",
+      "queryText": "Which blocks explain am, is, and are in synthetic English Unit 1?",
+      "expectedStatus": "resolved",
+      "scopeId": "scope-eng-u1",
+      "expectedBlockIds": [
+        "eng-u1-text-be-forms",
+        "eng-u1-guide-be-forms"
+      ],
+      "scopeBlockIds": [
+        "eng-u1-text-greetings",
+        "eng-u1-text-be-forms",
+        "eng-u1-guide-greetings",
+        "eng-u1-guide-be-forms",
+        "eng-u1-notes-practice",
+        "eng-u1-notes-vocabulary"
+      ],
+      "expectedDuplicateClusterIds": [
+        "dup-eng-u1-be-forms"
+      ]
+    },
+    {
+      "queryId": "q-03",
+      "intent": "source-lookup",
+      "queryText": "Find the core greeting vocabulary list for synthetic English Unit 1.",
+      "expectedStatus": "resolved",
+      "scopeId": "scope-eng-u1",
+      "expectedBlockIds": [
+        "eng-u1-notes-vocabulary"
+      ],
+      "scopeBlockIds": [
+        "eng-u1-text-greetings",
+        "eng-u1-text-be-forms",
+        "eng-u1-guide-greetings",
+        "eng-u1-guide-be-forms",
+        "eng-u1-notes-practice",
+        "eng-u1-notes-vocabulary"
+      ],
+      "expectedDuplicateClusterIds": []
+    },
+    {
+      "queryId": "q-04",
+      "intent": "source-lookup",
+      "queryText": "Find speaking practice for greetings in synthetic English Unit 1.",
+      "expectedStatus": "resolved",
+      "scopeId": "scope-eng-u1",
+      "expectedBlockIds": [
+        "eng-u1-notes-practice"
+      ],
+      "scopeBlockIds": [
+        "eng-u1-text-greetings",
+        "eng-u1-text-be-forms",
+        "eng-u1-guide-greetings",
+        "eng-u1-guide-be-forms",
+        "eng-u1-notes-practice",
+        "eng-u1-notes-vocabulary"
+      ],
+      "expectedDuplicateClusterIds": []
+    },
+    {
+      "queryId": "q-05",
+      "intent": "source-lookup",
+      "queryText": "Find the family-member lesson in synthetic English Unit 2.",
+      "expectedStatus": "resolved",
+      "scopeId": "scope-eng-u2",
+      "expectedBlockIds": [
+        "eng-u2-text-family",
+        "eng-u2-guide-family"
+      ],
+      "scopeBlockIds": [
+        "eng-u2-text-family",
+        "eng-u2-text-possessives",
+        "eng-u2-guide-family",
+        "eng-u2-guide-possessives",
+        "eng-u2-notes-practice",
+        "eng-u2-notes-vocabulary"
+      ],
+      "expectedDuplicateClusterIds": [
+        "dup-eng-u2-family"
+      ]
+    },
+    {
+      "queryId": "q-06",
+      "intent": "source-lookup",
+      "queryText": "Which blocks practice possessive words in synthetic English Unit 2?",
+      "expectedStatus": "resolved",
+      "scopeId": "scope-eng-u2",
+      "expectedBlockIds": [
+        "eng-u2-text-possessives",
+        "eng-u2-guide-possessives"
+      ],
+      "scopeBlockIds": [
+        "eng-u2-text-family",
+        "eng-u2-text-possessives",
+        "eng-u2-guide-family",
+        "eng-u2-guide-possessives",
+        "eng-u2-notes-practice",
+        "eng-u2-notes-vocabulary"
+      ],
+      "expectedDuplicateClusterIds": []
+    },
+    {
+      "queryId": "q-07",
+      "intent": "source-lookup",
+      "queryText": "Find the definition of positive and negative integers.",
+      "expectedStatus": "resolved",
+      "scopeId": "scope-math-u1",
+      "expectedBlockIds": [
+        "math-u1-text-integers",
+        "math-u1-guide-integers"
+      ],
+      "scopeBlockIds": [
+        "math-u1-text-integers",
+        "math-u1-text-number-line",
+        "math-u1-guide-integers",
+        "math-u1-guide-number-line",
+        "math-u1-notes-practice",
+        "math-u1-notes-vocabulary"
+      ],
+      "expectedDuplicateClusterIds": [
+        "dup-math-u1-integers"
+      ]
+    },
+    {
+      "queryId": "q-08",
+      "intent": "source-lookup",
+      "queryText": "Find the number-line ordering lesson for integers.",
+      "expectedStatus": "resolved",
+      "scopeId": "scope-math-u1",
+      "expectedBlockIds": [
+        "math-u1-text-number-line",
+        "math-u1-guide-number-line"
+      ],
+      "scopeBlockIds": [
+        "math-u1-text-integers",
+        "math-u1-text-number-line",
+        "math-u1-guide-integers",
+        "math-u1-guide-number-line",
+        "math-u1-notes-practice",
+        "math-u1-notes-vocabulary"
+      ],
+      "expectedDuplicateClusterIds": [
+        "dup-math-u1-number-line"
+      ]
+    },
+    {
+      "queryId": "q-09",
+      "intent": "completeness",
+      "queryText": "Enumerate all knowledge blocks for synthetic English Unit 1.",
+      "expectedStatus": "resolved",
+      "scopeId": "scope-eng-u1",
+      "expectedBlockIds": [
+        "eng-u1-text-greetings",
+        "eng-u1-text-be-forms",
+        "eng-u1-guide-greetings",
+        "eng-u1-guide-be-forms",
+        "eng-u1-notes-practice",
+        "eng-u1-notes-vocabulary"
+      ],
+      "scopeBlockIds": [
+        "eng-u1-text-greetings",
+        "eng-u1-text-be-forms",
+        "eng-u1-guide-greetings",
+        "eng-u1-guide-be-forms",
+        "eng-u1-notes-practice",
+        "eng-u1-notes-vocabulary"
+      ],
+      "expectedDuplicateClusterIds": [
+        "dup-eng-u1-greetings",
+        "dup-eng-u1-be-forms"
+      ]
+    },
+    {
+      "queryId": "q-10",
+      "intent": "completeness",
+      "queryText": "Enumerate all knowledge blocks for synthetic English Unit 2.",
+      "expectedStatus": "resolved",
+      "scopeId": "scope-eng-u2",
+      "expectedBlockIds": [
+        "eng-u2-text-family",
+        "eng-u2-text-possessives",
+        "eng-u2-guide-family",
+        "eng-u2-guide-possessives",
+        "eng-u2-notes-practice",
+        "eng-u2-notes-vocabulary"
+      ],
+      "scopeBlockIds": [
+        "eng-u2-text-family",
+        "eng-u2-text-possessives",
+        "eng-u2-guide-family",
+        "eng-u2-guide-possessives",
+        "eng-u2-notes-practice",
+        "eng-u2-notes-vocabulary"
+      ],
+      "expectedDuplicateClusterIds": [
+        "dup-eng-u2-family"
+      ]
+    },
+    {
+      "queryId": "q-11",
+      "intent": "completeness",
+      "queryText": "Enumerate all knowledge blocks for synthetic Mathematics Unit 1.",
+      "expectedStatus": "resolved",
+      "scopeId": "scope-math-u1",
+      "expectedBlockIds": [
+        "math-u1-text-integers",
+        "math-u1-text-number-line",
+        "math-u1-guide-integers",
+        "math-u1-guide-number-line",
+        "math-u1-notes-practice",
+        "math-u1-notes-vocabulary"
+      ],
+      "scopeBlockIds": [
+        "math-u1-text-integers",
+        "math-u1-text-number-line",
+        "math-u1-guide-integers",
+        "math-u1-guide-number-line",
+        "math-u1-notes-practice",
+        "math-u1-notes-vocabulary"
+      ],
+      "expectedDuplicateClusterIds": [
+        "dup-math-u1-integers",
+        "dup-math-u1-number-line"
+      ]
+    },
+    {
+      "queryId": "q-12",
+      "intent": "completeness",
+      "queryText": "Enumerate grammar evidence for synthetic English Unit 1.",
+      "expectedStatus": "resolved",
+      "scopeId": "scope-eng-u1",
+      "expectedBlockIds": [
+        "eng-u1-text-be-forms",
+        "eng-u1-guide-be-forms"
+      ],
+      "scopeBlockIds": [
+        "eng-u1-text-greetings",
+        "eng-u1-text-be-forms",
+        "eng-u1-guide-greetings",
+        "eng-u1-guide-be-forms",
+        "eng-u1-notes-practice",
+        "eng-u1-notes-vocabulary"
+      ],
+      "expectedDuplicateClusterIds": [
+        "dup-eng-u1-be-forms"
+      ]
+    },
+    {
+      "queryId": "q-13",
+      "intent": "completeness",
+      "queryText": "Enumerate family vocabulary evidence for synthetic English Unit 2.",
+      "expectedStatus": "resolved",
+      "scopeId": "scope-eng-u2",
+      "expectedBlockIds": [
+        "eng-u2-text-family",
+        "eng-u2-guide-family",
+        "eng-u2-notes-vocabulary"
+      ],
+      "scopeBlockIds": [
+        "eng-u2-text-family",
+        "eng-u2-text-possessives",
+        "eng-u2-guide-family",
+        "eng-u2-guide-possessives",
+        "eng-u2-notes-practice",
+        "eng-u2-notes-vocabulary"
+      ],
+      "expectedDuplicateClusterIds": [
+        "dup-eng-u2-family"
+      ]
+    },
+    {
+      "queryId": "q-14",
+      "intent": "completeness",
+      "queryText": "Enumerate integer terminology and order evidence.",
+      "expectedStatus": "resolved",
+      "scopeId": "scope-math-u1",
+      "expectedBlockIds": [
+        "math-u1-text-integers",
+        "math-u1-text-number-line",
+        "math-u1-guide-integers",
+        "math-u1-guide-number-line",
+        "math-u1-notes-vocabulary"
+      ],
+      "scopeBlockIds": [
+        "math-u1-text-integers",
+        "math-u1-text-number-line",
+        "math-u1-guide-integers",
+        "math-u1-guide-number-line",
+        "math-u1-notes-practice",
+        "math-u1-notes-vocabulary"
+      ],
+      "expectedDuplicateClusterIds": [
+        "dup-math-u1-integers",
+        "dup-math-u1-number-line"
+      ]
+    },
+    {
+      "queryId": "q-15",
+      "intent": "knowledge-organization",
+      "queryText": "Organize a synthetic English Unit 1 knowledge outline.",
+      "expectedStatus": "resolved",
+      "scopeId": "scope-eng-u1",
+      "expectedBlockIds": [
+        "eng-u1-text-greetings",
+        "eng-u1-text-be-forms",
+        "eng-u1-guide-greetings",
+        "eng-u1-guide-be-forms",
+        "eng-u1-notes-practice",
+        "eng-u1-notes-vocabulary"
+      ],
+      "scopeBlockIds": [
+        "eng-u1-text-greetings",
+        "eng-u1-text-be-forms",
+        "eng-u1-guide-greetings",
+        "eng-u1-guide-be-forms",
+        "eng-u1-notes-practice",
+        "eng-u1-notes-vocabulary"
+      ],
+      "expectedDuplicateClusterIds": [
+        "dup-eng-u1-greetings",
+        "dup-eng-u1-be-forms"
+      ]
+    },
+    {
+      "queryId": "q-16",
+      "intent": "knowledge-organization",
+      "queryText": "Organize a synthetic English Unit 2 knowledge outline.",
+      "expectedStatus": "resolved",
+      "scopeId": "scope-eng-u2",
+      "expectedBlockIds": [
+        "eng-u2-text-family",
+        "eng-u2-text-possessives",
+        "eng-u2-guide-family",
+        "eng-u2-guide-possessives",
+        "eng-u2-notes-practice",
+        "eng-u2-notes-vocabulary"
+      ],
+      "scopeBlockIds": [
+        "eng-u2-text-family",
+        "eng-u2-text-possessives",
+        "eng-u2-guide-family",
+        "eng-u2-guide-possessives",
+        "eng-u2-notes-practice",
+        "eng-u2-notes-vocabulary"
+      ],
+      "expectedDuplicateClusterIds": [
+        "dup-eng-u2-family"
+      ]
+    },
+    {
+      "queryId": "q-17",
+      "intent": "knowledge-organization",
+      "queryText": "Organize a synthetic Mathematics Unit 1 knowledge outline.",
+      "expectedStatus": "resolved",
+      "scopeId": "scope-math-u1",
+      "expectedBlockIds": [
+        "math-u1-text-integers",
+        "math-u1-text-number-line",
+        "math-u1-guide-integers",
+        "math-u1-guide-number-line",
+        "math-u1-notes-practice",
+        "math-u1-notes-vocabulary"
+      ],
+      "scopeBlockIds": [
+        "math-u1-text-integers",
+        "math-u1-text-number-line",
+        "math-u1-guide-integers",
+        "math-u1-guide-number-line",
+        "math-u1-notes-practice",
+        "math-u1-notes-vocabulary"
+      ],
+      "expectedDuplicateClusterIds": [
+        "dup-math-u1-integers",
+        "dup-math-u1-number-line"
+      ]
+    },
+    {
+      "queryId": "q-18",
+      "intent": "knowledge-organization",
+      "queryText": "Organize introductions, greetings, and be forms for synthetic English Unit 1.",
+      "expectedStatus": "resolved",
+      "scopeId": "scope-eng-u1",
+      "expectedBlockIds": [
+        "eng-u1-text-greetings",
+        "eng-u1-text-be-forms",
+        "eng-u1-guide-greetings",
+        "eng-u1-guide-be-forms",
+        "eng-u1-notes-practice"
+      ],
+      "scopeBlockIds": [
+        "eng-u1-text-greetings",
+        "eng-u1-text-be-forms",
+        "eng-u1-guide-greetings",
+        "eng-u1-guide-be-forms",
+        "eng-u1-notes-practice",
+        "eng-u1-notes-vocabulary"
+      ],
+      "expectedDuplicateClusterIds": [
+        "dup-eng-u1-greetings",
+        "dup-eng-u1-be-forms"
+      ]
+    },
+    {
+      "queryId": "q-19",
+      "intent": "knowledge-organization",
+      "queryText": "Organize family and possessive-word knowledge for synthetic English Unit 2.",
+      "expectedStatus": "resolved",
+      "scopeId": "scope-eng-u2",
+      "expectedBlockIds": [
+        "eng-u2-text-family",
+        "eng-u2-text-possessives",
+        "eng-u2-guide-family",
+        "eng-u2-guide-possessives",
+        "eng-u2-notes-practice",
+        "eng-u2-notes-vocabulary"
+      ],
+      "scopeBlockIds": [
+        "eng-u2-text-family",
+        "eng-u2-text-possessives",
+        "eng-u2-guide-family",
+        "eng-u2-guide-possessives",
+        "eng-u2-notes-practice",
+        "eng-u2-notes-vocabulary"
+      ],
+      "expectedDuplicateClusterIds": [
+        "dup-eng-u2-family"
+      ]
+    },
+    {
+      "queryId": "q-20",
+      "intent": "knowledge-organization",
+      "queryText": "Organize integer concepts and number-line reasoning.",
+      "expectedStatus": "resolved",
+      "scopeId": "scope-math-u1",
+      "expectedBlockIds": [
+        "math-u1-text-integers",
+        "math-u1-text-number-line",
+        "math-u1-guide-integers",
+        "math-u1-guide-number-line",
+        "math-u1-notes-practice",
+        "math-u1-notes-vocabulary"
+      ],
+      "scopeBlockIds": [
+        "math-u1-text-integers",
+        "math-u1-text-number-line",
+        "math-u1-guide-integers",
+        "math-u1-guide-number-line",
+        "math-u1-notes-practice",
+        "math-u1-notes-vocabulary"
+      ],
+      "expectedDuplicateClusterIds": [
+        "dup-math-u1-integers",
+        "dup-math-u1-number-line"
+      ]
+    },
+    {
+      "queryId": "q-21",
+      "intent": "source-lookup",
+      "queryText": "Find the lesson for an unspecified synthetic unit.",
+      "expectedStatus": "recoverable",
+      "scopeId": null,
+      "expectedBlockIds": [],
+      "scopeBlockIds": [],
+      "expectedDuplicateClusterIds": []
+    },
+    {
+      "queryId": "q-22",
+      "intent": "completeness",
+      "queryText": "Enumerate knowledge without a subject or unit scope.",
+      "expectedStatus": "recoverable",
+      "scopeId": null,
+      "expectedBlockIds": [],
+      "scopeBlockIds": [],
+      "expectedDuplicateClusterIds": []
+    },
+    {
+      "queryId": "q-23",
+      "intent": "knowledge-organization",
+      "queryText": "Organize notes from an unknown material alias.",
+      "expectedStatus": "recoverable",
+      "scopeId": null,
+      "expectedBlockIds": [],
+      "scopeBlockIds": [],
+      "expectedDuplicateClusterIds": []
+    },
+    {
+      "queryId": "q-24",
+      "intent": "source-lookup",
+      "queryText": "Find a chapter when the requested scope is ambiguous.",
+      "expectedStatus": "recoverable",
+      "scopeId": null,
+      "expectedBlockIds": [],
+      "scopeBlockIds": [],
+      "expectedDuplicateClusterIds": []
+    }
+  ]
+}

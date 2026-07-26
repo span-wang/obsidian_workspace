@@ -4,6 +4,7 @@ import pytest
 
 from adapters.sqlite_provider_repository import SqliteProviderRepository
 from application.providers import ProviderService, ProviderUnavailableError, ProviderValidationError
+from ports.provider_client import ProviderClientError
 
 
 class FakeRepository:
@@ -183,3 +184,32 @@ def test_sqlite_persists_typed_models_and_dual_defaults_without_secret(tmp_path)
     assert reopened.get(provider.provider_id).models[0].model_type in {"chat", None}
     assert reopened.get_default("chat").model_id == "chat-model"
     assert b"secret" not in (tmp_path / "providers.sqlite3").read_bytes()
+
+
+def test_generation_exposes_only_safe_provider_client_errors() -> None:
+    class FailingClient(FakeClient):
+        def generate_chat(self, endpoint, secret, model_id, prompt, cancel_event=None):
+            raise ProviderClientError("Provider request failed with HTTP 429.")
+
+    service, _, _ = make_service(client=FailingClient())
+    provider = discovered_provider(service)
+    service.configure_model(provider.provider_id, "chat-model", "chat")
+    service.test_model(provider.provider_id, "chat-model")
+
+    with pytest.raises(ProviderUnavailableError, match="HTTP 429"):
+        service.generate_chat(provider.provider_id, "chat-model", "prompt")
+
+
+def test_generation_hides_unexpected_provider_errors() -> None:
+    class FailingClient(FakeClient):
+        def generate_chat(self, endpoint, secret, model_id, prompt, cancel_event=None):
+            raise RuntimeError("credential=secret")
+
+    service, _, _ = make_service(client=FailingClient())
+    provider = discovered_provider(service)
+    service.configure_model(provider.provider_id, "chat-model", "chat")
+    service.test_model(provider.provider_id, "chat-model")
+
+    with pytest.raises(ProviderUnavailableError, match="could not generate this section") as error:
+        service.generate_chat(provider.provider_id, "chat-model", "prompt")
+    assert "credential=secret" not in str(error.value)

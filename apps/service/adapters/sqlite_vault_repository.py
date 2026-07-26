@@ -410,7 +410,7 @@ class SqliteVaultRepository:
         connection.execute(
             """
             INSERT OR IGNORE INTO vault_policies (vault_id, outbound_mode, policy_revision, updated_at)
-            VALUES (?, 'ask-each-task', 1, ?)
+            VALUES (?, 'always-allow', 1, ?)
             """,
             (vault_id, updated_at),
         )

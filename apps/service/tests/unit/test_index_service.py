@@ -1,5 +1,6 @@
 from hashlib import sha256
 from pathlib import Path
+import sqlite3
 
 from adapters.filesystem_vault_adapter import LocalVaultFilesystem
 from adapters.sqlite_index_repository import SqliteIndexRepository
@@ -62,6 +63,34 @@ def test_reconcile_keeps_derived_and_native_evidence_identities_distinct(tmp_pat
     assert documents["native.md"].source_id is None
     assert documents["native.md"].source_sha256 is None
     assert documents["native.md"].heading_locations == ("line:1",)
+
+
+def test_backfill_current_blocks_does_not_rescan_or_replace_documents(tmp_path: Path, monkeypatch) -> None:
+    service, repository, vault = _service(tmp_path)
+    (vault.path / "native.md").write_text("# Native\n", encoding="utf-8")
+    service.reconcile(vault.vault_id)
+    before = repository.current_documents(vault.vault_id)[0]
+    with sqlite3.connect(repository.database_path) as connection:
+        connection.execute(
+            "UPDATE index_blocks SET block_content_sha256 = '' WHERE document_id = ?",
+            (before.document_id,),
+        )
+
+    monkeypatch.setattr(
+        service.filesystem,
+        "list_markdown_files",
+        lambda _path: (_ for _ in ()).throw(AssertionError("backfill must not scan Markdown files")),
+    )
+
+    report = service.backfill_current_blocks(vault.vault_id)
+    after = repository.current_documents(vault.vault_id)[0]
+
+    assert report.backfilled_block_count == 1
+    assert report.is_consistent is True
+    assert after.document_id == before.document_id
+    assert after.blocks[0].sequence == before.blocks[0].sequence
+    assert after.blocks[0].location == before.blocks[0].location
+    assert after.blocks[0].text == before.blocks[0].text
 
 
 def test_reconcile_recovers_tagged_provenance_from_historical_unverifiable_index(
