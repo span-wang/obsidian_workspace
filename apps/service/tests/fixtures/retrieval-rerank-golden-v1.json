@@ -1,0 +1,93 @@
+{
+  "schemaVersion": 1,
+  "fixtureId": "retrieval-rerank-golden-v1",
+  "provenance": "synthetic-deidentified",
+  "candidateWindow": 20,
+  "resultLimit": 8,
+  "gates": {
+    "minimumMacroRecallGainAt8": 0.0,
+    "minimumMacroPrecisionGainAt8": 0.2,
+    "minimumMacroMrrGainAt8": 0.5,
+    "maximumFixtureAdapterP95LatencyMs": 25.0
+  },
+  "cases": [
+    {
+      "queryId": "be-forms-pronouns",
+      "queryText": "How do forms of be change with pronouns?",
+      "expectedCandidateIds": ["beformslesson", "beformspractice"],
+      "candidates": [
+        {"candidateId": "greetingdialog", "headingPath": ["Greetings"], "blockKind": "paragraph", "text": "Greeting dialogue for meeting a new classmate.", "allowedTags": []},
+        {"candidateId": "selfintro", "headingPath": ["Introductions"], "blockKind": "paragraph", "text": "Introduce your name and hometown.", "allowedTags": []},
+        {"candidateId": "schoolplaces", "headingPath": ["School"], "blockKind": "paragraph", "text": "Names for classrooms, libraries and playgrounds.", "allowedTags": []},
+        {"candidateId": "colors", "headingPath": ["Colours"], "blockKind": "paragraph", "text": "Vocabulary for common colours.", "allowedTags": []},
+        {"candidateId": "family", "headingPath": ["Family"], "blockKind": "paragraph", "text": "Words for parents, siblings and relatives.", "allowedTags": []},
+        {"candidateId": "food", "headingPath": ["Food"], "blockKind": "paragraph", "text": "Names for meals and drinks.", "allowedTags": []},
+        {"candidateId": "classroom", "headingPath": ["Classroom objects"], "blockKind": "paragraph", "text": "Words for desks, books and pens.", "allowedTags": []},
+        {"candidateId": "weather", "headingPath": ["Weather"], "blockKind": "paragraph", "text": "Sunny, cloudy and rainy weather words.", "allowedTags": []},
+        {"candidateId": "beformslesson", "headingPath": ["Grammar", "Be forms"], "blockKind": "paragraph", "text": "Use am with I, is with he she it, and are with you we they.", "allowedTags": ["grammar"]},
+        {"candidateId": "beformspractice", "headingPath": ["Grammar", "Be forms practice"], "blockKind": "exercise", "text": "Choose am, is or are for each pronoun in the sentence.", "allowedTags": ["grammar"]},
+        {"candidateId": "animals", "headingPath": ["Animals"], "blockKind": "paragraph", "text": "Vocabulary for pets and farm animals.", "allowedTags": []},
+        {"candidateId": "numbers", "headingPath": ["Numbers"], "blockKind": "paragraph", "text": "Read and write numbers from one to one hundred.", "allowedTags": []},
+        {"candidateId": "days", "headingPath": ["Days"], "blockKind": "paragraph", "text": "Names of weekdays and weekends.", "allowedTags": []},
+        {"candidateId": "sports", "headingPath": ["Sports"], "blockKind": "paragraph", "text": "Talk about favorite sports and games.", "allowedTags": []},
+        {"candidateId": "hobbies", "headingPath": ["Hobbies"], "blockKind": "paragraph", "text": "Talk about reading, music and drawing.", "allowedTags": []},
+        {"candidateId": "transport", "headingPath": ["Transport"], "blockKind": "paragraph", "text": "Travel by bus, bike and train.", "allowedTags": []},
+        {"candidateId": "clothes", "headingPath": ["Clothes"], "blockKind": "paragraph", "text": "Vocabulary for shirts, shoes and coats.", "allowedTags": []},
+        {"candidateId": "routines", "headingPath": ["Routines"], "blockKind": "paragraph", "text": "Describe morning and evening routines.", "allowedTags": []},
+        {"candidateId": "festivals", "headingPath": ["Festivals"], "blockKind": "paragraph", "text": "Talk about holidays and celebrations.", "allowedTags": []},
+        {"candidateId": "subjects", "headingPath": ["Subjects"], "blockKind": "paragraph", "text": "Names for school subjects.", "allowedTags": []}
+      ],
+      "response": [
+        {"candidateId": "beformslesson", "relevance": 0.99}, {"candidateId": "beformspractice", "relevance": 0.98},
+        {"candidateId": "greetingdialog", "relevance": 0.30}, {"candidateId": "selfintro", "relevance": 0.29},
+        {"candidateId": "schoolplaces", "relevance": 0.28}, {"candidateId": "colors", "relevance": 0.27},
+        {"candidateId": "family", "relevance": 0.26}, {"candidateId": "food", "relevance": 0.25},
+        {"candidateId": "classroom", "relevance": 0.24}, {"candidateId": "weather", "relevance": 0.23},
+        {"candidateId": "animals", "relevance": 0.22}, {"candidateId": "numbers", "relevance": 0.21},
+        {"candidateId": "days", "relevance": 0.20}, {"candidateId": "sports", "relevance": 0.19},
+        {"candidateId": "hobbies", "relevance": 0.18}, {"candidateId": "transport", "relevance": 0.17},
+        {"candidateId": "clothes", "relevance": 0.16}, {"candidateId": "routines", "relevance": 0.15},
+        {"candidateId": "festivals", "relevance": 0.14}, {"candidateId": "subjects", "relevance": 0.13}
+      ]
+    },
+    {
+      "queryId": "negative-integers-opposites",
+      "queryText": "Where is the lesson about numbers below zero and opposite values?",
+      "expectedCandidateIds": ["negativeintegers", "integeropposites"],
+      "candidates": [
+        {"candidateId": "wholenumbers", "headingPath": ["Whole numbers"], "blockKind": "paragraph", "text": "Count objects with whole numbers.", "allowedTags": []},
+        {"candidateId": "fractions", "headingPath": ["Fractions"], "blockKind": "paragraph", "text": "Represent equal parts with fractions.", "allowedTags": []},
+        {"candidateId": "decimals", "headingPath": ["Decimals"], "blockKind": "paragraph", "text": "Read decimal tenths and hundredths.", "allowedTags": []},
+        {"candidateId": "shapes", "headingPath": ["Shapes"], "blockKind": "paragraph", "text": "Identify triangles, squares and circles.", "allowedTags": []},
+        {"candidateId": "measurement", "headingPath": ["Measurement"], "blockKind": "paragraph", "text": "Measure length and mass.", "allowedTags": []},
+        {"candidateId": "addition", "headingPath": ["Addition"], "blockKind": "paragraph", "text": "Add two digit positive numbers.", "allowedTags": []},
+        {"candidateId": "subtraction", "headingPath": ["Subtraction"], "blockKind": "paragraph", "text": "Subtract within one hundred.", "allowedTags": []},
+        {"candidateId": "multiplication", "headingPath": ["Multiplication"], "blockKind": "paragraph", "text": "Multiply equal groups.", "allowedTags": []},
+        {"candidateId": "division", "headingPath": ["Division"], "blockKind": "paragraph", "text": "Share objects equally.", "allowedTags": []},
+        {"candidateId": "negativeintegers", "headingPath": ["Integers", "Below zero"], "blockKind": "paragraph", "text": "Negative integers are values below zero on a number line.", "allowedTags": ["number-sense"]},
+        {"candidateId": "integeropposites", "headingPath": ["Integers", "Opposites"], "blockKind": "exercise", "text": "Every integer has an opposite at the same distance from zero.", "allowedTags": ["number-sense"]},
+        {"candidateId": "patterns", "headingPath": ["Patterns"], "blockKind": "paragraph", "text": "Find the next item in a repeated pattern.", "allowedTags": []},
+        {"candidateId": "graphs", "headingPath": ["Graphs"], "blockKind": "paragraph", "text": "Read a simple bar graph.", "allowedTags": []},
+        {"candidateId": "time", "headingPath": ["Time"], "blockKind": "paragraph", "text": "Tell time to five minutes.", "allowedTags": []},
+        {"candidateId": "money", "headingPath": ["Money"], "blockKind": "paragraph", "text": "Add coins and notes.", "allowedTags": []},
+        {"candidateId": "perimeter", "headingPath": ["Perimeter"], "blockKind": "paragraph", "text": "Measure the boundary of a rectangle.", "allowedTags": []},
+        {"candidateId": "area", "headingPath": ["Area"], "blockKind": "paragraph", "text": "Cover a rectangle with unit squares.", "allowedTags": []},
+        {"candidateId": "coordinates", "headingPath": ["Coordinates"], "blockKind": "paragraph", "text": "Locate a point on a grid.", "allowedTags": []},
+        {"candidateId": "equations", "headingPath": ["Equations"], "blockKind": "paragraph", "text": "Solve a missing number equation.", "allowedTags": []},
+        {"candidateId": "data", "headingPath": ["Data"], "blockKind": "paragraph", "text": "Sort information into a table.", "allowedTags": []}
+      ],
+      "response": [
+        {"candidateId": "negativeintegers", "relevance": 0.99}, {"candidateId": "integeropposites", "relevance": 0.98},
+        {"candidateId": "wholenumbers", "relevance": 0.30}, {"candidateId": "fractions", "relevance": 0.29},
+        {"candidateId": "decimals", "relevance": 0.28}, {"candidateId": "shapes", "relevance": 0.27},
+        {"candidateId": "measurement", "relevance": 0.26}, {"candidateId": "addition", "relevance": 0.25},
+        {"candidateId": "subtraction", "relevance": 0.24}, {"candidateId": "multiplication", "relevance": 0.23},
+        {"candidateId": "division", "relevance": 0.22}, {"candidateId": "patterns", "relevance": 0.21},
+        {"candidateId": "graphs", "relevance": 0.20}, {"candidateId": "time", "relevance": 0.19},
+        {"candidateId": "money", "relevance": 0.18}, {"candidateId": "perimeter", "relevance": 0.17},
+        {"candidateId": "area", "relevance": 0.16}, {"candidateId": "coordinates", "relevance": 0.15},
+        {"candidateId": "equations", "relevance": 0.14}, {"candidateId": "data", "relevance": 0.13}
+      ]
+    }
+  ]
+}

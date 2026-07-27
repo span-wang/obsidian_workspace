@@ -1176,11 +1176,12 @@ test("shows a task loading failure instead of an empty task list", async ({ page
   await expect(page.getByText("当前没有导入任务。")).toHaveCount(0);
 });
 
-test("configures a chat-only Provider without requiring an Embedding model", async ({ page }) => {
+test("configures independent chat and Rerank models without requiring an Embedding model", async ({ page }) => {
   let providers = [];
   let defaults = {
     chat: { default: null, status: "unconfigured", reason: "No chat Provider model is selected." },
-    embedding: { default: null, status: "unconfigured", reason: "No embedding Provider model is selected." }
+    embedding: { default: null, status: "unconfigured", reason: "No embedding Provider model is selected." },
+    rerank: { default: null, status: "unconfigured", reason: "No rerank Provider model is selected." }
   };
 
   function unverifiedProvider(payload) {
@@ -1269,9 +1270,21 @@ test("configures a chat-only Provider without requiring an Embedding model", asy
       await route.fulfill({ json: { status: "cleared" } });
       return;
     }
+    if (method === "PUT" && url.endsWith("/defaults/rerank")) {
+      const payload = route.request().postDataJSON();
+      defaults.rerank = { default: { ...payload, updated_at: "2026-07-21T00:03:00+00:00" }, status: "available", reason: null };
+      await route.fulfill({ json: { default: defaults.rerank.default } });
+      return;
+    }
+    if (method === "DELETE" && url.endsWith("/defaults/rerank")) {
+      defaults.rerank = { default: null, status: "unconfigured", reason: "No rerank Provider model is selected." };
+      await route.fulfill({ json: { status: "cleared" } });
+      return;
+    }
     if (method === "DELETE" && url.endsWith("/provider-test")) {
       providers = [];
       defaults.chat = { default: null, status: "unconfigured", reason: "No chat Provider model is selected." };
+      defaults.rerank = { default: null, status: "unconfigured", reason: "No rerank Provider model is selected." };
       await route.fulfill({ json: { status: "removed" } });
       return;
     }
@@ -1299,6 +1312,7 @@ test("configures a chat-only Provider without requiring an Embedding model", asy
   await expect(page.getByText("模型发现：通过")).toBeVisible();
   await expect(page.getByText("服务健康：通过")).toBeVisible();
   await expect(page.getByRole("heading", { name: "Embedding 模型" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Rerank（重排）模型" })).toBeVisible();
   await page.getByLabel("model/chat::primary 模型类型").selectOption("chat");
   await page.getByRole("button", { name: "测试模型" }).click();
   await expect(page.getByText("模型验证已完成。")).toBeVisible();
@@ -1306,6 +1320,10 @@ test("configures a chat-only Provider without requiring an Embedding model", asy
   await expect(page.getByText("对话/文本生成默认 Model 已更新。")).toBeVisible();
   await page.getByLabel("全局对话/文本生成 Model").selectOption("");
   await expect(page.getByText("对话/文本生成默认 Model 已清除。")).toBeVisible();
+  await page.getByLabel("model/chat::primary 模型类型").selectOption("rerank");
+  await page.getByRole("button", { name: "测试模型" }).click();
+  await page.getByLabel("全局 Rerank（重排）Model").selectOption(JSON.stringify(["provider-test", "model/chat::primary"]));
+  await expect(page.getByText("Rerank（重排）默认 Model 已更新。")).toBeVisible();
   const deleteButton = page.getByRole("button", { name: "删除" });
   await deleteButton.focus();
   await deleteButton.click();
@@ -2207,6 +2225,146 @@ test("confirms per-task knowledge-organization authorization before generating",
   expect(executionRequests).toBe(1);
 });
 
+test("confirms a content-free rerank preview before sending its task authorization", async ({ page }) => {
+  const session = {
+    session_id: "session-rerank", title: "受控候选重排", selected_vault_id: "vault-rerank",
+    selected_vault_label: "Rerank Vault", selected_provider_id: "provider-rerank",
+    selected_provider_label: "Verified Chat", selected_model_id: "chat-rerank", selected_model_label: "chat-rerank",
+    scope_kind: "vault", scope_path: null, message_count: 1,
+    created_at: "2026-07-27T00:00:00+00:00", updated_at: "2026-07-27T00:00:00+00:00",
+    last_activity_at: "2026-07-27T00:00:00+00:00"
+  };
+  const authorizationId = "authorization-rerank-sensitive";
+  const candidateText = "不应展示或发送到浏览器的候选正文";
+  const absolutePath = "C:\\private\\rerank-source.md";
+  const contentHash = "f".repeat(64);
+  const preview = {
+    vault_id: "vault-rerank",
+    provider_id: "provider-rerank",
+    provider_name: "Verified Chat",
+    model_id: "chat-rerank",
+    provider_configuration_revision: "provider-revision-7",
+    policy_revision: 12,
+    file_count: 2,
+    candidate_count: 4,
+    input_character_count: 1200,
+    blocked_file_count: 1,
+    blocked_candidate_count: 1,
+    content_categories: ["source-lookup-query", "retrieval-candidate"],
+    is_authorizable: true,
+    blocking_reason: "其中一项候选命中 never-send-cloud。",
+    candidate_text: candidateText,
+    absolute_path: absolutePath,
+    content_sha256: contentHash
+  };
+  const completedResult = {
+    result_id: "result-rerank", task_id: "task-rerank", snapshot_id: "snapshot-rerank",
+    vault_id: "vault-rerank", status: "completed", summary: "已按本次确认调用候选重排。",
+    recovery_action: null, retrieval_duration_ms: 9, generation_duration_ms: 0,
+    rerank_authorization_id: authorizationId, rerank_status: "completed",
+    rerank_network_request_count: 1, rerank_duration_ms: 4, evidences: []
+  };
+  let completed = false;
+  let previewRequests = 0;
+  let confirmationRequests = 0;
+  let executionRequests = 0;
+  const previewBodies = [];
+  const confirmationBodies = [];
+  const executionBodies = [];
+  const detail = () => ({
+    session,
+    messages: [{ message_id: "message-rerank", role: "user", content: "定位语法规则" }],
+    task_states: [], citations: [], generation_results: [], attachments: [], completeness_results: [],
+    knowledge_organization_results: [], deep_creation_results: [],
+    task_snapshots: [{
+      snapshot_id: "snapshot-rerank", task_id: "task-rerank", vault_id: "vault-rerank",
+      intent: "source-lookup", status: completed ? "completed" : "prepared", scope_kind: "vault",
+      scope_path: null, source_count: 2, source_digest: "a".repeat(64), index_status: "healthy",
+      exclusion_summary: "已配置 never-send-cloud 排除项", outbound_scope_summary: "尚未发送", invalidation_reason: null
+    }],
+    retrieval_results: completed ? [completedResult] : []
+  });
+
+  await page.route("**/api/**", async (route) => {
+    const request = route.request();
+    const pathname = new URL(request.url()).pathname;
+    if (pathname === "/api/health") return route.fulfill({ json: { service: serviceName } });
+    if (pathname === "/api/session") return route.fulfill({ json: { status: "ok" } });
+    if (pathname === "/api/vaults") return route.fulfill({ json: { vaults: [{
+      vault_id: "vault-rerank", display_name: "Rerank Vault", managed_root_relative_path: "platform",
+      authorization_status: "active", access_status: "available"
+    }] } });
+    if (pathname === "/api/providers/defaults") return route.fulfill({ json: { chat: {}, embedding: {} } });
+    if (pathname === "/api/providers") return route.fulfill({ json: { providers: [] } });
+    if (pathname === "/api/import-tasks") return route.fulfill({ json: { tasks: [] } });
+    if (pathname === "/api/sessions" && request.method() === "GET") {
+      return route.fulfill({ json: { sessions: [session], page: 1, page_size: 25, total: 1, total_pages: 1 } });
+    }
+    if (pathname === "/api/sessions/session-rerank" && request.method() === "GET") {
+      return route.fulfill({ json: detail() });
+    }
+    if (pathname === "/api/sessions/session-rerank/tasks/task-rerank/rerank-authorizations" && request.method() === "POST") {
+      const body = request.postDataJSON();
+      previewBodies.push(body);
+      expect(body).toEqual({});
+      previewRequests += 1;
+      return route.fulfill({ json: {
+        preview,
+        authorization: { authorization_id: authorizationId, status: "pending" }
+      } });
+    }
+    if (pathname === `/api/vaults/vault-rerank/outbound-authorizations/${authorizationId}/confirm` && request.method() === "POST") {
+      const body = request.postDataJSON();
+      confirmationBodies.push(body);
+      expect(body).toEqual({ approved: true });
+      confirmationRequests += 1;
+      return route.fulfill({ json: { authorization: { authorization_id: authorizationId, status: "approved" } } });
+    }
+    if (pathname === "/api/sessions/session-rerank/tasks/task-rerank/execute/stream" && request.method() === "POST") {
+      const body = request.postDataJSON();
+      executionBodies.push(body);
+      expect(body).toEqual({ rerank_authorization_id: authorizationId });
+      executionRequests += 1;
+      completed = true;
+      return route.fulfill(resultEventStream(completedResult));
+    }
+    return route.fallback();
+  });
+
+  await page.goto("/");
+  await page.getByRole("link", { name: "会话", exact: true }).click();
+  await page.getByRole("button", { name: "执行检索", exact: true }).click();
+
+  const authorizationPreview = page.getByLabel("点查 rerank 外发授权预览");
+  await expect(authorizationPreview).toBeVisible();
+  await expect(authorizationPreview).toContainText("候选 4 项；文件 2 项；输入 1200 个字符");
+  await expect(authorizationPreview).toContainText("已排除的候选不会发送；其中一项候选命中 never-send-cloud。");
+  await expect(page.getByRole("button", { name: "确认并执行 rerank", exact: true })).toBeVisible();
+  expect(previewRequests).toBe(1);
+  expect(confirmationRequests).toBe(0);
+  expect(executionRequests).toBe(0);
+  expect(previewBodies).toEqual([{}]);
+
+  const previewText = await page.locator("body").innerText();
+  expect(previewText).not.toContain(candidateText);
+  expect(previewText).not.toContain(absolutePath);
+  expect(previewText).not.toContain(contentHash);
+  expect(previewText).not.toContain(authorizationId);
+
+  await page.getByRole("button", { name: "确认并执行 rerank", exact: true }).click();
+  await expect(page.getByLabel("本地知识库证据")).toContainText("已按本次确认调用候选重排。");
+  expect(confirmationRequests).toBe(1);
+  expect(executionRequests).toBe(1);
+  expect(confirmationBodies).toEqual([{ approved: true }]);
+  expect(executionBodies).toEqual([{ rerank_authorization_id: authorizationId }]);
+  for (const body of [...previewBodies, ...confirmationBodies, ...executionBodies]) {
+    const serialized = JSON.stringify(body);
+    expect(serialized).not.toContain(candidateText);
+    expect(serialized).not.toContain(absolutePath);
+    expect(serialized).not.toContain(contentHash);
+  }
+});
+
 test("blocks an oversized knowledge-organization preview before it can create a snapshot", async ({ page }) => {
   const session = {
     session_id: "session-budget", title: "范围预算", selected_vault_id: "vault-a",
@@ -2276,6 +2434,86 @@ test("blocks an oversized knowledge-organization preview before it can create a 
   await expect(page.getByText("第 1 段：已计划；目标：整理大范围资料", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "固定快照", exact: true })).toHaveCount(0);
   expect(snapshotCreateRequests).toBe(0);
+});
+
+test("fixes an enumeration snapshot without query scope confirmation", async ({ page }) => {
+  const session = {
+    session_id: "session-query-scope", title: "范围确认", selected_vault_id: "vault-a",
+    selected_vault_label: "Query Vault", selected_provider_id: "provider-1",
+    selected_provider_label: "Local", selected_model_id: "chat-1", selected_model_label: "chat-1",
+    scope_kind: "vault", scope_path: null, message_count: 0,
+    created_at: "2026-07-26T00:00:00+00:00", updated_at: "2026-07-26T00:00:00+00:00",
+    last_activity_at: "2026-07-26T00:00:00+00:00"
+  };
+  const taskSnapshots = [];
+  let createdTaskRequest = null;
+  const preview = () => ({
+    intent: "knowledge-organization", intent_source: "explicit", vault_id: "vault-a",
+    scope_kind: "vault", scope_path: null, provider_id: "provider-1", model_id: "chat-1",
+    index_status: "healthy", index_updated_at: "2026-07-26T00:00:00+00:00", index_digest: "i".repeat(64),
+    policy_revision: 1, exclusion_summary: "无排除项。", outbound_mode: "ask-each-task",
+    outbound_scope_summary: "仅使用本地索引范围预览；不会调用 Provider、Model 或互联网。",
+    source_count: 2, source_digest: "s".repeat(64), source_sample: [], is_ready: true,
+    blocking_reason: null, recovery_action: null,
+    query_scope: {
+      subject: "英语", grade_volume: null, unit_no: 1, material_type: null,
+      status: "recoverable", reason: "incomplete-scope", confidence: null, source: "query",
+      document_count: 0, block_count: 0, material_types: [], gaps: ["缺少册次。"], is_confirmed: false
+    }
+  });
+
+  await page.route("**/api/**", async (route) => {
+    const request = route.request();
+    const pathname = new URL(request.url()).pathname;
+    if (pathname === "/api/health") return route.fulfill({ json: { service: serviceName } });
+    if (pathname === "/api/session") return route.fulfill({ json: { status: "ok" } });
+    if (pathname === "/api/vaults") return route.fulfill({ json: { vaults: [{
+      vault_id: "vault-a", display_name: "Query Vault", managed_root_relative_path: "platform",
+      authorization_status: "active", access_status: "available"
+    }] } });
+    if (pathname === "/api/providers/defaults") return route.fulfill({ json: { chat: {}, embedding: {} } });
+    if (pathname === "/api/providers") return route.fulfill({ json: { providers: [{
+      provider_id: "provider-1", name: "Local", credential_configured: true,
+      verification: { is_verified: true },
+      models: [{ model_id: "chat-1", model_type: "chat", is_discovered: true, verification: { ok: true } }]
+    }] } });
+    if (pathname === "/api/import-tasks") return route.fulfill({ json: { tasks: [] } });
+    if (pathname === "/api/sessions" && request.method() === "GET") {
+      return route.fulfill({ json: { sessions: [session], page: 1, page_size: 25, total: 1, total_pages: 1 } });
+    }
+    if (pathname === "/api/sessions/session-query-scope" && request.method() === "GET") {
+      return route.fulfill({ json: {
+        session, messages: [], task_states: [], citations: [], generation_results: [], attachments: [],
+        task_snapshots: taskSnapshots, retrieval_results: [], completeness_results: [], knowledge_organization_results: []
+      } });
+    }
+    if (pathname === "/api/sessions/session-query-scope/task-preview" && request.method() === "POST") {
+      return route.fulfill({ json: { preview: preview() } });
+    }
+    if (pathname === "/api/sessions/session-query-scope/tasks" && request.method() === "POST") {
+      createdTaskRequest = request.postDataJSON();
+      taskSnapshots.push({
+        snapshot_id: "snapshot-query-scope", task_id: "task-query-scope", vault_id: "vault-a",
+        intent: "knowledge-organization", status: "prepared", scope_kind: "vault", scope_path: null,
+        source_count: 2, source_digest: "s".repeat(64), index_status: "healthy",
+        outbound_scope_summary: "仅使用冻结本地证据。"
+      });
+      return route.fulfill({ json: { snapshot: taskSnapshots[0] } });
+    }
+    return route.fallback();
+  });
+
+  await page.goto("/");
+  await page.getByRole("link", { name: "会话", exact: true }).click();
+  await page.getByLabel("选择任务类型").selectOption("knowledge-organization");
+  await page.getByLabel("输入问题或继续创作").fill("整理英语第一单元知识点");
+  await page.getByRole("button", { name: "准备任务", exact: true }).click();
+
+  await expect(page.getByLabel("查询范围预览")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "固定快照", exact: true })).toBeEnabled();
+  await page.getByRole("button", { name: "固定快照", exact: true }).click();
+
+  expect(createdTaskRequest).toEqual({ content: "整理英语第一单元知识点", intent: "knowledge-organization" });
 });
 
 test("shows restored frozen bindings and never calls an interrupted plan prepared", async ({ page }) => {

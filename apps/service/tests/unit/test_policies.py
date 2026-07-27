@@ -130,6 +130,37 @@ def test_ask_each_task_still_limits_large_human_authorization_scope_sets(
         )
 
 
+def test_index_embedding_requires_confirmation_and_allows_a_frozen_batch(
+    tmp_path: Path,
+) -> None:
+    policy_service, vault_id = authorize_vault(tmp_path)
+    scopes = [
+        OutboundScope(f"teaching/source-{index}.md", None)
+        for index in range(PolicyService.MAX_SCOPE_COUNT + 1)
+    ]
+
+    always_allow = policy_service.request_outbound_authorization(
+        vault_id,
+        provider_id="provider-a",
+        model_id="embedding-a",
+        operation="index-embedding",
+        task_id="embedding-index",
+        scopes=[OutboundScope("teaching/source.md", None)],
+    )
+    assert always_allow.status == "pending"
+
+    policy_service.set_outbound_mode(vault_id, "ask-each-task")
+    batch = policy_service.request_outbound_authorization(
+        vault_id,
+        provider_id="provider-a",
+        model_id="embedding-a",
+        operation="index-embedding",
+        task_id="embedding-index",
+        scopes=scopes,
+    )
+    assert batch.status == "pending"
+
+
 def test_never_send_cloud_overrides_always_allow_and_invalidates_existing_snapshots(
     tmp_path: Path,
 ) -> None:

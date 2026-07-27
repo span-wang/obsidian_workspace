@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from adapters.sqlite_index_repository import SqliteIndexRepository
-from domain.indexing import IndexBlock, IndexedDocument
+from domain.indexing import HeadingQuery, IndexBlock, IndexedDocument
 
 
 def _document(
@@ -169,6 +169,24 @@ def test_fts_rows_follow_save_invalidation_and_rebuild_lifecycle(tmp_path: Path)
         repository.database_path
     )] == [("rebuilt", 1)]
     assert _fts_row_count(repository.database_path) == 1
+
+
+def test_heading_search_is_independent_and_limits_to_current_allowed_blocks(tmp_path: Path) -> None:
+    repository = SqliteIndexRepository(tmp_path / "indexes.sqlite3")
+    repository.save_document(_document("Unit 1 Grammar", "notes/unit-1.md"))
+    repository.save_document(_document("Unit 1 Vocabulary", "notes/unit-1-vocabulary.md"))
+    repository.save_document(_document("Unit 1 Stale", "notes/stale.md", stale_reason="changed"))
+    repository.save_document(_document("Unit 2 Grammar", "notes/unit-2.md"))
+
+    hits = repository.search_heading(
+        "vault-1",
+        HeadingQuery(("unit1",), 8, ("notes/unit-1.md", "notes/unit-1-vocabulary.md")),
+    )
+
+    assert [(hit.relative_path, hit.block.heading_path) for hit in hits] == [
+        ("notes/unit-1-vocabulary.md", ("Unit 1 Vocabulary",)),
+        ("notes/unit-1.md", ("Unit 1 Grammar",)),
+    ]
 
 
 def test_document_block_and_fts_writes_roll_back_together(

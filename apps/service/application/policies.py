@@ -31,6 +31,13 @@ class OutboundAuthorizationDenied(ValueError):
 class PolicyService:
     MAX_IDENTIFIER_LENGTH = 128
     MAX_SCOPE_COUNT = 32
+    MAX_EMBEDDING_BATCH_SCOPE_COUNT = 10_000
+    MAX_METADATA_BATCH_SCOPE_COUNT = 10_000
+    MAX_UNIT_CARD_SCOPE_COUNT = 10_000
+    EXPLICIT_APPROVAL_OPERATIONS = frozenset(
+        {"index-embedding", "index-unit-card", "rerank-source-lookup"}
+    )
+    DEFAULT_APPROVAL_OPERATIONS = frozenset({"index-metadata"})
 
     def __init__(
         self, vault_service: VaultService, repository: VaultPolicyRepository
@@ -178,7 +185,10 @@ class PolicyService:
         normalized_operation = self._normalize_identifier(operation, "Operation", required=True)
         normalized_task_id = self._normalize_identifier(task_id, "Task", required=True)
         normalized_scopes = self._normalize_scopes(
-            scopes, enforce_count=policy.outbound_mode != "always-allow"
+            scopes,
+            max_scope_count=self._request_scope_limit(
+                policy.outbound_mode, normalized_operation
+            ),
         )
         for scope in normalized_scopes:
             evaluation = self.preview(
@@ -188,7 +198,16 @@ class PolicyService:
                 raise OutboundAuthorizationDenied(evaluation.reason)
         timestamp = utc_now()
         scope_summary = bounded_scope_summary(normalized_scopes)
-        status = "approved" if policy.outbound_mode == "always-allow" else "pending"
+        status = (
+            "pending"
+            if normalized_operation in self.EXPLICIT_APPROVAL_OPERATIONS
+            else "approved"
+            if (
+                normalized_operation in self.DEFAULT_APPROVAL_OPERATIONS
+                or policy.outbound_mode == "always-allow"
+            )
+            else "pending"
+        )
         authorization = OutboundAuthorization(
             authorization_id=str(uuid4()),
             vault_id=vault_id,
@@ -255,7 +274,10 @@ class PolicyService:
         normalized_model_id = self._normalize_identifier(model_id, "Model")
         normalized_operation = self._normalize_identifier(operation, "Operation", required=True)
         normalized_task_id = self._normalize_identifier(task_id, "Task", required=True)
-        normalized_scopes = self._normalize_scopes(scopes, enforce_count=False)
+        normalized_scopes = self._normalize_scopes(
+            scopes,
+            max_scope_count=self._check_scope_limit(normalized_operation),
+        )
         actual_digest = outbound_context_digest(
             provider_id=normalized_provider_id,
             model_id=normalized_model_id,
@@ -310,11 +332,11 @@ class PolicyService:
             )
 
     def _normalize_scopes(
-        self, scopes: list[OutboundScope], *, enforce_count: bool = True
+        self, scopes: list[OutboundScope], *, max_scope_count: int | None
     ) -> tuple[OutboundScope, ...]:
         if not scopes:
             raise PolicyValidationError("Outbound authorization needs an operation, task, and scope.")
-        if enforce_count and len(scopes) > self.MAX_SCOPE_COUNT:
+        if max_scope_count is not None and len(scopes) > max_scope_count:
             raise PolicyValidationError("Outbound authorization has too many scoped items.")
         if any(
             len(scope.source_path) > self.MAX_IDENTIFIER_LENGTH * 4
@@ -332,6 +354,26 @@ class PolicyService:
             )
         except ValueError as error:
             raise PolicyValidationError(str(error)) from error
+
+    def _request_scope_limit(self, outbound_mode: str, operation: str) -> int | None:
+        if operation == "index-embedding":
+            return self.MAX_EMBEDDING_BATCH_SCOPE_COUNT
+        if operation == "index-metadata":
+            return self.MAX_METADATA_BATCH_SCOPE_COUNT
+        if operation == "index-unit-card":
+            return self.MAX_UNIT_CARD_SCOPE_COUNT
+        if outbound_mode == "always-allow":
+            return None
+        return self.MAX_SCOPE_COUNT
+
+    def _check_scope_limit(self, operation: str) -> int | None:
+        if operation == "index-embedding":
+            return self.MAX_EMBEDDING_BATCH_SCOPE_COUNT
+        if operation == "index-metadata":
+            return self.MAX_METADATA_BATCH_SCOPE_COUNT
+        if operation == "index-unit-card":
+            return self.MAX_UNIT_CARD_SCOPE_COUNT
+        return None
 
     def _normalize_identifier(
         self, value: str | None, label: str, *, required: bool = False

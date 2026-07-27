@@ -1,6 +1,7 @@
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 from adapters.filesystem_vault_adapter import LocalVaultFilesystem
@@ -10,6 +11,7 @@ from application.policies import PolicyService
 from application.sessions import SessionService
 from application.vaults import VaultService
 from api.main import (
+    authorization_payload,
     create_app,
     session_citation_payload,
     session_completeness_result_payload,
@@ -17,10 +19,17 @@ from api.main import (
     session_deep_creation_result_payload,
     session_knowledge_organization_result_payload,
     session_retrieval_result_payload,
+    rerank_authorization_payload,
+    rerank_authorization_preview_payload,
 )
 from api.runtime import RuntimeState
 from domain.providers import Provider, ProviderModel, ProviderProbeResults, ProbeResult, ResolvedProviderModel
 from domain.indexing import BlockHit, IndexBlock, IndexedDocument, IndexHealth, LexicalQuery
+from domain.policies import OutboundAuthorization
+from domain.retrieval_rerank import (
+    RERANK_CONTENT_CATEGORIES,
+    RerankAuthorizationPreview,
+)
 from domain.sessions import (
     SessionCompletenessCoverageItem,
     SessionCompletenessResult,
@@ -83,6 +92,51 @@ def asgi_request(app, method: str, path: str, *, body: dict[str, object] | None 
     return response_start["status"], headers, response_body
 
 
+def asgi_stream_request(
+    app, method: str, path: str, *, body: dict[str, object], cookie: str
+):
+    target = urlsplit(path)
+    request_body = json.dumps(body).encode()
+    messages: list[dict[str, object]] = []
+    sent = False
+
+    async def receive() -> dict[str, object]:
+        nonlocal sent
+        if not sent:
+            sent = True
+            return {"type": "http.request", "body": request_body, "more_body": False}
+        await asyncio.Event().wait()
+        raise AssertionError("The stream receive task should be cancelled after completion.")
+
+    async def send(message: dict[str, object]) -> None:
+        messages.append(message)
+
+    asyncio.run(
+        app(
+            {
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": method,
+                "scheme": "http",
+                "path": target.path,
+                "raw_path": target.path.encode(),
+                "query_string": target.query.encode(),
+                "headers": [(b"content-type", b"application/json"), (b"cookie", cookie.encode())],
+                "client": ("127.0.0.1", 10000),
+                "server": ("127.0.0.1", 6240),
+            },
+            receive,
+            send,
+        )
+    )
+    response_start = next(message for message in messages if message["type"] == "http.response.start")
+    response_body = b"".join(
+        message.get("body", b"") for message in messages if message["type"] == "http.response.body"
+    )
+    return response_start["status"], response_body
+
+
 def test_retrieval_payload_exposes_independent_source_groups_from_snapshot_vault() -> None:
     result = SessionRetrievalResult(
         "result-1", "session-1", "task-1", "snapshot-1", "completed", "本地证据。", None, 1, 0,
@@ -127,6 +181,201 @@ def test_retrieval_payload_exposes_independent_source_groups_from_snapshot_vault
     assert unavailable["source_groups"] == []
 
 
+def test_rerank_authorization_payloads_are_content_free() -> None:
+    preview = RerankAuthorizationPreview(
+        "vault-1",
+        "provider-1",
+        "Fixture Provider",
+        "chat-1",
+        "revision-1",
+        1,
+        2,
+        1,
+        321,
+        3,
+        1,
+        RERANK_CONTENT_CATEGORIES,
+        True,
+    )
+    authorization = OutboundAuthorization(
+        "authorization-1",
+        "vault-1",
+        1,
+        "provider-1",
+        "chat-1",
+        "rerank-source-lookup",
+        "rerank-source-lookup:" + "a" * 64,
+        "b" * 64,
+        "1 scoped item(s)",
+        None,
+        None,
+        "pending",
+        "now",
+        "now",
+    )
+
+    serialized_preview = rerank_authorization_preview_payload(preview)
+    serialized_authorization = rerank_authorization_payload(authorization)
+    serialized_generic_authorization = authorization_payload(authorization)
+    encoded = json.dumps(
+        {
+            "preview": serialized_preview,
+            "authorization": serialized_authorization,
+            "generic_authorization": serialized_generic_authorization,
+        }
+    )
+
+    assert serialized_preview["candidate_count"] == 2
+    assert serialized_preview["blocked_candidate_count"] == 3
+    assert serialized_authorization == {
+        "authorization_id": "authorization-1",
+        "status": "pending",
+    }
+    assert serialized_generic_authorization == serialized_authorization
+    for forbidden in (
+        "relative_path",
+        "source_path",
+        "candidateId",
+        "block_content_sha256",
+        "snapshot_digest",
+        "actual_scope_digest",
+        "rerank-source-lookup:",
+    ):
+        assert forbidden not in encoded
+
+
+def test_rerank_authorization_route_and_execute_routes_forward_the_opaque_id(tmp_path: Path) -> None:
+    authorization = OutboundAuthorization(
+        "authorization-1",
+        "vault-1",
+        1,
+        "provider-1",
+        "chat-1",
+        "rerank-source-lookup",
+        "rerank-source-lookup:" + "a" * 64,
+        "b" * 64,
+        "1 scoped item(s)",
+        None,
+        None,
+        "pending",
+        "now",
+        "now",
+    )
+    preview = RerankAuthorizationPreview(
+        "vault-1",
+        "provider-1",
+        "Fixture Provider",
+        "chat-1",
+        "revision-1",
+        1,
+        2,
+        1,
+        321,
+        0,
+        0,
+        RERANK_CONTENT_CATEGORIES,
+        True,
+    )
+    result = SessionRetrievalResult(
+        "result-1",
+        "session-1",
+        "task-1",
+        "snapshot-1",
+        "no-evidence",
+        "No local evidence.",
+        None,
+        1,
+        0,
+        "now",
+        rerank_authorization_id=authorization.authorization_id,
+        rerank_status="authorization-invalid",
+    )
+
+    class Sessions:
+        def __init__(self) -> None:
+            self.executions: list[tuple[str, str, str | None, bool]] = []
+
+        @staticmethod
+        def prepare_rerank_authorization(session_id: str, task_id: str):
+            assert (session_id, task_id) == ("session-1", "task-1")
+            return preview, authorization
+
+        def execute_task(
+            self,
+            session_id: str,
+            task_id: str,
+            on_stream_chunk=None,
+            rerank_authorization_id: str | None = None,
+        ) -> SessionRetrievalResult:
+            self.executions.append(
+                (session_id, task_id, rerank_authorization_id, on_stream_chunk is not None)
+            )
+            if on_stream_chunk is not None:
+                on_stream_chunk(1, "streamed evidence")
+            return result
+
+        @staticmethod
+        def detail(session_id: str):
+            assert session_id == "session-1"
+            return SimpleNamespace(
+                task_snapshots=(
+                    SimpleNamespace(
+                        snapshot_id="snapshot-1",
+                        vault_id="vault-1",
+                        status="prepared",
+                        invalidation_reason=None,
+                    ),
+                )
+            )
+
+    sessions = Sessions()
+    app = create_app(
+        runtime=RuntimeState(data_directory=tmp_path / "app-data", sqlite_version="3.45.1")
+    )
+    app.state.session_service = sessions
+    _, root_headers, _ = asgi_request(app, "GET", "/")
+    cookie = root_headers["set-cookie"].split(";", maxsplit=1)[0]
+
+    authorization_status, _, authorization_body = asgi_request(
+        app,
+        "POST",
+        "/api/sessions/session-1/tasks/task-1/rerank-authorizations",
+        body={},
+        cookie=cookie,
+    )
+    execute_status, _, execute_body = asgi_request(
+        app,
+        "POST",
+        "/api/sessions/session-1/tasks/task-1/execute",
+        body={"rerank_authorization_id": "authorization-1"},
+        cookie=cookie,
+    )
+    stream_status, stream_body = asgi_stream_request(
+        app,
+        "POST",
+        "/api/sessions/session-1/tasks/task-1/execute/stream",
+        body={"rerank_authorization_id": "authorization-2"},
+        cookie=cookie,
+    )
+
+    authorization_response = json.loads(authorization_body)
+    assert authorization_status == 200
+    assert authorization_response["authorization"] == {
+        "authorization_id": "authorization-1",
+        "status": "pending",
+    }
+    assert "snapshot_digest" not in authorization_body.decode()
+    assert execute_status == 200
+    assert json.loads(execute_body)["result"]["rerank_authorization_id"] == "authorization-1"
+    assert stream_status == 200
+    assert b"event: chunk" in stream_body
+    assert b"event: result" in stream_body
+    assert sessions.executions == [
+        ("session-1", "task-1", "authorization-1", False),
+        ("session-1", "task-1", "authorization-2", True),
+    ]
+
+
 def test_completeness_payload_marks_invalidated_snapshot_as_source_changed() -> None:
     first = SessionCompletenessCoverageItem(
         1, "native", "notes/unit.md", "a" * 64, None, None, None,
@@ -138,7 +387,7 @@ def test_completeness_payload_marks_invalidated_snapshot_as_source_changed() -> 
     )
     result = SessionCompletenessResult(
         "result-1", "session-1", "task-1", "snapshot-1", "complete", "完整完成。",
-        None, (1,), 1, "2026-07-23T00:00:00+00:00",
+        None, (1,), 1, "2026-07-23T00:00:00+00:00", candidate_duplicate_clusters=((1, 2),),
     )
     snapshot = type("Snapshot", (), {
         "vault_id": "vault-1", "status": "invalidated", "invalidation_reason": "来源已改变。",
@@ -153,6 +402,7 @@ def test_completeness_payload_marks_invalidated_snapshot_as_source_changed() -> 
     assert payload["coverage_total"] == 2
     assert payload["coverage_has_more"] is True
     assert payload["coverage_counts"]["planned"] == 2
+    assert payload["candidate_duplicate_clusters"] == [[1, 2]]
 
 
 def test_knowledge_organization_payload_exposes_frozen_plan_and_stale_state() -> None:
@@ -535,8 +785,14 @@ def test_session_task_preview_and_confirmation_use_strict_private_snapshot_contr
                 for block in document.blocks
             ]
 
+        def filter_blocks(self, vault_id: str, filters) -> list:
+            assert vault_id == vault.vault_id
+            self.last_scope_filter = filters
+            return []
+
         def __init__(self) -> None:
             self.current: list[IndexedDocument] = []
+            self.last_scope_filter = None
 
     indexes = Indexes()
     session_service = SessionService(
@@ -579,6 +835,38 @@ def test_session_task_preview_and_confirmation_use_strict_private_snapshot_contr
         "POST",
         f"/api/sessions/{session_id}/task-preview",
         body={"content": "列出全部单词", "intent": "auto"},
+        cookie=cookie,
+    )
+    confirmed_preview_status, _, confirmed_preview_body = asgi_request(
+        app,
+        "POST",
+        f"/api/sessions/{session_id}/task-preview",
+        body={
+            "content": "整理第一单元知识点",
+            "intent": "knowledge-organization",
+            "query_scope": {
+                "subject": "英语",
+                "grade_volume": "七年级上册",
+                "unit_no": 1,
+                "material_type": "textbook",
+            },
+        },
+        cookie=cookie,
+    )
+    confirmed_task_status, _, confirmed_task_body = asgi_request(
+        app,
+        "POST",
+        f"/api/sessions/{session_id}/tasks",
+        body={
+            "content": "整理第一单元知识点",
+            "intent": "knowledge-organization",
+            "query_scope": {
+                "subject": "英语",
+                "grade_volume": "七年级上册",
+                "unit_no": 1,
+                "material_type": "textbook",
+            },
+        },
         cookie=cookie,
     )
     task_status, _, task_body = asgi_request(
@@ -661,6 +949,22 @@ def test_session_task_preview_and_confirmation_use_strict_private_snapshot_contr
     assert preview["intent"] == "completeness"
     assert preview["intent_source"] == "auto"
     assert preview["outbound_scope_summary"].startswith("尚未发送")
+    assert preview["query_scope"]["status"] == "recoverable"
+    assert preview["query_scope"]["gaps"] == ["缺少学科。", "缺少册次。", "缺少单元。"]
+    assert confirmed_preview_status == 200
+    confirmed_scope = json.loads(confirmed_preview_body)["preview"]["query_scope"]
+    assert confirmed_scope["source"] == "confirmed"
+    assert confirmed_scope["confidence"] == 1.0
+    assert confirmed_scope["material_type"] == "textbook"
+    assert confirmed_scope["gaps"] == ["确认范围内没有可用的内容块。"]
+    assert indexes.last_scope_filter.material_type == "textbook"
+    assert confirmed_task_status == 200
+    assert json.loads(confirmed_task_body)["snapshot"]["query_scope"] == {
+        "subject": "英语",
+        "grade_volume": "七年级上册",
+        "unit_no": 1,
+        "material_type": "textbook",
+    }
     assert task_status == 200
     snapshot = json.loads(task_body)["snapshot"]
     assert snapshot["status"] == "prepared"
@@ -698,13 +1002,15 @@ def test_session_task_preview_and_confirmation_use_strict_private_snapshot_contr
     assert unavailable_preview["recovery_action"] == "选择已验证的 chat Model 后重试。"
 
 
-def test_default_session_service_receives_lexical_runtime_switch(tmp_path: Path) -> None:
+def test_default_session_service_receives_retrieval_runtime_switches(tmp_path: Path) -> None:
     app = create_app(
         runtime=RuntimeState(
             data_directory=tmp_path / "app-data",
             sqlite_version="3.45.1",
             lexical_retrieval_enabled=False,
+            hybrid_retrieval_enabled=True,
         )
     )
 
     assert app.state.session_service.lexical_retrieval_enabled is False
+    assert app.state.session_service.hybrid_retrieval_enabled is True

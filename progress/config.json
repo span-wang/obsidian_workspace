@@ -1,7 +1,7 @@
 {
   "projectName": "Obsidian Personal Knowledge Platform",
   "initiativeName": "Retrieval Redesign",
-  "updatedOn": "2026-07-26",
+  "updatedOn": "2026-07-27",
   "planDocument": "docs/retrieval-redesign.md",
   "generatedFile": "docs/retrieval-progress.md",
   "sourceFiles": [
@@ -73,6 +73,16 @@
       "id": "RET-07",
       "label": "受控增强",
       "goal": "以独立开关验证 LLM 元数据、单元卡片和 rerank 的实际增益。"
+    },
+    {
+      "id": "RET-08",
+      "label": "受控 rerank 接入",
+      "goal": "以逐任务授权、执行前重验和默认关闭开关，将已评测的点查 rerank 受控接入生产链路。"
+    },
+    {
+      "id": "RET-09",
+      "label": "真实 Provider 测量",
+      "goal": "只以脱敏 fixture 在明确隐私与请求上限内测量真实 rerank Provider；费用按用户决定明确未计算，默认开关保持关闭。"
     }
   ],
   "trackingRules": [

@@ -176,9 +176,20 @@ class SqliteSessionRepository:
                     status TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    invalidation_reason TEXT
+                    invalidation_reason TEXT,
+                    query_scope_subject TEXT,
+                    query_scope_grade_volume TEXT,
+                    query_scope_unit_no INTEGER,
+                    query_scope_material_type TEXT
                 )"""
             )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS session_repository_migrations (
+                    migration_id TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                )"""
+            )
+            self._apply_snapshot_query_scope_migration(connection)
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS session_task_snapshot_sources (
                     snapshot_id TEXT NOT NULL REFERENCES session_task_snapshots(snapshot_id) ON DELETE CASCADE,
@@ -275,9 +286,14 @@ class SqliteSessionRepository:
                     excerpt TEXT,
                     disposition TEXT NOT NULL,
                     reason TEXT,
+                    knowledge_kind TEXT NOT NULL DEFAULT 'other',
+                    block_content_sha256 TEXT,
+                    token_estimate INTEGER,
                     PRIMARY KEY (snapshot_id, ordinal)
                 )"""
             )
+            self._apply_completeness_coverage_kind_migration(connection)
+            self._apply_completeness_coverage_block_migration(connection)
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS session_retrieval_results (
                     result_id TEXT PRIMARY KEY,
@@ -290,9 +306,14 @@ class SqliteSessionRepository:
                     retrieval_duration_ms INTEGER NOT NULL,
                     generation_duration_ms INTEGER NOT NULL,
                     created_at TEXT NOT NULL,
+                    rerank_authorization_id TEXT,
+                    rerank_status TEXT NOT NULL DEFAULT 'not-requested',
+                    rerank_network_request_count INTEGER NOT NULL DEFAULT 0,
+                    rerank_duration_ms INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(session_id, task_id)
                 )"""
             )
+            self._apply_retrieval_rerank_migration(connection)
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS session_retrieval_evidences (
                     result_id TEXT NOT NULL REFERENCES session_retrieval_results(result_id) ON DELETE CASCADE,
@@ -326,6 +347,7 @@ class SqliteSessionRepository:
                     recovery_action TEXT,
                     processed_ordinals_json TEXT NOT NULL,
                     outcomes_json TEXT NOT NULL DEFAULT '[]',
+                    candidate_duplicate_clusters_json TEXT NOT NULL DEFAULT '[]',
                     duration_ms INTEGER NOT NULL,
                     created_at TEXT NOT NULL,
                     UNIQUE(session_id, task_id)
@@ -337,6 +359,7 @@ class SqliteSessionRepository:
             self._ensure_completeness_result_column(
                 connection, "outcomes_json", "TEXT NOT NULL DEFAULT '[]'"
             )
+            self._apply_completeness_candidate_migration(connection)
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS session_knowledge_organization_results (
                     result_id TEXT PRIMARY KEY,
@@ -419,6 +442,157 @@ class SqliteSessionRepository:
         columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
         if name not in columns:
             connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+
+    @classmethod
+    def _apply_snapshot_query_scope_migration(cls, connection: sqlite3.Connection) -> None:
+        migration_id = "ret-05-02-session-task-query-scope-v1"
+        if connection.execute(
+            "SELECT 1 FROM session_repository_migrations WHERE migration_id = ?", (migration_id,)
+        ).fetchone():
+            return
+        connection.execute("SAVEPOINT session_task_query_scope")
+        try:
+            cls._ensure_table_column(
+                connection, "session_task_snapshots", "query_scope_subject", "TEXT"
+            )
+            cls._ensure_table_column(
+                connection, "session_task_snapshots", "query_scope_grade_volume", "TEXT"
+            )
+            cls._ensure_table_column(
+                connection, "session_task_snapshots", "query_scope_unit_no", "INTEGER"
+            )
+            cls._ensure_table_column(
+                connection, "session_task_snapshots", "query_scope_material_type", "TEXT"
+            )
+            connection.execute(
+                "INSERT INTO session_repository_migrations (migration_id, applied_at) VALUES (?, ?)",
+                (migration_id, utc_now()),
+            )
+        except Exception:
+            connection.execute("ROLLBACK TO session_task_query_scope")
+            raise
+        finally:
+            connection.execute("RELEASE session_task_query_scope")
+
+    @classmethod
+    def _apply_completeness_coverage_kind_migration(cls, connection: sqlite3.Connection) -> None:
+        migration_id = "ret-05-03-session-completeness-coverage-kind-v1"
+        if connection.execute(
+            "SELECT 1 FROM session_repository_migrations WHERE migration_id = ?", (migration_id,)
+        ).fetchone():
+            return
+        connection.execute("SAVEPOINT session_completeness_coverage_kind")
+        try:
+            cls._ensure_table_column(
+                connection,
+                "session_task_snapshot_coverage_items",
+                "knowledge_kind",
+                "TEXT NOT NULL DEFAULT 'other'",
+            )
+            connection.execute(
+                "INSERT INTO session_repository_migrations (migration_id, applied_at) VALUES (?, ?)",
+                (migration_id, utc_now()),
+            )
+        except Exception:
+            connection.execute("ROLLBACK TO session_completeness_coverage_kind")
+            raise
+        finally:
+            connection.execute("RELEASE session_completeness_coverage_kind")
+
+    @classmethod
+    def _apply_completeness_coverage_block_migration(cls, connection: sqlite3.Connection) -> None:
+        migration_id = "ret-05-04-session-completeness-coverage-block-v1"
+        if connection.execute(
+            "SELECT 1 FROM session_repository_migrations WHERE migration_id = ?", (migration_id,)
+        ).fetchone():
+            return
+        connection.execute("SAVEPOINT session_completeness_coverage_block")
+        try:
+            cls._ensure_table_column(
+                connection,
+                "session_task_snapshot_coverage_items",
+                "block_content_sha256",
+                "TEXT",
+            )
+            cls._ensure_table_column(
+                connection,
+                "session_task_snapshot_coverage_items",
+                "token_estimate",
+                "INTEGER",
+            )
+            connection.execute(
+                "INSERT INTO session_repository_migrations (migration_id, applied_at) VALUES (?, ?)",
+                (migration_id, utc_now()),
+            )
+        except Exception:
+            connection.execute("ROLLBACK TO session_completeness_coverage_block")
+            raise
+        finally:
+            connection.execute("RELEASE session_completeness_coverage_block")
+
+    @classmethod
+    def _apply_completeness_candidate_migration(cls, connection: sqlite3.Connection) -> None:
+        migration_id = "ret-05-04-session-completeness-candidates-v1"
+        if connection.execute(
+            "SELECT 1 FROM session_repository_migrations WHERE migration_id = ?", (migration_id,)
+        ).fetchone():
+            return
+        connection.execute("SAVEPOINT session_completeness_candidates")
+        try:
+            cls._ensure_completeness_result_column(
+                connection,
+                "candidate_duplicate_clusters_json",
+                "TEXT NOT NULL DEFAULT '[]'",
+            )
+            connection.execute(
+                "INSERT INTO session_repository_migrations (migration_id, applied_at) VALUES (?, ?)",
+                (migration_id, utc_now()),
+            )
+        except Exception:
+            connection.execute("ROLLBACK TO session_completeness_candidates")
+            raise
+        finally:
+            connection.execute("RELEASE session_completeness_candidates")
+
+    @classmethod
+    def _apply_retrieval_rerank_migration(cls, connection: sqlite3.Connection) -> None:
+        migration_id = "ret-08-01-session-retrieval-rerank-audit-v1"
+        if connection.execute(
+            "SELECT 1 FROM session_repository_migrations WHERE migration_id = ?", (migration_id,)
+        ).fetchone():
+            return
+        connection.execute("SAVEPOINT session_retrieval_rerank_audit")
+        try:
+            cls._ensure_table_column(
+                connection, "session_retrieval_results", "rerank_authorization_id", "TEXT"
+            )
+            cls._ensure_table_column(
+                connection,
+                "session_retrieval_results",
+                "rerank_status",
+                "TEXT NOT NULL DEFAULT 'not-requested'",
+            )
+            cls._ensure_table_column(
+                connection,
+                "session_retrieval_results",
+                "rerank_network_request_count",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            cls._ensure_table_column(
+                connection,
+                "session_retrieval_results",
+                "rerank_duration_ms",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            connection.execute(
+                "INSERT INTO session_repository_migrations (migration_id, applied_at) VALUES (?, ?)",
+                (migration_id, utc_now()),
+            )
+        except Exception:
+            connection.execute("ROLLBACK TO session_retrieval_rerank_audit")
+            raise
+        finally:
+            connection.execute("RELEASE session_retrieval_rerank_audit")
 
     def create(self, session: PersistentSession) -> None:
         with self._connect() as connection:
@@ -871,8 +1045,9 @@ class SqliteSessionRepository:
             connection.execute(
                 """INSERT INTO session_completeness_results (
                     result_id, session_id, task_id, snapshot_id, status, summary, recovery_action,
-                    processed_ordinals_json, outcomes_json, duration_ms, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    processed_ordinals_json, outcomes_json, candidate_duplicate_clusters_json, duration_ms,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     result.result_id, result.session_id, result.task_id, result.snapshot_id,
                     result.status, result.summary, result.recovery_action,
@@ -886,6 +1061,7 @@ class SqliteSessionRepository:
                         }
                         for outcome in result.outcomes
                     ]),
+                    json.dumps(result.candidate_duplicate_clusters),
                     result.duration_ms, result.created_at,
                 ),
             )
@@ -1105,8 +1281,9 @@ class SqliteSessionRepository:
                 scope_kind, scope_path, provider_id, model_id, index_status, index_updated_at,
                 index_digest, policy_revision, exclusion_summary, outbound_mode,
                 outbound_scope_summary, source_count, source_digest, status, created_at,
-                updated_at, invalidation_reason
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                updated_at, invalidation_reason, query_scope_subject, query_scope_grade_volume,
+                query_scope_unit_no, query_scope_material_type
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             self._snapshot_values(snapshot),
         )
         connection.executemany(
@@ -1131,13 +1308,15 @@ class SqliteSessionRepository:
         connection.executemany(
             """INSERT INTO session_task_snapshot_coverage_items (
                 snapshot_id, ordinal, identity_kind, relative_path, content_sha256, source_id,
-                source_content_hash, source_path, heading, location, page, excerpt, disposition, reason
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                source_content_hash, source_path, heading, location, page, excerpt, disposition, reason,
+                knowledge_kind, block_content_sha256, token_estimate
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [
                 (
                     snapshot.snapshot_id, item.ordinal, item.identity_kind, item.relative_path,
                     item.content_sha256, item.source_id, item.source_content_hash, item.source_path,
                     item.heading, item.location, item.page, item.excerpt, item.disposition, item.reason,
+                    item.knowledge_kind, item.block_content_sha256, item.token_estimate,
                 )
                 for item in snapshot.coverage_items
             ],
@@ -1234,8 +1413,9 @@ class SqliteSessionRepository:
         connection.execute(
             """INSERT INTO session_retrieval_results (
                 result_id, session_id, task_id, snapshot_id, status, summary, recovery_action,
-                retrieval_duration_ms, generation_duration_ms, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                retrieval_duration_ms, generation_duration_ms, created_at, rerank_authorization_id,
+                rerank_status, rerank_network_request_count, rerank_duration_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 result.result_id,
                 result.session_id,
@@ -1247,6 +1427,10 @@ class SqliteSessionRepository:
                 result.retrieval_duration_ms,
                 result.generation_duration_ms,
                 result.created_at,
+                result.rerank_authorization_id,
+                result.rerank_status,
+                result.rerank_network_request_count,
+                result.rerank_duration_ms,
             ),
         )
         connection.executemany(
@@ -1345,6 +1529,10 @@ class SqliteSessionRepository:
             snapshot.created_at,
             snapshot.updated_at,
             snapshot.invalidation_reason,
+            snapshot.query_scope_subject,
+            snapshot.query_scope_grade_volume,
+            snapshot.query_scope_unit_no,
+            snapshot.query_scope_material_type,
         )
 
     @staticmethod
@@ -1443,7 +1631,8 @@ class SqliteSessionRepository:
                     item["ordinal"], item["identity_kind"], item["relative_path"],
                     item["content_sha256"], item["source_id"], item["source_content_hash"],
                     item["source_path"], item["heading"], item["location"], item["page"],
-                    item["excerpt"], item["disposition"], item["reason"],
+                    item["excerpt"], item["disposition"], item["reason"], item["knowledge_kind"],
+                    item["block_content_sha256"], item["token_estimate"],
                 )
                 for item in coverage_rows
             ),
@@ -1501,6 +1690,10 @@ class SqliteSessionRepository:
                 )
                 for section in deep_creation_section_rows
             ),
+            query_scope_subject=row["query_scope_subject"],
+            query_scope_grade_volume=row["query_scope_grade_volume"],
+            query_scope_unit_no=row["query_scope_unit_no"],
+            query_scope_material_type=row["query_scope_material_type"],
         )
 
     @staticmethod
@@ -1555,6 +1748,10 @@ class SqliteSessionRepository:
                 )
                 for evidence in evidence_rows
             ),
+            row["rerank_authorization_id"],
+            row["rerank_status"],
+            int(row["rerank_network_request_count"]),
+            int(row["rerank_duration_ms"]),
         )
 
     @staticmethod
@@ -1569,6 +1766,7 @@ class SqliteSessionRepository:
                 )
                 for outcome in json.loads(row["outcomes_json"])
             ),
+            tuple(tuple(cluster) for cluster in json.loads(row["candidate_duplicate_clusters_json"])),
         )
 
     @staticmethod

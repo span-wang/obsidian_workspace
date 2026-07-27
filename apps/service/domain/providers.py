@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 
 
-MODEL_TYPES = frozenset({"chat", "embedding"})
+MODEL_TYPES = frozenset({"chat", "embedding", "rerank"})
 
 
 @dataclass(frozen=True)
@@ -74,3 +74,35 @@ class ModelSelection:
 class ResolvedProviderModel:
     provider: Provider
     model: ProviderModel
+
+
+@dataclass(frozen=True)
+class ChatUsage:
+    """Provider-reported token counts for one streaming chat response."""
+
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+    def __post_init__(self) -> None:
+        if any(
+            type(value) is not int or value < 0
+            for value in (self.prompt_tokens, self.completion_tokens, self.total_tokens)
+        ):
+            raise ValueError("Chat usage counts must be non-negative integers.")
+        if self.total_tokens != self.prompt_tokens + self.completion_tokens:
+            raise ValueError("Chat usage total must match its input and output token counts.")
+
+
+@dataclass(frozen=True)
+class ChatGeneration:
+    """One bounded chat response, with usage only when the Provider reports it."""
+
+    content: str
+    usage: ChatUsage | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.content, str) or not self.content.strip():
+            raise ValueError("Chat generation content is required.")
+        if self.usage is not None and not isinstance(self.usage, ChatUsage):
+            raise ValueError("Chat generation usage is invalid.")

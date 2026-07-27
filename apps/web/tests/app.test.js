@@ -16,9 +16,12 @@ import {
   IMPORT_TASKS_ENDPOINT,
   KnowledgeGraphWorkbench,
   LOCAL_SESSION_ENDPOINT,
+  MetadataExtractionPanel,
   NAVIGATION_DESTINATIONS,
   ProjectionRebuildVerificationPanel,
+  ProviderManagement,
   PROVIDERS_ENDPOINT,
+  RerankAuthorizationPreview,
   SESSIONS_ENDPOINT,
   SessionManagement,
   TagManagement,
@@ -121,6 +124,103 @@ test("uses relative same-origin endpoints for health and local session checks", 
     "commit-completed",
     "indexing-completed"
   ]);
+});
+
+test("renders an independent Rerank model type and default selector", () => {
+  const markup = renderToStaticMarkup(React.createElement(ProviderManagement, {
+    providers: [{
+      provider_id: "provider-1",
+      name: "Rerank Provider",
+      endpoint: "https://rerank.example/v1",
+      credential_configured: true,
+      verification: { is_verified: true, discovery: { ok: true }, health: { ok: true } },
+      models: [{
+        model_id: "rerank-1",
+        model_type: "rerank",
+        is_discovered: true,
+        verification: { ok: true }
+      }]
+    }],
+    isLoading: false,
+    modelDefaults: {
+      chat: { default: null, status: "unconfigured", reason: null },
+      embedding: { default: null, status: "unconfigured", reason: null },
+      rerank: { default: null, status: "unconfigured", reason: null }
+    },
+    onOpenForm: () => {},
+    onUpdate: () => {},
+    onConfirm: () => {},
+    onDefaultsChange: async () => {}
+  }));
+
+  assert.match(markup, /Rerank（重排）模型/);
+  assert.match(markup, /全局 Rerank（重排）Model/);
+  assert.match(markup, /默认关闭，只有获得单次外发授权后才会发送候选。/);
+  assert.match(markup, /<option value="rerank" selected="">Rerank（重排）<\/option>/);
+  assert.match(markup, /Rerank Provider \/ rerank-1/);
+});
+
+test("renders a rerank authorization preview without candidate content or identity", () => {
+  const markup = renderToStaticMarkup(React.createElement(RerankAuthorizationPreview, {
+    preview: {
+      vault_id: "vault-1",
+      provider_id: "provider-1",
+      provider_name: "已验证 Chat Provider",
+      model_id: "chat-1",
+      provider_configuration_revision: 7,
+      policy_revision: 11,
+      candidate_count: 20,
+      file_count: 5,
+      input_character_count: 4800,
+      blocked_candidate_count: 2,
+      blocked_file_count: 1,
+      content_categories: ["教材", "个人笔记"],
+      is_authorizable: true,
+      blocking_reason: "部分候选命中 never-send-cloud。",
+      candidate_text: "不应显示的候选正文",
+      absolute_path: "C:\\private\\lesson.md",
+      content_sha256: "deadbeef"
+    },
+    authorization: { authorization_id: "authorization-secret", status: "pending" },
+    isSubmitting: false,
+    onConfirm: () => {},
+    onUseLocal: () => {}
+  }));
+
+  assert.match(markup, /点查 rerank 外发授权预览/);
+  assert.match(markup, /已验证 Chat Provider；Model：chat-1/);
+  assert.match(markup, /候选 20 项；文件 5 项；输入 4800 个字符/);
+  assert.match(markup, /已排除候选 2 项；文件 1 项/);
+  assert.match(markup, /内容类别：教材、个人笔记/);
+  assert.match(markup, /外发策略修订：11/);
+  assert.match(markup, /确认并执行 rerank/);
+  assert.match(markup, /仅本地执行/);
+  assert.match(markup, /已排除的候选不会发送；部分候选命中 never-send-cloud。/);
+  assert.doesNotMatch(markup, /不应显示的候选正文|C:\\private|deadbeef|authorization-secret/);
+});
+
+test("keeps rerank unavailable previews local only", () => {
+  const markup = renderToStaticMarkup(React.createElement(RerankAuthorizationPreview, {
+    preview: {
+      candidate_count: 0,
+      file_count: 0,
+      input_character_count: 0,
+      blocked_candidate_count: 1,
+      blocked_file_count: 1,
+      content_categories: ["retrieval-candidate"],
+      is_authorizable: false,
+      blocking_reason: "所有候选均被 never-send-cloud 排除。"
+    },
+    authorization: null,
+    isSubmitting: false,
+    onConfirm: () => {},
+    onUseLocal: () => {}
+  }));
+
+  assert.match(markup, /当前候选不满足 rerank 外发条件，将只执行本地 RRF 检索。/);
+  assert.match(markup, /所有候选均被 never-send-cloud 排除。/);
+  assert.match(markup, /仅本地执行/);
+  assert.doesNotMatch(markup, /确认并执行 rerank|执行受控 rerank/);
 });
 
 test("renders a bounded three-pane session workspace with a context composer", () => {
@@ -754,6 +854,18 @@ test("renders index health and explicit recovery controls without exposing conte
   assert.match(markup, /确认重新关联/);
   assert.match(markup, /核对变更/);
   assert.match(markup, /重建索引/);
+});
+
+test("renders the metadata extraction action and local review surface", () => {
+  const markup = renderToStaticMarkup(
+    React.createElement(MetadataExtractionPanel, {
+      vault: { vault_id: "vault-1" }
+    })
+  );
+
+  assert.match(markup, /元数据审核/);
+  assert.match(markup, /抽取元数据/);
+  assert.match(markup, /没有待审核的元数据候选/);
 });
 
 test("renders a partial index summary without unmounting the workspace", () => {

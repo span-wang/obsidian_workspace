@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "provenance": "synthetic-deidentified",
+  "thresholds": {
+    "minimumCardCoverage": 1.0,
+    "minimumOriginalCitationRecall": 1.0,
+    "minimumMacroRecallGain": 0.5
+  },
+  "cases": [
+    {
+      "queryId": "unit-overview-01",
+      "expectedBlockIds": ["grammar-01", "vocabulary-01"],
+      "cardOffBlockIds": ["grammar-01"],
+      "cardOnBlockIds": ["grammar-01", "vocabulary-01"],
+      "cardMatched": true,
+      "cardSourceBlockIds": ["grammar-01", "vocabulary-01"]
+    },
+    {
+      "queryId": "unit-overview-02",
+      "expectedBlockIds": ["phrase-02", "sentence-02"],
+      "cardOffBlockIds": ["phrase-02"],
+      "cardOnBlockIds": ["phrase-02", "sentence-02"],
+      "cardMatched": true,
+      "cardSourceBlockIds": ["phrase-02", "sentence-02"]
+    }
+  ]
+}

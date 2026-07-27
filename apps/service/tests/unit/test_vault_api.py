@@ -2,16 +2,22 @@ import asyncio
 import json
 import threading
 from dataclasses import replace
+from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 from adapters.windows_directory_picker import WindowsDirectoryPicker
+from application.policies import OutboundAuthorizationDenied
 from application.providers import utc_now
+from application.unit_card_service import UnitCardExecutionError
 from api.main import create_app, publish_graph_refresh
 from api.runtime import RuntimeState
 from domain.evidence import DocxOoxmlLocator, PdfRegionLocator
+from domain.embeddings import EmbeddingProfileLocator
 from domain.graph_projection import DurableGraphProjection, GraphProjectionBlock
+from domain.indexing import IndexBlock, IndexBlockMetadata, IndexedDocument, LexicalQuery
+from domain.metadata_extraction import MetadataCandidate
 from domain.providers import ModelSelection, ProbeResult, Provider, ProviderModel, ProviderProbeResults, ResolvedProviderModel
 
 
@@ -37,10 +43,12 @@ class FakeProviderService:
         self.providers: dict[str, Provider] = {}
         self.defaults: dict[str, ModelSelection] = {}
         self.secrets: list[str] = []
+        self.embedding_inputs: list[tuple[str, ...]] = []
+        self.metadata_prompts: list[str] = []
 
     def create(self, name: str, endpoint: str, secret: str) -> Provider:
         self.secrets.append(secret)
-        provider = self._provider("provider-1", name, endpoint)
+        provider = self._provider(f"provider-{len(self.providers) + 1}", name, endpoint)
         self.providers[provider.provider_id] = provider
         return provider
 
@@ -102,6 +110,66 @@ class FakeProviderService:
         provider = self.providers[selection.provider_id]
         model = next(model for model in provider.models if model.model_id == selection.model_id)
         return ResolvedProviderModel(provider, model)
+
+    def embedding_profile_locator(
+        self, provider_id: str, model_id: str, *, expected_provider_updated_at: str
+    ) -> EmbeddingProfileLocator:
+        provider = self.providers[provider_id]
+        if provider.updated_at != expected_provider_updated_at:
+            raise RuntimeError("The embedding Provider configuration changed.")
+        return EmbeddingProfileLocator(
+            provider_id, provider.endpoint, expected_provider_updated_at, model_id
+        )
+
+    def create_embeddings(
+        self,
+        provider_id: str,
+        model_id: str,
+        inputs: tuple[str, ...],
+        *,
+        expected_provider_updated_at: str,
+    ) -> tuple[tuple[float, ...], ...]:
+        self.embedding_profile_locator(
+            provider_id, model_id, expected_provider_updated_at=expected_provider_updated_at
+        )
+        self.embedding_inputs.append(inputs)
+        return tuple((9.125, float(index)) for index, _value in enumerate(inputs, start=1))
+
+    def generate_chat(
+        self,
+        provider_id: str,
+        model_id: str,
+        prompt: str,
+        *,
+        expected_provider_updated_at: str | None = None,
+    ) -> str:
+        provider = self.providers[provider_id]
+        assert provider.updated_at == expected_provider_updated_at
+        assert any(model.model_id == model_id and model.model_type == "chat" for model in provider.models)
+        self.metadata_prompts.append(prompt)
+        if "Create a constrained unit-card map summary" in prompt:
+            return json.dumps(
+                {
+                    "items": [
+                        {
+                            "knowledge_kind": "grammar",
+                            "concept_keys": ["subject verb agreement"],
+                        }
+                    ]
+                }
+            )
+        return json.dumps(
+            {
+                "items": [
+                    {
+                        "item_id": 1,
+                        "knowledge_kind": "grammar",
+                        "concept_keys": ["subject verb agreement"],
+                        "confidence": 0.91,
+                    }
+                ]
+            }
+        )
 
     @staticmethod
     def _provider(
@@ -197,6 +265,178 @@ def test_vault_commands_require_a_local_session_and_use_the_native_picker(tmp_pa
     assert json.loads(unauthenticated_body)["code"] == "local_session_required"
     assert root_status == 200
     assert selection_id
+
+
+def test_unit_card_execution_api_preserves_stable_blocked_error_codes(tmp_path: Path) -> None:
+    vault_path = tmp_path / "vault"
+    vault_path.mkdir()
+    app = create_app_for_test(tmp_path, FakeDirectoryPicker(vault_path))
+    _, root_headers, _ = asgi_request(app, "GET", "/")
+    cookie = root_headers["set-cookie"].split(";", maxsplit=1)[0]
+
+    class FailingUnitCardService:
+        def __init__(self, error: Exception) -> None:
+            self.error = error
+
+        def execute(self, *_args):
+            raise self.error
+
+    endpoint = "/api/vaults/vault-a/unit-card-authorizations/execute"
+    body = {
+        "scope_kind": "vault",
+        "chat_authorization_id": "chat-auth",
+        "embedding_authorization_id": "embedding-auth",
+    }
+    app.state.unit_card_service = FailingUnitCardService(
+        UnitCardExecutionError("Unit card Provider is unavailable.")
+    )
+    execution_status, _, execution_body = asgi_request(
+        app, "POST", endpoint, body=body, cookie=cookie
+    )
+    app.state.unit_card_service = FailingUnitCardService(
+        OutboundAuthorizationDenied("never-send-cloud blocks this source.")
+    )
+    authorization_status, _, authorization_body = asgi_request(
+        app, "POST", endpoint, body=body, cookie=cookie
+    )
+
+    assert execution_status == 409
+    assert json.loads(execution_body)["code"] == "unit_card_execution_blocked"
+    assert authorization_status == 403
+    assert json.loads(authorization_body)["code"] == "outbound_authorization_denied"
+
+
+def test_unit_card_authorization_api_requires_two_approvals_and_keeps_source_text_private(
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "vault"
+    vault_path.mkdir()
+    provider_service = FakeProviderService()
+    app = create_app_for_test(
+        tmp_path, FakeDirectoryPicker(vault_path), provider_service=provider_service
+    )
+    _, root_headers, _ = asgi_request(app, "GET", "/")
+    cookie = root_headers["set-cookie"].split(";", maxsplit=1)[0]
+    selection_id = select_directory(app, cookie)
+    _, _, created_body = asgi_request(
+        app,
+        "POST",
+        "/api/vaults",
+        body={"selection_id": selection_id, "managed_root": "platform"},
+        cookie=cookie,
+    )
+    vault_id = json.loads(created_body)["vault"]["vault_id"]
+
+    chat_provider = provider_service.create("Card Chat", "https://chat.example/v1", "chat-secret")
+    provider_service.test(chat_provider.provider_id)
+    provider_service.configure_model(chat_provider.provider_id, "model-alpha", "chat")
+    provider_service.test_model(chat_provider.provider_id, "model-alpha")
+    provider_service.set_default("chat", chat_provider.provider_id, "model-alpha")
+    embedding_provider = provider_service.create(
+        "Card Embedding", "https://embed.example/v1", "embedding-secret"
+    )
+    provider_service.test(embedding_provider.provider_id)
+    provider_service.configure_model(embedding_provider.provider_id, "model-alpha", "embedding")
+    provider_service.test_model(embedding_provider.provider_id, "model-alpha")
+    provider_service.set_default("embedding", embedding_provider.provider_id, "model-alpha")
+
+    source_text = "This indexed source text must not appear in unit-card API responses."
+    document = IndexedDocument(
+        document_id="unit-card-api-document",
+        vault_id=vault_id,
+        relative_path="teaching/unit-1.md",
+        content_sha256=sha256(source_text.encode("utf-8")).hexdigest(),
+        document_kind="native",
+        heading_locations=(),
+        links=(),
+        tags=(),
+        blocks=(IndexBlock(1, "line:1", source_text, retrieval_text=source_text),),
+        indexed_at="2026-07-27T00:00:00+00:00",
+        block_metadata=(
+            IndexBlockMetadata(1, "english", "7a", 1, "textbook", "human", 1.0, "accepted"),
+        ),
+    )
+    repository = app.state.indexing_service.repository
+    repository.save_document(document)
+    candidate = MetadataCandidate(
+        candidate_id="unit-card-api-candidate",
+        vault_id=vault_id,
+        document_id=document.document_id,
+        relative_path=document.relative_path,
+        sequence=1,
+        block_content_sha256=document.blocks[0].block_content_sha256,
+        knowledge_kind="grammar",
+        concept_keys=("subject verb agreement",),
+        confidence=0.91,
+        provider_id=chat_provider.provider_id,
+        model_id="model-alpha",
+        provider_configuration_revision=provider_service.get(chat_provider.provider_id).updated_at,
+        status="accepted",
+        review_reason=None,
+        decision_reason="Reviewed.",
+        created_at="2026-07-27T00:00:00+00:00",
+        updated_at="2026-07-27T00:00:00+00:00",
+    )
+    repository.save_metadata_candidates(vault_id, (candidate,))
+
+    endpoint = f"/api/vaults/{vault_id}/unit-card-authorizations"
+    unauthorized_status, _, _ = asgi_request(
+        app, "POST", f"{endpoint}/preview", body={"scope_kind": "vault"}
+    )
+    preview_status, _, preview_body = asgi_request(
+        app, "POST", f"{endpoint}/preview", body={"scope_kind": "vault"}, cookie=cookie
+    )
+    request_status, _, request_body = asgi_request(
+        app, "POST", endpoint, body={"scope_kind": "vault"}, cookie=cookie
+    )
+    requested = json.loads(request_body)
+    chat_authorization_id = requested["chat_authorization"]["authorization_id"]
+    embedding_authorization_id = requested["embedding_authorization"]["authorization_id"]
+    chat_confirm_status, _, _ = asgi_request(
+        app,
+        "POST",
+        f"{endpoint}/{chat_authorization_id}/confirm",
+        body={"approved": True},
+        cookie=cookie,
+    )
+    embedding_confirm_status, _, _ = asgi_request(
+        app,
+        "POST",
+        f"{endpoint}/{embedding_authorization_id}/confirm",
+        body={"approved": True},
+        cookie=cookie,
+    )
+    execution_command = {
+        "scope_kind": "vault",
+        "chat_authorization_id": chat_authorization_id,
+        "embedding_authorization_id": embedding_authorization_id,
+    }
+    check_status, _, check_body = asgi_request(
+        app, "POST", f"{endpoint}/check", body=execution_command, cookie=cookie
+    )
+    execution_status, _, execution_body = asgi_request(
+        app, "POST", f"{endpoint}/execute", body=execution_command, cookie=cookie
+    )
+
+    preview = json.loads(preview_body)["preview"]
+    execution = json.loads(execution_body)["report"]
+    hits = repository.search_unit_cards_lexical(
+        vault_id, LexicalQuery("subject agreement", 8, (document.relative_path,))
+    )
+    assert unauthorized_status == 403
+    assert preview_status == request_status == chat_confirm_status == embedding_confirm_status == 200
+    assert check_status == execution_status == 200
+    assert preview["content_categories"][-1] == "unit-card-summary"
+    assert preview["card_count"] == 1
+    assert requested["chat_authorization"]["status"] == "pending"
+    assert requested["embedding_authorization"]["status"] == "pending"
+    assert json.loads(check_body)["chat_authorization"]["status"] == "approved"
+    assert execution["status"] == "completed"
+    assert execution["chat_network_request_count"] == execution["embedding_network_request_count"] == 1
+    assert [hit.card.card_id for hit in hits]
+    assert source_text.encode() not in preview_body
+    assert source_text.encode() not in request_body
+    assert source_text.encode() not in execution_body
 
 
 def test_vault_commands_persist_application_state_without_changing_existing_vault_files(
@@ -527,6 +767,244 @@ def test_vault_authorization_rejects_client_paths_with_the_standard_error_contra
     assert payload["retryable"] is False
 
 
+def test_embedding_authorization_api_freezes_a_content_free_batch_and_invalidates_on_policy_change(
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "vault"
+    vault_path.mkdir()
+    provider_service = FakeProviderService()
+    app = create_app_for_test(
+        tmp_path, FakeDirectoryPicker(vault_path), provider_service=provider_service
+    )
+    _, root_headers, _ = asgi_request(app, "GET", "/")
+    cookie = root_headers["set-cookie"].split(";", maxsplit=1)[0]
+    selection_id = select_directory(app, cookie)
+    _, _, created_body = asgi_request(
+        app,
+        "POST",
+        "/api/vaults",
+        body={"selection_id": selection_id, "managed_root": "platform"},
+        cookie=cookie,
+    )
+    vault_id = json.loads(created_body)["vault"]["vault_id"]
+    provider = provider_service.create("Embedding Cloud", "https://provider.example/v1", "secret")
+    provider_service.test(provider.provider_id)
+    provider_service.configure_model(provider.provider_id, "model-alpha", "embedding")
+    provider_service.test_model(provider.provider_id, "model-alpha")
+    provider_service.set_default("embedding", provider.provider_id, "model-alpha")
+    body_text = "This indexed block must not appear in the authorization preview."
+    app.state.indexing_service.repository.save_document(
+        IndexedDocument(
+            document_id="embedding-preview-document",
+            vault_id=vault_id,
+            relative_path="teaching/unit-1.md",
+            content_sha256=sha256(body_text.encode("utf-8")).hexdigest(),
+            document_kind="native",
+            heading_locations=(),
+            links=(),
+            tags=(),
+            blocks=(
+                IndexBlock(
+                    1,
+                    "line:1",
+                    body_text,
+                    contextual_prefix="Unit 1 context",
+                    retrieval_text=body_text,
+                ),
+            ),
+            indexed_at="2026-07-26T00:00:00+00:00",
+        )
+    )
+
+    denied_status, _, _ = asgi_request(
+        app,
+        "POST",
+        f"/api/vaults/{vault_id}/embedding-authorizations/preview",
+        body={"scope_kind": "directory", "relative_path": "teaching"},
+    )
+    preview_status, _, preview_body = asgi_request(
+        app,
+        "POST",
+        f"/api/vaults/{vault_id}/embedding-authorizations/preview",
+        body={"scope_kind": "directory", "relative_path": "teaching"},
+        cookie=cookie,
+    )
+    request_status, _, request_body = asgi_request(
+        app,
+        "POST",
+        f"/api/vaults/{vault_id}/embedding-authorizations",
+        body={"scope_kind": "directory", "relative_path": "teaching"},
+        cookie=cookie,
+    )
+    authorization_id = json.loads(request_body)["authorization"]["authorization_id"]
+    confirm_status, _, confirm_body = asgi_request(
+        app,
+        "POST",
+        f"/api/vaults/{vault_id}/embedding-authorizations/{authorization_id}/confirm",
+        body={"approved": True},
+        cookie=cookie,
+    )
+    check_status, _, _ = asgi_request(
+        app,
+        "POST",
+        f"/api/vaults/{vault_id}/embedding-authorizations/{authorization_id}/check",
+        body={"scope_kind": "directory", "relative_path": "teaching"},
+        cookie=cookie,
+    )
+    execute_status, _, execute_body = asgi_request(
+        app,
+        "POST",
+        f"/api/vaults/{vault_id}/embedding-authorizations/{authorization_id}/execute",
+        body={"scope_kind": "directory", "relative_path": "teaching"},
+        cookie=cookie,
+    )
+    index_status, _, index_body = asgi_request(
+        app,
+        "GET",
+        f"/api/vaults/{vault_id}/index",
+        cookie=cookie,
+    )
+    rule_status, _, _ = asgi_request(
+        app,
+        "POST",
+        f"/api/vaults/{vault_id}/policy/rules",
+        body={"kind": "never-send-cloud", "relative_path": "teaching"},
+        cookie=cookie,
+    )
+    invalid_status, _, invalid_body = asgi_request(
+        app,
+        "POST",
+        f"/api/vaults/{vault_id}/embedding-authorizations/{authorization_id}/check",
+        body={"scope_kind": "directory", "relative_path": "teaching"},
+        cookie=cookie,
+    )
+
+    preview = json.loads(preview_body)["preview"]
+    assert denied_status == 403
+    assert preview_status == 200
+    assert preview["provider_id"] == provider.provider_id
+    assert preview["model_id"] == "model-alpha"
+    assert preview["file_count"] == 1
+    assert preview["block_count"] == 1
+    assert preview["content_categories"] == ["contextual-prefix", "retrieval-text"]
+    assert body_text.encode() not in preview_body
+    assert request_status == 200
+    assert json.loads(request_body)["authorization"]["status"] == "pending"
+    assert confirm_status == 200
+    assert json.loads(confirm_body)["authorization"]["status"] == "approved"
+    assert check_status == 200
+    execution = json.loads(execute_body)["report"]
+    assert execute_status == 200
+    assert execution["status"] == "completed"
+    assert execution["block_count"] == 1
+    assert execution["network_batch_count"] == 1
+    assert provider_service.embedding_inputs == [("Unit 1 context\n\n" + body_text,)]
+    assert body_text.encode() not in execute_body
+    assert b"9.125" not in execute_body
+    index = json.loads(index_body)["index"]
+    assert index_status == 200
+    assert index["semantic_status"] == "available"
+    assert index["semantic_covered_block_count"] == 1
+    assert index["semantic_eligible_block_count"] == 1
+    assert index["semantic_profile_count"] == 1
+    assert b"9.125" not in index_body
+    assert rule_status == 200
+    assert invalid_status == 403
+    assert json.loads(invalid_body)["code"] == "outbound_authorization_denied"
+
+
+def test_metadata_api_uses_default_outbound_approval_and_keeps_block_text_private(tmp_path: Path) -> None:
+    vault_path = tmp_path / "vault"
+    vault_path.mkdir()
+    provider_service = FakeProviderService()
+    app = create_app_for_test(
+        tmp_path, FakeDirectoryPicker(vault_path), provider_service=provider_service
+    )
+    _, root_headers, _ = asgi_request(app, "GET", "/")
+    cookie = root_headers["set-cookie"].split(";", maxsplit=1)[0]
+    selection_id = select_directory(app, cookie)
+    _, _, created_body = asgi_request(
+        app,
+        "POST",
+        "/api/vaults",
+        body={"selection_id": selection_id, "managed_root": "platform"},
+        cookie=cookie,
+    )
+    vault_id = json.loads(created_body)["vault"]["vault_id"]
+    provider = provider_service.create("Metadata Cloud", "https://provider.example/v1", "secret")
+    provider_service.test(provider.provider_id)
+    provider_service.configure_model(provider.provider_id, "model-alpha", "chat")
+    provider_service.test_model(provider.provider_id, "model-alpha")
+    provider_service.set_default("chat", provider.provider_id, "model-alpha")
+    body_text = "This indexed block must not appear in metadata API responses."
+    app.state.indexing_service.repository.save_document(
+        IndexedDocument(
+            document_id="metadata-api-document",
+            vault_id=vault_id,
+            relative_path="teaching/unit-1.md",
+            content_sha256=sha256(body_text.encode("utf-8")).hexdigest(),
+            document_kind="native",
+            heading_locations=(),
+            links=(),
+            tags=(),
+            blocks=(IndexBlock(1, "line:1", body_text, retrieval_text=body_text),),
+            indexed_at="2026-07-27T00:00:00+00:00",
+        )
+    )
+
+    request_status, _, request_body = asgi_request(
+        app,
+        "POST",
+        f"/api/vaults/{vault_id}/metadata-authorizations",
+        body={"scope_kind": "vault"},
+        cookie=cookie,
+    )
+    authorization_id = json.loads(request_body)["authorization"]["authorization_id"]
+    execute_status, _, execute_body = asgi_request(
+        app,
+        "POST",
+        f"/api/vaults/{vault_id}/metadata-authorizations/{authorization_id}/execute",
+        body={"scope_kind": "vault"},
+        cookie=cookie,
+    )
+    candidates_status, _, candidates_body = asgi_request(
+        app,
+        "GET",
+        f"/api/vaults/{vault_id}/metadata-candidates?status=required-check",
+        cookie=cookie,
+    )
+    candidate_id = json.loads(candidates_body)["candidates"][0]["candidate_id"]
+    decision_status, _, decision_body = asgi_request(
+        app,
+        "POST",
+        f"/api/vaults/{vault_id}/metadata-candidates/{candidate_id}/decision",
+        body={"decision": "accepted", "reason": "Checked against the indexed block."},
+        cookie=cookie,
+    )
+    audited_status, _, audited_body = asgi_request(
+        app,
+        "GET",
+        f"/api/vaults/{vault_id}/metadata-candidates",
+        cookie=cookie,
+    )
+
+    assert request_status == 200
+    assert json.loads(request_body)["authorization"]["status"] == "approved"
+    assert execute_status == 200
+    assert json.loads(execute_body)["report"]["required_review_count"] == 1
+    assert candidates_status == 200
+    assert json.loads(candidates_body)["candidates"][0]["knowledge_kind"] == "grammar"
+    assert decision_status == 200
+    assert json.loads(decision_body)["candidate"]["status"] == "accepted"
+    assert json.loads(candidates_body)["audit"]["reviewed_count"] == 0
+    assert audited_status == 200
+    assert json.loads(audited_body)["audit"]["acceptance_rate"] == 1.0
+    assert body_text.encode() not in request_body
+    assert body_text.encode() not in execute_body
+    assert body_text.encode() not in candidates_body
+    assert provider_service.metadata_prompts
+
+
 def test_provider_api_requires_a_local_session_and_never_returns_submitted_credentials(
     tmp_path: Path,
 ) -> None:
@@ -577,6 +1055,24 @@ def test_provider_api_requires_a_local_session_and_never_returns_submitted_crede
     resolved_status, _, resolved_body = asgi_request(
         app, "GET", "/api/providers/defaults/chat/resolved", cookie=cookie
     )
+    rerank_configure_status, _, _ = asgi_request(
+        app, "PUT", f"/api/providers/{provider_id}/models",
+        body={"model_id": "model-alpha", "model_type": "rerank"}, cookie=cookie
+    )
+    rerank_model_test_status, _, _ = asgi_request(
+        app, "POST", f"/api/providers/{provider_id}/models/test",
+        body={"model_id": "model-alpha"}, cookie=cookie
+    )
+    rerank_default_status, _, rerank_default_body = asgi_request(
+        app,
+        "PUT",
+        "/api/providers/defaults/rerank",
+        body={"provider_id": provider_id, "model_id": "model-alpha"},
+        cookie=cookie,
+    )
+    rerank_resolved_status, _, rerank_resolved_body = asgi_request(
+        app, "GET", "/api/providers/defaults/rerank/resolved", cookie=cookie
+    )
     invalid_status, _, invalid_body = asgi_request(
         app,
         "POST",
@@ -596,12 +1092,19 @@ def test_provider_api_requires_a_local_session_and_never_returns_submitted_crede
     assert json.loads(test_body)["provider"]["models"][0]["model_type"] is None
     assert defaults_status == 200
     assert json.loads(defaults_body)["embedding"]["status"] == "unconfigured"
+    assert json.loads(defaults_body)["rerank"]["status"] == "unconfigured"
     assert configure_status == 200
     assert model_test_status == 200
     assert default_status == 200
     assert json.loads(default_body)["default"]["model_id"] == "model-alpha"
     assert resolved_status == 200
     assert json.loads(resolved_body)["provider"]["provider_id"] == provider_id
+    assert rerank_configure_status == 200
+    assert rerank_model_test_status == 200
+    assert rerank_default_status == 200
+    assert json.loads(rerank_default_body)["default"]["model_id"] == "model-alpha"
+    assert rerank_resolved_status == 200
+    assert json.loads(rerank_resolved_body)["model"]["model_type"] == "rerank"
     assert invalid_status == 422
     assert json.loads(invalid_body)["code"] == "request_validation_failed"
     assert b"must-not-leak" not in invalid_body

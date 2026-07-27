@@ -5,6 +5,11 @@ import sqlite3
 from pathlib import Path
 
 from domain.providers import ModelSelection, ProbeResult, Provider, ProviderModel, ProviderProbeResults
+from domain.tasks import utc_now
+
+
+_RERANK_MODEL_TYPE_MIGRATION_ID = "ret-09-02-provider-rerank-model-type-v1"
+_LEGACY_MODEL_TYPES = frozenset({"chat", "embedding"})
 
 
 class SqliteProviderRepository:
@@ -48,6 +53,7 @@ class SqliteProviderRepository:
                 provider_id TEXT NOT NULL REFERENCES providers(provider_id) ON DELETE CASCADE,
                 model_id TEXT NOT NULL, updated_at TEXT NOT NULL)""")
             self._migrate_legacy_default(connection)
+            self._apply_rerank_model_type_migration(connection)
 
     @staticmethod
     def _add_model_columns(connection: sqlite3.Connection) -> None:
@@ -83,6 +89,47 @@ class SqliteProviderRepository:
                            (legacy["updated_at"], legacy["provider_id"], legacy["model_id"]))
         connection.execute("DELETE FROM background_model_default WHERE singleton = 1")
 
+    @staticmethod
+    def _apply_rerank_model_type_migration(connection: sqlite3.Connection) -> None:
+        connection.execute("SAVEPOINT provider_rerank_model_type_migration")
+        try:
+            connection.execute("""CREATE TABLE IF NOT EXISTS provider_schema_migrations (
+                migration_id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)""")
+            applied = connection.execute(
+                "SELECT 1 FROM provider_schema_migrations WHERE migration_id = ?",
+                (_RERANK_MODEL_TYPE_MIGRATION_ID,),
+            ).fetchone()
+            if applied is None:
+                columns = {
+                    row["name"]
+                    for row in connection.execute("PRAGMA table_info(provider_models)").fetchall()
+                }
+                if "configured_model_type" not in columns:
+                    connection.execute("ALTER TABLE provider_models ADD COLUMN configured_model_type TEXT")
+                connection.execute(
+                    """UPDATE provider_models SET configured_model_type = model_type
+                    WHERE configured_model_type IS NULL AND model_type IN ('chat', 'embedding')"""
+                )
+                connection.execute("""CREATE TABLE IF NOT EXISTS model_defaults_v2 (
+                    model_type TEXT PRIMARY KEY CHECK (model_type IN ('chat', 'embedding', 'rerank')),
+                    provider_id TEXT NOT NULL REFERENCES providers(provider_id) ON DELETE CASCADE,
+                    model_id TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+                connection.execute("""INSERT INTO model_defaults_v2
+                    (model_type, provider_id, model_id, updated_at)
+                    SELECT model_type, provider_id, model_id, updated_at FROM model_defaults
+                    WHERE model_type IN ('chat', 'embedding')
+                    ON CONFLICT(model_type) DO NOTHING""")
+                connection.execute(
+                    "INSERT INTO provider_schema_migrations (migration_id, applied_at) VALUES (?, ?)",
+                    (_RERANK_MODEL_TYPE_MIGRATION_ID, utc_now()),
+                )
+        except Exception:
+            connection.execute("ROLLBACK TO provider_rerank_model_type_migration")
+            connection.execute("RELEASE provider_rerank_model_type_migration")
+            raise
+        else:
+            connection.execute("RELEASE provider_rerank_model_type_migration")
+
     def save(self, provider: Provider) -> None:
         with self._connect() as connection:
             connection.execute("""INSERT INTO providers (provider_id, name, endpoint, credential_reference,
@@ -103,9 +150,10 @@ class SqliteProviderRepository:
                  provider.last_tested_at, provider.created_at, provider.updated_at, provider.transport))
             connection.execute("DELETE FROM provider_models WHERE provider_id = ?", (provider.provider_id,))
             connection.executemany("""INSERT INTO provider_models (provider_id, model_id, capabilities_json,
-                model_type, verification_ok, verification_reason, is_discovered, verified_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                [(model.provider_id, model.model_id, json.dumps([]), model.model_type,
+                model_type, configured_model_type, verification_ok, verification_reason, is_discovered, verified_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [(model.provider_id, model.model_id, json.dumps([]),
+                  None if model.model_type == "rerank" else model.model_type, model.model_type,
                   int(model.verification.ok), model.verification.reason, int(model.is_discovered), model.verified_at)
                  for model in provider.models])
 
@@ -132,19 +180,30 @@ class SqliteProviderRepository:
 
     def get_default(self, model_type: str) -> ModelSelection | None:
         with self._connect() as connection:
-            row = connection.execute("SELECT model_type, provider_id, model_id, updated_at FROM model_defaults WHERE model_type = ?", (model_type,)).fetchone()
+            row = connection.execute(
+                """SELECT model_type, provider_id, model_id, updated_at FROM model_defaults_v2
+                WHERE model_type = ?""",
+                (model_type,),
+            ).fetchone()
         return None if row is None else ModelSelection(row["model_type"], row["provider_id"], row["model_id"], row["updated_at"])
 
     def save_default(self, selection: ModelSelection) -> None:
         with self._connect() as connection:
-            connection.execute("""INSERT INTO model_defaults (model_type, provider_id, model_id, updated_at)
+            connection.execute("""INSERT INTO model_defaults_v2 (model_type, provider_id, model_id, updated_at)
                 VALUES (?, ?, ?, ?) ON CONFLICT(model_type) DO UPDATE SET provider_id=excluded.provider_id,
                 model_id=excluded.model_id, updated_at=excluded.updated_at""",
                 (selection.model_type, selection.provider_id, selection.model_id, selection.updated_at))
+            if selection.model_type in _LEGACY_MODEL_TYPES:
+                connection.execute("""INSERT INTO model_defaults (model_type, provider_id, model_id, updated_at)
+                    VALUES (?, ?, ?, ?) ON CONFLICT(model_type) DO UPDATE SET provider_id=excluded.provider_id,
+                    model_id=excluded.model_id, updated_at=excluded.updated_at""",
+                    (selection.model_type, selection.provider_id, selection.model_id, selection.updated_at))
 
     def delete_default(self, model_type: str) -> None:
         with self._connect() as connection:
-            connection.execute("DELETE FROM model_defaults WHERE model_type = ?", (model_type,))
+            connection.execute("DELETE FROM model_defaults_v2 WHERE model_type = ?", (model_type,))
+            if model_type in _LEGACY_MODEL_TYPES:
+                connection.execute("DELETE FROM model_defaults WHERE model_type = ?", (model_type,))
 
     @staticmethod
     def _provider_from_row(row: sqlite3.Row, models: list[sqlite3.Row]) -> Provider:
@@ -152,7 +211,10 @@ class SqliteProviderRepository:
             return ProbeResult(bool(row[f"{name}_ok"]), row[f"{name}_reason"])
         return Provider(row["provider_id"], row["name"], row["endpoint"], row["credential_reference"],
                         bool(row["credential_configured"]), ProviderProbeResults(probe("discovery"), probe("health")),
-                        tuple(ProviderModel(model["provider_id"], model["model_id"], model["model_type"],
+                        tuple(ProviderModel(model["provider_id"], model["model_id"],
+                                            model["configured_model_type"]
+                                            if model["configured_model_type"] is not None
+                                            else model["model_type"],
                                             ProbeResult(bool(model["verification_ok"]), model["verification_reason"]),
                                             bool(model["is_discovered"]), model["verified_at"])
                               for model in models), row["last_tested_at"], row["created_at"], row["updated_at"], row["transport"])

@@ -86,6 +86,7 @@ def _lexical_retrieval(golden_set: RetrievalGoldenSet) -> dict[str, object]:
             "macroPrecision": metrics.macro_precision,
             "macroScopeCoverage": metrics.macro_scope_coverage,
             "macroDuplicatePrecision": metrics.macro_duplicate_precision,
+            "macroDuplicateRecall": metrics.macro_duplicate_recall,
             "perQuery": [
                 {
                     "queryId": item.query_id,
@@ -93,6 +94,7 @@ def _lexical_retrieval(golden_set: RetrievalGoldenSet) -> dict[str, object]:
                     "precision": item.precision,
                     "scopeCoverage": item.scope_coverage,
                     "duplicatePrecision": item.duplicate_precision,
+                    "duplicateRecall": item.duplicate_recall,
                 }
                 for item in metrics.query_metrics
             ],

@@ -138,6 +138,7 @@ class RetrievalQueryMetrics:
     precision: float
     scope_coverage: float
     duplicate_precision: float
+    duplicate_recall: float
 
 
 @dataclass(frozen=True)
@@ -159,6 +160,10 @@ class RetrievalEvaluationReport:
     @property
     def macro_duplicate_precision(self) -> float:
         return _macro_metric(self.query_metrics, "duplicate_precision")
+
+    @property
+    def macro_duplicate_recall(self) -> float:
+        return _macro_metric(self.query_metrics, "duplicate_recall")
 
 
 def _macro_metric(metrics: tuple[RetrievalQueryMetrics, ...], name: str) -> float:
@@ -443,7 +448,7 @@ def _validate_prediction_blocks(
 
 def _evaluate_query(query: RetrievalGoldenQuery, prediction: RetrievalPrediction) -> RetrievalQueryMetrics:
     if prediction.scope_status != query.expected_status:
-        return RetrievalQueryMetrics(query.query_id, 0.0, 0.0, 0.0, 0.0)
+        return RetrievalQueryMetrics(query.query_id, 0.0, 0.0, 0.0, 0.0, 0.0)
     if query.expected_status == "recoverable":
         is_empty = not (
             prediction.retrieved_block_ids
@@ -451,7 +456,7 @@ def _evaluate_query(query: RetrievalGoldenQuery, prediction: RetrievalPrediction
             or prediction.duplicate_clusters
         )
         score = 1.0 if is_empty else 0.0
-        return RetrievalQueryMetrics(query.query_id, score, score, score, score)
+        return RetrievalQueryMetrics(query.query_id, score, score, score, score, score)
     retrieved = set(prediction.retrieved_block_ids)
     expected = set(query.expected_block_ids)
     scoped = set(prediction.scoped_block_ids)
@@ -464,6 +469,7 @@ def _evaluate_query(query: RetrievalGoldenQuery, prediction: RetrievalPrediction
         precision=_precision(retrieved, expected),
         scope_coverage=_coverage(scoped, scope),
         duplicate_precision=_precision(predicted_pairs, expected_pairs),
+        duplicate_recall=_coverage(predicted_pairs, expected_pairs),
     )
 
 

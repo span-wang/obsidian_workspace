@@ -1,6 +1,219 @@
 {
   "logs": [
     {
+      "date": "2026-07-27",
+      "taskId": "RET-09-01",
+      "action": "完成独立原生 Rerank 模型的受限真实 Provider 测量",
+      "result": "用户在前端配置并验证独立 Rerank 默认模型后，RET-09-01 仅对固定、内容哈希校验通过的 synthetic-deidentified fixture 发出两条原生 POST /rerank 请求。首次使用错误的相对 fixture 路径只在本地批准 fixture 校验处失败，未出网且未写入报告；修正后完成测量。报告不含 prompt、候选正文、响应正文、绝对路径、endpoint、secret 或授权 token：macro recall@8 +1.0、macro precision@8 +0.25、macro MRR@8 +1.0，quality gate=true；端到端 p50=1014.314 ms、p95=1699.467 ms。用户明确不做价格或费用预算，费用标记为未计算。报告的 passesGate 保持 false、生产 rerank 默认开关保持关闭，等待更多已审阅样本和人工复核；未新增技术债。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_retrieval_live_rerank_eval.py tests/unit/test_openai_compatible_provider.py tests/unit/test_providers.py -q（59 passed）",
+        "uv run --directory apps/service ruff check domain/providers.py ports/provider_client.py adapters/openai_compatible_provider.py adapters/sqlite_provider_repository.py application/providers.py application/provider_reranker.py application/sessions.py application/retrieval_live_rerank_eval.py api/main.py api/retrieval_live_rerank_eval.py tests/unit/test_retrieval_live_rerank_eval.py（All checks passed）",
+        "npm run lint（通过）",
+        "npm run unit（前端 25 passed；服务端 584 passed，3 skipped）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6253'; npm run integration（11 passed，2 skipped）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6254'; npm run browser-test（29 passed）",
+        "npm run retrieval:rerank-live -- --confirm-live-egress --provider-id <redacted> --model-id BAAI/bge-reranker-v2-m3 --max-requests 2 --fixture tests/fixtures/retrieval-rerank-golden-v1.json --data-dir <local-data-dir> --output output/live-rerank/ret-09-01-bge-reranker-v2-m3-20260727.json（completed；2 条请求；p50=1014.314 ms；p95=1699.467 ms；质量门槛通过；费用未计算）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过；仅 Windows 行尾提示）"
+      ],
+      "files": [
+        "apps/service/application/retrieval_live_rerank_eval.py",
+        "apps/service/api/retrieval_live_rerank_eval.py",
+        "apps/service/tests/fixtures/retrieval-rerank-golden-v1.json",
+        "output/live-rerank/ret-09-01-bge-reranker-v2-m3-20260727.json（被忽略的本地报告）",
+        "progress/"
+      ],
+      "next": "在更多已审阅、不可逆脱敏样本完成并人工复核质量和延迟前，rerank 默认保持关闭。"
+    },
+    {
+      "date": "2026-07-27",
+      "taskId": "RET-09-02",
+      "action": "完成独立原生 Rerank 模型配置与受控接入",
+      "result": "新增独立 rerank 模型类型、默认选择和兼容 SQLite migration，保留既有 chat 与 embedding 配置。前端 Provider 设置显示 Rerank（重排）模型选择、模型类型和手动测试入口；生产重排、source-lookup 授权快照和 live fixture 都只解析该独立默认模型。原生合同固定为 POST /rerank 的 model、query、documents，完整、唯一、有限且位于 [0,1] 的 index/relevance_score 是唯一可接受响应；任何失败都保留本地 RRF。DeepSeek chat 模型不再可作为 rerank 目标。实现及自动化回归未调用真实 Provider；默认开关保持关闭，未新增技术债。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_retrieval_rerank.py tests/unit/test_provider_reranker.py tests/unit/test_retrieval_live_rerank_eval.py tests/unit/test_sessions.py tests/unit/test_vault_api.py tests/unit/test_providers.py tests/unit/test_openai_compatible_provider.py tests/unit/test_sqlite_provider_repository_rerank.py（166 passed）",
+        "npm run lint（通过）",
+        "npm run unit（前端 25 passed；服务端 584 passed，3 skipped）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6253'; npm run integration（11 passed，2 skipped）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6254'; npm run browser-test（29 passed）",
+        "git diff --check（通过；仅 Windows 行尾提示）"
+      ],
+      "files": [
+        "apps/service/domain/providers.py",
+        "apps/service/ports/provider_client.py",
+        "apps/service/adapters/openai_compatible_provider.py",
+        "apps/service/adapters/sqlite_provider_repository.py",
+        "apps/service/application/providers.py",
+        "apps/service/application/provider_reranker.py",
+        "apps/service/application/sessions.py",
+        "apps/service/application/retrieval_live_rerank_eval.py",
+        "apps/service/api/main.py",
+        "apps/service/api/retrieval_live_rerank_eval.py",
+        "apps/web/src/app.js",
+        "progress/"
+      ],
+      "next": "RET-09-01 仅以固定不可逆脱敏 fixture、显式出网确认和最多两条请求完成真实测量；默认开关继续关闭。"
+    },
+    {
+      "date": "2026-07-27",
+      "taskId": "RET-09-01",
+      "action": "执行无预算的受限真实 Provider rerank 并复核流式最终内容边界",
+      "result": "用户已确认仅对版本化、不可逆脱敏 rerank fixture 进行受控真实 Provider 测量，并确认无需费用预算。live-eval 继续要求显式出网确认、HTTPS Provider/model、请求与输出 token 上限；价格、报价来源和费用预算可选且必须成组提供。仅接受固定路径和内容哈希均校验通过的 fixture，HTTPS 校验先于凭据读取，报告只能写入被忽略的 output/live-rerank/。首次调用在第一条 fixture 请求后因没有可用最终内容停止；随后适配器增加对 final message.content 的兼容，同时明确拒绝把 reasoning_content 当作最终答案。第二次、单请求重试确认 deepseek-v4-pro 只返回推理片段而没有最终 JSON。两次真实请求都只使用 fixture，不读取 vault、索引或会话数据；失败报告不包含 prompt、响应正文、endpoint、secret 或 token。由于没有完整 rerank 响应，未得到可用的延迟、usage 或质量测量；未提供价格时费用明确标记为未计算，默认 rerank 保持关闭。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_openai_compatible_provider.py tests/unit/test_providers.py tests/unit/test_provider_reranker.py tests/unit/test_retrieval_live_rerank_eval.py -q（55 passed）",
+        "uv run --directory apps/service ruff check domain/providers.py ports/provider_client.py adapters/openai_compatible_provider.py application/providers.py application/retrieval_live_rerank_eval.py api/retrieval_live_rerank_eval.py tests/unit/test_retrieval_live_rerank_eval.py tests/unit/test_openai_compatible_provider.py tests/unit/test_providers.py（All checks passed）",
+        "npm run lint（All checks passed）",
+        "npm run unit（前端 24 passed；服务端 tests/unit 573 项，exit 0）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过；仅显示 Windows 行尾转换提示）",
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_retrieval_live_rerank_eval.py -q（11 passed；无预算路径）",
+        "npm run retrieval:rerank-live（deepseek-v4-pro；首次在第 1 条请求后停止，第二次以 max-requests=1 重试；两次均无最终 JSON，费用未计算，默认保持关闭）"
+      ],
+      "files": [
+        "apps/service/domain/providers.py",
+        "apps/service/ports/provider_client.py",
+        "apps/service/adapters/openai_compatible_provider.py",
+        "apps/service/application/providers.py",
+        "apps/service/application/retrieval_live_rerank_eval.py",
+        "apps/service/api/retrieval_live_rerank_eval.py",
+        "apps/service/tests/unit/test_retrieval_live_rerank_eval.py",
+        "apps/service/tests/unit/test_openai_compatible_provider.py",
+        "apps/service/tests/unit/test_providers.py",
+        "package.json",
+        "progress/"
+      ],
+      "next": "这是错误使用 chat 模型的历史失败记录；后续已由独立原生 Rerank 模型配置和 RET-09-01 的受限测量取代，默认开关仍关闭。"
+    },
+    {
+      "date": "2026-07-27",
+      "taskId": "RET-08-01",
+      "action": "完成点查 rerank 授权快照与受控接入",
+      "result": "为 source-lookup 的 RRF 前 20 个候选建立仅本机会话可见的 rerank-source-lookup 预览和逐任务显式确认。授权不可逆绑定查询、候选顺序、候选投影、源块哈希、范围、policy revision 与 chat Provider/model/config revision；执行前重新校验 never-send-cloud、HTTPS 和全部快照条件。默认关闭的开关开启后，rerank 仅位于 RRF 与邻域扩展之间；未确认、失效、阻断、预检、Provider 或并发失败均保留本地 RRF。授权响应、UI 和请求体不暴露候选正文、绝对路径、内容哈希或任务摘要；审计只记录授权 ID、状态、网络请求数和延迟。未新增技术债；真实 Provider 延迟与费用尚未测量，默认保持关闭。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_rerank_authorizations.py tests/unit/test_sessions.py tests/unit/test_sessions_api.py tests/unit/test_provider_reranker.py tests/unit/test_runtime.py -q（134 passed）",
+        "npm run retrieval:rerank-ab（qualityGate=true；macro recall@8 +1.0；macro precision@8 +0.25；macro MRR@8 +1.0；真实 Provider 延迟和费用未测，passesGate=false，默认保持关闭）",
+        "npm run lint（All checks passed）",
+        "npm run unit（前端 24 passed；服务端 550 passed，3 skipped）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6251'; npm run integration（11 passed，2 skipped；默认 6240 被既有本机实例占用，未停止）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6251'; npm run browser-test（29 passed）",
+        "git diff --check（通过；仅显示 Windows 行尾转换提示）"
+      ],
+      "files": [
+        "apps/service/domain/retrieval_rerank.py",
+        "apps/service/ports/reranker.py",
+        "apps/service/application/provider_reranker.py",
+        "apps/service/application/sessions.py",
+        "apps/service/adapters/sqlite_session_repository.py",
+        "apps/service/api/main.py",
+        "apps/service/api/runtime.py",
+        "apps/service/domain/sessions.py",
+        "apps/service/tests/unit/test_rerank_authorizations.py",
+        "apps/service/tests/unit/test_provider_reranker.py",
+        "apps/service/tests/unit/test_sessions.py",
+        "apps/service/tests/unit/test_sessions_api.py",
+        "apps/web/src/app.js",
+        "apps/web/tests/app.test.js",
+        "browser-tests/loopback.spec.mjs",
+        "progress/"
+      ],
+      "next": "在已审阅、不可逆脱敏的真实样本上测量真实 Provider 的延迟和费用；在质量、成本和隐私边界均重新满足门槛前，rerank 默认保持关闭。"
+    },
+    {
+      "date": "2026-07-27",
+      "taskId": "RET-07-03",
+      "action": "完成点查 rerank A/B 评测与受控 adapter 合同",
+      "result": "新增 path-free RerankerPort、复用已验证 chat Model 的 HTTPS/revision adapter 和严格 JSON 校验；未知或重复候选 ID、非有限或越界 relevance、无序平分和非法响应均整体拒绝。新增 top-20 到 top-8 的不可逆脱敏 A/B fixture 与报告：脚本化本地 adapter 的 macro recall@8 +1.0、precision@8 +0.25、MRR@8 +1.0，fixture latency gate 通过。真实 Provider 延迟和费用没有测量，因此 passesGate=false，未接入生产 source-lookup，默认保持关闭；测试未调用真实 Provider，未新增技术债。",
+      "verification": [
+        "npm run retrieval:rerank-ab（qualityGate=true；macro recall@8 +1.0；macro precision@8 +0.25；macro MRR@8 +1.0；真实 Provider 延迟和费用未测，passesGate=false）",
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_retrieval_rerank.py tests/unit/test_provider_reranker.py tests/unit/test_retrieval_rerank_eval.py -q（9 passed）",
+        "npm run lint（All checks passed）",
+        "npm run unit（前端 23 passed；服务端 523 passed，3 skipped）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6247'; npm run integration（11 passed，2 skipped；默认 6240 被既有本机实例占用，未停止）"
+      ],
+      "files": [
+        "apps/service/domain/retrieval_rerank.py",
+        "apps/service/ports/reranker.py",
+        "apps/service/application/provider_reranker.py",
+        "apps/service/application/retrieval_rerank_eval.py",
+        "apps/service/tests/fixtures/retrieval-rerank-golden-v1.json",
+        "apps/service/tests/unit/test_retrieval_rerank.py",
+        "apps/service/tests/unit/test_provider_reranker.py",
+        "apps/service/tests/unit/test_retrieval_rerank_eval.py",
+        "docs/ret-07-03-rerank-ab-v1.json",
+        "package.json",
+        "progress/"
+      ],
+      "next": "建立 rerank-source-lookup 的候选正文外发授权、内容哈希重验和真实 Provider 延迟/成本评测后，才评估生产点查启用。"
+    },
+    {
+      "date": "2026-07-27",
+      "taskId": "RET-07-02",
+      "action": "完成单元卡片生成、失效与受控召回",
+      "result": "新增独立单元卡片投影、来源块引用、FTS 和向量 migration；仅聚合 current、可核验、非 stale、非 pending 且人工 accepted 的 metadata 候选。用户确认的 index-unit-card 以 chat 摘要和 Embedding 两份独立授权执行，每次网络调用前重验范围、never-send-cloud、来源哈希、policy 和 Provider revision。卡片输出只包含已审核概念，命中会展开为原始块证据而不作为 evidence 返回。源块、scope、审核决定和 Provider/default profile 变化均会失效卡片；feature flag 默认关闭。脱敏评测达到 coverage=1.0、原始引用召回=1.0、macro recall@8 增益=0.5。未新增技术债，测试未调用真实 Provider。",
+      "verification": [
+        "npm run retrieval:unit-card-eval（passesGate=true；card coverage=1.0；original citation recall=1.0；card-on macro recall@8=1.0；macro recall gain@8=0.5）",
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_unit_cards.py tests/unit/test_unit_card_authorizations.py tests/unit/test_unit_card_service.py tests/unit/test_unit_card_evaluation.py tests/unit/test_sqlite_unit_cards.py tests/unit/test_sessions.py tests/unit/test_vault_api.py -q（95 passed）",
+        "uv run --directory apps/service ruff check domain application adapters api ports tests/unit（All checks passed）",
+        "npm run lint（All checks passed）",
+        "npm run unit（前端 23 passed；服务端 514 passed，3 skipped）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6246'; npm run integration（11 passed，2 skipped；默认 6240 被现有本机进程占用，未停止）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过；仅显示 Windows 行尾转换提示）"
+      ],
+      "files": [
+        "apps/service/domain/unit_cards.py",
+        "apps/service/domain/unit_card_authorization.py",
+        "apps/service/application/unit_card_authorizations.py",
+        "apps/service/application/unit_card_service.py",
+        "apps/service/application/unit_card_evaluation.py",
+        "apps/service/adapters/sqlite_index_repository.py",
+        "apps/service/application/providers.py",
+        "apps/service/application/sessions.py",
+        "apps/service/api/main.py",
+        "apps/service/api/runtime.py",
+        "apps/service/tests/fixtures/unit-card-golden-v1.json",
+        "apps/service/tests/unit/test_unit_cards.py",
+        "apps/service/tests/unit/test_unit_card_authorizations.py",
+        "apps/service/tests/unit/test_unit_card_service.py",
+        "apps/service/tests/unit/test_sqlite_unit_cards.py",
+        "apps/service/tests/unit/test_unit_card_evaluation.py",
+        "docs/ret-07-02-unit-card-eval-v1.json",
+        "progress/"
+      ],
+      "next": "实施 RET-07-03：以独立 A/B 评测验证点查 rerank 的质量、延迟与成本。"
+    },
+    {
+      "date": "2026-07-27",
+      "taskId": "RET-07-01",
+      "action": "完成 LLM 元数据抽取与本地审核",
+      "result": "新增独立的 index-metadata 授权与冻结批次：该 operation 按用户确认默认批准，但仍在每次调用前重验范围、never-send-cloud、policy revision、Provider/model 和块内容哈希。仅向已验证的 HTTPS chat Provider 发送批次内序号和正文；严格的完整 JSON 校验失败时不会部分写入。候选绑定 vault、文档、块序号和哈希；低置信度或新 concept_key 进入 required-check，并提供本机受保护的接受/排除与审核通过率报告。候选不会自动合并、改写源文件或改变检索排序。测试使用 fake Provider，未发出真实 Provider 请求。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_metadata_authorizations.py tests/unit/test_metadata_extraction.py tests/unit/test_metadata_service.py tests/unit/test_sqlite_index_metadata_candidates.py tests/unit/test_vault_api.py -q（21 passed）",
+        "uv run --directory apps/service ruff check domain/metadata_extraction.py application/metadata_authorizations.py application/metadata_service.py adapters/sqlite_index_repository.py api/main.py tests/unit/test_metadata_authorizations.py tests/unit/test_metadata_extraction.py tests/unit/test_metadata_service.py tests/unit/test_sqlite_index_metadata_candidates.py tests/unit/test_vault_api.py（All checks passed）",
+        "npm run unit（前端 23 passed；服务端 488 passed，3 skipped）",
+        "npm run lint（All checks passed）",
+        "npm run integration（13 passed）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6245'; npm run browser-test（28 passed）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过；仅显示 Windows 行尾转换提示）"
+      ],
+      "files": [
+        "apps/service/domain/metadata_extraction.py",
+        "apps/service/application/metadata_authorizations.py",
+        "apps/service/application/metadata_service.py",
+        "apps/service/adapters/sqlite_index_repository.py",
+        "apps/service/api/main.py",
+        "apps/web/src/app.js",
+        "apps/web/src/style.css",
+        "apps/service/tests/unit/test_metadata_authorizations.py",
+        "apps/service/tests/unit/test_metadata_extraction.py",
+        "apps/service/tests/unit/test_metadata_service.py",
+        "apps/service/tests/unit/test_sqlite_index_metadata_candidates.py",
+        "progress/"
+      ],
+      "next": "实施 RET-07-02：仅消费已审核候选生成单元卡片，并在源块变化后使卡片失效。"
+    },
+    {
       "date": "2026-07-26",
       "taskId": "RET-04-03",
       "action": "完成词法 A/B、会话切换与手写评分退役",
@@ -420,6 +633,215 @@
         "progress/"
       ],
       "next": "实施 RET-04-01：为 FTS5 增加 migration 与和 index document/block 生命周期一致的同步。"
+    },
+    {
+      "date": "2026-07-26",
+      "taskId": "RET-05-01",
+      "action": "完成共享查询范围解析",
+      "result": "新增纯领域 QueryUnderstanding 合同，返回任务 intent、来源、scope_filter、规则置信度与不可变 query_terms。范围解析直接调用 normalize_query_scope，完整范围才标记 0.95 置信度；缺失或冲突范围保持 recoverable。自动路由保留既有四类任务，并在已解析单元且不存在具体疑问时选择枚举型 completeness。本步未接入 SessionService、API、前端、filter_blocks 或 Provider。未新增技术债。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_retrieval_query.py tests/unit/test_retrieval_metadata.py（16 passed）",
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit（425 passed，3 skipped）",
+        "uv run --directory apps/service ruff check domain/retrieval_query.py tests/unit/test_retrieval_query.py（All checks passed）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过）"
+      ],
+      "files": [
+        "apps/service/domain/retrieval_query.py",
+        "apps/service/tests/unit/test_retrieval_query.py",
+        "progress/"
+      ],
+      "next": "实施 RET-05-02：将稳定的查询范围合同接入范围预览 API 与前端确认。"
+    },
+    {
+      "date": "2026-07-26",
+      "taskId": "RET-05-02",
+      "action": "完成可编辑范围预览 API 与前端确认",
+      "result": "任务预览现返回查询范围、来源、置信度、文件/块计数、资料类型统计和可恢复缺口。用户可在本机同源工作台中修正学科、册次、单元和资料类型；枚举型任务在范围未确认、范围为空或编辑后尚未更新预览时不能固定快照。确认值通过 ret-05-02-session-task-query-scope-v1 迁移持久化在私有快照中，供 RET-05-03 使用；不保存正文或绝对路径。本步未改变 source-lookup 的词法执行路径、枚举、去重、生成或 Provider 行为，未新增技术债。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_retrieval_query.py tests/unit/test_sessions.py tests/unit/test_sessions_api.py（81 passed）",
+        "npm run lint（All checks passed）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6242'; npm run test（前端 22 passed；服务端 428 passed，3 skipped；integration 11 passed，2 skipped；browser 28 passed）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过）"
+      ],
+      "files": [
+        "apps/service/domain/retrieval_query.py",
+        "apps/service/domain/sessions.py",
+        "apps/service/application/sessions.py",
+        "apps/service/adapters/sqlite_session_repository.py",
+        "apps/service/api/main.py",
+        "apps/service/tests/unit/test_retrieval_query.py",
+        "apps/service/tests/unit/test_sessions.py",
+        "apps/service/tests/unit/test_sessions_api.py",
+        "apps/web/src/app.js",
+        "apps/web/src/style.css",
+        "apps/web/tests/app.test.js",
+        "browser-tests/loopback.spec.mjs",
+        "progress/"
+      ],
+      "next": "实施 RET-05-03：用已确认快照范围执行全量 filter_blocks、知识类型分桶和覆盖缺口统计。"
+    },
+    {
+      "date": "2026-07-26",
+      "taskId": "RET-05-03",
+      "action": "完成枚举型全量过滤与分桶",
+      "result": "完整 query scope 的 completeness 快照现通过 BlockFilter 枚举所有允许的 current、可核验块，不复用点查 top-k。每个冻结 coverage item 按标题规则标记 grammar、vocabulary、phrase、sentence-pattern、exercise 或 other，并随 session SQLite 的 ret-05-03-session-completeness-coverage-kind-v1 迁移持久化。调用方提供处理预算时，范围仍完整枚举，超出的块以 uncovered 和明确原因记录，不会静默丢弃。执行和快照复核均复用已冻结的 query scope；未带完整范围的历史任务保持既有兼容路径。未新增技术债或出网行为。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_sessions.py（62 passed）",
+        "uv run --directory apps/service ruff check application/sessions.py domain/sessions.py adapters/sqlite_session_repository.py tests/unit/test_sessions.py（All checks passed）",
+        "npm run unit（前端 22 passed；服务端 434 passed，3 skipped）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6243'; npm run integration（11 passed，2 skipped；默认 6240 被既有本机实例占用，未停止该实例）",
+        "npm run lint（All checks passed）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过）"
+      ],
+      "files": [
+        "apps/service/domain/sessions.py",
+        "apps/service/application/sessions.py",
+        "apps/service/adapters/sqlite_session_repository.py",
+        "apps/service/tests/unit/test_sessions.py",
+        "progress/"
+      ],
+      "next": "实施 RET-05-04：基于冻结的块精确哈希和 knowledge_kind 标记完成原子条目去重与按模型窗口计算的分层生成。"
+    },
+    {
+      "date": "2026-07-26",
+      "taskId": "RET-06-01",
+      "action": "完成 Embedding 出网授权与范围预览",
+      "result": "新增仅限本机会话的 index-embedding 预览、申请、确认和执行前核验。目录或 vault 选择只枚举 current、可核验、非 stale、非 pending 的索引块；never-send-cloud 逐文件排除并返回不含正文的样本。每个批次都冻结 provider/model、选择范围、文件集合、块序号和正文哈希；新增文件、同路径块内容变化、Provider/model、范围或 policy revision 变化均会在执行前拒绝。即使 vault policy 为 always-allow，index-embedding 仍必须由用户逐批次确认。本步没有调用 Provider、读取凭据或发送正文，未新增技术债。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_embedding_authorizations.py tests/unit/test_policies.py tests/unit/test_vault_api.py（23 passed）",
+        "uv run --directory apps/service ruff check domain/embedding_authorization.py application/embedding_authorizations.py application/policies.py api/main.py tests/unit/test_embedding_authorizations.py tests/unit/test_policies.py tests/unit/test_vault_api.py（All checks passed）",
+        "npm run unit（前端 22 passed；服务端 442 passed，3 skipped）",
+        "npm run lint（All checks passed）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6244'; npm run integration（11 passed，2 skipped）"
+      ],
+      "files": [
+        "apps/service/domain/embedding_authorization.py",
+        "apps/service/application/embedding_authorizations.py",
+        "apps/service/application/policies.py",
+        "apps/service/api/main.py",
+        "apps/service/tests/unit/test_embedding_authorizations.py",
+        "apps/service/tests/unit/test_policies.py",
+        "apps/service/tests/unit/test_vault_api.py",
+        "progress/"
+      ],
+      "next": "实施 RET-06-02：在每个已核验批次之前调用 create_embeddings，并加入 profile fingerprint、缓存与维度校验。"
+    },
+    {
+      "date": "2026-07-26",
+      "taskId": "RET-05-04",
+      "action": "完成原子条目精确去重、候选重复与 map-reduce 计划合同",
+      "result": "冻结的 completeness coverage item 现持久化 block_content_sha256 与 token_estimate；仅相同块正文哈希会合并，合并结果通过 retained evidence ordinal 保留全部来源引用。标题英文词归一只生成候选重复簇，绝不自动合并。新增纯领域 map-reduce 计划器，必须显式传入模型窗口、输出预留、提示开销与批次数；单项或批次数超预算时以 uncovered atomic ordinal 返回，未调用 Provider 或发送正文。Session SQLite 通过 ret-05-04-session-completeness-coverage-block-v1 与 ret-05-04-session-completeness-candidates-v1 幂等升级，并持久化候选簇。golden 指标补充 duplicate recall；未新增技术债。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_retrieval_enumeration.py tests/unit/test_retrieval_golden.py tests/unit/test_sessions.py tests/unit/test_sessions_api.py（85 passed）",
+        "uv run --directory apps/service ruff check application/sessions.py application/retrieval_golden.py application/retrieval_baseline.py application/retrieval_lexical_ab.py domain/sessions.py domain/retrieval_enumeration.py adapters/sqlite_session_repository.py api/main.py tests/unit/test_retrieval_enumeration.py tests/unit/test_retrieval_golden.py tests/unit/test_sessions.py tests/unit/test_sessions_api.py（All checks passed）",
+        "uv run --directory apps/service python -m application.retrieval_golden --fixture tests/fixtures/retrieval-golden-v1.json --validate-only（通过）",
+        "npm run unit（前端 22 passed；服务端 438 passed，3 skipped）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6243'; npm run integration（11 passed，2 skipped）",
+        "npm run lint（All checks passed）"
+      ],
+      "files": [
+        "apps/service/domain/retrieval_enumeration.py",
+        "apps/service/domain/sessions.py",
+        "apps/service/application/sessions.py",
+        "apps/service/application/retrieval_golden.py",
+        "apps/service/application/retrieval_baseline.py",
+        "apps/service/application/retrieval_lexical_ab.py",
+        "apps/service/adapters/sqlite_session_repository.py",
+        "apps/service/api/main.py",
+        "apps/service/tests/unit/test_retrieval_enumeration.py",
+        "apps/service/tests/unit/test_retrieval_golden.py",
+        "apps/service/tests/unit/test_sessions.py",
+        "apps/service/tests/unit/test_sessions_api.py",
+        "progress/"
+      ],
+      "next": "后续生成执行消费已冻结的 map-reduce 计划；RET-06-04 在完成独立向量通道与 golden calibration 后，才扩展候选重复信号。"
+    },
+    {
+      "date": "2026-07-27",
+      "taskId": "RET-06-02",
+      "action": "完成 Embedding 批量客户端、配置指纹与跨 vault 缓存",
+      "result": "OpenAI-compatible client 现以受限批次调用 create_embeddings，并按响应 index 恢复原始顺序，拒绝缺失/重复 index、非有限值和不一致维度。Embedding profile fingerprint 固定绑定 provider ID、endpoint、Provider.updated_at 配置 revision、model ID 与维度；index.sqlite 新增可回滚 embedding_cache migration，使用 float32 BLOB，按 profile 和归一化输入缓存。缓存命中不出网；同一 locator 出现多维度、损坏向量、Provider 配置变更或非 HTTPS endpoint 均失败关闭。执行 API 仅在 RET-06-01 授权核验通过后运行，并在每个网络批次前重新读取授权快照；响应只含状态和计数，不含正文或向量。未写入 index_blocks、未建立向量检索表或内存矩阵，未新增技术债。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_openai_compatible_provider.py tests/unit/test_providers.py tests/unit/test_embedding_authorizations.py tests/unit/test_embedding_service.py tests/unit/test_sqlite_embedding_cache.py tests/unit/test_vault_api.py（46 passed）",
+        "uv run --directory apps/service ruff check adapters/openai_compatible_provider.py adapters/sqlite_index_repository.py application/providers.py application/embedding_authorizations.py application/embedding_service.py domain/embedding_authorization.py domain/embeddings.py api/main.py tests/unit/test_openai_compatible_provider.py tests/unit/test_providers.py tests/unit/test_embedding_service.py tests/unit/test_sqlite_embedding_cache.py tests/unit/test_vault_api.py（All checks passed）",
+        "npm run unit（前端 22 passed；服务端 459 passed，3 skipped）",
+        "npm run lint（All checks passed）",
+        "npm run integration（13 passed）",
+        "npm run progress:build && npm run progress:check",
+        "git diff --check"
+      ],
+      "files": [
+        "apps/service/domain/embeddings.py",
+        "apps/service/application/embedding_service.py",
+        "apps/service/adapters/openai_compatible_provider.py",
+        "apps/service/adapters/sqlite_index_repository.py",
+        "apps/service/application/providers.py",
+        "apps/service/application/embedding_authorizations.py",
+        "apps/service/api/main.py",
+        "apps/service/tests/unit/test_embedding_service.py",
+        "apps/service/tests/unit/test_sqlite_embedding_cache.py",
+        "progress/"
+      ],
+      "next": "实施 RET-06-03：消费已验证的 profile/cache，持久化 current block vector，维护 vault/profile float32 矩阵和真实 semantic_status。"
+    },
+    {
+      "date": "2026-07-27",
+      "taskId": "RET-06-04",
+      "action": "完成独立三路召回、RRF 与点查语义查询",
+      "result": "source-lookup 在受 policy 和冻结 manifest 限制的相同路径集上独立执行 BM25、heading_path 前缀和完整 profile 的本地 KNN，再用 RRF k=60 融合；任一通道都不向另一通道提供硬过滤。命中证据补入同文档相邻块，并保留 lexical、semantic、heading 或 neighborhood 渠道标记。OBSIDIAN_PLATFORM_HYBRID_RETRIEVAL 默认关闭；开启后使用已验证的默认 HTTPS embedding Provider 只发送当前用户点查问题。用户已确认该查询默认授权、无额外交互；不发送 vault 正文、索引块或绝对路径。版本化脱敏评测的两条语义改写均达到 recall@8=1.0，RRF k=20/60/100 同分，保留 k=60；未新增技术债。",
+      "verification": [
+        "npm run retrieval:hybrid-eval（生成 docs/ret-06-04-hybrid-eval-v1.json；macro recall@8=1.0）",
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_retrieval_hybrid.py tests/unit/test_retrieval_hybrid_eval.py tests/unit/test_sessions.py tests/unit/test_sessions_api.py tests/unit/test_runtime.py tests/unit/test_sqlite_index_fts_lifecycle.py -q（106 passed）",
+        "npm run lint（All checks passed）",
+        "npm run unit（前端 22 passed；服务端 480 passed，3 skipped）",
+        "npm run integration（13 passed）"
+      ],
+      "files": [
+        "apps/service/domain/retrieval_hybrid.py",
+        "apps/service/application/retrieval_hybrid_eval.py",
+        "apps/service/application/sessions.py",
+        "apps/service/adapters/sqlite_index_repository.py",
+        "apps/service/api/runtime.py",
+        "apps/service/tests/fixtures/retrieval-hybrid-golden-v1.json",
+        "apps/service/tests/unit/test_retrieval_hybrid.py",
+        "apps/service/tests/unit/test_retrieval_hybrid_eval.py",
+        "docs/ret-06-04-hybrid-eval-v1.json",
+        "progress/"
+      ],
+      "next": "实施 RET-07-01：在稳定的混合召回之上增加受控的 LLM 元数据抽取与审核。"
+    },
+    {
+      "date": "2026-07-27",
+      "taskId": "RET-06-03",
+      "action": "完成 float32 向量存储、内存矩阵与健康状态",
+      "result": "index.sqlite 新增可回滚的 ret-06-03-index-block-vectors-v1 migration，以 current block、完整 embedding profile fingerprint、正文哈希、授权输入哈希和归一化 float32 BLOB 绑定向量。已授权批次在最终快照重验后将缓存命中和新建向量一次性绑定到仍为 current、可核验、非 stale、非 pending 的块。repository 按 vault/profile 缓存精确 KNN 矩阵，保存、失效、回填、关联状态转换和重建路径在提交成功后使矩阵 generation 失效；检索与健康检查拒绝跨 vault/profile、非允许路径、损坏、零向量或 rich 输入哈希不匹配的行。semantic_status 现返回 unavailable、partial、available 或 blocked，并报告最大单 profile 覆盖率。未新增 Provider 请求、授权操作或正文出网路径，未新增技术债。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_embedding_authorizations.py tests/unit/test_embedding_service.py tests/unit/test_sqlite_embedding_cache.py tests/unit/test_sqlite_index_vectors.py tests/unit/test_index_service.py tests/unit/test_vault_api.py -q（41 passed）",
+        "uv run --directory apps/service ruff check domain/embeddings.py application/embedding_authorizations.py application/embedding_service.py adapters/sqlite_index_repository.py tests/unit/test_embedding_authorizations.py tests/unit/test_embedding_service.py tests/unit/test_sqlite_index_vectors.py（All checks passed）",
+        "npm run unit（前端 22 passed；服务端 465 passed，3 skipped）",
+        "npm run lint（All checks passed）",
+        "npm run integration（13 passed）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过）"
+      ],
+      "files": [
+        "apps/service/domain/embeddings.py",
+        "apps/service/domain/indexing.py",
+        "apps/service/ports/index_repository.py",
+        "apps/service/application/embedding_authorizations.py",
+        "apps/service/application/embedding_service.py",
+        "apps/service/adapters/sqlite_index_repository.py",
+        "apps/service/api/main.py",
+        "apps/service/tests/unit/test_embedding_authorizations.py",
+        "apps/service/tests/unit/test_embedding_service.py",
+        "apps/service/tests/unit/test_sqlite_index_vectors.py",
+        "apps/service/tests/unit/test_vault_api.py",
+        "progress/"
+      ],
+      "next": "实施 RET-06-04：以独立 vector、lexical 与 heading 候选集校准 RRF，并在不改变 D-002 授权边界的前提下接入点查路径。"
     }
   ]
 }

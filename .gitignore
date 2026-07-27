@@ -9,6 +9,7 @@ __pycache__/
 test-results/
 playwright-report/
 output/runtime/
+output/live-rerank/
 cloudflare/*.json
 cloudflare/*.pid
 cloudflare/*.log

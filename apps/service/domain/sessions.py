@@ -13,10 +13,35 @@ from domain.policies import normalize_vault_relative_path
 MAX_SESSION_PAGE = 10_000_000
 TASK_INTENTS = frozenset({"source-lookup", "completeness", "knowledge-organization", "deep-creation"})
 RETRIEVAL_CHANNELS = frozenset(
-    {"keyword", "semantic", "structure", "metadata", "tag", "link", "lexical"}
+    {
+        "keyword",
+        "semantic",
+        "structure",
+        "metadata",
+        "tag",
+        "link",
+        "lexical",
+        "heading",
+        "neighborhood",
+        "unit-card",
+    }
 )
 RETRIEVAL_RESULT_STATUSES = frozenset(
     {"completed", "no-evidence", "excluded", "index-unavailable", "provider-model-unavailable"}
+)
+RERANK_EXECUTION_STATUSES = frozenset(
+    {
+        "not-requested",
+        "disabled",
+        "authorization-invalid",
+        "blocked",
+        "unavailable",
+        "concurrent",
+        "failed",
+        "partial-response",
+        "invalid-response",
+        "completed",
+    }
 )
 CITATION_STATUSES = frozenset({"valid", "pending-verification", "stale", "unsupported"})
 GENERATION_RESULT_STATUSES = frozenset(
@@ -127,6 +152,9 @@ class SessionCompletenessCoverageItem:
     excerpt: str | None
     disposition: str
     reason: str | None = None
+    knowledge_kind: str = "other"
+    block_content_sha256: str | None = None
+    token_estimate: int | None = None
 
     def __post_init__(self) -> None:
         if self.ordinal < 1 or self.identity_kind not in {"derived", "native"}:
@@ -147,6 +175,21 @@ class SessionCompletenessCoverageItem:
             raise ValueError("Completeness coverage location is invalid.")
         if self.disposition not in {"planned", "excluded", "uncovered"}:
             raise ValueError("Completeness coverage disposition is invalid.")
+        if self.knowledge_kind not in {
+            "grammar",
+            "vocabulary",
+            "phrase",
+            "sentence-pattern",
+            "exercise",
+            "other",
+        }:
+            raise ValueError("Completeness coverage knowledge kind is invalid.")
+        if self.block_content_sha256 is not None:
+            _validate_sha256(self.block_content_sha256, "Completeness coverage block hash")
+        if self.token_estimate is not None and (
+            type(self.token_estimate) is not int or self.token_estimate < 0
+        ):
+            raise ValueError("Completeness coverage token estimate is invalid.")
         if self.disposition == "planned":
             if not self.excerpt or len(self.excerpt) > 1000 or self.reason is not None:
                 raise ValueError("Planned completeness coverage needs an excerpt and no gap reason.")
@@ -272,6 +315,10 @@ class SessionTaskSnapshot:
     coverage_items: tuple[SessionCompletenessCoverageItem, ...] = ()
     organization_sections: tuple[SessionKnowledgeOrganizationPlanSection, ...] = ()
     deep_creation_sections: tuple[SessionDeepCreationPlanSection, ...] = ()
+    query_scope_subject: str | None = None
+    query_scope_grade_volume: str | None = None
+    query_scope_unit_no: int | None = None
+    query_scope_material_type: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -291,6 +338,27 @@ class SessionTaskSnapshot:
         ):
             raise ValueError("Task snapshot is invalid.")
         normalize_session_scope(self.scope_kind, self.scope_path)
+        query_scope = (
+            self.query_scope_subject,
+            self.query_scope_grade_volume,
+            self.query_scope_unit_no,
+            self.query_scope_material_type,
+        )
+        if any(value is not None for value in query_scope):
+            if not all(query_scope[:3]):
+                raise ValueError("Task snapshot query scope must be complete when present.")
+            if any(
+                not isinstance(value, str) or not value.strip()
+                for value in (self.query_scope_subject, self.query_scope_grade_volume)
+            ):
+                raise ValueError("Task snapshot query scope text is invalid.")
+            if type(self.query_scope_unit_no) is not int or self.query_scope_unit_no < 1:
+                raise ValueError("Task snapshot query scope unit is invalid.")
+            if self.query_scope_material_type is not None and (
+                not isinstance(self.query_scope_material_type, str)
+                or not self.query_scope_material_type.strip()
+            ):
+                raise ValueError("Task snapshot query scope material type is invalid.")
         _validate_sha256(self.index_digest, "Task snapshot index digest")
         _validate_sha256(self.source_digest, "Task snapshot source digest")
         if self.status == "invalidated" and not self.invalidation_reason:
@@ -630,6 +698,10 @@ class SessionRetrievalResult:
     generation_duration_ms: int
     created_at: str
     evidences: tuple[SessionRetrievalEvidence, ...] = ()
+    rerank_authorization_id: str | None = None
+    rerank_status: str = "not-requested"
+    rerank_network_request_count: int = 0
+    rerank_duration_ms: int = 0
 
     def __post_init__(self) -> None:
         if (
@@ -641,8 +713,23 @@ class SessionRetrievalResult:
             or not self.summary.strip()
             or self.retrieval_duration_ms < 0
             or self.generation_duration_ms < 0
+            or self.rerank_status not in RERANK_EXECUTION_STATUSES
+            or type(self.rerank_network_request_count) is not int
+            or self.rerank_network_request_count < 0
+            or type(self.rerank_duration_ms) is not int
+            or self.rerank_duration_ms < 0
         ):
             raise ValueError("Retrieval result is invalid.")
+        if self.rerank_authorization_id is not None and (
+            not isinstance(self.rerank_authorization_id, str)
+            or not self.rerank_authorization_id.strip()
+            or len(self.rerank_authorization_id) > 128
+        ):
+            raise ValueError("Retrieval rerank authorization identity is invalid.")
+        if self.rerank_network_request_count and self.rerank_authorization_id is None:
+            raise ValueError("Rerank network activity needs an authorization identity.")
+        if self.rerank_status == "completed" and self.rerank_network_request_count != 1:
+            raise ValueError("Completed rerank results need one network request.")
         if self.status == "completed" and not self.evidences:
             raise ValueError("Completed retrieval results need evidence.")
         if self.status != "completed" and self.evidences:
@@ -691,6 +778,7 @@ class SessionCompletenessResult:
     duration_ms: int
     created_at: str
     outcomes: tuple[SessionCompletenessItemOutcome, ...] = ()
+    candidate_duplicate_clusters: tuple[tuple[int, ...], ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -721,6 +809,13 @@ class SessionCompletenessResult:
             )
             if successful != self.processed_ordinals:
                 raise ValueError("Completeness processed coverage must match item outcomes.")
+        if any(
+            len(cluster) < 2
+            or tuple(sorted(set(cluster))) != cluster
+            or any(ordinal < 1 for ordinal in cluster)
+            for cluster in self.candidate_duplicate_clusters
+        ):
+            raise ValueError("Completeness candidate duplicate clusters are invalid.")
 
 
 KNOWLEDGE_ORGANIZATION_RESULT_STATUSES = frozenset(

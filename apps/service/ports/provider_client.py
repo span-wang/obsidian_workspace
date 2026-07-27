@@ -1,6 +1,8 @@
 from threading import Event
 from typing import Iterable, Protocol
 
+from domain.providers import ChatGeneration
+
 
 class ProviderClientError(RuntimeError):
     """Raised by a Provider client with a safe message for the local user."""
@@ -21,6 +23,29 @@ class ProviderClient(Protocol):
         self, endpoint: str, secret: str, model_id: str, cancel_event: Event | None = None
     ) -> None: ...
 
+    def probe_rerank(
+        self, endpoint: str, secret: str, model_id: str, cancel_event: Event | None = None
+    ) -> None: ...
+
+    def create_embeddings(
+        self,
+        endpoint: str,
+        secret: str,
+        model_id: str,
+        inputs: tuple[str, ...],
+        cancel_event: Event | None = None,
+    ) -> tuple[tuple[float, ...], ...]: ...
+
+    def rerank(
+        self,
+        endpoint: str,
+        secret: str,
+        model_id: str,
+        query: str,
+        documents: tuple[str, ...],
+        cancel_event: Event | None = None,
+    ) -> tuple[float, ...]: ...
+
     def generate_chat(
         self,
         endpoint: str,
@@ -29,6 +54,16 @@ class ProviderClient(Protocol):
         prompt: str,
         cancel_event: Event | None = None,
     ) -> str: ...
+
+    def generate_chat_with_usage(
+        self,
+        endpoint: str,
+        secret: str,
+        model_id: str,
+        prompt: str,
+        max_output_tokens: int,
+        cancel_event: Event | None = None,
+    ) -> ChatGeneration: ...
 
     def stream_chat(
         self,

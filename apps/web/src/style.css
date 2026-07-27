@@ -1211,6 +1211,18 @@ button:disabled {
   font-size: 13px;
 }
 
+.rerank-authorization-preview {
+  display: grid;
+  gap: 4px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid #d7d7d2;
+}
+
+.rerank-authorization-actions {
+  margin-top: 2px;
+}
+
 .knowledge-organization-plan {
   display: grid;
   gap: 8px;
@@ -1433,6 +1445,27 @@ button:disabled {
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
+}
+
+.metadata-extraction {
+  display: grid;
+  gap: 8px;
+  margin-top: 6px;
+  padding-top: 12px;
+  border-top: 1px solid #e9e9e4;
+}
+
+.metadata-extraction h4 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.metadata-candidate-row {
+  display: grid;
+  gap: 5px;
+  padding: 10px 0;
+  border-top: 1px solid #e9e9e4;
 }
 
 .index-status-healthy {

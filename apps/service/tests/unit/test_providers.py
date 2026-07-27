@@ -1,9 +1,11 @@
 import threading
+from dataclasses import replace
 
 import pytest
 
 from adapters.sqlite_provider_repository import SqliteProviderRepository
 from application.providers import ProviderService, ProviderUnavailableError, ProviderValidationError
+from domain.providers import ChatGeneration, ChatUsage
 from ports.provider_client import ProviderClientError
 
 
@@ -40,11 +42,13 @@ class FakeRepository:
 class FakeCredentials:
     def __init__(self) -> None:
         self.values = {}
+        self.reads = []
 
     def save(self, reference, secret) -> None:
         self.values[reference] = secret
 
     def read(self, reference):
+        self.reads.append(reference)
         return self.values[reference]
 
     def delete(self, reference) -> None:
@@ -59,7 +63,7 @@ class FakeClient:
 
     def discover_models(self, endpoint, secret, cancel_event=None):
         self.calls.append("discover")
-        return ("chat-model", "embedding-model")
+        return ("chat-model", "embedding-model", "rerank-model")
 
     def health_check(self, endpoint, secret, cancel_event=None) -> None:
         self.calls.append("health")
@@ -73,6 +77,23 @@ class FakeClient:
     def probe_embedding(self, endpoint, secret, model_id, cancel_event=None) -> None:
         self.calls.append(("embedding", model_id))
 
+    def probe_rerank(self, endpoint, secret, model_id, cancel_event=None) -> None:
+        self.calls.append(("rerank-probe", model_id))
+
+    def create_embeddings(self, endpoint, secret, model_id, inputs, cancel_event=None):
+        self.calls.append(("create-embeddings", model_id, inputs))
+        return tuple((float(index), 1.0) for index, _value in enumerate(inputs, start=1))
+
+    def rerank(self, endpoint, secret, model_id, query, documents, cancel_event=None):
+        self.calls.append(("rerank", model_id, query, documents))
+        return tuple(1.0 / (index + 1) for index in range(len(documents)))
+
+    def generate_chat_with_usage(
+        self, endpoint, secret, model_id, prompt, max_output_tokens, cancel_event=None
+    ):
+        self.calls.append(("generate-chat-with-usage", model_id, max_output_tokens))
+        return ChatGeneration("{\"results\":[]}", ChatUsage(10, 5, 15))
+
 
 class FakeInvalidator:
     def __init__(self) -> None:
@@ -82,10 +103,23 @@ class FakeInvalidator:
         self.calls.append(provider_id)
 
 
-def make_service(*, repository=None, client=None):
+class FakeUnitCardInvalidator:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def invalidate_unit_cards_for_provider_change(self, provider_id, updated_at) -> None:
+        self.calls.append((provider_id, updated_at))
+
+
+def make_service(*, repository=None, client=None, unit_card_invalidator=None):
     credentials = FakeCredentials()
-    service = ProviderService(repository=repository or FakeRepository(), credentials=credentials,
-                              client=client or FakeClient(), authorization_invalidator=FakeInvalidator())
+    service = ProviderService(
+        repository=repository or FakeRepository(),
+        credentials=credentials,
+        client=client or FakeClient(),
+        authorization_invalidator=FakeInvalidator(),
+        unit_card_invalidator=unit_card_invalidator,
+    )
     return service, service.repository, credentials
 
 
@@ -101,7 +135,11 @@ def test_provider_test_only_discovers_and_checks_health() -> None:
 
     assert client.calls == ["discover", "health"]
     assert provider.verification.is_verified is True
-    assert {model.model_id for model in provider.models} == {"chat-model", "embedding-model"}
+    assert {model.model_id for model in provider.models} == {
+        "chat-model",
+        "embedding-model",
+        "rerank-model",
+    }
     assert all(model.model_type is None for model in provider.models)
 
 
@@ -112,14 +150,22 @@ def test_models_are_verified_by_type_and_defaults_are_independent() -> None:
 
     service.configure_model(provider.provider_id, "chat-model", "chat")
     service.configure_model(provider.provider_id, "embedding-model", "embedding")
+    service.configure_model(provider.provider_id, "rerank-model", "rerank")
     service.test_model(provider.provider_id, "chat-model")
     service.test_model(provider.provider_id, "embedding-model")
+    service.test_model(provider.provider_id, "rerank-model")
     service.set_default("chat", provider.provider_id, "chat-model")
     service.set_default("embedding", provider.provider_id, "embedding-model")
+    service.set_default("rerank", provider.provider_id, "rerank-model")
 
-    assert client.calls[-2:] == [("chat", "chat-model"), ("embedding", "embedding-model")]
+    assert client.calls[-3:] == [
+        ("chat", "chat-model"),
+        ("embedding", "embedding-model"),
+        ("rerank-probe", "rerank-model"),
+    ]
     assert service.resolve_model("chat").model.model_id == "chat-model"
     assert service.resolve_model("embedding").model.model_id == "embedding-model"
+    assert service.resolve_model("rerank").model.model_id == "rerank-model"
 
 
 def test_refresh_invalidates_previously_verified_models() -> None:
@@ -135,6 +181,21 @@ def test_refresh_invalidates_previously_verified_models() -> None:
     assert chat.verification.ok is False
     with pytest.raises(ProviderUnavailableError, match="unavailable"):
         service.resolve_model("chat")
+
+
+def test_provider_selection_changes_invalidate_unit_card_projections() -> None:
+    unit_card_invalidator = FakeUnitCardInvalidator()
+    service, _, _ = make_service(unit_card_invalidator=unit_card_invalidator)
+    provider = discovered_provider(service)
+    service.configure_model(provider.provider_id, "chat-model", "chat")
+    service.test_model(provider.provider_id, "chat-model")
+    unit_card_invalidator.calls.clear()
+
+    service.set_default("chat", provider.provider_id, "chat-model")
+
+    assert [provider_id for provider_id, _updated_at in unit_card_invalidator.calls] == [
+        provider.provider_id
+    ]
 
 
 def test_invalid_update_keeps_the_existing_credential() -> None:
@@ -213,3 +274,204 @@ def test_generation_hides_unexpected_provider_errors() -> None:
     with pytest.raises(ProviderUnavailableError, match="could not generate this section") as error:
         service.generate_chat(provider.provider_id, "chat-model", "prompt")
     assert "credential=secret" not in str(error.value)
+
+
+def test_measured_generation_is_locked_to_the_expected_provider_revision() -> None:
+    client = FakeClient()
+    service, _, _ = make_service(client=client)
+    provider = discovered_provider(service)
+    service.configure_model(provider.provider_id, "chat-model", "chat")
+    verified = service.test_model(provider.provider_id, "chat-model")
+
+    generation = service.generate_chat_with_usage(
+        verified.provider_id,
+        "chat-model",
+        "rank these candidates",
+        max_output_tokens=128,
+        expected_provider_updated_at=verified.updated_at,
+    )
+
+    assert generation.usage == ChatUsage(10, 5, 15)
+    assert client.calls[-1] == ("generate-chat-with-usage", "chat-model", 128)
+
+
+def test_measured_generation_rejects_a_stale_revision_before_provider_egress() -> None:
+    client = FakeClient()
+    service, _, _ = make_service(client=client)
+    provider = discovered_provider(service)
+    service.configure_model(provider.provider_id, "chat-model", "chat")
+    service.test_model(provider.provider_id, "chat-model")
+
+    with pytest.raises(ProviderUnavailableError, match="configuration changed"):
+        service.generate_chat_with_usage(
+            provider.provider_id,
+            "chat-model",
+            "rank these candidates",
+            max_output_tokens=128,
+            expected_provider_updated_at="stale-revision",
+        )
+
+    assert ("generate-chat-with-usage", "chat-model", 128) not in client.calls
+
+
+def test_measured_generation_rejects_http_before_reading_a_provider_credential() -> None:
+    client = FakeClient()
+    service, _, credentials = make_service(client=client)
+    provider = service.test(service.create("Cloud", "http://127.0.0.1/v1", "secret").provider_id)
+    service.configure_model(provider.provider_id, "chat-model", "chat")
+    verified = service.test_model(provider.provider_id, "chat-model")
+    credentials.reads.clear()
+
+    with pytest.raises(ProviderUnavailableError, match="HTTPS"):
+        service.generate_chat_with_usage(
+            verified.provider_id,
+            "chat-model",
+            "rank these candidates",
+            max_output_tokens=128,
+            expected_provider_updated_at=verified.updated_at,
+        )
+
+    assert ("generate-chat-with-usage", "chat-model", 128) not in client.calls
+    assert credentials.reads == []
+
+
+def test_batch_embeddings_are_locked_to_the_expected_https_provider_revision() -> None:
+    client = FakeClient()
+    service, _, _ = make_service(client=client)
+    provider = discovered_provider(service)
+    service.configure_model(provider.provider_id, "embedding-model", "embedding")
+    verified = service.test_model(provider.provider_id, "embedding-model")
+
+    locator = service.embedding_profile_locator(
+        verified.provider_id,
+        "embedding-model",
+        expected_provider_updated_at=verified.updated_at,
+    )
+    vectors = service.create_embeddings(
+        verified.provider_id,
+        "embedding-model",
+        ("first", "second"),
+        expected_provider_updated_at=verified.updated_at,
+    )
+
+    assert locator.endpoint == "https://provider.example/v1"
+    assert locator.configuration_revision == verified.updated_at
+    assert vectors == ((1.0, 1.0), (2.0, 1.0))
+    assert client.calls[-1] == ("create-embeddings", "embedding-model", ("first", "second"))
+
+
+def test_batch_embeddings_reject_stale_configuration_revisions_before_provider_egress() -> None:
+    client = FakeClient()
+    service, _, _ = make_service(client=client)
+    provider = discovered_provider(service)
+    service.configure_model(provider.provider_id, "embedding-model", "embedding")
+    verified = service.test_model(provider.provider_id, "embedding-model")
+
+    with pytest.raises(ProviderUnavailableError, match="configuration changed"):
+        service.create_embeddings(
+            verified.provider_id,
+            "embedding-model",
+            ("first",),
+            expected_provider_updated_at="stale-revision",
+        )
+
+    assert not any(call[0] == "create-embeddings" for call in client.calls if isinstance(call, tuple))
+
+
+def test_batch_embeddings_refuse_http_even_for_an_otherwise_verified_model() -> None:
+    client = FakeClient()
+    service, _, _ = make_service(client=client)
+    provider = service.test(service.create("Cloud", "http://127.0.0.1/v1", "secret").provider_id)
+    service.configure_model(provider.provider_id, "embedding-model", "embedding")
+    verified = service.test_model(provider.provider_id, "embedding-model")
+
+    with pytest.raises(ProviderUnavailableError, match="HTTPS"):
+        service.create_embeddings(
+            verified.provider_id,
+            "embedding-model",
+            ("first",),
+            expected_provider_updated_at=verified.updated_at,
+        )
+
+    assert not any(call[0] == "create-embeddings" for call in client.calls if isinstance(call, tuple))
+
+
+def test_rerank_is_locked_to_a_verified_https_model_and_expected_provider_revision() -> None:
+    client = FakeClient()
+    service, _, _ = make_service(client=client)
+    provider = discovered_provider(service)
+    service.configure_model(provider.provider_id, "rerank-model", "rerank")
+    verified = service.test_model(provider.provider_id, "rerank-model")
+
+    scores = service.rerank(
+        verified.provider_id,
+        "rerank-model",
+        "find the evidence",
+        ("first", "second"),
+        expected_provider_updated_at=verified.updated_at,
+    )
+
+    assert scores == (1.0, 0.5)
+    assert client.calls[-1] == (
+        "rerank",
+        "rerank-model",
+        "find the evidence",
+        ("first", "second"),
+    )
+
+
+def test_rerank_rejects_a_stale_revision_before_provider_egress() -> None:
+    client = FakeClient()
+    service, _, _ = make_service(client=client)
+    provider = discovered_provider(service)
+    service.configure_model(provider.provider_id, "rerank-model", "rerank")
+    service.test_model(provider.provider_id, "rerank-model")
+
+    with pytest.raises(ProviderUnavailableError, match="configuration changed"):
+        service.rerank(
+            provider.provider_id,
+            "rerank-model",
+            "find the evidence",
+            ("first",),
+            expected_provider_updated_at="stale-revision",
+        )
+
+    assert not any(call[0] == "rerank" for call in client.calls if isinstance(call, tuple))
+
+
+def test_rerank_rejects_http_before_reading_a_provider_credential_or_egress() -> None:
+    client = FakeClient()
+    service, repository, credentials = make_service(client=client)
+    provider = discovered_provider(service)
+    service.configure_model(provider.provider_id, "rerank-model", "rerank")
+    verified = service.test_model(provider.provider_id, "rerank-model")
+    repository.save(replace(verified, endpoint="http://127.0.0.1/v1"))
+    credentials.reads.clear()
+
+    with pytest.raises(ProviderUnavailableError, match="HTTPS"):
+        service.rerank(
+            verified.provider_id,
+            "rerank-model",
+            "find the evidence",
+            ("first",),
+            expected_provider_updated_at=verified.updated_at,
+        )
+
+    assert not any(call[0] == "rerank" for call in client.calls if isinstance(call, tuple))
+    assert credentials.reads == []
+
+
+def test_rerank_model_test_rejects_http_before_reading_a_provider_credential() -> None:
+    client = FakeClient()
+    service, _, credentials = make_service(client=client)
+    provider = service.test(service.create("Cloud", "http://127.0.0.1/v1", "secret").provider_id)
+    service.configure_model(provider.provider_id, "rerank-model", "rerank")
+    credentials.reads.clear()
+
+    tested = service.test_model(provider.provider_id, "rerank-model")
+
+    model = next(item for item in tested.models if item.model_id == "rerank-model")
+    assert model.verification.ok is False
+    assert "HTTPS" in (model.verification.reason or "")
+    assert ("rerank-probe", "rerank-model") not in client.calls
+    assert credentials.reads == []

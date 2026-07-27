@@ -34,11 +34,27 @@ from adapters.windows_credential_manager import WindowsCredentialManager
 from adapters.windows_directory_picker import WindowsDirectoryPicker
 from adapters.windows_import_picker import WindowsImportPicker
 from application.directory_selections import DirectorySelectionError, DirectorySelectionStore
+from application.embedding_authorizations import (
+    EmbeddingAuthorizationService,
+    EmbeddingAuthorizationValidationError,
+)
+from application.embedding_service import EmbeddingExecutionError, EmbeddingService
 from application.import_selections import ImportSelectionError, ImportSelectionStore
 from application.ingest import ImportTaskError, ImportTaskService
 from application.indexing import IndexingService
 from application.knowledge_graph import EmptyGraphCandidateRepository, KnowledgeGraphService
 from application.local_session import LocalSession, create_local_session
+from application.metadata_authorizations import (
+    MetadataAuthorizationService,
+    MetadataAuthorizationValidationError,
+)
+from application.metadata_service import MetadataExtractionError, MetadataExtractionService
+from application.provider_reranker import ProviderReranker
+from application.unit_card_authorizations import (
+    UnitCardAuthorizationService,
+    UnitCardAuthorizationValidationError,
+)
+from application.unit_card_service import UnitCardExecutionError, UnitCardService
 from application.policies import (
     OutboundAuthorizationDenied,
     PolicyService,
@@ -64,6 +80,21 @@ from domain.policies import (
     VaultPolicy,
     normalize_vault_relative_path,
 )
+from domain.embedding_authorization import EmbeddingAuthorizationPreview, EmbeddingBatchScope
+from domain.embeddings import EmbeddingExecutionReport
+from domain.metadata_extraction import (
+    MetadataAuditReport,
+    MetadataAuthorizationPreview,
+    MetadataBatchScope,
+    MetadataCandidate,
+    MetadataExtractionReport,
+    metadata_audit_report,
+)
+from domain.unit_card_authorization import (
+    UnitCardAuthorizationPreview,
+    UnitCardBatchScope,
+    UnitCardExecutionReport,
+)
 from domain.providers import ModelSelection, ProbeResult, Provider, ProviderModel
 from domain.derived_notes import (
     DerivedMarkdownProposal,
@@ -76,6 +107,8 @@ from domain.metadata_tags import MetadataTagProposal, TagChangePreview, TagDefin
 from domain.evidence import EvidenceLocator
 from domain.indexing import IndexBlock, IndexHealth
 from domain.review_commits import CommitJournal, ReviewSnapshot
+from domain.retrieval_query import QueryScopeSelection
+from domain.retrieval_rerank import RERANK_AUTHORIZATION_OPERATION, RerankAuthorizationPreview
 from domain.tasks import ImportTask, ImportTaskEvent, ImportTaskItem
 from domain.sessions import (
     MAX_SESSION_PAGE,
@@ -238,14 +271,30 @@ class SessionMessageCommand(BaseModel):
     content: str
 
 
+class SessionQueryScopeCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    subject: str | None = None
+    grade_volume: str | None = None
+    unit_no: int | None = None
+    material_type: str | None = None
+
+
 class SessionTaskCommand(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     content: str
     intent: Literal["auto", "source-lookup", "completeness", "knowledge-organization", "deep-creation"] = "auto"
+    query_scope: SessionQueryScopeCommand | None = None
 
 
 class SessionTaskExecutionCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rerank_authorization_id: str | None = Field(default=None, min_length=1, max_length=128)
+
+
+class SessionRerankAuthorizationCommand(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
@@ -394,6 +443,32 @@ class OutboundAuthorizationCheckCommand(OutboundAuthorizationCommand):
 
 class AuthorizationConfirmationCommand(BaseModel):
     approved: bool
+
+
+class EmbeddingBatchScopeCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope_kind: Literal["vault", "directory"]
+    relative_path: str | None = None
+
+
+class UnitCardBatchScopeCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope_kind: Literal["vault", "directory"]
+    relative_path: str | None = None
+
+
+class UnitCardExecutionCommand(UnitCardBatchScopeCommand):
+    chat_authorization_id: str = Field(min_length=1)
+    embedding_authorization_id: str = Field(min_length=1)
+
+
+class MetadataCandidateDecisionCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: Literal["accepted", "excluded"]
+    reason: str = Field(pattern=r".*\S.*")
 
 
 class ProviderCommand(BaseModel):
@@ -614,6 +689,8 @@ def preview_payload(preview: PolicyEvaluation) -> dict[str, object]:
 
 
 def authorization_payload(authorization: OutboundAuthorization) -> dict[str, object]:
+    if authorization.operation == RERANK_AUTHORIZATION_OPERATION:
+        return rerank_authorization_payload(authorization)
     return {
         "authorization_id": authorization.authorization_id,
         "vault_id": authorization.vault_id,
@@ -629,6 +706,198 @@ def authorization_payload(authorization: OutboundAuthorization) -> dict[str, obj
         "status": authorization.status,
         "created_at": authorization.created_at,
         "updated_at": authorization.updated_at,
+    }
+
+
+def embedding_authorization_preview_payload(
+    preview: EmbeddingAuthorizationPreview,
+) -> dict[str, object]:
+    return {
+        "vault_id": preview.vault_id,
+        "scope_kind": preview.scope.kind,
+        "relative_path": preview.scope.relative_path,
+        "provider_id": preview.provider_id,
+        "provider_name": preview.provider_name,
+        "model_id": preview.model_id,
+        "policy_revision": preview.policy_revision,
+        "file_count": preview.file_count,
+        "block_count": preview.block_count,
+        "blocked_file_count": preview.blocked_file_count,
+        "blocked_block_count": preview.blocked_block_count,
+        "blocked_documents": [
+            {
+                "relative_path": document.relative_path,
+                "block_count": document.block_count,
+                "reason": document.reason,
+            }
+            for document in preview.blocked_documents
+        ],
+        "content_categories": list(preview.content_categories),
+        "is_authorizable": preview.is_authorizable,
+    }
+
+
+def rerank_authorization_preview_payload(
+    preview: RerankAuthorizationPreview,
+) -> dict[str, object]:
+    """Expose only content-free facts before a source-lookup rerank is authorized."""
+
+    return {
+        "vault_id": preview.vault_id,
+        "provider_id": preview.provider_id,
+        "provider_name": preview.provider_name,
+        "model_id": preview.model_id,
+        "provider_configuration_revision": preview.provider_configuration_revision,
+        "policy_revision": preview.policy_revision,
+        "file_count": preview.file_count,
+        "candidate_count": preview.candidate_count,
+        "input_character_count": preview.input_character_count,
+        "blocked_file_count": preview.blocked_file_count,
+        "blocked_candidate_count": preview.blocked_candidate_count,
+        "content_categories": list(preview.content_categories),
+        "is_authorizable": preview.is_authorizable,
+        "blocking_reason": preview.blocking_reason,
+    }
+
+
+def rerank_authorization_payload(authorization: OutboundAuthorization) -> dict[str, object]:
+    """Keep rerank task digests and scope digests inside local authorization storage."""
+
+    return {
+        "authorization_id": authorization.authorization_id,
+        "status": authorization.status,
+    }
+
+
+def embedding_execution_payload(report: EmbeddingExecutionReport) -> dict[str, object]:
+    return {
+        "vault_id": report.vault_id,
+        "authorization_id": report.authorization_id,
+        "status": report.status,
+        "file_count": report.file_count,
+        "block_count": report.block_count,
+        "cache_hit_block_count": report.cache_hit_block_count,
+        "provider_block_count": report.provider_block_count,
+        "created_cache_entry_count": report.created_cache_entry_count,
+        "network_batch_count": report.network_batch_count,
+    }
+
+
+def unit_card_authorization_preview_payload(
+    preview: UnitCardAuthorizationPreview,
+) -> dict[str, object]:
+    return {
+        "vault_id": preview.vault_id,
+        "scope_kind": preview.scope.kind,
+        "relative_path": preview.scope.relative_path,
+        "chat_provider_id": preview.chat_provider_id,
+        "chat_provider_name": preview.chat_provider_name,
+        "chat_model_id": preview.chat_model_id,
+        "embedding_provider_id": preview.embedding_provider_id,
+        "embedding_provider_name": preview.embedding_provider_name,
+        "embedding_model_id": preview.embedding_model_id,
+        "policy_revision": preview.policy_revision,
+        "file_count": preview.file_count,
+        "block_count": preview.block_count,
+        "card_count": preview.card_count,
+        "blocked_file_count": preview.blocked_file_count,
+        "blocked_block_count": preview.blocked_block_count,
+        "blocked_documents": [
+            {
+                "relative_path": document.relative_path,
+                "block_count": document.block_count,
+                "reason": document.reason,
+            }
+            for document in preview.blocked_documents
+        ],
+        "content_categories": list(preview.content_categories),
+        "is_authorizable": preview.is_authorizable,
+    }
+
+
+def unit_card_execution_payload(report: UnitCardExecutionReport) -> dict[str, object]:
+    return {
+        "vault_id": report.vault_id,
+        "chat_authorization_id": report.chat_authorization_id,
+        "embedding_authorization_id": report.embedding_authorization_id,
+        "status": report.status,
+        "file_count": report.file_count,
+        "block_count": report.block_count,
+        "card_count": report.card_count,
+        "chat_network_request_count": report.chat_network_request_count,
+        "embedding_network_request_count": report.embedding_network_request_count,
+    }
+
+
+def metadata_authorization_preview_payload(
+    preview: MetadataAuthorizationPreview,
+) -> dict[str, object]:
+    return {
+        "vault_id": preview.vault_id,
+        "scope_kind": preview.scope.kind,
+        "relative_path": preview.scope.relative_path,
+        "provider_id": preview.provider_id,
+        "provider_name": preview.provider_name,
+        "model_id": preview.model_id,
+        "policy_revision": preview.policy_revision,
+        "file_count": preview.file_count,
+        "block_count": preview.block_count,
+        "blocked_file_count": preview.blocked_file_count,
+        "blocked_block_count": preview.blocked_block_count,
+        "blocked_documents": [
+            {
+                "relative_path": document.relative_path,
+                "block_count": document.block_count,
+                "reason": document.reason,
+            }
+            for document in preview.blocked_documents
+        ],
+        "content_categories": list(preview.content_categories),
+        "is_authorizable": preview.is_authorizable,
+    }
+
+
+def metadata_execution_payload(report: MetadataExtractionReport) -> dict[str, object]:
+    return {
+        "vault_id": report.vault_id,
+        "authorization_id": report.authorization_id,
+        "status": report.status,
+        "file_count": report.file_count,
+        "block_count": report.block_count,
+        "candidate_count": report.candidate_count,
+        "required_review_count": report.required_review_count,
+        "network_batch_count": report.network_batch_count,
+    }
+
+
+def metadata_candidate_payload(candidate: MetadataCandidate) -> dict[str, object]:
+    return {
+        "candidate_id": candidate.candidate_id,
+        "vault_id": candidate.vault_id,
+        "relative_path": candidate.relative_path,
+        "sequence": candidate.sequence,
+        "knowledge_kind": candidate.knowledge_kind,
+        "concept_keys": list(candidate.concept_keys),
+        "confidence": candidate.confidence,
+        "provider_id": candidate.provider_id,
+        "model_id": candidate.model_id,
+        "status": candidate.status,
+        "review_reason": candidate.review_reason,
+        "decision_reason": candidate.decision_reason,
+        "created_at": candidate.created_at,
+        "updated_at": candidate.updated_at,
+    }
+
+
+def metadata_audit_payload(report: MetadataAuditReport) -> dict[str, object]:
+    return {
+        "candidate_count": report.candidate_count,
+        "required_review_count": report.required_review_count,
+        "pending_count": report.pending_count,
+        "reviewed_count": report.reviewed_count,
+        "accepted_count": report.accepted_count,
+        "excluded_count": report.excluded_count,
+        "acceptance_rate": report.acceptance_rate,
     }
 
 
@@ -739,6 +1008,12 @@ def session_task_snapshot_payload(snapshot) -> dict[str, object]:
         "source_digest": snapshot.source_digest,
         "source_sample": source_sample,
         "source_sample_truncated": snapshot.source_count > len(source_sample),
+        "query_scope": {
+            "subject": snapshot.query_scope_subject,
+            "grade_volume": snapshot.query_scope_grade_volume,
+            "unit_no": snapshot.query_scope_unit_no,
+            "material_type": snapshot.query_scope_material_type,
+        } if snapshot.query_scope_subject is not None else None,
         "coverage": {
             "planned_count": sum(item.disposition == "planned" for item in snapshot.coverage_items),
             "excluded_count": sum(item.disposition == "excluded" for item in snapshot.coverage_items),
@@ -788,6 +1063,7 @@ def session_task_preview_payload(preview) -> dict[str, object]:
         "source_digest": preview.source_digest,
         "source_sample": source_sample,
         "source_sample_truncated": preview.source_count > len(source_sample),
+        "query_scope": query_scope_preview_payload(preview.scope_preview),
         "knowledge_organization_plan": knowledge_organization_plan_payload(
             preview.organization_sections,
             evidence_count=preview.organization_evidence_count,
@@ -802,6 +1078,57 @@ def session_task_preview_payload(preview) -> dict[str, object]:
         "blocking_reason": preview.blocking_reason,
         "recovery_action": preview.recovery_action,
     }
+
+
+def query_scope_preview_payload(scope_preview) -> dict[str, object] | None:
+    if scope_preview is None:
+        return None
+    scope_filter = scope_preview.scope_filter
+    return {
+        "subject": scope_filter.subject,
+        "grade_volume": scope_filter.grade_volume,
+        "unit_no": scope_filter.unit_no,
+        "material_type": scope_filter.material_type,
+        "status": scope_filter.scope_status,
+        "reason": scope_filter.reason,
+        "confidence": scope_preview.scope_confidence,
+        "source": scope_preview.scope_source,
+        "document_count": scope_preview.document_count,
+        "block_count": scope_preview.block_count,
+        "material_types": [
+            {
+                "material_type": item.material_type,
+                "document_count": item.document_count,
+                "block_count": item.block_count,
+            }
+            for item in scope_preview.material_types
+        ],
+        "gaps": list(scope_preview.gaps),
+        "is_confirmed": scope_preview.is_confirmed,
+    }
+
+
+def query_scope_selection(command: SessionQueryScopeCommand | None) -> QueryScopeSelection | None:
+    if command is None:
+        return None
+    return QueryScopeSelection(
+        command.subject,
+        command.grade_volume,
+        command.unit_no,
+        command.material_type,
+    )
+
+
+def embedding_batch_scope(command: EmbeddingBatchScopeCommand) -> EmbeddingBatchScope:
+    return EmbeddingBatchScope(command.scope_kind, command.relative_path)
+
+
+def metadata_batch_scope(command: EmbeddingBatchScopeCommand) -> MetadataBatchScope:
+    return MetadataBatchScope(command.scope_kind, command.relative_path)
+
+
+def unit_card_batch_scope(command: UnitCardBatchScopeCommand) -> UnitCardBatchScope:
+    return UnitCardBatchScope(command.scope_kind, command.relative_path)
 
 
 def session_citation_payload(citation: SessionCitation) -> dict[str, object]:
@@ -860,6 +1187,10 @@ def session_retrieval_result_payload(
         "recovery_action": result.recovery_action,
         "retrieval_duration_ms": result.retrieval_duration_ms,
         "generation_duration_ms": result.generation_duration_ms,
+        "rerank_authorization_id": result.rerank_authorization_id,
+        "rerank_status": result.rerank_status,
+        "rerank_network_request_count": result.rerank_network_request_count,
+        "rerank_duration_ms": result.rerank_duration_ms,
         "created_at": result.created_at,
         "vault_id": vault_id,
         "snapshot_status": snapshot.status if snapshot is not None else None,
@@ -949,6 +1280,7 @@ def session_completeness_result_payload(
         "coverage_offset": coverage_offset,
         "coverage_has_more": coverage_offset + len(selected_items) < len(items),
         "coverage_counts": coverage_counts,
+        "candidate_duplicate_clusters": [list(cluster) for cluster in result.candidate_duplicate_clusters],
         "coverage": [
             {
                 "ordinal": item.ordinal,
@@ -1264,6 +1596,7 @@ def model_defaults_payload(provider_service: ProviderService) -> dict[str, objec
     return {
         "chat": model_default_payload(provider_service, "chat"),
         "embedding": model_default_payload(provider_service, "embedding"),
+        "rerank": model_default_payload(provider_service, "rerank"),
     }
 
 
@@ -1300,6 +1633,9 @@ def index_health_payload(health: IndexHealth) -> dict[str, object]:
         "stale_count": health.stale_count,
         "failure_count": health.failure_count,
         "semantic_status": health.semantic_status,
+        "semantic_covered_block_count": health.semantic_covered_block_count,
+        "semantic_eligible_block_count": health.semantic_eligible_block_count,
+        "semantic_profile_count": health.semantic_profile_count,
         "failed_paths": list(health.failed_paths),
         "stale_paths": list(health.stale_paths),
         "stale_details": list(health.stale_details),
@@ -1725,6 +2061,66 @@ def vault_error(error: Exception) -> HTTPException:
                 "retryable": True,
             },
         )
+    if isinstance(error, EmbeddingAuthorizationValidationError):
+        return HTTPException(
+            status_code=400,
+            detail={
+                "code": "embedding_authorization_invalid",
+                "message": str(error),
+                "details": {},
+                "retryable": True,
+            },
+        )
+    if isinstance(error, EmbeddingExecutionError):
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": "embedding_execution_blocked",
+                "message": str(error),
+                "details": {},
+                "retryable": True,
+            },
+        )
+    if isinstance(error, MetadataAuthorizationValidationError):
+        return HTTPException(
+            status_code=400,
+            detail={
+                "code": "metadata_authorization_invalid",
+                "message": str(error),
+                "details": {},
+                "retryable": True,
+            },
+        )
+    if isinstance(error, MetadataExtractionError):
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": "metadata_extraction_blocked",
+                "message": str(error),
+                "details": {},
+                "retryable": True,
+            },
+        )
+    if isinstance(error, UnitCardAuthorizationValidationError):
+        return HTTPException(
+            status_code=400,
+            detail={
+                "code": "unit_card_authorization_invalid",
+                "message": str(error),
+                "details": {},
+                "retryable": True,
+            },
+        )
+    if isinstance(error, UnitCardExecutionError):
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": "unit_card_execution_blocked",
+                "message": str(error),
+                "details": {},
+                "retryable": True,
+            },
+        )
     if isinstance(error, PolicyValidationError):
         return HTTPException(
             status_code=400,
@@ -1980,7 +2376,42 @@ def create_app(
         credentials=WindowsCredentialManager(),
         client=OpenAiCompatibleProviderClient(),
         authorization_invalidator=app.state.vault_service.repository,
+        unit_card_invalidator=app.state.indexing_service.repository,
     )
+    app.state.embedding_authorization_service = EmbeddingAuthorizationService(
+        app.state.vault_service,
+        app.state.policy_service,
+        app.state.provider_service,
+        app.state.indexing_service.repository,
+    )
+    app.state.embedding_service = EmbeddingService(
+        app.state.embedding_authorization_service,
+        app.state.provider_service,
+        app.state.indexing_service.repository,
+    )
+    app.state.metadata_authorization_service = MetadataAuthorizationService(
+        app.state.vault_service,
+        app.state.policy_service,
+        app.state.provider_service,
+        app.state.indexing_service.repository,
+    )
+    app.state.metadata_service = MetadataExtractionService(
+        app.state.metadata_authorization_service,
+        app.state.provider_service,
+        app.state.indexing_service.repository,
+    )
+    app.state.unit_card_authorization_service = UnitCardAuthorizationService(
+        app.state.vault_service,
+        app.state.policy_service,
+        app.state.provider_service,
+        app.state.indexing_service.repository,
+    )
+    app.state.unit_card_service = UnitCardService(
+        app.state.unit_card_authorization_service,
+        app.state.provider_service,
+        app.state.indexing_service.repository,
+    )
+    app.state.reranker = ProviderReranker(app.state.provider_service)
     app.state.session_service = session_service or SessionService(
         SqliteSessionRepository(runtime.data_directory / "sessions.sqlite3"),
         vault_service=app.state.vault_service,
@@ -1988,6 +2419,10 @@ def create_app(
         policy_service=app.state.policy_service,
         index_repository=app.state.indexing_service.repository,
         lexical_retrieval_enabled=runtime.lexical_retrieval_enabled,
+        hybrid_retrieval_enabled=runtime.hybrid_retrieval_enabled,
+        unit_card_retrieval_enabled=runtime.unit_card_retrieval_enabled,
+        reranker=app.state.reranker,
+        rerank_retrieval_enabled=runtime.rerank_retrieval_enabled,
     )
     app.state.directory_picker = directory_picker or WindowsDirectoryPicker()
     app.state.directory_selections = directory_selections or DirectorySelectionStore()
@@ -2286,7 +2721,10 @@ def create_app(
     ) -> dict[str, object]:
         try:
             preview = app.state.session_service.preview_task(
-                session_id, command.content, intent=command.intent
+                session_id,
+                command.content,
+                intent=command.intent,
+                query_scope=query_scope_selection(command.query_scope),
             )
             return {"preview": session_task_preview_payload(preview)}
         except Exception as error:
@@ -2298,9 +2736,38 @@ def create_app(
     ) -> dict[str, object]:
         try:
             snapshot = app.state.session_service.create_task(
-                session_id, command.content, intent=command.intent
+                session_id,
+                command.content,
+                intent=command.intent,
+                query_scope=query_scope_selection(command.query_scope),
             )
             return {"snapshot": session_task_snapshot_payload(snapshot)}
+        except Exception as error:
+            raise session_error(error) from error
+
+    @app.post(
+        "/api/sessions/{session_id}/tasks/{task_id}/rerank-authorizations",
+        dependencies=[Depends(require_current_local_session)],
+    )
+    def request_session_rerank_authorization(
+        request: Request,
+        session_id: str,
+        task_id: str,
+        command: SessionRerankAuthorizationCommand,
+    ) -> dict[str, object]:
+        del request, command
+        try:
+            preview, authorization = app.state.session_service.prepare_rerank_authorization(
+                session_id, task_id
+            )
+            return {
+                "preview": rerank_authorization_preview_payload(preview),
+                "authorization": (
+                    rerank_authorization_payload(authorization)
+                    if authorization is not None
+                    else None
+                ),
+            }
         except Exception as error:
             raise session_error(error) from error
 
@@ -2315,7 +2782,11 @@ def create_app(
         command: SessionTaskExecutionCommand,
     ) -> dict[str, object]:
         try:
-            result = app.state.session_service.execute_task(session_id, task_id)
+            result = app.state.session_service.execute_task(
+                session_id,
+                task_id,
+                rerank_authorization_id=command.rerank_authorization_id,
+            )
             detail = app.state.session_service.detail(session_id)
             snapshot = next(
                 (item for item in detail.task_snapshots if item.snapshot_id == result.snapshot_id),
@@ -2354,6 +2825,7 @@ def create_app(
                     on_stream_chunk=lambda ordinal, content: events.put(
                         ("chunk", {"ordinal": ordinal, "content": content})
                     ),
+                    rerank_authorization_id=command.rerank_authorization_id,
                 )
                 detail = app.state.session_service.detail(session_id)
                 snapshot = next(
@@ -3539,6 +4011,277 @@ def create_app(
                 ],
             )
             return {"authorization": authorization_payload(authorization)}
+        except Exception as error:
+            raise vault_error(error) from error
+
+    @app.post("/api/vaults/{vault_id}/embedding-authorizations/preview")
+    def preview_embedding_authorization(
+        request: Request, vault_id: str, command: EmbeddingBatchScopeCommand
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            preview = app.state.embedding_authorization_service.preview(
+                vault_id, embedding_batch_scope(command)
+            )
+            return {"preview": embedding_authorization_preview_payload(preview)}
+        except Exception as error:
+            raise vault_error(error) from error
+
+    @app.post("/api/vaults/{vault_id}/embedding-authorizations")
+    def request_embedding_authorization(
+        request: Request, vault_id: str, command: EmbeddingBatchScopeCommand
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            preview, authorization = app.state.embedding_authorization_service.request(
+                vault_id, embedding_batch_scope(command)
+            )
+            return {
+                "preview": embedding_authorization_preview_payload(preview),
+                "authorization": authorization_payload(authorization),
+            }
+        except Exception as error:
+            raise vault_error(error) from error
+
+    @app.post(
+        "/api/vaults/{vault_id}/embedding-authorizations/{authorization_id}/confirm"
+    )
+    def confirm_embedding_authorization(
+        request: Request,
+        vault_id: str,
+        authorization_id: str,
+        command: AuthorizationConfirmationCommand,
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            authorization = app.state.embedding_authorization_service.confirm(
+                vault_id, authorization_id, approved=command.approved
+            )
+            return {"authorization": authorization_payload(authorization)}
+        except Exception as error:
+            raise vault_error(error) from error
+
+    @app.post(
+        "/api/vaults/{vault_id}/embedding-authorizations/{authorization_id}/check"
+    )
+    def check_embedding_authorization(
+        request: Request,
+        vault_id: str,
+        authorization_id: str,
+        command: EmbeddingBatchScopeCommand,
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            preview, authorization = app.state.embedding_authorization_service.check(
+                vault_id, authorization_id, embedding_batch_scope(command)
+            )
+            return {
+                "preview": embedding_authorization_preview_payload(preview),
+                "authorization": authorization_payload(authorization),
+            }
+        except Exception as error:
+            raise vault_error(error) from error
+
+    @app.post(
+        "/api/vaults/{vault_id}/embedding-authorizations/{authorization_id}/execute"
+    )
+    def execute_embedding_authorization(
+        request: Request,
+        vault_id: str,
+        authorization_id: str,
+        command: EmbeddingBatchScopeCommand,
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            report = app.state.embedding_service.execute(
+                vault_id, authorization_id, embedding_batch_scope(command)
+            )
+            return {"report": embedding_execution_payload(report)}
+        except Exception as error:
+            raise vault_error(error) from error
+
+    @app.post("/api/vaults/{vault_id}/metadata-authorizations/preview")
+    def preview_metadata_authorization(
+        request: Request, vault_id: str, command: EmbeddingBatchScopeCommand
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            preview = app.state.metadata_authorization_service.preview(
+                vault_id, metadata_batch_scope(command)
+            )
+            return {"preview": metadata_authorization_preview_payload(preview)}
+        except Exception as error:
+            raise vault_error(error) from error
+
+    @app.post("/api/vaults/{vault_id}/metadata-authorizations")
+    def request_metadata_authorization(
+        request: Request, vault_id: str, command: EmbeddingBatchScopeCommand
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            preview, authorization = app.state.metadata_authorization_service.request(
+                vault_id, metadata_batch_scope(command)
+            )
+            return {
+                "preview": metadata_authorization_preview_payload(preview),
+                "authorization": authorization_payload(authorization),
+            }
+        except Exception as error:
+            raise vault_error(error) from error
+
+    @app.post("/api/vaults/{vault_id}/metadata-authorizations/{authorization_id}/check")
+    def check_metadata_authorization(
+        request: Request,
+        vault_id: str,
+        authorization_id: str,
+        command: EmbeddingBatchScopeCommand,
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            authorization = app.state.metadata_authorization_service.check(
+                vault_id, authorization_id, metadata_batch_scope(command)
+            )
+            return {"authorization": authorization_payload(authorization)}
+        except Exception as error:
+            raise vault_error(error) from error
+
+    @app.post("/api/vaults/{vault_id}/metadata-authorizations/{authorization_id}/execute")
+    def execute_metadata_authorization(
+        request: Request,
+        vault_id: str,
+        authorization_id: str,
+        command: EmbeddingBatchScopeCommand,
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            report = app.state.metadata_service.execute(
+                vault_id, authorization_id, metadata_batch_scope(command)
+            )
+            return {"report": metadata_execution_payload(report)}
+        except Exception as error:
+            raise vault_error(error) from error
+
+    @app.post("/api/vaults/{vault_id}/unit-card-authorizations/preview")
+    def preview_unit_card_authorization(
+        request: Request, vault_id: str, command: UnitCardBatchScopeCommand
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            preview = app.state.unit_card_authorization_service.preview(
+                vault_id, unit_card_batch_scope(command)
+            )
+            return {"preview": unit_card_authorization_preview_payload(preview)}
+        except Exception as error:
+            raise vault_error(error) from error
+
+    @app.post("/api/vaults/{vault_id}/unit-card-authorizations")
+    def request_unit_card_authorization(
+        request: Request, vault_id: str, command: UnitCardBatchScopeCommand
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            preview, chat_authorization, embedding_authorization = (
+                app.state.unit_card_authorization_service.request(
+                    vault_id, unit_card_batch_scope(command)
+                )
+            )
+            return {
+                "preview": unit_card_authorization_preview_payload(preview),
+                "chat_authorization": authorization_payload(chat_authorization),
+                "embedding_authorization": authorization_payload(embedding_authorization),
+            }
+        except Exception as error:
+            raise vault_error(error) from error
+
+    @app.post(
+        "/api/vaults/{vault_id}/unit-card-authorizations/{authorization_id}/confirm"
+    )
+    def confirm_unit_card_authorization(
+        request: Request,
+        vault_id: str,
+        authorization_id: str,
+        command: AuthorizationConfirmationCommand,
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            authorization = app.state.policy_service.confirm_outbound_authorization(
+                vault_id, authorization_id, approved=command.approved
+            )
+            return {"authorization": authorization_payload(authorization)}
+        except Exception as error:
+            raise vault_error(error) from error
+
+    @app.post("/api/vaults/{vault_id}/unit-card-authorizations/check")
+    def check_unit_card_authorization(
+        request: Request, vault_id: str, command: UnitCardExecutionCommand
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            checked = app.state.unit_card_authorization_service.checked_batch(
+                vault_id,
+                command.chat_authorization_id,
+                command.embedding_authorization_id,
+                unit_card_batch_scope(command),
+            )
+            return {
+                "preview": unit_card_authorization_preview_payload(checked.preview),
+                "chat_authorization": authorization_payload(checked.chat_authorization),
+                "embedding_authorization": authorization_payload(checked.embedding_authorization),
+            }
+        except Exception as error:
+            raise vault_error(error) from error
+
+    @app.post("/api/vaults/{vault_id}/unit-card-authorizations/execute")
+    def execute_unit_card_authorization(
+        request: Request, vault_id: str, command: UnitCardExecutionCommand
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            report = app.state.unit_card_service.execute(
+                vault_id,
+                command.chat_authorization_id,
+                command.embedding_authorization_id,
+                unit_card_batch_scope(command),
+            )
+            return {"report": unit_card_execution_payload(report)}
+        except Exception as error:
+            raise vault_error(error) from error
+
+    @app.get("/api/vaults/{vault_id}/metadata-candidates")
+    def list_metadata_candidates(
+        request: Request, vault_id: str, status: str | None = Query(default=None)
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            statuses = (status,) if status is not None else ()
+            candidates = app.state.indexing_service.repository.list_metadata_candidates(
+                vault_id, statuses
+            )
+            all_candidates = (
+                candidates
+                if not statuses
+                else app.state.indexing_service.repository.list_metadata_candidates(vault_id, ())
+            )
+            return {
+                "candidates": [metadata_candidate_payload(candidate) for candidate in candidates],
+                "audit": metadata_audit_payload(metadata_audit_report(vault_id, all_candidates)),
+            }
+        except Exception as error:
+            raise vault_error(error) from error
+
+    @app.post("/api/vaults/{vault_id}/metadata-candidates/{candidate_id}/decision")
+    def decide_metadata_candidate(
+        request: Request,
+        vault_id: str,
+        candidate_id: str,
+        command: MetadataCandidateDecisionCommand,
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            candidate = app.state.indexing_service.repository.decide_metadata_candidate(
+                vault_id, candidate_id, command.decision, command.reason
+            )
+            return {"candidate": metadata_candidate_payload(candidate)}
         except Exception as error:
             raise vault_error(error) from error
 

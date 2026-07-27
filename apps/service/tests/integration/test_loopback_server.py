@@ -242,6 +242,11 @@ def test_provider_endpoints_keep_the_local_session_boundary_and_typed_default_st
             "status": "unconfigured",
             "reason": "No embedding Provider model is selected.",
         },
+        "rerank": {
+            "default": None,
+            "status": "unconfigured",
+            "reason": "No rerank Provider model is selected.",
+        },
     }
 
 

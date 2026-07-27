@@ -109,7 +109,7 @@ FTS5 我也实测了：沙箱 SQLite 3.37.2（比 `scripts/preflight.mjs:7` 要�
 
 ### Embedding：云端 Provider，但必须解决三个工程问题
 
-你已经选定云端。`adapters/openai_compatible_provider.py:86` 已有 `probe_embedding`（POST `/embeddings`），`domain/providers.py:4` 的 `MODEL_TYPES = frozenset({"chat", "embedding"})` 已含 embedding，`ProviderService.set_default("embedding", ...)` 也在（`application/providers.py`）。缺的是真正取向量的方法和三件事：
+你已经选定云端。`adapters/openai_compatible_provider.py` 已有 `probe_embedding`（POST `/embeddings`），`domain/providers.py` 的 `MODEL_TYPES` 现区分 `chat`、`embedding` 与独立 `rerank`，`ProviderService.set_default("embedding", ...)` 也在（`application/providers.py`）。缺的是真正取向量的方法和三件事：
 
 **(a) 批量与缓存。** 客户端要加 `create_embeddings(endpoint, secret, model_id, inputs: tuple[str, ...])`。先计算绑定 Provider 配置与模型维度的 `embedding_profile_fingerprint`，缓存键 = `sha256(profile_fingerprint + "\x00" + normalized_text)`，存 `embedding_cache` 表。重新索引同一份资料时零调用。
 
@@ -440,6 +440,18 @@ rerank 放在最后且只对点查型生效。枚举型绝不 rerank——rerank
 
 退出条件：`concept_keys` 人工通过率、单元卡片覆盖率、rerank 增益分别达到阈值；没有可测增益的增强不进入默认路径。
 
+**阶段 RET-08：受控 rerank 接入**
+
+产物：source-lookup 的逐任务 rerank 授权快照、内容与范围重验、默认关闭开关和本地 RRF 回退。
+
+退出条件：未确认、快照变化、策略阻断或 Provider 失败时均不发送候选正文；受控启用只影响 RRF 后的点查排序，并保留原始证据。
+
+**阶段 RET-09：真实 Provider 测量**
+
+产物：独立的原生 rerank Provider/model 设置，以及只对固定路径和内容哈希都校验通过的版本化、不可逆脱敏 fixture 进行受限真实调用的 CLI；原生合同固定为 `POST /rerank`、`{model, query, documents}` 与完整 `index/relevance_score` 响应。报告只写入被忽略的 `output/live-rerank/`，记录不含正文的延迟和质量结果。
+
+退出条件：调用前必须显式提供已验证的 HTTPS rerank Provider/model、最多两条请求和出网确认；HTTPS 检查发生在读取凭据前。用户已决定不做价格或费用预算，报告明确标记为未计算，仍不启用默认开关；未获得质量复核时默认开关保持关闭。
+
 每阶段都要按仓库现有规范补测试。`npm run test`（`package.json:21`）串联 `unit`（前端单测 + `pytest tests/unit`）→ `integration`（先 build 再 `pytest tests/integration`）→ `browser-test`（build + Playwright，`browser-tests/playwright.config.mjs` 里 `workers: 1`、baseURL 固定 `http://127.0.0.1:6240`）。检索层改动会同时触达三层，尤其是集成测试里的索引与任务快照断言。
 
 ---
@@ -448,7 +460,7 @@ rerank 放在最后且只对点查型生效。枚举型绝不 rerank——rerank
 
 **D-001 Graph 生命周期（技术默认：索引侧耐久投影）。** 不让索引依赖 import task 数据库；提交时复制检索所需的不可变投影。该建议解除 RET-01 的架构歧义，开发前只需确认保留期限与删除语义。
 
-**D-002 出网粒度（待用户确认，阻塞 RET-06）。** 推荐按 vault/目录一次授权一个索引批次，正文逐块发送给指定 Provider，并在范围预览中显示文件数、块数和 Provider。保守备选是只对个人清单与标题/摘要做 Embedding，教材正文只走 BM25。
+**D-002 出网粒度（已确认）。** Embedding 按 vault/目录批次、冻结范围和显式确认执行；点查语义查询只发送用户问题，默认不发送 vault 正文。source-lookup rerank 是独立 operation：仅在逐任务授权、内容哈希和 Provider revision 重验后，才向独立的 HTTPS rerank 模型发送查询和候选块文本；默认开关保持关闭。RET-09 的真实测量仅发送固定路径和内容哈希均已校验的版本化、不可逆脱敏 fixture，必须单独给出已验证 rerank Provider/model；用户已决定不做价格或费用预算，费用明确标记为未计算，不改变生产默认开关。
 
 **D-003 目录规则（默认：适配真实资料，不强制迁移目录）。** RET-00 收集真实目录样本，规则由测试夹具驱动；推荐目录只作为新资料建议，不把重命名现有 vault 作为检索改造前置条件。
 

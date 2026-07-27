@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "fixtureId": "retrieval-hybrid-golden-v1",
+  "provenance": "synthetic-deidentified",
+  "cases": [
+    {
+      "queryId": "semantic-rewrite-be-forms",
+      "queryText": "How do the linking verb forms change with different pronouns?",
+      "expectedBlockIds": ["eng-u1-text-be-forms", "eng-u1-guide-be-forms"],
+      "channels": {
+        "lexical": ["eng-u1-text-greetings"],
+        "semantic": ["eng-u1-text-be-forms", "eng-u1-guide-be-forms"],
+        "heading": ["eng-u1-text-greetings"]
+      }
+    },
+    {
+      "queryId": "semantic-rewrite-integer-signs",
+      "queryText": "Locate the lesson about numbers below zero and their opposites.",
+      "expectedBlockIds": ["math-u1-text-integers", "math-u1-guide-integers"],
+      "channels": {
+        "lexical": ["math-u1-text-number-line"],
+        "semantic": ["math-u1-text-integers", "math-u1-guide-integers"],
+        "heading": ["math-u1-text-number-line"]
+      }
+    }
+  ]
+}

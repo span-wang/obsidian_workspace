@@ -5,6 +5,7 @@ from hashlib import sha256
 from math import isfinite
 from pathlib import PurePosixPath
 
+from domain.embeddings import EmbeddingProfile
 from domain.evidence import DocxOoxmlLocator, DocumentLocator, PdfRegionLocator, SourceScopeLocator
 
 
@@ -216,6 +217,53 @@ class LexicalQuery:
 
 
 @dataclass(frozen=True)
+class HeadingQuery:
+    """A bounded structural lookup against persisted heading-path prefixes."""
+
+    prefixes: tuple[str, ...]
+    limit: int
+    allowed_relative_paths: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.prefixes, tuple) or not self.prefixes:
+            raise ValueError("Heading queries need immutable prefixes.")
+        if any(not isinstance(prefix, str) or not prefix.strip() for prefix in self.prefixes):
+            raise ValueError("Heading query prefixes must be non-empty text.")
+        if type(self.limit) is not int or self.limit < 1:
+            raise ValueError("Heading query limits must be positive integers.")
+        if not isinstance(self.allowed_relative_paths, tuple):
+            raise ValueError("Heading query allowed paths must be immutable.")
+        for relative_path in self.allowed_relative_paths:
+            _validate_relative_path(relative_path)
+
+
+@dataclass(frozen=True)
+class VectorQuery:
+    """A profile-bound exact KNN query constrained to policy-approved paths."""
+
+    profile: EmbeddingProfile
+    vector: tuple[float, ...]
+    limit: int
+    allowed_relative_paths: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.profile, EmbeddingProfile):
+            raise ValueError("Vector queries need an embedding profile.")
+        if not isinstance(self.vector, tuple) or len(self.vector) != self.profile.dimension:
+            raise ValueError("Vector query dimension must match its embedding profile.")
+        if any(type(value) not in {int, float} or not isfinite(value) for value in self.vector):
+            raise ValueError("Vector query values must be finite numbers.")
+        if not any(value != 0 for value in self.vector):
+            raise ValueError("Vector query must not be zero.")
+        if type(self.limit) is not int or self.limit < 1:
+            raise ValueError("Vector query limits must be positive integers.")
+        if not isinstance(self.allowed_relative_paths, tuple):
+            raise ValueError("Vector query allowed paths must be immutable.")
+        for relative_path in self.allowed_relative_paths:
+            _validate_relative_path(relative_path)
+
+
+@dataclass(frozen=True)
 class BlockHit:
     """One lexical candidate without leaking SQLite row details across the port."""
 
@@ -370,6 +418,9 @@ class IndexHealth:
     stale_count: int
     failure_count: int
     semantic_status: str
+    semantic_covered_block_count: int = 0
+    semantic_eligible_block_count: int = 0
+    semantic_profile_count: int = 0
     failed_paths: tuple[str, ...] = ()
     stale_paths: tuple[str, ...] = ()
     stale_details: tuple[str, ...] = ()
@@ -380,6 +431,15 @@ class IndexHealth:
     rich_block_issue_codes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        semantic_counts = (
+            self.semantic_covered_block_count,
+            self.semantic_eligible_block_count,
+            self.semantic_profile_count,
+        )
+        if any(type(count) is not int or count < 0 for count in semantic_counts):
+            raise ValueError("Index semantic coverage counts must be non-negative integers.")
+        if self.semantic_covered_block_count > self.semantic_eligible_block_count:
+            raise ValueError("Index semantic coverage cannot exceed eligible blocks.")
         if self.rich_block_read_mode not in {"rich", "legacy"}:
             raise ValueError("Index rich block read mode is invalid.")
         if self.rich_block_status not in {"enabled", "disabled", "blocked"}:

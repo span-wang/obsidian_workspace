@@ -1,0 +1,98 @@
+{
+  "calibrations": {
+    "100": {
+      "cases": [
+        {
+          "queryId": "semantic-rewrite-be-forms",
+          "recallAt8": 1.0,
+          "retrievedBlockIds": [
+            "eng-u1-text-greetings",
+            "eng-u1-text-be-forms",
+            "eng-u1-guide-be-forms"
+          ]
+        },
+        {
+          "queryId": "semantic-rewrite-integer-signs",
+          "recallAt8": 1.0,
+          "retrievedBlockIds": [
+            "math-u1-text-number-line",
+            "math-u1-text-integers",
+            "math-u1-guide-integers"
+          ]
+        }
+      ],
+      "macroRecallAt8": 1.0
+    },
+    "20": {
+      "cases": [
+        {
+          "queryId": "semantic-rewrite-be-forms",
+          "recallAt8": 1.0,
+          "retrievedBlockIds": [
+            "eng-u1-text-greetings",
+            "eng-u1-text-be-forms",
+            "eng-u1-guide-be-forms"
+          ]
+        },
+        {
+          "queryId": "semantic-rewrite-integer-signs",
+          "recallAt8": 1.0,
+          "retrievedBlockIds": [
+            "math-u1-text-number-line",
+            "math-u1-text-integers",
+            "math-u1-guide-integers"
+          ]
+        }
+      ],
+      "macroRecallAt8": 1.0
+    },
+    "60": {
+      "cases": [
+        {
+          "queryId": "semantic-rewrite-be-forms",
+          "recallAt8": 1.0,
+          "retrievedBlockIds": [
+            "eng-u1-text-greetings",
+            "eng-u1-text-be-forms",
+            "eng-u1-guide-be-forms"
+          ]
+        },
+        {
+          "queryId": "semantic-rewrite-integer-signs",
+          "recallAt8": 1.0,
+          "retrievedBlockIds": [
+            "math-u1-text-number-line",
+            "math-u1-text-integers",
+            "math-u1-guide-integers"
+          ]
+        }
+      ],
+      "macroRecallAt8": 1.0
+    }
+  },
+  "candidateLimit": 8,
+  "cases": [
+    {
+      "queryId": "semantic-rewrite-be-forms",
+      "recallAt8": 1.0,
+      "retrievedBlockIds": [
+        "eng-u1-text-greetings",
+        "eng-u1-text-be-forms",
+        "eng-u1-guide-be-forms"
+      ]
+    },
+    {
+      "queryId": "semantic-rewrite-integer-signs",
+      "recallAt8": 1.0,
+      "retrievedBlockIds": [
+        "math-u1-text-number-line",
+        "math-u1-text-integers",
+        "math-u1-guide-integers"
+      ]
+    }
+  ],
+  "fixtureId": "retrieval-hybrid-golden-v1",
+  "schemaVersion": 1,
+  "selectedRrfK": 60,
+  "semanticRewriteRecallAt8": 1.0
+}

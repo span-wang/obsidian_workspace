@@ -16,6 +16,7 @@ class FixtureProviderHandler(BaseHTTPRequestHandler):
     stream_event = {"choices": [{"delta": {"content": "结构化结论"}}]}
     stream_events: list[dict[str, object]] = []
     embedding_data = [{"embedding": [0.1]}]
+    rerank_results = [{"index": 0, "relevance_score": 0.9}]
     response_delay_seconds = 0
 
     def do_GET(self) -> None:  # noqa: N802
@@ -48,6 +49,11 @@ class FixtureProviderHandler(BaseHTTPRequestHandler):
             if self.response_delay_seconds:
                 time.sleep(self.response_delay_seconds)
             self._json_response({"data": self.embedding_data})
+            return
+        if self.path == "/v1/rerank":
+            if self.response_delay_seconds:
+                time.sleep(self.response_delay_seconds)
+            self._json_response({"results": self.rerank_results})
             return
         self.send_error(404)
 
@@ -96,6 +102,7 @@ def with_fixture_provider(callback) -> None:
     FixtureProviderHandler.stream_event = {"choices": [{"delta": {"content": "结构化结论"}}]}
     FixtureProviderHandler.stream_events = []
     FixtureProviderHandler.embedding_data = [{"embedding": [0.1]}]
+    FixtureProviderHandler.rerank_results = [{"index": 0, "relevance_score": 0.9}]
     FixtureProviderHandler.response_delay_seconds = 0
     server = ThreadingHTTPServer(("127.0.0.1", 0), FixtureProviderHandler)
     thread = threading.Thread(target=server.serve_forever)
@@ -137,6 +144,128 @@ def test_empty_stream_or_embedding_response_does_not_verify_capability() -> None
     with_fixture_provider(verify)
 
 
+def test_create_embeddings_orders_indexed_vectors_and_sends_one_bounded_batch() -> None:
+    def verify(client, endpoint) -> None:
+        FixtureProviderHandler.embedding_data = [
+            {"index": 1, "embedding": [0.3, 0.4]},
+            {"index": 0, "embedding": [0.1, 0.2]},
+        ]
+        assert client.create_embeddings(
+            endpoint, "test-secret", "model-alpha", ("first", "second")
+        ) == ((0.1, 0.2), (0.3, 0.4))
+
+    with_fixture_provider(verify)
+
+    assert FixtureProviderHandler.calls[-1] == (
+        "POST",
+        "/v1/embeddings",
+        {"model": "model-alpha", "input": ["first", "second"]},
+    )
+
+
+@pytest.mark.parametrize(
+    "embedding_data",
+    [
+        [{"index": 0, "embedding": [0.1]}],
+        [{"index": 0, "embedding": [0.1]}, {"index": 0, "embedding": [0.2]}],
+        [{"index": 0, "embedding": [0.1]}, {"index": 1, "embedding": [0.2, 0.3]}],
+        [{"index": 0, "embedding": [float("nan")]}, {"index": 1, "embedding": [0.2]}],
+    ],
+)
+def test_create_embeddings_rejects_malformed_or_non_finite_vectors(embedding_data) -> None:
+    def verify(client, endpoint) -> None:
+        FixtureProviderHandler.embedding_data = embedding_data
+        with pytest.raises(ProviderClientError, match="Embedding response"):
+            client.create_embeddings(endpoint, "test-secret", "model-alpha", ("first", "second"))
+
+    with_fixture_provider(verify)
+
+
+def test_native_rerank_orders_scores_by_request_indexes_and_sends_the_explicit_contract() -> None:
+    def verify(client, endpoint) -> None:
+        FixtureProviderHandler.rerank_results = [
+            {"index": 1, "relevance_score": 0.8},
+            {"index": 0, "relevance_score": 0.2},
+        ]
+        assert client.rerank(
+            endpoint, "test-secret", "rerank-model", "find the evidence", ("first", "second")
+        ) == (0.2, 0.8)
+
+    with_fixture_provider(verify)
+
+    assert FixtureProviderHandler.calls[-1] == (
+        "POST",
+        "/v1/rerank",
+        {
+            "model": "rerank-model",
+            "query": "find the evidence",
+            "documents": ["first", "second"],
+        },
+    )
+
+
+def test_native_rerank_probe_uses_one_minimal_valid_request() -> None:
+    def verify(client, endpoint) -> None:
+        client.probe_rerank(endpoint, "test-secret", "rerank-model")
+
+    with_fixture_provider(verify)
+
+    assert FixtureProviderHandler.calls[-1] == (
+        "POST",
+        "/v1/rerank",
+        {"model": "rerank-model", "query": "ping", "documents": ["ping"]},
+    )
+
+
+@pytest.mark.parametrize(
+    "rerank_results",
+    [
+        [{"index": 0, "relevance_score": 0.1}],
+        [
+            {"index": 0, "relevance_score": 0.1},
+            {"index": 0, "relevance_score": 0.2},
+        ],
+        [
+            {"index": 0, "relevance_score": 0.1},
+            {"index": 2, "relevance_score": 0.2},
+        ],
+        [
+            {"index": 0, "relevance_score": -0.1},
+            {"index": 1, "relevance_score": 0.2},
+        ],
+        [
+            {"index": 0, "relevance_score": float("nan")},
+            {"index": 1, "relevance_score": 0.2},
+        ],
+    ],
+)
+def test_native_rerank_rejects_incomplete_or_invalid_score_mappings(rerank_results) -> None:
+    def verify(client, endpoint) -> None:
+        FixtureProviderHandler.rerank_results = rerank_results
+        with pytest.raises(ProviderClientError, match="Rerank response"):
+            client.rerank(endpoint, "test-secret", "rerank-model", "query", ("first", "second"))
+
+    with_fixture_provider(verify)
+
+
+@pytest.mark.parametrize(
+    ("query", "documents"),
+    [
+        ("", ("document",)),
+        ("query", ("",)),
+        ("query", ("document",) * 21),
+    ],
+)
+def test_native_rerank_rejects_invalid_requests_before_opening_a_connection(query, documents) -> None:
+    def verify(client, endpoint) -> None:
+        with pytest.raises(ProviderClientError, match="Rerank"):
+            client.rerank(endpoint, "test-secret", "rerank-model", query, documents)
+
+    with_fixture_provider(verify)
+
+    assert FixtureProviderHandler.calls == []
+
+
 def test_openai_compatible_adapter_collects_streaming_chat_content() -> None:
     def verify(client, endpoint) -> None:
         assert client.generate_chat(endpoint, "test-secret", "model-alpha", "仅使用此段证据。") == "结构化结论"
@@ -170,6 +299,109 @@ def test_openai_compatible_adapter_streams_chat_content_chunks() -> None:
             "stream": True,
         },
     )
+
+
+def test_openai_compatible_adapter_accepts_a_final_message_content_chunk() -> None:
+    def verify(client, endpoint) -> None:
+        FixtureProviderHandler.stream_event = {
+            "choices": [{"message": {"content": "final response"}}]
+        }
+        assert client.generate_chat(endpoint, "test-secret", "model-alpha", "respond") == "final response"
+
+    with_fixture_provider(verify)
+
+
+def test_measured_chat_generation_uses_the_streaming_contract_and_keeps_only_usage_counts() -> None:
+    def verify(client, endpoint) -> None:
+        FixtureProviderHandler.stream_events = [
+            {"choices": [{"delta": {"content": '{"results":['}}]},
+            {"choices": [{"delta": {"content": "]}"}}]},
+            {
+                "choices": [],
+                "usage": {"prompt_tokens": 101, "completion_tokens": 11, "total_tokens": 112},
+            },
+        ]
+        generation = client.generate_chat_with_usage(
+            endpoint, "test-secret", "model-alpha", "仅排序候选。", 128
+        )
+
+        assert generation.content == '{"results":[]}'
+        assert generation.usage is not None
+        assert generation.usage.prompt_tokens == 101
+        assert generation.usage.completion_tokens == 11
+        assert generation.usage.total_tokens == 112
+
+    with_fixture_provider(verify)
+
+    assert FixtureProviderHandler.calls[-1] == (
+        "POST",
+        "/v1/chat/completions",
+        {
+            "model": "model-alpha",
+            "messages": [{"role": "user", "content": "仅排序候选。"}],
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "max_tokens": 128,
+        },
+    )
+
+
+def test_measured_chat_generation_keeps_a_valid_response_when_usage_is_not_reported() -> None:
+    def verify(client, endpoint) -> None:
+        generation = client.generate_chat_with_usage(
+            endpoint, "test-secret", "model-alpha", "仅排序候选。", 128
+        )
+
+        assert generation.content == "结构化结论"
+        assert generation.usage is None
+
+    with_fixture_provider(verify)
+
+
+def test_measured_chat_generation_ignores_reasoning_before_a_final_message_content_chunk() -> None:
+    def verify(client, endpoint) -> None:
+        FixtureProviderHandler.stream_events = [
+            {"choices": [{"delta": {"reasoning_content": "intermediate"}}]},
+            {"choices": [{"message": {"content": '{"results":[]}'}}]},
+        ]
+        generation = client.generate_chat_with_usage(
+            endpoint, "test-secret", "model-alpha", "only rank", 128
+        )
+
+        assert generation.content == '{"results":[]}'
+        assert "intermediate" not in generation.content
+
+    with_fixture_provider(verify)
+
+
+def test_measured_chat_generation_rejects_reasoning_without_final_content() -> None:
+    def verify(client, endpoint) -> None:
+        FixtureProviderHandler.stream_event = {
+            "choices": [{"delta": {"reasoning_content": "intermediate"}}]
+        }
+        with pytest.raises(ProviderClientError, match="reasoning but no final content"):
+            client.generate_chat_with_usage(endpoint, "test-secret", "model-alpha", "only rank", 128)
+
+    with_fixture_provider(verify)
+
+
+def test_measured_chat_generation_rejects_inconsistent_usage_counts() -> None:
+    def verify(client, endpoint) -> None:
+        FixtureProviderHandler.stream_events = [
+            {"choices": [{"delta": {"content": "结构化结论"}}]},
+            {
+                "choices": [],
+                "usage": {"prompt_tokens": 101, "completion_tokens": 11, "total_tokens": 113},
+            },
+        ]
+        generation = client.generate_chat_with_usage(
+            endpoint, "test-secret", "model-alpha", "仅排序候选。", 128
+        )
+
+        assert generation.content == "结构化结论"
+        assert generation.usage is None
+
+    with_fixture_provider(verify)
 
 
 def test_generation_waits_for_the_configured_request_deadline_not_one_second() -> None:

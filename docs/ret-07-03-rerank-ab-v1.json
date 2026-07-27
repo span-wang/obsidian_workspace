@@ -1,0 +1,133 @@
+{
+  "adapter": {
+    "inputCandidateCharacters": 1792,
+    "kind": "fixture-scripted-reranker",
+    "latencyMs": {
+      "measurement": "local synthetic adapter only",
+      "p50": 0.005,
+      "p95": 0.0085
+    },
+    "networkEgress": false,
+    "providerCostUsd": null,
+    "providerLatencyMs": null,
+    "timingRunsPerCase": 5
+  },
+  "baseline": {
+    "cases": [
+      {
+        "mrrAt8": 0.0,
+        "precisionAt8": 0.0,
+        "queryId": "be-forms-pronouns",
+        "recallAt8": 0.0,
+        "retrievedCandidateIds": [
+          "greetingdialog",
+          "selfintro",
+          "schoolplaces",
+          "colors",
+          "family",
+          "food",
+          "classroom",
+          "weather"
+        ]
+      },
+      {
+        "mrrAt8": 0.0,
+        "precisionAt8": 0.0,
+        "queryId": "negative-integers-opposites",
+        "recallAt8": 0.0,
+        "retrievedCandidateIds": [
+          "wholenumbers",
+          "fractions",
+          "decimals",
+          "shapes",
+          "measurement",
+          "addition",
+          "subtraction",
+          "multiplication"
+        ]
+      }
+    ],
+    "macroMrrAt8": 0.0,
+    "macroPrecisionAt8": 0.0,
+    "macroRecallAt8": 0.0
+  },
+  "candidateWindow": 20,
+  "comparison": {
+    "cost": {
+      "additionalProviderCostUsd": null,
+      "baselineProviderCostUsd": 0.0,
+      "rerankProviderCostUsd": null,
+      "status": "not-measured"
+    },
+    "costGatePassed": false,
+    "decision": "keep-disabled-until-live-provider-latency-and-cost-are-measured",
+    "defaultEnabled": false,
+    "fixtureAdapterLatencyGatePassed": true,
+    "latency": {
+      "additionalProviderLatencyMs": null,
+      "baselineProviderLatencyMs": 0.0,
+      "fixtureAdapterAddedLatencyMs": {
+        "p50": 0.005,
+        "p95": 0.0085
+      },
+      "rerankProviderLatencyMs": null
+    },
+    "latencyGatePassed": false,
+    "macroMrrGainAt8": 1.0,
+    "macroPrecisionGainAt8": 0.25,
+    "macroRecallGainAt8": 1.0,
+    "passesGate": false,
+    "providerCostMeasured": false,
+    "providerLatencyMeasured": false,
+    "qualityGatePassed": true
+  },
+  "fixtureId": "retrieval-rerank-golden-v1",
+  "gates": {
+    "maximumFixtureAdapterP95LatencyMs": 25.0,
+    "minimumMacroMrrGainAt8": 0.5,
+    "minimumMacroPrecisionGainAt8": 0.2,
+    "minimumMacroRecallGainAt8": 0.0
+  },
+  "provenance": "synthetic-deidentified",
+  "reranked": {
+    "cases": [
+      {
+        "mrrAt8": 1.0,
+        "precisionAt8": 0.25,
+        "queryId": "be-forms-pronouns",
+        "recallAt8": 1.0,
+        "retrievedCandidateIds": [
+          "beformslesson",
+          "beformspractice",
+          "greetingdialog",
+          "selfintro",
+          "schoolplaces",
+          "colors",
+          "family",
+          "food"
+        ]
+      },
+      {
+        "mrrAt8": 1.0,
+        "precisionAt8": 0.25,
+        "queryId": "negative-integers-opposites",
+        "recallAt8": 1.0,
+        "retrievedCandidateIds": [
+          "negativeintegers",
+          "integeropposites",
+          "wholenumbers",
+          "fractions",
+          "decimals",
+          "shapes",
+          "measurement",
+          "addition"
+        ]
+      }
+    ],
+    "macroMrrAt8": 1.0,
+    "macroPrecisionAt8": 0.25,
+    "macroRecallAt8": 1.0
+  },
+  "resultLimit": 8,
+  "schemaVersion": 1
+}

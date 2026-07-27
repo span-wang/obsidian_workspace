@@ -452,6 +452,15 @@ function modelOptions(providers, modelType) {
   ));
 }
 
+function modelTypeLabel(modelType) {
+  const labels = {
+    chat: "对话/文本生成",
+    embedding: "Embedding",
+    rerank: "Rerank（重排）"
+  };
+  return labels[modelType] || modelType;
+}
+
 function sessionComposerContext(session) {
   return {
     vault_id: session?.selected_vault_id || "",
@@ -668,6 +677,89 @@ function ConfirmationPanel({ request, error, isSubmitting, onClose, onConfirm })
   );
 }
 
+function rerankContentCategoriesText(contentCategories) {
+  if (!Array.isArray(contentCategories)) return "未标注";
+  const labels = contentCategories.filter(
+    (category) => typeof category === "string" && category.trim()
+  );
+  return labels.length ? labels.join("、") : "未标注";
+}
+
+export function RerankAuthorizationPreview({
+  preview,
+  authorization,
+  isSubmitting,
+  onConfirm,
+  onUseLocal
+}) {
+  const canConfirm = Boolean(preview?.is_authorizable && authorization?.authorization_id && onConfirm);
+  const provider = preview?.provider_name || preview?.provider_id || "未指定";
+  const authorizationReady = authorization?.status === "approved";
+  return React.createElement(
+    "section",
+    { className: "rerank-authorization-preview", "aria-label": "点查 rerank 外发授权预览" },
+    React.createElement("strong", null, "点查 rerank 外发授权预览"),
+    React.createElement("span", null, `Provider：${provider}；Model：${preview?.model_id || "未指定"}`),
+    React.createElement(
+      "span",
+      null,
+      `候选 ${preview?.candidate_count || 0} 项；文件 ${preview?.file_count || 0} 项；输入 ${preview?.input_character_count || 0} 个字符`
+    ),
+    React.createElement(
+      "span",
+      null,
+      `已排除候选 ${preview?.blocked_candidate_count || 0} 项；文件 ${preview?.blocked_file_count || 0} 项`
+    ),
+    React.createElement("span", null, `内容类别：${rerankContentCategoriesText(preview?.content_categories)}`),
+    React.createElement(
+      "span",
+      null,
+      `Provider 配置修订：${preview?.provider_configuration_revision ?? "未提供"}`
+    ),
+    React.createElement("span", null, `外发策略修订：${preview?.policy_revision ?? "未提供"}`),
+    React.createElement(
+      "span",
+      { className: "row-note" },
+      preview?.is_authorizable
+        ? "预览不显示候选正文、绝对路径或内容哈希；确认后仅本次任务可使用该授权。"
+        : `当前候选不满足 rerank 外发条件，将只执行本地 RRF 检索。${preview?.blocking_reason ? ` 原因：${preview.blocking_reason}` : ""}`
+    ),
+    (preview?.blocked_candidate_count || preview?.blocked_file_count) && preview?.is_authorizable
+      ? React.createElement(
+          "span",
+          { className: "row-note" },
+          `已排除的候选不会发送；${preview?.blocking_reason || "只会发送剩余允许候选。"}`
+        )
+      : null,
+    React.createElement(
+      "div",
+      { className: "detail-actions rerank-authorization-actions" },
+      React.createElement(
+        "button",
+        {
+          className: "secondary-button",
+          type: "button",
+          disabled: isSubmitting,
+          onClick: onUseLocal
+        },
+        "仅本地执行"
+      ),
+      canConfirm
+        ? React.createElement(
+            "button",
+            {
+              className: "primary-button",
+              type: "button",
+              disabled: isSubmitting,
+              onClick: onConfirm
+            },
+            authorizationReady ? "执行受控 rerank" : "确认并执行 rerank"
+          )
+        : null
+    )
+  );
+}
+
 export function SessionManagement({
   sessionPage,
   filters,
@@ -691,6 +783,8 @@ export function SessionManagement({
   onPreviewTask,
   onCreateTask,
   onExecuteTask,
+  onPrepareRerankAuthorization,
+  onConfirmRerankAuthorization,
   onConfirmKnowledgeOrganizationAuthorization,
   onConfirmDeepCreationAuthorization,
   onLoadCompletenessCoverage,
@@ -706,6 +800,7 @@ export function SessionManagement({
   const [message, setMessage] = React.useState("");
   const [taskIntent, setTaskIntent] = React.useState("auto");
   const [taskPreview, setTaskPreview] = React.useState(null);
+  const [rerankAuthorizationRequest, setRerankAuthorizationRequest] = React.useState(null);
   const [streamingDeepCreation, setStreamingDeepCreation] = React.useState(null);
   const [coveragePages, setCoveragePages] = React.useState({});
   const [editingGenerationResultId, setEditingGenerationResultId] = React.useState(null);
@@ -759,6 +854,7 @@ export function SessionManagement({
     setMessage("");
     setTaskIntent("auto");
     setTaskPreview(null);
+    setRerankAuthorizationRequest(null);
     setStreamingDeepCreation(null);
   }, [selectedSession?.session_id]);
 
@@ -859,6 +955,7 @@ export function SessionManagement({
     selectedSession && !contextIsDirty && selectedSession.selected_vault_id && selectedSession.scope_kind
       && selectedSession.selected_provider_id && selectedSession.selected_model_id && message.trim()
   );
+  const canFixTask = Boolean(taskPreview?.is_ready);
 
   async function saveContext() {
     if (!selectedSession) return;
@@ -1433,7 +1530,11 @@ export function SessionManagement({
     try {
       const preview = await onPreviewTask(selectedSession.session_id, message, taskIntent);
       setTaskPreview(preview);
-      setStatus(preview.is_ready ? "范围已准备，请确认固定任务快照。" : preview.blocking_reason || "当前范围不可执行。 ");
+      setStatus(
+        preview.is_ready
+          ? "范围已准备，请确认固定任务快照。"
+          : preview.blocking_reason || "当前范围不可执行。"
+      );
     } catch (requestError) {
       setTaskPreview(null);
       setStatus(requestError.message);
@@ -1443,7 +1544,7 @@ export function SessionManagement({
   }
 
   async function createTask() {
-    if (!taskPreview?.is_ready || !selectedSession || contextIsDirty) return;
+    if (!canFixTask || !selectedSession || contextIsDirty) return;
     setStatus("");
     setIsSubmitting(true);
     try {
@@ -1458,7 +1559,7 @@ export function SessionManagement({
     }
   }
 
-  async function executeTask(taskId) {
+  async function executeTask(taskId, rerankAuthorizationId) {
     if (!selectedSession || !onExecuteTask) return;
     setStatus("");
     setIsSubmitting(true);
@@ -1480,17 +1581,69 @@ export function SessionManagement({
               [chunk.ordinal]: (current.sections[chunk.ordinal] || "") + chunk.content
             }
           };
-        })
+        }),
+        rerankAuthorizationId
       );
       if (execution?.isCurrent === false) return;
       const result = execution?.result || execution;
       setStatus(["completed", "complete"].includes(result.status) ? "任务已完成，证据已刷新。" : result.summary);
+      setRerankAuthorizationRequest((current) => current?.taskId === taskId ? null : current);
     } catch (requestError) {
       setStatus(requestError.message);
     } finally {
       if (isDeepCreation) setStreamingDeepCreation(null);
       setIsSubmitting(false);
     }
+  }
+
+  async function prepareRerankAuthorization(snapshot) {
+    if (!selectedSession || !onPrepareRerankAuthorization) {
+      await executeTask(snapshot.task_id);
+      return;
+    }
+    setStatus("");
+    setIsSubmitting(true);
+    try {
+      const prepared = await onPrepareRerankAuthorization(selectedSession.session_id, snapshot.task_id);
+      const preview = prepared?.preview;
+      const authorization = prepared?.authorization;
+      if (preview?.is_authorizable && authorization?.authorization_id) {
+        setRerankAuthorizationRequest({
+          taskId: snapshot.task_id,
+          vaultId: preview.vault_id || snapshot.vault_id,
+          preview,
+          authorization
+        });
+        setStatus("请核对本次 rerank 外发范围并明确确认，或仅使用本地 RRF 检索。");
+        return;
+      }
+      await executeTask(snapshot.task_id);
+    } catch {
+      await executeTask(snapshot.task_id);
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  async function confirmRerankAuthorization(request) {
+    if (!request || !onConfirmRerankAuthorization) return;
+    setStatus("");
+    setIsSubmitting(true);
+    try {
+      if (request.authorization.status !== "approved") {
+        await onConfirmRerankAuthorization(request.vaultId, request.authorization.authorization_id);
+      }
+      await executeTask(request.taskId, request.authorization.authorization_id);
+    } catch (requestError) {
+      setStatus(requestError.message);
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  async function executeTaskLocally(taskId) {
+    setRerankAuthorizationRequest((current) => current?.taskId === taskId ? null : current);
+    await executeTask(taskId);
   }
 
   async function confirmKnowledgeOrganizationAuthorization(result) {
@@ -1863,8 +2016,12 @@ export function SessionManagement({
               const canExecute = snapshot.status === "prepared"
                 && ["source-lookup", "knowledge-organization", "completeness", "deep-creation"].includes(snapshot.intent);
               const frozenVault = vaultsById.get(snapshot.vault_id);
+              const isSourceLookup = snapshot.intent === "source-lookup";
               const isKnowledgeOrganization = snapshot.intent === "knowledge-organization";
               const isDeepCreation = snapshot.intent === "deep-creation";
+              const rerankRequest = rerankAuthorizationRequest?.taskId === snapshot.task_id
+                ? rerankAuthorizationRequest
+                : null;
               const organizationResult = isKnowledgeOrganization
                 ? knowledgeOrganizationResults.find((result) => result.snapshot_id === snapshot.snapshot_id)
                 : null;
@@ -1908,8 +2065,24 @@ export function SessionManagement({
                 snapshot.invalidation_reason
                   ? React.createElement("span", { className: "form-error" }, `需重新准备：${snapshot.invalidation_reason}`)
                   : null,
-                canExecute
-                  ? React.createElement("button", { className: "secondary-button", type: "button", disabled: isSubmitting, onClick: () => executeTask(snapshot.task_id) }, snapshot.intent === "completeness" ? "执行完整性检索" : snapshot.intent === "knowledge-organization" ? "生成知识整理" : snapshot.intent === "deep-creation" ? "生成深度创作" : "执行检索")
+                rerankRequest
+                  ? React.createElement(RerankAuthorizationPreview, {
+                      preview: rerankRequest.preview,
+                      authorization: rerankRequest.authorization,
+                      isSubmitting,
+                      onConfirm: () => confirmRerankAuthorization(rerankRequest),
+                      onUseLocal: () => executeTaskLocally(snapshot.task_id)
+                    })
+                  : null,
+                canExecute && !rerankRequest
+                  ? React.createElement("button", {
+                      className: "secondary-button",
+                      type: "button",
+                      disabled: isSubmitting,
+                      onClick: isSourceLookup
+                        ? () => prepareRerankAuthorization(snapshot)
+                        : () => executeTask(snapshot.task_id)
+                    }, snapshot.intent === "completeness" ? "执行完整性检索" : snapshot.intent === "knowledge-organization" ? "生成知识整理" : snapshot.intent === "deep-creation" ? "生成深度创作" : "执行检索")
                  : null
               );
             })
@@ -2032,7 +2205,7 @@ export function SessionManagement({
               React.createElement("button", { className: "secondary-button", type: "button", disabled: isSubmitting || !context.vault_id || !context.provider_id || !context.model_id || (context.scope_kind === "directory" && !context.scope_path.trim()), onClick: saveContext }, "保存语境"),
               React.createElement("button", { className: "primary-button", type: "submit", disabled: isSubmitting || !canPrepare }, "准备任务"),
               taskPreview?.is_ready
-                ? React.createElement("button", { className: "secondary-button", type: "button", disabled: isSubmitting || contextIsDirty, onClick: createTask }, "固定快照")
+                ? React.createElement("button", { className: "secondary-button", type: "button", disabled: isSubmitting || contextIsDirty || !canFixTask, onClick: createTask }, "固定快照")
                 : null
             )
           )
@@ -2574,6 +2747,137 @@ export function VaultIndexStatus({ vault, onUpdate }) {
         onClick: () => runIndexAction("rebuild")
       }, "重建索引")
     ),
+    React.createElement(MetadataExtractionPanel, { vault }),
+    status ? React.createElement("p", { className: "status-line", role: "status" }, status) : null
+  );
+}
+
+export function MetadataExtractionPanel({ vault }) {
+  const [candidates, setCandidates] = React.useState([]);
+  const [audit, setAudit] = React.useState(null);
+  const [status, setStatus] = React.useState("");
+  const [isActing, setIsActing] = React.useState(false);
+
+  const loadCandidates = React.useCallback(async () => {
+    const response = await requestJson(`${VAULTS_ENDPOINT}/${vault.vault_id}/metadata-candidates`);
+    setCandidates(response.candidates || []);
+    setAudit(response.audit || null);
+  }, [vault.vault_id]);
+
+  React.useEffect(() => {
+    let active = true;
+    loadCandidates().catch((error) => {
+      if (active) setStatus(error.message);
+    });
+    return () => { active = false; };
+  }, [loadCandidates]);
+
+  async function extractMetadata() {
+    setIsActing(true);
+    setStatus("");
+    try {
+      const requested = await requestJson(`${VAULTS_ENDPOINT}/${vault.vault_id}/metadata-authorizations`, {
+        method: "POST",
+        body: JSON.stringify({ scope_kind: "vault" })
+      });
+      if (requested.authorization?.status !== "approved") {
+        throw new Error("元数据授权未获批准。请检查当前 vault 的外发策略后重试。");
+      }
+      const executed = await requestJson(
+        `${VAULTS_ENDPOINT}/${vault.vault_id}/metadata-authorizations/${requested.authorization.authorization_id}/execute`,
+        { method: "POST", body: JSON.stringify({ scope_kind: "vault" }) }
+      );
+      await loadCandidates();
+      setStatus(`已抽取 ${executed.report.candidate_count} 项元数据候选；${executed.report.required_review_count} 项待审核。`);
+    } catch (error) {
+      setStatus(error.message);
+    } finally {
+      setIsActing(false);
+    }
+  }
+
+  async function decideCandidate(candidateId, decision) {
+    setIsActing(true);
+    setStatus("");
+    try {
+      const response = await requestJson(
+        `${VAULTS_ENDPOINT}/${vault.vault_id}/metadata-candidates/${candidateId}/decision`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            decision,
+            reason: decision === "accepted" ? "已审核索引块元数据候选。" : "已排除索引块元数据候选。"
+          })
+        }
+      );
+      setCandidates((current) => current.map((candidate) => (
+        candidate.candidate_id === candidateId ? response.candidate : candidate
+      )));
+    } catch (error) {
+      setStatus(error.message);
+    } finally {
+      setIsActing(false);
+    }
+  }
+
+  const requiredCandidates = candidates.filter((candidate) => candidate.status === "required-check");
+  return React.createElement(
+    "section",
+    { className: "metadata-extraction", "aria-label": "元数据审核" },
+    React.createElement("h4", null, "元数据审核"),
+    React.createElement(
+      "div",
+      { className: "detail-actions" },
+      React.createElement(
+        "button",
+        { className: "secondary-button", type: "button", disabled: isActing, onClick: extractMetadata },
+        "抽取元数据"
+      )
+    ),
+    requiredCandidates.length
+      ? requiredCandidates.map((candidate) => React.createElement(
+        "div",
+        { className: "metadata-candidate-row", key: candidate.candidate_id },
+        React.createElement("strong", null, `${candidate.relative_path} #${candidate.sequence}`),
+        React.createElement(
+          "span",
+          { className: "row-note" },
+          `${candidate.knowledge_kind}；${candidate.concept_keys.join("、")}；置信度 ${candidate.confidence}`
+        ),
+        React.createElement("span", { className: "row-note" }, candidate.review_reason),
+        React.createElement(
+          "div",
+          { className: "detail-actions" },
+          React.createElement(
+            "button",
+            {
+              className: "secondary-button",
+              type: "button",
+              disabled: isActing,
+              onClick: () => decideCandidate(candidate.candidate_id, "accepted")
+            },
+            "接受"
+          ),
+          React.createElement(
+            "button",
+            {
+              className: "danger-button",
+              type: "button",
+              disabled: isActing,
+              onClick: () => decideCandidate(candidate.candidate_id, "excluded")
+            },
+            "排除"
+          )
+        )
+      ))
+      : React.createElement("p", { className: "row-note" }, "没有待审核的元数据候选。"),
+    audit?.reviewed_count
+      ? React.createElement(
+        "p",
+        { className: "row-note" },
+        `已审核 ${audit.reviewed_count} 项；接受 ${audit.accepted_count} 项；通过率 ${(audit.acceptance_rate * 100).toFixed(1)}%。`
+      )
+      : null,
     status ? React.createElement("p", { className: "status-line", role: "status" }, status) : null
   );
 }
@@ -2944,6 +3248,11 @@ function ProviderVerification({ provider }) {
 }
 
 function ModelDefaultSelector({ modelType, label, description, providers, modelDefault, onChange, onClear }) {
+  modelDefault = modelDefault || {
+    default: null,
+    status: "unconfigured",
+    reason: `尚未配置${modelTypeLabel(modelType)} Model。`
+  };
   const options = modelOptions(providers, modelType);
   const selectedValue = modelDefault.default
     ? JSON.stringify([modelDefault.default.provider_id, modelDefault.default.model_id])
@@ -2979,7 +3288,7 @@ function ModelDefaultSelector({ modelType, label, description, providers, modelD
   );
 }
 
-function ProviderManagement({ providers, isLoading, modelDefaults, onOpenForm, onUpdate, onConfirm, onDefaultsChange }) {
+export function ProviderManagement({ providers, isLoading, modelDefaults, onOpenForm, onUpdate, onConfirm, onDefaultsChange }) {
   const [status, setStatus] = React.useState("");
 
   async function testProvider(provider) {
@@ -3032,7 +3341,7 @@ function ProviderManagement({ providers, isLoading, modelDefaults, onOpenForm, o
         body: JSON.stringify({ provider_id: providerId, model_id: modelId })
       });
       await onDefaultsChange();
-      setStatus(`${modelType === "chat" ? "对话/文本生成" : "Embedding"}默认 Model 已更新。`);
+      setStatus(`${modelTypeLabel(modelType)}默认 Model 已更新。`);
     } catch (error) {
       setStatus(error.message);
     }
@@ -3043,7 +3352,7 @@ function ProviderManagement({ providers, isLoading, modelDefaults, onOpenForm, o
     try {
       await requestJson(`${PROVIDERS_ENDPOINT}/defaults/${modelType}`, { method: "DELETE" });
       await onDefaultsChange();
-      setStatus(`${modelType === "chat" ? "对话/文本生成" : "Embedding"}默认 Model 已清除。`);
+      setStatus(`${modelTypeLabel(modelType)}默认 Model 已清除。`);
     } catch (error) {
       setStatus(error.message);
     }
@@ -3086,6 +3395,20 @@ function ProviderManagement({ providers, isLoading, modelDefaults, onOpenForm, o
         onClear: clearDefault
       })
     ),
+    React.createElement(
+      "div",
+      { className: "model-default-section", "aria-labelledby": "rerank-model-heading" },
+      React.createElement("h3", { id: "rerank-model-heading" }, "Rerank（重排）模型"),
+      React.createElement(ModelDefaultSelector, {
+        modelType: "rerank",
+        label: "全局 Rerank（重排）Model",
+        description: "用于候选重排；默认关闭，只有获得单次外发授权后才会发送候选。",
+        providers,
+        modelDefault: modelDefaults.rerank,
+        onChange: changeDefault,
+        onClear: clearDefault
+      })
+    ),
     status ? React.createElement("p", { className: "status-line", role: "status" }, status) : null,
     isLoading
       ? React.createElement("p", { className: "empty-state", role: "status" }, "正在加载 Provider 配置。")
@@ -3120,7 +3443,8 @@ function ProviderManagement({ providers, isLoading, modelDefaults, onOpenForm, o
                 onChange: (event) => configureModel(provider.provider_id, model.model_id, event.target.value) },
               React.createElement("option", { value: "" }, "选择类型"),
               React.createElement("option", { value: "chat" }, "对话/文本生成"),
-              React.createElement("option", { value: "embedding" }, "Embedding")
+              React.createElement("option", { value: "embedding" }, "Embedding"),
+              React.createElement("option", { value: "rerank" }, "Rerank（重排）")
             )
           ),
           React.createElement("span", { className: model.verification.ok ? "provider-check provider-check-ok" : "provider-check provider-check-failed" }, model.verification.ok ? "已验证" : model.verification.reason || "未验证"),
@@ -4676,7 +5000,8 @@ export function App() {
   const [sessionDetailError, setSessionDetailError] = React.useState("");
   const [modelDefaults, setModelDefaults] = React.useState({
     chat: { default: null, status: "unconfigured", reason: "正在加载对话/文本生成 Model。" },
-    embedding: { default: null, status: "unconfigured", reason: "正在加载 Embedding Model。" }
+    embedding: { default: null, status: "unconfigured", reason: "正在加载 Embedding Model。" },
+    rerank: { default: null, status: "unconfigured", reason: "正在加载 Rerank（重排）Model。" }
   });
   const [selectedVaultId, setSelectedVaultId] = React.useState(null);
   const [selectedTaskId, setSelectedTaskId] = React.useState(null);
@@ -4723,7 +5048,8 @@ export function App() {
       .then((response) => setModelDefaults(response))
       .catch((error) => setModelDefaults({
         chat: { default: null, status: "unavailable", reason: error.message },
-        embedding: { default: null, status: "unavailable", reason: error.message }
+        embedding: { default: null, status: "unavailable", reason: error.message },
+        rerank: { default: null, status: "unavailable", reason: error.message }
       }))
   ), []);
 
@@ -4986,11 +5312,27 @@ export function App() {
     return response.snapshot;
   }
 
-  async function executePersistentSessionTask(sessionId, taskId, onChunk) {
+  async function preparePersistentRerankAuthorization(sessionId, taskId) {
+    return requestJson(`${SESSIONS_ENDPOINT}/${sessionId}/tasks/${taskId}/rerank-authorizations`, {
+      method: "POST",
+      body: JSON.stringify({})
+    });
+  }
+
+  async function confirmPersistentRerankAuthorization(vaultId, authorizationId) {
+    return requestJson(
+      `${VAULTS_ENDPOINT}/${encodeURIComponent(vaultId)}/outbound-authorizations/${encodeURIComponent(authorizationId)}/confirm`,
+      { method: "POST", body: JSON.stringify({ approved: true }) }
+    );
+  }
+
+  async function executePersistentSessionTask(sessionId, taskId, onChunk, rerankAuthorizationId) {
     let result = null;
     await requestEventStream(`${SESSIONS_ENDPOINT}/${sessionId}/tasks/${taskId}/execute/stream`, {
       method: "POST",
-      body: JSON.stringify({})
+      body: JSON.stringify(
+        rerankAuthorizationId ? { rerank_authorization_id: rerankAuthorizationId } : {}
+      )
     }, (event, payload) => {
       if (event === "chunk") {
         onChunk?.(payload);
@@ -5208,6 +5550,8 @@ export function App() {
       onPreviewTask: previewPersistentSessionTask,
       onCreateTask: createPersistentSessionTask,
       onExecuteTask: executePersistentSessionTask,
+      onPrepareRerankAuthorization: preparePersistentRerankAuthorization,
+      onConfirmRerankAuthorization: confirmPersistentRerankAuthorization,
       onConfirmKnowledgeOrganizationAuthorization: confirmPersistentKnowledgeOrganizationAuthorization,
       onConfirmDeepCreationAuthorization: confirmPersistentDeepCreationAuthorization,
       onLoadCompletenessCoverage: loadPersistentCompletenessCoverage,

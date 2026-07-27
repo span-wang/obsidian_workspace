@@ -1,5 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from hashlib import sha256
+import sqlite3
 from threading import Barrier, Event, Thread
 import pytest
 
@@ -26,18 +28,44 @@ from domain.sessions import (
     group_retrieval_evidence,
     new_session,
 )
-from domain.indexing import BlockHit, IndexBlock, IndexHealth, IndexedDocument, LexicalQuery
+from domain.indexing import (
+    BlockHit,
+    IndexBlock,
+    IndexBlockMetadata,
+    IndexBlockRef,
+    IndexHealth,
+    IndexedDocument,
+    HeadingQuery,
+    LexicalQuery,
+    VectorQuery,
+)
 from domain.policies import OutboundAuthorization, OutboundScope, PolicyEvaluation
 from domain.providers import Provider, ProviderModel, ProviderProbeResults, ProbeResult, ResolvedProviderModel
+from domain.retrieval_metadata import RetrievalMetadata
+from domain.retrieval_query import QueryScopeSelection
+from domain.retrieval_rerank import RerankResponse, RerankScore
+from domain.unit_cards import UnitCard, UnitCardHit, UnitCardScope, UnitCardSource
 from domain.vaults import Vault
+from ports.reranker import RerankerExecutionError
 
 
-def task_service_fixture(tmp_path, documents=()):
+def task_service_fixture(
+    tmp_path,
+    documents=(),
+    *,
+    hybrid_retrieval_enabled: bool = False,
+    reranker=None,
+    rerank_retrieval_enabled: bool = False,
+):
     vault = Vault("vault-1", tmp_path, "platform", "active", "available", "healthy", "now", "now", True)
     provider = Provider(
-        "provider-1", "Local", "http://localhost:9000", "opaque", True,
+        "provider-1", "Local", "https://provider.example/v1", "opaque", True,
         ProviderProbeResults(ProbeResult.success(), ProbeResult.success()),
-        (ProviderModel("provider-1", "chat-1", "chat", ProbeResult.success(), True, "now"),),
+        (
+            ProviderModel("provider-1", "chat-1", "chat", ProbeResult.success(), True, "now"),
+            ProviderModel("provider-1", "embedding-1", "embedding", ProbeResult.success(), True, "now"),
+            ProviderModel("provider-1", "rerank-1", "rerank", ProbeResult.success(), True, "now"),
+        ),
         "now", "now", "now",
     )
 
@@ -52,11 +80,15 @@ def task_service_fixture(tmp_path, documents=()):
     class Providers:
         available = True
         generated_prompts = []
+        embedding_queries = []
+
+        def __init__(self) -> None:
+            self.provider = provider
 
         def resolve_specific_model(self, *_args):
             if not self.available:
                 raise ValueError("Model unavailable")
-            return ResolvedProviderModel(provider, provider.models[0])
+            return ResolvedProviderModel(self.provider, self.provider.models[0])
 
         def generate_chat(self, provider_id, model_id, prompt):
             if not self.available:
@@ -72,6 +104,18 @@ def task_service_fixture(tmp_path, documents=()):
             self.generated_prompts.append(prompt)
             yield "基于已冻结"
             yield "证据的结构化结论。"
+
+        def resolve_model(self, model_type):
+            assert model_type in {"embedding", "rerank"}
+            if not self.available:
+                raise ValueError("Model unavailable")
+            index = 1 if model_type == "embedding" else 2
+            return ResolvedProviderModel(self.provider, self.provider.models[index])
+
+        def create_embeddings(self, provider_id, model_id, inputs, *, expected_provider_updated_at):
+            assert (provider_id, model_id, expected_provider_updated_at) == ("provider-1", "embedding-1", "now")
+            self.embedding_queries.extend(inputs)
+            return ((1.0, 0.0),)
 
     class Policies:
         policy_revision = 1
@@ -125,9 +169,18 @@ def task_service_fixture(tmp_path, documents=()):
         def __init__(self) -> None:
             self.current = list(documents)
             self.lexical_queries = []
+            self.heading_queries = []
+            self.vector_queries = []
+            self.lexical_results = None
+            self.heading_results = None
+            self.vector_results = None
+            self.unit_card_lexical_results = None
+            self.unit_card_vector_results = None
+            self.unit_card_source_refs = []
+            self.semantic_status = "unavailable"
 
         def health(self, vault_id):
-            return IndexHealth(vault_id, "healthy", "now", len(self.current), 0, 0, "unavailable")
+            return IndexHealth(vault_id, "healthy", "now", len(self.current), 0, 0, self.semantic_status)
 
         def current_documents(self, _vault_id):
             return self.current
@@ -136,6 +189,8 @@ def task_service_fixture(tmp_path, documents=()):
             assert vault_id == vault.vault_id
             assert isinstance(query, LexicalQuery)
             self.lexical_queries.append(query)
+            if self.lexical_results is not None:
+                return self.lexical_results
             return [
                 BlockHit(document.document_id, document.relative_path, block, 1.0)
                 for document in self.current
@@ -143,11 +198,55 @@ def task_service_fixture(tmp_path, documents=()):
                 for block in document.blocks
             ]
 
+        def search_heading(self, vault_id, query):
+            assert vault_id == vault.vault_id
+            assert isinstance(query, HeadingQuery)
+            self.heading_queries.append(query)
+            return self.heading_results or []
+
+        def search_vector(self, vault_id, query):
+            assert vault_id == vault.vault_id
+            assert isinstance(query, VectorQuery)
+            self.vector_queries.append(query)
+            return self.vector_results or []
+
+        def search_unit_cards_lexical(self, vault_id, query):
+            assert vault_id == vault.vault_id
+            assert isinstance(query, LexicalQuery)
+            return self.unit_card_lexical_results or []
+
+        def search_unit_cards_vector(self, vault_id, query):
+            assert vault_id == vault.vault_id
+            assert isinstance(query, VectorQuery)
+            return self.unit_card_vector_results or []
+
+        def resolve_unit_card_sources(self, vault_id, _card_id, allowed_relative_paths):
+            assert vault_id == vault.vault_id
+            return [
+                reference
+                for reference in self.unit_card_source_refs
+                if reference.relative_path in allowed_relative_paths
+            ]
+
+        def filter_blocks(self, vault_id, filters):
+            assert vault_id == vault.vault_id
+            return [
+                IndexBlockRef(document.document_id, document.relative_path, block, metadata)
+                for document in self.current
+                if document.relative_path in filters.allowed_relative_paths
+                for block, metadata in zip(document.blocks, document.block_metadata, strict=True)
+                if metadata.scope_key == (filters.subject, filters.grade_volume, filters.unit_no)
+                and (filters.material_type is None or metadata.material_type == filters.material_type)
+            ]
+
     repository = SqliteSessionRepository(tmp_path / "sessions.sqlite3")
     vaults, providers, policies, indexes = Vaults(), Providers(), Policies(), Indexes()
     service = SessionService(
         repository, vault_service=vaults, provider_service=providers, policy_service=policies,
         index_repository=indexes,
+        hybrid_retrieval_enabled=hybrid_retrieval_enabled,
+        reranker=reranker,
+        rerank_retrieval_enabled=rerank_retrieval_enabled,
     )
     session = service.create("英语")
     service.update_context(
@@ -210,6 +309,177 @@ def test_session_records_survive_repository_reopen_and_delete_only_private_child
     with pytest.raises(KeyError):
         restarted.get_detail(session.session_id)
     assert database.exists()
+
+
+def test_query_scope_snapshot_migration_upgrades_old_session_databases_idempotently(tmp_path) -> None:
+    database = tmp_path / "sessions.sqlite3"
+    repository = SqliteSessionRepository(database)
+    with repository._connect() as connection:
+        connection.execute("DROP TABLE session_task_snapshots")
+        connection.execute(
+            """CREATE TABLE session_task_snapshots (
+                snapshot_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                intent TEXT NOT NULL,
+                intent_source TEXT NOT NULL,
+                vault_id TEXT NOT NULL,
+                scope_kind TEXT NOT NULL,
+                scope_path TEXT,
+                provider_id TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                index_status TEXT NOT NULL,
+                index_updated_at TEXT,
+                index_digest TEXT NOT NULL,
+                policy_revision INTEGER NOT NULL,
+                exclusion_summary TEXT NOT NULL,
+                outbound_mode TEXT NOT NULL,
+                outbound_scope_summary TEXT NOT NULL,
+                source_count INTEGER NOT NULL,
+                source_digest TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                invalidation_reason TEXT
+            )"""
+        )
+        connection.execute(
+            "DELETE FROM session_repository_migrations WHERE migration_id = ?",
+            ("ret-05-02-session-task-query-scope-v1",),
+        )
+
+    SqliteSessionRepository(database)
+    SqliteSessionRepository(database)
+
+    with sqlite3.connect(database) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(session_task_snapshots)")}
+        assert {
+            "query_scope_subject",
+            "query_scope_grade_volume",
+            "query_scope_unit_no",
+            "query_scope_material_type",
+        } <= columns
+        assert connection.execute(
+            "SELECT COUNT(*) FROM session_repository_migrations WHERE migration_id = ?",
+            ("ret-05-02-session-task-query-scope-v1",),
+        ).fetchone()[0] == 1
+
+
+def test_completeness_coverage_kind_migration_upgrades_old_session_databases_idempotently(tmp_path) -> None:
+    database = tmp_path / "sessions.sqlite3"
+    repository = SqliteSessionRepository(database)
+    with repository._connect() as connection:
+        connection.execute("DROP TABLE session_task_snapshot_coverage_items")
+        connection.execute(
+            """CREATE TABLE session_task_snapshot_coverage_items (
+                snapshot_id TEXT NOT NULL REFERENCES session_task_snapshots(snapshot_id) ON DELETE CASCADE,
+                ordinal INTEGER NOT NULL,
+                identity_kind TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                content_sha256 TEXT NOT NULL,
+                source_id TEXT,
+                source_content_hash TEXT,
+                source_path TEXT,
+                heading TEXT,
+                location TEXT NOT NULL,
+                page INTEGER,
+                excerpt TEXT,
+                disposition TEXT NOT NULL,
+                reason TEXT,
+                PRIMARY KEY (snapshot_id, ordinal)
+            )"""
+        )
+        connection.execute(
+            "DELETE FROM session_repository_migrations WHERE migration_id = ?",
+            ("ret-05-03-session-completeness-coverage-kind-v1",),
+        )
+
+    SqliteSessionRepository(database)
+    SqliteSessionRepository(database)
+
+    with sqlite3.connect(database) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(session_task_snapshot_coverage_items)")
+        }
+        assert "knowledge_kind" in columns
+        assert connection.execute(
+            "SELECT COUNT(*) FROM session_repository_migrations WHERE migration_id = ?",
+            ("ret-05-03-session-completeness-coverage-kind-v1",),
+        ).fetchone()[0] == 1
+
+
+def test_ret_05_04_migrations_upgrade_legacy_coverage_and_results_idempotently(tmp_path) -> None:
+    database = tmp_path / "sessions.sqlite3"
+    repository = SqliteSessionRepository(database)
+    with repository._connect() as connection:
+        connection.execute("DROP TABLE session_task_snapshot_coverage_items")
+        connection.execute(
+            """CREATE TABLE session_task_snapshot_coverage_items (
+                snapshot_id TEXT NOT NULL REFERENCES session_task_snapshots(snapshot_id) ON DELETE CASCADE,
+                ordinal INTEGER NOT NULL,
+                identity_kind TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                content_sha256 TEXT NOT NULL,
+                source_id TEXT,
+                source_content_hash TEXT,
+                source_path TEXT,
+                heading TEXT,
+                location TEXT NOT NULL,
+                page INTEGER,
+                excerpt TEXT,
+                disposition TEXT NOT NULL,
+                reason TEXT,
+                knowledge_kind TEXT NOT NULL DEFAULT 'other',
+                PRIMARY KEY (snapshot_id, ordinal)
+            )"""
+        )
+        connection.execute("DROP TABLE session_completeness_results")
+        connection.execute(
+            """CREATE TABLE session_completeness_results (
+                result_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                task_id TEXT NOT NULL,
+                snapshot_id TEXT NOT NULL REFERENCES session_task_snapshots(snapshot_id) ON DELETE CASCADE,
+                status TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                recovery_action TEXT,
+                processed_ordinals_json TEXT NOT NULL,
+                outcomes_json TEXT NOT NULL DEFAULT '[]',
+                duration_ms INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(session_id, task_id)
+            )"""
+        )
+        connection.executemany(
+            "DELETE FROM session_repository_migrations WHERE migration_id = ?",
+            [
+                ("ret-05-04-session-completeness-coverage-block-v1",),
+                ("ret-05-04-session-completeness-candidates-v1",),
+            ],
+        )
+
+    SqliteSessionRepository(database)
+    SqliteSessionRepository(database)
+
+    with sqlite3.connect(database) as connection:
+        coverage_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(session_task_snapshot_coverage_items)")
+        }
+        result_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(session_completeness_results)")
+        }
+        assert {"block_content_sha256", "token_estimate"} <= coverage_columns
+        assert "candidate_duplicate_clusters_json" in result_columns
+        for migration_id in (
+            "ret-05-04-session-completeness-coverage-block-v1",
+            "ret-05-04-session-completeness-candidates-v1",
+        ):
+            assert connection.execute(
+                "SELECT COUNT(*) FROM session_repository_migrations WHERE migration_id = ?",
+                (migration_id,),
+            ).fetchone()[0] == 1
 
 
 def test_session_service_creates_isolated_defaults_and_enforces_bounded_listing(tmp_path) -> None:
@@ -461,6 +731,213 @@ def test_task_preview_classifies_intent_and_confirms_an_immutable_source_snapsho
     assert restarted.task_states[0].snapshot_id == snapshot.snapshot_id
 
 
+def test_task_preview_reports_confirmed_query_scope_counts_and_gaps(tmp_path) -> None:
+    def document(
+        document_id: str, relative_path: str, *, unit_no: int, material_type: str, block_count: int
+    ) -> IndexedDocument:
+        blocks = tuple(
+            IndexBlock(sequence, f"heading: Unit {unit_no}", f"block {sequence}")
+            for sequence in range(1, block_count + 1)
+        )
+        metadata = tuple(
+            IndexBlockMetadata(
+                sequence=block.sequence,
+                subject="英语",
+                grade_volume="七年级上册",
+                unit_no=unit_no,
+                material_type=material_type,
+                meta_origin="rule",
+                meta_confidence=0.95,
+                meta_status="accepted",
+            )
+            for block in blocks
+        )
+        return IndexedDocument(
+            document_id=document_id,
+            vault_id="vault-1",
+            relative_path=relative_path,
+            content_sha256="a" * 64,
+            document_kind="native",
+            heading_locations=("heading: Unit",),
+            links=(),
+            tags=(),
+            blocks=blocks,
+            indexed_at="now",
+            block_metadata=metadata,
+        )
+
+    service, repository, session, _, _, _, _ = task_service_fixture(
+        tmp_path,
+        (
+            document("textbook", "notes/textbook.md", unit_no=1, material_type="textbook", block_count=2),
+            document("workbook", "notes/workbook.md", unit_no=1, material_type="workbook", block_count=1),
+            document("other", "notes/other.md", unit_no=2, material_type="textbook", block_count=1),
+        ),
+    )
+
+    incomplete = service.preview_task(session.session_id, "整理英语第一单元知识点")
+    confirmed = service.preview_task(
+        session.session_id,
+        "整理英语第一单元知识点",
+        query_scope=QueryScopeSelection("英语", "七年级上册", 1, None),
+    )
+
+    assert incomplete.scope_preview.is_confirmed is False
+    assert incomplete.scope_preview.gaps == ("缺少册次。",)
+    assert confirmed.scope_preview.is_confirmed is True
+    assert confirmed.scope_preview.document_count == 2
+    assert confirmed.scope_preview.block_count == 3
+    assert [
+        (item.material_type, item.document_count, item.block_count)
+        for item in confirmed.scope_preview.material_types
+    ] == [("textbook", 1, 2), ("workbook", 1, 1)]
+    assert confirmed.scope_preview.gaps == ()
+    snapshot = service.create_task(
+        session.session_id,
+        "整理英语第一单元知识点",
+        query_scope=QueryScopeSelection("英语", "七年级上册", 1, None),
+    )
+    restarted = SqliteSessionRepository(repository.database_path).get_detail(session.session_id)
+
+    assert snapshot.query_scope_subject == "英语"
+    assert snapshot.query_scope_grade_volume == "七年级上册"
+    assert snapshot.query_scope_unit_no == 1
+    assert restarted.task_snapshots[0].query_scope_material_type is None
+
+
+def test_completeness_uses_confirmed_scope_for_full_enumeration_and_bucketing(tmp_path) -> None:
+    def document(
+        document_id: str,
+        relative_path: str,
+        unit_no: int,
+        *blocks: IndexBlock,
+    ) -> IndexedDocument:
+        metadata = tuple(
+            IndexBlockMetadata(
+                sequence=block.sequence,
+                subject="英语",
+                grade_volume="七年级上册",
+                unit_no=unit_no,
+                material_type="textbook",
+                meta_origin="rule",
+                meta_confidence=0.95,
+                meta_status="accepted",
+            )
+            for block in blocks
+        )
+        return IndexedDocument(
+            document_id,
+            "vault-1",
+            relative_path,
+            document_id[0] * 64,
+            "native",
+            (),
+            (),
+            (),
+            blocks,
+            "now",
+            block_metadata=metadata,
+        )
+
+    selected_blocks = (
+        IndexBlock(1, "heading: Grammar Focus", "be verbs", heading_path=("Unit 1", "Grammar Focus")),
+        IndexBlock(2, "heading: Words and Expressions", "hello", heading_path=("Unit 1", "Words and Expressions")),
+        IndexBlock(3, "heading: Culture", "school life", heading_path=("Unit 1", "Culture")),
+        *(
+            IndexBlock(
+                sequence,
+                "heading: Culture",
+                f"school life {sequence}",
+                heading_path=("Unit 1", "Culture"),
+            )
+            for sequence in range(4, 10)
+        ),
+    )
+    documents = (
+        document(
+            "a-textbook",
+            "notes/unit-1.md",
+            1,
+            *selected_blocks,
+        ),
+        document(
+            "b-other-unit",
+            "notes/unit-2.md",
+            2,
+            IndexBlock(1, "heading: Grammar Focus", "present tense", heading_path=("Unit 2", "Grammar Focus")),
+        ),
+    )
+    service, repository, session, _, _, _, _ = task_service_fixture(tmp_path, documents)
+    selection = QueryScopeSelection("英语", "七年级上册", 1, None)
+
+    snapshot = service.create_task(
+        session.session_id,
+        "列出第一单元全部内容",
+        query_scope=selection,
+    )
+    result = service.execute_task(session.session_id, snapshot.task_id)
+    restarted = SqliteSessionRepository(repository.database_path).get_detail(session.session_id)
+
+    assert [item.relative_path for item in snapshot.coverage_items] == ["notes/unit-1.md"] * 9
+    assert [item.knowledge_kind for item in snapshot.coverage_items] == [
+        "grammar",
+        "vocabulary",
+        *("other" for _ in range(7)),
+    ]
+    assert result.status == "complete"
+    assert result.processed_ordinals == tuple(range(1, 10))
+    assert [item.knowledge_kind for item in restarted.task_snapshots[0].coverage_items] == [
+        "grammar",
+        "vocabulary",
+        *("other" for _ in range(7)),
+    ]
+
+
+def test_completeness_records_explicit_gaps_when_a_planning_budget_is_exceeded(tmp_path) -> None:
+    blocks = (
+        IndexBlock(1, "heading: Grammar Focus", "be verbs", heading_path=("Unit 1", "Grammar Focus")),
+        IndexBlock(2, "heading: Exercises", "choose", heading_path=("Unit 1", "Exercises")),
+    )
+    document = IndexedDocument(
+        "native-1",
+        "vault-1",
+        "notes/unit-1.md",
+        "a" * 64,
+        "native",
+        (),
+        (),
+        (),
+        blocks,
+        "now",
+        block_metadata=tuple(
+            IndexBlockMetadata(
+                block.sequence,
+                "英语",
+                "七年级上册",
+                1,
+                "textbook",
+                "rule",
+                0.95,
+                "accepted",
+            )
+            for block in blocks
+        ),
+    )
+    service, _, session, _, _, _, _ = task_service_fixture(tmp_path, (document,))
+    sources = service._snapshot_sources(service.get(session.session_id), "vault-1")
+    scope_filter = RetrievalMetadata(
+        "英语", "七年级上册", 1, None, "resolved", "user-confirmed-scope"
+    )
+
+    items = service._scoped_completeness_coverage_items(
+        "vault-1", scope_filter, sources, coverage_item_budget=1
+    )
+
+    assert [item.disposition for item in items] == ["planned", "uncovered"]
+    assert items[1].knowledge_kind == "exercise"
+    assert items[1].reason == "超出本次处理预算，尚未覆盖。"
+
+
 def test_task_snapshot_is_invalidated_when_context_changes(tmp_path) -> None:
     class Vaults:
         def get(self, vault_id):
@@ -691,6 +1168,79 @@ def test_source_lookup_limits_lexical_hits_to_snapshot_scope_and_policy(tmp_path
     assert indexes.lexical_queries[-1].allowed_relative_paths == ("notes/visible.md",)
 
 
+def test_unit_card_retrieval_expands_only_original_card_sources_as_evidence(tmp_path) -> None:
+    first = IndexBlock(1, "heading: Unit 1", "Grammar source evidence")
+    second = IndexBlock(2, "heading: Unit 1", "Vocabulary source evidence")
+    metadata = (
+        IndexBlockMetadata(1, "english", "7a", 1, "textbook", "human", 1.0, "accepted"),
+        IndexBlockMetadata(2, "english", "7a", 1, "textbook", "human", 1.0, "accepted"),
+    )
+    document = IndexedDocument(
+        "native-1",
+        "vault-1",
+        "notes/unit-01.md",
+        "a" * 64,
+        "native",
+        (),
+        (),
+        (),
+        (first, second),
+        "now",
+        block_metadata=metadata,
+    )
+    service, _, session, _, _, _, indexes = task_service_fixture(tmp_path, (document,))
+    source = UnitCardSource(
+        "native-1",
+        document.relative_path,
+        1,
+        first.block_content_sha256,
+        "candidate-a",
+        "grammar",
+        ("subject verb agreement",),
+    )
+    second_source = UnitCardSource(
+        "native-1",
+        document.relative_path,
+        2,
+        second.block_content_sha256,
+        "candidate-b",
+        "vocabulary",
+        ("friendship words",),
+    )
+    card_text = "english 7a Unit 1\ngrammar: subject verb agreement"
+    card = UnitCard(
+        "unit-card:fixture",
+        "vault-1",
+        UnitCardScope("english", "7a", 1),
+        "a" * 64,
+        sha256(card_text.encode("utf-8")).hexdigest(),
+        card_text,
+        (source, second_source),
+        "chat-provider",
+        "chat-model",
+        "revision-a",
+        "now",
+    )
+    indexes.lexical_results = []
+    indexes.unit_card_lexical_results = [UnitCardHit(card, 1.0, "unit-card-lexical")]
+    indexes.unit_card_source_refs = [
+        IndexBlockRef(document.document_id, document.relative_path, first, metadata[0]),
+        IndexBlockRef(document.document_id, document.relative_path, second, metadata[1]),
+    ]
+    service.unit_card_retrieval_enabled = True
+    snapshot = service.create_task(session.session_id, "第一单元讲了什么", intent="source-lookup")
+
+    result = service.execute_task(session.session_id, snapshot.task_id)
+
+    assert result.status == "completed"
+    assert [evidence.excerpt for evidence in result.evidences] == [
+        "Grammar source evidence",
+        "Vocabulary source evidence",
+    ]
+    assert {evidence.matched_channels for evidence in result.evidences} == {("unit-card",)}
+    assert all(evidence.relative_path == document.relative_path for evidence in result.evidences)
+
+
 def test_source_lookup_fails_closed_when_lexical_retrieval_is_disabled(tmp_path) -> None:
     document = IndexedDocument(
         "native-1", "vault-1", "notes/unit.md", "a" * 64, "native", (), (), (),
@@ -704,6 +1254,540 @@ def test_source_lookup_fails_closed_when_lexical_retrieval_is_disabled(tmp_path)
 
     assert result.status == "no-evidence"
     assert result.recovery_action == "启用本机词法检索后重新准备任务。"
+
+
+def test_hybrid_source_lookup_uses_an_independent_semantic_channel_without_prompt(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1",
+        "vault-1",
+        "notes/unit.md",
+        "a" * 64,
+        "native",
+        (),
+        (),
+        (),
+        (
+            IndexBlock(1, "heading: Context", "context before the concept"),
+            IndexBlock(2, "heading: Target", "semantic target evidence"),
+            IndexBlock(3, "heading: Follow-up", "context after the concept"),
+        ),
+        "now",
+    )
+    service, _, session, _, providers, policies, indexes = task_service_fixture(tmp_path, (document,))
+    service.hybrid_retrieval_enabled = True
+    indexes.semantic_status = "partial"
+    indexes.lexical_results = []
+    indexes.vector_results = [BlockHit(document.document_id, document.relative_path, document.blocks[1], 1.0)]
+    snapshot = service.create_task(session.session_id, "改写后的概念问题", intent="source-lookup")
+
+    result = service.execute_task(session.session_id, snapshot.task_id)
+
+    assert result.status == "completed"
+    assert result.evidences[0].excerpt == "semantic target evidence"
+    assert result.evidences[0].matched_channels == ("semantic",)
+    assert {evidence.matched_channels for evidence in result.evidences[1:]} == {("neighborhood",)}
+    assert providers.embedding_queries == ["改写后的概念问题"]
+    assert len(indexes.lexical_queries) == 1
+    assert len(indexes.heading_queries) == 1
+    assert len(indexes.vector_queries) == 1
+    assert policies.authorizations == {}
+
+
+class _FixtureReranker:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple, object]] = []
+
+    def rerank(self, query, candidates, *, target):
+        self.calls.append((query, candidates, target))
+        return RerankResponse(
+            tuple(
+                RerankScore(candidate.candidate_id, 1.0 - ordinal / 100)
+                for ordinal, candidate in enumerate(reversed(candidates), start=1)
+            )
+        )
+
+
+class _BlockingFixtureReranker(_FixtureReranker):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = Event()
+        self.release = Event()
+
+    def rerank(self, query, candidates, *, target):
+        self.calls.append((query, candidates, target))
+        self.started.set()
+        assert self.release.wait(2)
+        return RerankResponse(
+            tuple(
+                RerankScore(candidate.candidate_id, 1.0 - ordinal / 100)
+                for ordinal, candidate in enumerate(candidates, start=1)
+            )
+        )
+
+
+class _PreflightFailureReranker:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def rerank(self, query, candidates, *, target):
+        self.calls += 1
+        raise RerankerExecutionError("Rerank preflight failed.", network_request_count=0)
+
+
+def test_authorized_rerank_reorders_rrf_before_neighborhood_expansion_and_persists_audit(
+    tmp_path,
+) -> None:
+    blocks = tuple(
+        IndexBlock(
+            ordinal,
+            f"heading: Unit 1; block: {ordinal}",
+            f"evidence {ordinal}",
+            heading_path=("Unit 1",),
+        )
+        for ordinal in range(1, 6)
+    )
+    document = IndexedDocument(
+        "native-1",
+        "vault-1",
+        "notes/unit.md",
+        "a" * 64,
+        "native",
+        (),
+        (),
+        ("grammar",),
+        blocks,
+        "now",
+    )
+    reranker = _FixtureReranker()
+    service, repository, session, _, _, policies, _ = task_service_fixture(
+        tmp_path,
+        (document,),
+        hybrid_retrieval_enabled=True,
+        reranker=reranker,
+        rerank_retrieval_enabled=True,
+    )
+    policies.outbound_mode = "ask-each-task"
+    snapshot = service.create_task(session.session_id, "What is in Unit 1?", intent="source-lookup")
+
+    preview, authorization = service.prepare_rerank_authorization(session.session_id, snapshot.task_id)
+
+    assert preview.is_authorizable is True
+    assert preview.candidate_count == 5
+    assert preview.model_id == "rerank-1"
+    assert preview.content_categories == ("query", "block-text")
+    assert authorization is not None and authorization.status == "pending"
+    approved = policies.confirm_outbound_authorization(
+        "vault-1", authorization.authorization_id, approved=True
+    )
+
+    result = service.execute_task(
+        session.session_id,
+        snapshot.task_id,
+        rerank_authorization_id=approved.authorization_id,
+    )
+    restarted = SqliteSessionRepository(repository.database_path).get_detail(session.session_id)
+
+    assert result.rerank_status == "completed"
+    assert result.rerank_authorization_id == approved.authorization_id
+    assert result.rerank_network_request_count == 1
+    assert result.rerank_duration_ms >= 0
+    assert [evidence.excerpt for evidence in result.evidences] == [
+        "evidence 5",
+        "evidence 4",
+        "evidence 3",
+        "evidence 2",
+        "evidence 1",
+    ]
+    assert result.evidences[-1].matched_channels == ("neighborhood",)
+    assert len(reranker.calls) == 1
+    candidates = reranker.calls[0][1]
+    assert [candidate.candidate_id for candidate in candidates] == [
+        "candidate01",
+        "candidate02",
+        "candidate03",
+        "candidate04",
+        "candidate05",
+    ]
+    assert all("native-1" not in candidate.candidate_id for candidate in candidates)
+    assert restarted.retrieval_results[0].rerank_status == "completed"
+    assert restarted.retrieval_results[0].rerank_network_request_count == 1
+
+
+def test_rerank_excludes_never_send_cloud_candidates_but_can_authorize_remaining_candidates(
+    tmp_path,
+) -> None:
+    visible = IndexedDocument(
+        "visible",
+        "vault-1",
+        "notes/visible.md",
+        "a" * 64,
+        "native",
+        (),
+        (),
+        (),
+        (IndexBlock(1, "heading: Visible", "visible candidate", heading_path=("Visible",)),),
+        "now",
+    )
+    private = IndexedDocument(
+        "private",
+        "vault-1",
+        "notes/private.md",
+        "b" * 64,
+        "native",
+        (),
+        (),
+        (),
+        (IndexBlock(1, "heading: Private", "private candidate", heading_path=("Private",)),),
+        "now",
+    )
+    reranker = _FixtureReranker()
+    service, _, session, _, _, policies, _ = task_service_fixture(
+        tmp_path,
+        (visible, private),
+        hybrid_retrieval_enabled=True,
+        reranker=reranker,
+        rerank_retrieval_enabled=True,
+    )
+    policies.outbound_mode = "ask-each-task"
+    policies.preview = lambda _vault_id, _source_path, derived_path, stage: PolicyEvaluation(
+        stage != "outbound" or derived_path != "notes/private.md", stage, (), (), "fixture"
+    )
+    snapshot = service.create_task(session.session_id, "visible candidate", intent="source-lookup")
+
+    preview, authorization = service.prepare_rerank_authorization(session.session_id, snapshot.task_id)
+
+    assert preview.is_authorizable is True
+    assert (preview.candidate_count, preview.blocked_candidate_count) == (1, 1)
+    assert authorization is not None
+    approved = policies.confirm_outbound_authorization(
+        "vault-1", authorization.authorization_id, approved=True
+    )
+    result = service.execute_task(
+        session.session_id,
+        snapshot.task_id,
+        rerank_authorization_id=approved.authorization_id,
+    )
+
+    assert result.rerank_status == "completed"
+    assert len(reranker.calls) == 1
+    assert [candidate.text for candidate in reranker.calls[0][1]] == ["visible candidate"]
+
+
+@pytest.mark.parametrize(
+    "unsafe_value",
+    (r"\\server\share\private.md", r"\\?\C:\private.md", r"\Windows\private.md", "file:///C:/private.md", "/etc/private.md"),
+)
+def test_rerank_path_hygiene_never_sends_absolute_path_projections(tmp_path, unsafe_value) -> None:
+    document = IndexedDocument(
+        "native-1",
+        "vault-1",
+        "notes/unit.md",
+        "a" * 64,
+        "native",
+        (),
+        (),
+        (),
+        (IndexBlock(1, "heading: Unit", unsafe_value, heading_path=("Unit",)),),
+        "now",
+    )
+    reranker = _FixtureReranker()
+    service, _, session, _, _, _, _ = task_service_fixture(
+        tmp_path,
+        (document,),
+        hybrid_retrieval_enabled=True,
+        reranker=reranker,
+        rerank_retrieval_enabled=True,
+    )
+    snapshot = service.create_task(session.session_id, "find the item", intent="source-lookup")
+
+    preview, authorization = service.prepare_rerank_authorization(session.session_id, snapshot.task_id)
+    result = service.execute_task(
+        session.session_id,
+        snapshot.task_id,
+        rerank_authorization_id="authorization-not-issued",
+    )
+
+    assert preview.is_authorizable is False
+    assert authorization is None
+    assert result.rerank_status == "blocked"
+    assert reranker.calls == []
+
+
+@pytest.mark.parametrize("unsafe_field", ("query", "heading", "tag"))
+def test_rerank_path_hygiene_checks_query_heading_and_tags(tmp_path, unsafe_field) -> None:
+    unsafe_value = r"\\server\share\private.md"
+    heading_path = (unsafe_value,) if unsafe_field == "heading" else ("Unit",)
+    tags = (unsafe_value,) if unsafe_field == "tag" else ()
+    document = IndexedDocument(
+        "native-1",
+        "vault-1",
+        "notes/unit.md",
+        "a" * 64,
+        "native",
+        (),
+        (),
+        tags,
+        (IndexBlock(1, "heading: Unit", "safe candidate", heading_path=heading_path),),
+        "now",
+    )
+    reranker = _FixtureReranker()
+    service, _, session, _, _, _, _ = task_service_fixture(
+        tmp_path,
+        (document,),
+        hybrid_retrieval_enabled=True,
+        reranker=reranker,
+        rerank_retrieval_enabled=True,
+    )
+    query = unsafe_value if unsafe_field == "query" else "find the item"
+    snapshot = service.create_task(session.session_id, query, intent="source-lookup")
+
+    preview, authorization = service.prepare_rerank_authorization(session.session_id, snapshot.task_id)
+
+    assert preview.is_authorizable is False
+    assert authorization is None
+    assert reranker.calls == []
+
+
+def test_unconfirmed_rerank_authorization_keeps_local_rrf_without_a_provider_call(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1",
+        "vault-1",
+        "notes/unit.md",
+        "a" * 64,
+        "native",
+        (),
+        (),
+        (),
+        (IndexBlock(1, "heading: Unit", "local candidate", heading_path=("Unit",)),),
+        "now",
+    )
+    reranker = _FixtureReranker()
+    service, _, session, _, _, policies, _ = task_service_fixture(
+        tmp_path,
+        (document,),
+        hybrid_retrieval_enabled=True,
+        reranker=reranker,
+        rerank_retrieval_enabled=True,
+    )
+    policies.outbound_mode = "ask-each-task"
+    snapshot = service.create_task(session.session_id, "local candidate", intent="source-lookup")
+    _preview, authorization = service.prepare_rerank_authorization(session.session_id, snapshot.task_id)
+
+    result = service.execute_task(
+        session.session_id,
+        snapshot.task_id,
+        rerank_authorization_id=authorization.authorization_id,
+    )
+
+    assert result.rerank_status == "authorization-invalid"
+    assert result.rerank_network_request_count == 0
+    assert [evidence.excerpt for evidence in result.evidences] == ["local candidate"]
+    assert reranker.calls == []
+
+
+def test_rerank_preflight_failure_records_no_network_request(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1",
+        "vault-1",
+        "notes/unit.md",
+        "a" * 64,
+        "native",
+        (),
+        (),
+        (),
+        (IndexBlock(1, "heading: Unit", "local candidate", heading_path=("Unit",)),),
+        "now",
+    )
+    reranker = _PreflightFailureReranker()
+    service, _, session, _, _, policies, _ = task_service_fixture(
+        tmp_path,
+        (document,),
+        hybrid_retrieval_enabled=True,
+        reranker=reranker,
+        rerank_retrieval_enabled=True,
+    )
+    policies.outbound_mode = "ask-each-task"
+    snapshot = service.create_task(session.session_id, "local candidate", intent="source-lookup")
+    _preview, authorization = service.prepare_rerank_authorization(session.session_id, snapshot.task_id)
+    approved = policies.confirm_outbound_authorization(
+        "vault-1", authorization.authorization_id, approved=True
+    )
+
+    result = service.execute_task(
+        session.session_id,
+        snapshot.task_id,
+        rerank_authorization_id=approved.authorization_id,
+    )
+
+    assert result.rerank_status == "failed"
+    assert result.rerank_network_request_count == 0
+    assert reranker.calls == 1
+
+
+def test_changed_rerank_provider_revision_keeps_local_rrf_without_a_provider_call(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1",
+        "vault-1",
+        "notes/unit.md",
+        "a" * 64,
+        "native",
+        (),
+        (),
+        (),
+        (IndexBlock(1, "heading: Unit", "local candidate", heading_path=("Unit",)),),
+        "now",
+    )
+    reranker = _FixtureReranker()
+    service, _, session, _, providers, policies, _ = task_service_fixture(
+        tmp_path,
+        (document,),
+        hybrid_retrieval_enabled=True,
+        reranker=reranker,
+        rerank_retrieval_enabled=True,
+    )
+    policies.outbound_mode = "ask-each-task"
+    snapshot = service.create_task(session.session_id, "local candidate", intent="source-lookup")
+    _preview, authorization = service.prepare_rerank_authorization(session.session_id, snapshot.task_id)
+    approved = policies.confirm_outbound_authorization(
+        "vault-1", authorization.authorization_id, approved=True
+    )
+    providers.provider = replace(providers.provider, updated_at="provider-revision-changed")
+
+    result = service.execute_task(
+        session.session_id,
+        snapshot.task_id,
+        rerank_authorization_id=approved.authorization_id,
+    )
+
+    assert result.rerank_status == "authorization-invalid"
+    assert result.rerank_network_request_count == 0
+    assert [evidence.excerpt for evidence in result.evidences] == ["local candidate"]
+    assert reranker.calls == []
+
+
+def test_concurrent_rerank_execution_sends_only_one_provider_request(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1",
+        "vault-1",
+        "notes/unit.md",
+        "a" * 64,
+        "native",
+        (),
+        (),
+        (),
+        (IndexBlock(1, "heading: Unit", "local candidate", heading_path=("Unit",)),),
+        "now",
+    )
+    reranker = _BlockingFixtureReranker()
+    service, _, session, _, _, policies, _ = task_service_fixture(
+        tmp_path,
+        (document,),
+        hybrid_retrieval_enabled=True,
+        reranker=reranker,
+        rerank_retrieval_enabled=True,
+    )
+    policies.outbound_mode = "ask-each-task"
+    snapshot = service.create_task(session.session_id, "local candidate", intent="source-lookup")
+    _preview, authorization = service.prepare_rerank_authorization(session.session_id, snapshot.task_id)
+    approved = policies.confirm_outbound_authorization(
+        "vault-1", authorization.authorization_id, approved=True
+    )
+    fused, _unit_cards, _semantic_sent, _semantic_unavailable = service._hybrid_fused_candidates(
+        snapshot.vault_id,
+        "local candidate",
+        (document.relative_path,),
+        include_unit_cards=False,
+        limit=20,
+    )
+    first_result: dict[str, tuple] = {}
+    first = Thread(
+        target=lambda: first_result.setdefault(
+            "value",
+            service._apply_authorized_rerank(
+                snapshot,
+                "local candidate",
+                fused,
+                {document.document_id: document},
+                approved.authorization_id,
+            ),
+        )
+    )
+    first.start()
+    assert reranker.started.wait(2)
+
+    second = service._apply_authorized_rerank(
+        snapshot,
+        "local candidate",
+        fused,
+        {document.document_id: document},
+        approved.authorization_id,
+    )
+    reranker.release.set()
+    first.join(2)
+
+    assert second[1] == "concurrent"
+    assert first_result["value"][1] == "completed"
+    assert len(reranker.calls) == 1
+
+
+def test_concurrent_rerank_task_execution_cannot_overwrite_external_audit(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1",
+        "vault-1",
+        "notes/unit.md",
+        "a" * 64,
+        "native",
+        (),
+        (),
+        (),
+        (IndexBlock(1, "heading: Unit", "local candidate", heading_path=("Unit",)),),
+        "now",
+    )
+    reranker = _BlockingFixtureReranker()
+    service, repository, session, _, _, policies, _ = task_service_fixture(
+        tmp_path,
+        (document,),
+        hybrid_retrieval_enabled=True,
+        reranker=reranker,
+        rerank_retrieval_enabled=True,
+    )
+    policies.outbound_mode = "ask-each-task"
+    snapshot = service.create_task(session.session_id, "local candidate", intent="source-lookup")
+    _preview, authorization = service.prepare_rerank_authorization(session.session_id, snapshot.task_id)
+    approved = policies.confirm_outbound_authorization(
+        "vault-1", authorization.authorization_id, approved=True
+    )
+    first_result: dict[str, object] = {}
+    first = Thread(
+        target=lambda: first_result.setdefault(
+            "value",
+            service.execute_task(
+                session.session_id,
+                snapshot.task_id,
+                rerank_authorization_id=approved.authorization_id,
+            ),
+        )
+    )
+    first.start()
+    assert reranker.started.wait(2)
+
+    with pytest.raises(SessionValidationError, match="正在执行候选重排"):
+        service.execute_task(
+            session.session_id,
+            snapshot.task_id,
+            rerank_authorization_id=approved.authorization_id,
+        )
+
+    reranker.release.set()
+    first.join(2)
+
+    persisted = repository.get_detail(session.session_id).retrieval_results
+    assert not first.is_alive()
+    assert first_result["value"].rerank_status == "completed"
+    assert len(reranker.calls) == 1
+    assert [(result.rerank_status, result.rerank_network_request_count) for result in persisted] == [
+        ("completed", 1)
+    ]
 
 
 def test_completed_turn_keeps_its_snapshot_and_requires_reverification_after_edit(tmp_path) -> None:
@@ -1081,6 +2165,42 @@ def test_completeness_processes_batches_and_merges_duplicate_evidence(tmp_path) 
     assert [(outcome.status, outcome.evidence_ordinal) for outcome in result.outcomes] == [
         ("processed", 1), ("duplicate", 1)
     ]
+
+
+def test_completeness_exact_deduplication_keeps_sources_and_exposes_conservative_candidates(tmp_path) -> None:
+    documents = (
+        IndexedDocument(
+            "native-1", "vault-1", "notes/a.md", "a" * 64, "native", (), (), (),
+            (IndexBlock(1, "heading: Greetings and introductions", "same exact evidence"),), "now",
+        ),
+        IndexedDocument(
+            "native-2", "vault-1", "notes/b.md", "b" * 64, "native", (), (), (),
+            (IndexBlock(1, "heading: Greeting dialogue review", "different evidence"),), "now",
+        ),
+        IndexedDocument(
+            "native-3", "vault-1", "notes/c.md", "c" * 64, "native", (), (), (),
+            (IndexBlock(1, "heading: Greetings and introductions", "same exact evidence"),), "now",
+        ),
+    )
+    service, repository, session, *_ = task_service_fixture(tmp_path, documents)
+
+    snapshot = service.create_task(session.session_id, "列出全部资料", intent="completeness")
+    result = service.execute_task(session.session_id, snapshot.task_id)
+    restarted = SqliteSessionRepository(tmp_path / "sessions.sqlite3").get_detail(session.session_id)
+
+    assert result.status == "complete"
+    assert [(item.ordinal, item.block_content_sha256) for item in snapshot.coverage_items] == [
+        (1, snapshot.coverage_items[0].block_content_sha256),
+        (2, snapshot.coverage_items[1].block_content_sha256),
+        (3, snapshot.coverage_items[0].block_content_sha256),
+    ]
+    assert [(outcome.ordinal, outcome.status, outcome.evidence_ordinal) for outcome in result.outcomes] == [
+        (1, "processed", 1),
+        (2, "processed", 2),
+        (3, "duplicate", 1),
+    ]
+    assert result.candidate_duplicate_clusters == ((1, 2, 3),)
+    assert restarted.completeness_results[0] == result
 
 
 def test_completeness_records_item_failures_without_marking_snapshot_complete(tmp_path) -> None:
