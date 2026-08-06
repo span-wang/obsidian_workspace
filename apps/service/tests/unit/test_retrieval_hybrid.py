@@ -1,5 +1,10 @@
 from domain.indexing import BlockHit, IndexBlock
-from domain.retrieval_hybrid import RRF_K, fuse_rrf, heading_query_prefixes
+from domain.retrieval_hybrid import (
+    RRF_K,
+    fuse_rrf,
+    heading_query_prefixes,
+    heading_scope_prefixes,
+)
 
 
 def _hit(document_id: str, sequence: int) -> BlockHit:
@@ -17,6 +22,23 @@ def test_heading_prefixes_preserve_unit_and_chinese_heading_predicates() -> None
     assert "unit1" in prefixes
     assert "u1" in prefixes
     assert "第一单元" in prefixes
+
+
+def test_heading_scope_prefixes_normalize_generic_structural_heading_aliases() -> None:
+    chapter_query = set(heading_scope_prefixes("请列出第二章的全部内容"))
+    chapter_heading = set(heading_scope_prefixes("Chapter 2 Methods"))
+    module_query = set(heading_scope_prefixes("整理第三模块的资料"))
+    module_heading = set(heading_scope_prefixes("Module 3 Reference"))
+
+    assert chapter_query & chapter_heading
+    assert module_query & module_heading
+
+
+def test_heading_prefixes_translate_chinese_unit_scope_to_heading_aliases() -> None:
+    prefixes = heading_query_prefixes("将第一单元单词短语发给我")
+
+    assert "unit1" in prefixes
+    assert "u1" in prefixes
 
 
 def test_rrf_keeps_a_semantic_only_hit_when_lexical_misses() -> None:

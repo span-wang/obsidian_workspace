@@ -350,7 +350,7 @@ class CommitJournal:
         if not self.task_id or not self.vault_id or not self.unit_id or not self.created_at:
             raise ValueError("Commit journal identity is invalid.")
         _validate_sha256(self.snapshot_digest, "Commit journal snapshot digest is invalid.")
-        if self.status not in {"prepared", "committed", "failed"}:
+        if self.status not in {"prepared", "committed", "failed", "rolled-back"}:
             raise ValueError("Commit journal status is invalid.")
 
     def to_dict(self) -> dict[str, object]:

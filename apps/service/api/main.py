@@ -13,7 +13,7 @@ from urllib.parse import quote
 from urllib.request import urlopen
 
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
@@ -23,6 +23,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from adapters.filesystem_vault_adapter import LocalVaultFilesystem
 from adapters.filesystem_vault_committer import LocalVaultCommitter
 from adapters.local_import_task_runner import LocalImportTaskRunner
+from adapters.local_import_upload_store import LocalImportUploadStore
 from adapters.openai_compatible_provider import OpenAiCompatibleProviderClient
 from adapters.sqlite_provider_repository import SqliteProviderRepository
 from adapters.sqlite_session_repository import SqliteSessionRepository
@@ -34,9 +35,9 @@ from adapters.windows_credential_manager import WindowsCredentialManager
 from adapters.windows_directory_picker import WindowsDirectoryPicker
 from adapters.windows_import_picker import WindowsImportPicker
 from application.directory_selections import DirectorySelectionError, DirectorySelectionStore
-from application.embedding_authorizations import (
-    EmbeddingAuthorizationService,
-    EmbeddingAuthorizationValidationError,
+from application.embedding_batches import (
+    EmbeddingBatchService,
+    EmbeddingBatchValidationError,
 )
 from application.embedding_service import EmbeddingExecutionError, EmbeddingService
 from application.import_selections import ImportSelectionError, ImportSelectionStore
@@ -44,54 +45,43 @@ from application.ingest import ImportTaskError, ImportTaskService
 from application.indexing import IndexingService
 from application.knowledge_graph import EmptyGraphCandidateRepository, KnowledgeGraphService
 from application.local_session import LocalSession, create_local_session
-from application.metadata_authorizations import (
-    MetadataAuthorizationService,
-    MetadataAuthorizationValidationError,
+from application.metadata_batches import (
+    MetadataBatchService,
+    MetadataBatchValidationError,
 )
 from application.metadata_service import MetadataExtractionError, MetadataExtractionService
 from application.provider_reranker import ProviderReranker
-from application.unit_card_authorizations import (
-    UnitCardAuthorizationService,
-    UnitCardAuthorizationValidationError,
+from application.unit_card_batches import (
+    UnitCardBatchService,
+    UnitCardBatchValidationError,
 )
 from application.unit_card_service import UnitCardExecutionError, UnitCardService
-from application.policies import (
-    OutboundAuthorizationDenied,
-    PolicyService,
-    PolicyValidationError,
-)
+from application.policies import PolicyService, PolicyValidationError
 from application.providers import (
     ProviderService,
     ProviderUnavailableError,
     ProviderValidationError,
 )
+from application.markdown_structuring import MarkdownStructuringService
 from application.sessions import SessionNotFoundError, SessionService, SessionValidationError
 from application.vaults import VaultConflictError, VaultService, VaultValidationError
+from ports.import_upload_store import ImportUploadStore, ImportUploadStoreError
 from workers.converters.artifact_store import PrivateArtifactStore
 from workers.converters.launcher import ProvisionedConversionLauncher
 from workers.converters.provisioning import ProvisionedProfiles, load_provisioned_profiles
 from api.errors import error_response
 from api.runtime import RuntimeState, initialize_runtime
-from domain.policies import (
-    ExclusionRule,
-    OutboundAuthorization,
-    OutboundScope,
-    PolicyEvaluation,
-    VaultPolicy,
-    normalize_vault_relative_path,
-)
-from domain.embedding_authorization import EmbeddingAuthorizationPreview, EmbeddingBatchScope
+from domain.policies import ExclusionRule, PolicyEvaluation, VaultPolicy, normalize_vault_relative_path
+from domain.embedding_batches import EmbeddingBatchScope
 from domain.embeddings import EmbeddingExecutionReport
 from domain.metadata_extraction import (
     MetadataAuditReport,
-    MetadataAuthorizationPreview,
     MetadataBatchScope,
     MetadataCandidate,
     MetadataExtractionReport,
     metadata_audit_report,
 )
-from domain.unit_card_authorization import (
-    UnitCardAuthorizationPreview,
+from domain.unit_card_batches import (
     UnitCardBatchScope,
     UnitCardExecutionReport,
 )
@@ -108,7 +98,7 @@ from domain.evidence import EvidenceLocator
 from domain.indexing import IndexBlock, IndexHealth
 from domain.review_commits import CommitJournal, ReviewSnapshot
 from domain.retrieval_query import QueryScopeSelection
-from domain.retrieval_rerank import RERANK_AUTHORIZATION_OPERATION, RerankAuthorizationPreview
+from domain.retrieval_hybrid import RETRIEVAL_MODES
 from domain.tasks import ImportTask, ImportTaskEvent, ImportTaskItem
 from domain.sessions import (
     MAX_SESSION_PAGE,
@@ -149,6 +139,8 @@ RETRIEVAL_CHUNKING_LAB_FORWARDED_HEADERS = frozenset(
 )
 LOCAL_SESSION_COOKIE_NAME = "obsidian_platform_session"
 DEFAULT_BROWSER_URL = f"http://{DEFAULT_HOST}:{DEFAULT_PORT}/"
+IMPORT_UPLOAD_CHUNK_BYTES = 1024 * 1024
+MAX_IMPORT_UPLOAD_FILE_BYTES = 512 * 1024 * 1024
 IMPORT_TASK_SSE_EVENT_NAMES = frozenset(
     {
         "scan-started",
@@ -288,13 +280,21 @@ class SessionTaskCommand(BaseModel):
     query_scope: SessionQueryScopeCommand | None = None
 
 
-class SessionTaskExecutionCommand(BaseModel):
+class SessionRunCommand(SessionTaskCommand):
+    vault_id: str
+    scope_kind: Literal["vault", "directory"]
+    scope_path: str | None = None
+    provider_id: str
+    model_id: str
+
+
+class RetrievalModeCommand(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    rerank_authorization_id: str | None = Field(default=None, min_length=1, max_length=128)
+    mode: Literal["keyword", "semantic", "hybrid"]
 
 
-class SessionRerankAuthorizationCommand(BaseModel):
+class SessionTaskExecutionCommand(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
@@ -406,10 +406,6 @@ class VaultTagChangeApplyCommand(VaultTagChangeCommand):
     proposal_versions: list[list[int]]
 
 
-class PolicyModeCommand(BaseModel):
-    outbound_mode: str
-
-
 class ExclusionRuleCommand(BaseModel):
     kind: str
     relative_path: str
@@ -422,27 +418,6 @@ class PolicyPreviewCommand(BaseModel):
     candidate_kind: str | None = None
     candidate_relative_path: str | None = None
     replacing_rule_id: str | None = None
-
-
-class OutboundScopeCommand(BaseModel):
-    source_path: str
-    derived_path: str | None = None
-
-
-class OutboundAuthorizationCommand(BaseModel):
-    provider_id: str | None = None
-    model_id: str | None = None
-    operation: str
-    task_id: str
-    scopes: list[OutboundScopeCommand]
-
-
-class OutboundAuthorizationCheckCommand(OutboundAuthorizationCommand):
-    pass
-
-
-class AuthorizationConfirmationCommand(BaseModel):
-    approved: bool
 
 
 class EmbeddingBatchScopeCommand(BaseModel):
@@ -459,11 +434,6 @@ class UnitCardBatchScopeCommand(BaseModel):
     relative_path: str | None = None
 
 
-class UnitCardExecutionCommand(UnitCardBatchScopeCommand):
-    chat_authorization_id: str = Field(min_length=1)
-    embedding_authorization_id: str = Field(min_length=1)
-
-
 class MetadataCandidateDecisionCommand(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -476,7 +446,7 @@ class ProviderCommand(BaseModel):
 
     name: str
     endpoint: str
-    secret: str
+    secret: str | None = None
 
 
 class ProviderUpdateCommand(BaseModel):
@@ -688,91 +658,9 @@ def preview_payload(preview: PolicyEvaluation) -> dict[str, object]:
     }
 
 
-def authorization_payload(authorization: OutboundAuthorization) -> dict[str, object]:
-    if authorization.operation == RERANK_AUTHORIZATION_OPERATION:
-        return rerank_authorization_payload(authorization)
-    return {
-        "authorization_id": authorization.authorization_id,
-        "vault_id": authorization.vault_id,
-        "policy_revision": authorization.policy_revision,
-        "provider_id": authorization.provider_id,
-        "model_id": authorization.model_id,
-        "operation": authorization.operation,
-        "task_id": authorization.task_id,
-        "snapshot_digest": authorization.snapshot_digest,
-        "scope_summary": authorization.scope_summary,
-        "actual_scope_summary": authorization.actual_scope_summary,
-        "actual_scope_digest": authorization.actual_scope_digest,
-        "status": authorization.status,
-        "created_at": authorization.created_at,
-        "updated_at": authorization.updated_at,
-    }
-
-
-def embedding_authorization_preview_payload(
-    preview: EmbeddingAuthorizationPreview,
-) -> dict[str, object]:
-    return {
-        "vault_id": preview.vault_id,
-        "scope_kind": preview.scope.kind,
-        "relative_path": preview.scope.relative_path,
-        "provider_id": preview.provider_id,
-        "provider_name": preview.provider_name,
-        "model_id": preview.model_id,
-        "policy_revision": preview.policy_revision,
-        "file_count": preview.file_count,
-        "block_count": preview.block_count,
-        "blocked_file_count": preview.blocked_file_count,
-        "blocked_block_count": preview.blocked_block_count,
-        "blocked_documents": [
-            {
-                "relative_path": document.relative_path,
-                "block_count": document.block_count,
-                "reason": document.reason,
-            }
-            for document in preview.blocked_documents
-        ],
-        "content_categories": list(preview.content_categories),
-        "is_authorizable": preview.is_authorizable,
-    }
-
-
-def rerank_authorization_preview_payload(
-    preview: RerankAuthorizationPreview,
-) -> dict[str, object]:
-    """Expose only content-free facts before a source-lookup rerank is authorized."""
-
-    return {
-        "vault_id": preview.vault_id,
-        "provider_id": preview.provider_id,
-        "provider_name": preview.provider_name,
-        "model_id": preview.model_id,
-        "provider_configuration_revision": preview.provider_configuration_revision,
-        "policy_revision": preview.policy_revision,
-        "file_count": preview.file_count,
-        "candidate_count": preview.candidate_count,
-        "input_character_count": preview.input_character_count,
-        "blocked_file_count": preview.blocked_file_count,
-        "blocked_candidate_count": preview.blocked_candidate_count,
-        "content_categories": list(preview.content_categories),
-        "is_authorizable": preview.is_authorizable,
-        "blocking_reason": preview.blocking_reason,
-    }
-
-
-def rerank_authorization_payload(authorization: OutboundAuthorization) -> dict[str, object]:
-    """Keep rerank task digests and scope digests inside local authorization storage."""
-
-    return {
-        "authorization_id": authorization.authorization_id,
-        "status": authorization.status,
-    }
-
-
 def embedding_execution_payload(report: EmbeddingExecutionReport) -> dict[str, object]:
     return {
         "vault_id": report.vault_id,
-        "authorization_id": report.authorization_id,
         "status": report.status,
         "file_count": report.file_count,
         "block_count": report.block_count,
@@ -783,43 +671,9 @@ def embedding_execution_payload(report: EmbeddingExecutionReport) -> dict[str, o
     }
 
 
-def unit_card_authorization_preview_payload(
-    preview: UnitCardAuthorizationPreview,
-) -> dict[str, object]:
-    return {
-        "vault_id": preview.vault_id,
-        "scope_kind": preview.scope.kind,
-        "relative_path": preview.scope.relative_path,
-        "chat_provider_id": preview.chat_provider_id,
-        "chat_provider_name": preview.chat_provider_name,
-        "chat_model_id": preview.chat_model_id,
-        "embedding_provider_id": preview.embedding_provider_id,
-        "embedding_provider_name": preview.embedding_provider_name,
-        "embedding_model_id": preview.embedding_model_id,
-        "policy_revision": preview.policy_revision,
-        "file_count": preview.file_count,
-        "block_count": preview.block_count,
-        "card_count": preview.card_count,
-        "blocked_file_count": preview.blocked_file_count,
-        "blocked_block_count": preview.blocked_block_count,
-        "blocked_documents": [
-            {
-                "relative_path": document.relative_path,
-                "block_count": document.block_count,
-                "reason": document.reason,
-            }
-            for document in preview.blocked_documents
-        ],
-        "content_categories": list(preview.content_categories),
-        "is_authorizable": preview.is_authorizable,
-    }
-
-
 def unit_card_execution_payload(report: UnitCardExecutionReport) -> dict[str, object]:
     return {
         "vault_id": report.vault_id,
-        "chat_authorization_id": report.chat_authorization_id,
-        "embedding_authorization_id": report.embedding_authorization_id,
         "status": report.status,
         "file_count": report.file_count,
         "block_count": report.block_count,
@@ -829,38 +683,9 @@ def unit_card_execution_payload(report: UnitCardExecutionReport) -> dict[str, ob
     }
 
 
-def metadata_authorization_preview_payload(
-    preview: MetadataAuthorizationPreview,
-) -> dict[str, object]:
-    return {
-        "vault_id": preview.vault_id,
-        "scope_kind": preview.scope.kind,
-        "relative_path": preview.scope.relative_path,
-        "provider_id": preview.provider_id,
-        "provider_name": preview.provider_name,
-        "model_id": preview.model_id,
-        "policy_revision": preview.policy_revision,
-        "file_count": preview.file_count,
-        "block_count": preview.block_count,
-        "blocked_file_count": preview.blocked_file_count,
-        "blocked_block_count": preview.blocked_block_count,
-        "blocked_documents": [
-            {
-                "relative_path": document.relative_path,
-                "block_count": document.block_count,
-                "reason": document.reason,
-            }
-            for document in preview.blocked_documents
-        ],
-        "content_categories": list(preview.content_categories),
-        "is_authorizable": preview.is_authorizable,
-    }
-
-
 def metadata_execution_payload(report: MetadataExtractionReport) -> dict[str, object]:
     return {
         "vault_id": report.vault_id,
-        "authorization_id": report.authorization_id,
         "status": report.status,
         "file_count": report.file_count,
         "block_count": report.block_count,
@@ -950,6 +775,23 @@ def persistent_session_payload(session: PersistentSession) -> dict[str, object]:
         "created_at": session.created_at,
         "updated_at": session.updated_at,
         "last_activity_at": session.last_activity_at,
+    }
+
+
+def retrieval_mode_payload(mode: str) -> dict[str, object]:
+    labels = {
+        "keyword": "仅关键词",
+        "semantic": "仅语义",
+        "hybrid": "关键词与语义混合",
+        "disabled": "内容查找未启用",
+    }
+    return {
+        "mode": mode,
+        "label": labels.get(mode, mode),
+        "options": [
+            {"mode": option, "label": labels[option]}
+            for option in RETRIEVAL_MODES
+        ],
     }
 
 
@@ -1187,7 +1029,6 @@ def session_retrieval_result_payload(
         "recovery_action": result.recovery_action,
         "retrieval_duration_ms": result.retrieval_duration_ms,
         "generation_duration_ms": result.generation_duration_ms,
-        "rerank_authorization_id": result.rerank_authorization_id,
         "rerank_status": result.rerank_status,
         "rerank_network_request_count": result.rerank_network_request_count,
         "rerank_duration_ms": result.rerank_duration_ms,
@@ -1429,8 +1270,6 @@ def session_knowledge_organization_result_payload(
         "duration_ms": result.duration_ms,
         "created_at": result.created_at,
         "structure_kind": result.structure_kind,
-        "authorization_id": result.authorization_id,
-        "authorization_status": result.authorization_status,
         "vault_id": snapshot.vault_id if snapshot is not None else None,
         "snapshot_status": snapshot.status if snapshot is not None else None,
         "is_stale": stale,
@@ -1486,8 +1325,6 @@ def session_deep_creation_result_payload(
         "recovery_action": result.recovery_action,
         "duration_ms": result.duration_ms,
         "created_at": result.created_at,
-        "authorization_id": result.authorization_id,
-        "authorization_status": result.authorization_status,
         "vault_id": snapshot.vault_id if snapshot is not None else None,
         "snapshot_status": snapshot.status if snapshot is not None else None,
         "is_stale": stale,
@@ -1597,6 +1434,7 @@ def model_defaults_payload(provider_service: ProviderService) -> dict[str, objec
         "chat": model_default_payload(provider_service, "chat"),
         "embedding": model_default_payload(provider_service, "embedding"),
         "rerank": model_default_payload(provider_service, "rerank"),
+        "markdown": model_default_payload(provider_service, "markdown"),
     }
 
 
@@ -1842,6 +1680,7 @@ def note_proposal_payload(proposal) -> dict[str, object]:
             "relative_path": proposal.relative_path,
             "content_sha256": proposal.content_sha256,
             "heading_locations": list(proposal.heading_locations),
+            "structured_blocks": [block.to_dict() for block in proposal.structured_blocks],
             "markdown": proposal.markdown,
         }
     if not isinstance(proposal, DerivedMarkdownProposal):
@@ -2046,7 +1885,7 @@ def vault_error(error: Exception) -> HTTPException:
             status_code=404,
             detail={
                 "code": "vault_not_found",
-                "message": "Vault authorization was not found.",
+                "message": "Vault was not found.",
                 "details": {},
                 "retryable": False,
             },
@@ -2061,11 +1900,11 @@ def vault_error(error: Exception) -> HTTPException:
                 "retryable": True,
             },
         )
-    if isinstance(error, EmbeddingAuthorizationValidationError):
+    if isinstance(error, EmbeddingBatchValidationError):
         return HTTPException(
             status_code=400,
             detail={
-                "code": "embedding_authorization_invalid",
+                "code": "embedding_batch_invalid",
                 "message": str(error),
                 "details": {},
                 "retryable": True,
@@ -2081,11 +1920,11 @@ def vault_error(error: Exception) -> HTTPException:
                 "retryable": True,
             },
         )
-    if isinstance(error, MetadataAuthorizationValidationError):
+    if isinstance(error, MetadataBatchValidationError):
         return HTTPException(
             status_code=400,
             detail={
-                "code": "metadata_authorization_invalid",
+                "code": "metadata_batch_invalid",
                 "message": str(error),
                 "details": {},
                 "retryable": True,
@@ -2101,11 +1940,11 @@ def vault_error(error: Exception) -> HTTPException:
                 "retryable": True,
             },
         )
-    if isinstance(error, UnitCardAuthorizationValidationError):
+    if isinstance(error, UnitCardBatchValidationError):
         return HTTPException(
             status_code=400,
             detail={
-                "code": "unit_card_authorization_invalid",
+                "code": "unit_card_batch_invalid",
                 "message": str(error),
                 "details": {},
                 "retryable": True,
@@ -2131,16 +1970,6 @@ def vault_error(error: Exception) -> HTTPException:
                 "retryable": True,
             },
         )
-    if isinstance(error, OutboundAuthorizationDenied):
-        return HTTPException(
-            status_code=403,
-            detail={
-                "code": "outbound_authorization_denied",
-                "message": str(error),
-                "details": {},
-                "retryable": False,
-            },
-        )
     return HTTPException(
         status_code=500,
         detail={
@@ -2153,6 +1982,16 @@ def vault_error(error: Exception) -> HTTPException:
 
 
 def import_task_error(error: Exception) -> HTTPException:
+    if isinstance(error, ImportUploadStoreError):
+        return HTTPException(
+            status_code=400,
+            detail={
+                "code": "import_upload_invalid",
+                "message": str(error),
+                "details": {},
+                "retryable": True,
+            },
+        )
     if isinstance(error, ImportSelectionError):
         return HTTPException(
             status_code=400,
@@ -2333,6 +2172,7 @@ def create_app(
     knowledge_graph_service: KnowledgeGraphService | None = None,
     import_picker: WindowsImportPicker | None = None,
     import_selections: ImportSelectionStore | None = None,
+    import_upload_store: ImportUploadStore | None = None,
     converter_profiles: ProvisionedProfiles | None = None,
     retrieval_chunking_lab_build_directory: Path | None = None,
 ) -> FastAPI:
@@ -2375,39 +2215,38 @@ def create_app(
         repository=SqliteProviderRepository(runtime.data_directory / "vaults.sqlite3"),
         credentials=WindowsCredentialManager(),
         client=OpenAiCompatibleProviderClient(),
-        authorization_invalidator=app.state.vault_service.repository,
         unit_card_invalidator=app.state.indexing_service.repository,
     )
-    app.state.embedding_authorization_service = EmbeddingAuthorizationService(
+    app.state.embedding_batch_service = EmbeddingBatchService(
         app.state.vault_service,
         app.state.policy_service,
         app.state.provider_service,
         app.state.indexing_service.repository,
     )
     app.state.embedding_service = EmbeddingService(
-        app.state.embedding_authorization_service,
+        app.state.embedding_batch_service,
         app.state.provider_service,
         app.state.indexing_service.repository,
     )
-    app.state.metadata_authorization_service = MetadataAuthorizationService(
+    app.state.metadata_batch_service = MetadataBatchService(
         app.state.vault_service,
         app.state.policy_service,
         app.state.provider_service,
         app.state.indexing_service.repository,
     )
     app.state.metadata_service = MetadataExtractionService(
-        app.state.metadata_authorization_service,
+        app.state.metadata_batch_service,
         app.state.provider_service,
         app.state.indexing_service.repository,
     )
-    app.state.unit_card_authorization_service = UnitCardAuthorizationService(
+    app.state.unit_card_batch_service = UnitCardBatchService(
         app.state.vault_service,
         app.state.policy_service,
         app.state.provider_service,
         app.state.indexing_service.repository,
     )
     app.state.unit_card_service = UnitCardService(
-        app.state.unit_card_authorization_service,
+        app.state.unit_card_batch_service,
         app.state.provider_service,
         app.state.indexing_service.repository,
     )
@@ -2427,7 +2266,12 @@ def create_app(
     app.state.directory_picker = directory_picker or WindowsDirectoryPicker()
     app.state.directory_selections = directory_selections or DirectorySelectionStore()
     app.state.import_picker = import_picker or WindowsImportPicker()
-    app.state.import_selections = import_selections or ImportSelectionStore()
+    app.state.import_upload_store = import_upload_store or LocalImportUploadStore(
+        runtime.data_directory / "import-uploads"
+    )
+    app.state.import_selections = import_selections or ImportSelectionStore(
+        cleanup_paths=app.state.import_upload_store.cleanup_paths
+    )
     if import_task_service is None:
         task_repository = SqliteImportTaskRepository(runtime.data_directory / "tasks.sqlite3")
         recovered_tasks = task_repository.recover_interrupted_tasks()
@@ -2447,8 +2291,11 @@ def create_app(
             SqliteSourceRepository(runtime.data_directory / "tasks.sqlite3"),
             LocalVaultCommitter(),
             app.state.indexing_service,
+            embedding_service=app.state.embedding_service,
+            markdown_structuring_service=MarkdownStructuringService(app.state.provider_service),
             converter_profile=dict(provisioned_converters.profiles),
             artifact_store=artifact_store,
+            upload_store=app.state.import_upload_store,
         )
         import_task_service.recover_interrupted_commits(recovered_tasks)
     app.state.import_task_service = import_task_service
@@ -2520,6 +2367,18 @@ def create_app(
             app.state.local_session,
             request.cookies.get(LOCAL_SESSION_COOKIE_NAME),
         )
+
+    @app.get("/api/retrieval/mode", dependencies=[Depends(require_current_local_session)])
+    def get_retrieval_mode() -> dict[str, object]:
+        return retrieval_mode_payload(app.state.session_service.get_retrieval_mode())
+
+    @app.post("/api/retrieval/mode", dependencies=[Depends(require_current_local_session)])
+    def set_retrieval_mode(command: RetrievalModeCommand) -> dict[str, object]:
+        try:
+            mode = app.state.session_service.set_retrieval_mode(command.mode)
+            return retrieval_mode_payload(mode)
+        except Exception as error:
+            raise session_error(error) from error
 
     if runtime.retrieval_test_ui_enabled:
         assert retrieval_chunking_lab_build_directory is not None
@@ -2745,29 +2604,37 @@ def create_app(
         except Exception as error:
             raise session_error(error) from error
 
-    @app.post(
-        "/api/sessions/{session_id}/tasks/{task_id}/rerank-authorizations",
-        dependencies=[Depends(require_current_local_session)],
-    )
-    def request_session_rerank_authorization(
-        request: Request,
-        session_id: str,
-        task_id: str,
-        command: SessionRerankAuthorizationCommand,
+    @app.post("/api/sessions/{session_id}/run", dependencies=[Depends(require_current_local_session)])
+    def run_persistent_session_task(
+        request: Request, session_id: str, command: SessionRunCommand
     ) -> dict[str, object]:
-        del request, command
         try:
-            preview, authorization = app.state.session_service.prepare_rerank_authorization(
-                session_id, task_id
+            result = app.state.session_service.run_task(
+                session_id,
+                command.content,
+                vault_id=command.vault_id,
+                scope_kind=command.scope_kind,
+                scope_path=command.scope_path,
+                provider_id=command.provider_id,
+                model_id=command.model_id,
+                intent=command.intent,
+                query_scope=query_scope_selection(command.query_scope),
             )
-            return {
-                "preview": rerank_authorization_preview_payload(preview),
-                "authorization": (
-                    rerank_authorization_payload(authorization)
-                    if authorization is not None
-                    else None
-                ),
-            }
+            detail = app.state.session_service.detail(session_id)
+            snapshot = next(
+                (item for item in detail.task_snapshots if item.snapshot_id == result.snapshot_id),
+                None,
+            )
+            payload = (
+                session_completeness_result_payload(result, snapshot)
+                if isinstance(result, SessionCompletenessResult)
+                else session_knowledge_organization_result_payload(result, snapshot)
+                if isinstance(result, SessionKnowledgeOrganizationResult)
+                else session_deep_creation_result_payload(result, snapshot)
+                if isinstance(result, SessionDeepCreationResult)
+                else session_retrieval_result_payload(result, snapshot)
+            )
+            return {"result": payload}
         except Exception as error:
             raise session_error(error) from error
 
@@ -2782,11 +2649,7 @@ def create_app(
         command: SessionTaskExecutionCommand,
     ) -> dict[str, object]:
         try:
-            result = app.state.session_service.execute_task(
-                session_id,
-                task_id,
-                rerank_authorization_id=command.rerank_authorization_id,
-            )
+            result = app.state.session_service.execute_task(session_id, task_id)
             detail = app.state.session_service.detail(session_id)
             snapshot = next(
                 (item for item in detail.task_snapshots if item.snapshot_id == result.snapshot_id),
@@ -2825,7 +2688,6 @@ def create_app(
                     on_stream_chunk=lambda ordinal, content: events.put(
                         ("chunk", {"ordinal": ordinal, "content": content})
                     ),
-                    rerank_authorization_id=command.rerank_authorization_id,
                 )
                 detail = app.state.session_service.detail(session_id)
                 snapshot = next(
@@ -3064,6 +2926,51 @@ def create_app(
         label = paths[0].name if len(paths) == 1 else f"{paths[0].name} and {len(paths) - 1} more"
         return {"selection_id": selection_id, "label": label}
 
+    @app.post(
+        "/api/import-selections/uploads",
+        dependencies=[Depends(require_current_local_session)],
+    )
+    async def upload_import_files(
+        request: Request,
+        files: list[UploadFile] = File(...),
+        kind: Literal["files", "directory"] = Form("files"),
+    ) -> dict[str, str]:
+        session_secret = require_local_session(app, request)
+        batch_id = app.state.import_upload_store.start_batch()
+        try:
+            for ordinal, upload in enumerate(files):
+                bytes_written = 0
+                try:
+                    with app.state.import_upload_store.open_file(
+                        batch_id,
+                        ordinal,
+                        upload.filename or "",
+                        preserve_relative_path=kind == "directory",
+                    ) as (_, destination):
+                        while chunk := await upload.read(IMPORT_UPLOAD_CHUNK_BYTES):
+                            bytes_written += len(chunk)
+                            if bytes_written > MAX_IMPORT_UPLOAD_FILE_BYTES:
+                                raise ImportUploadStoreError(
+                                    "Each uploaded file must be at most 512 MiB."
+                                )
+                            destination.write(chunk)
+                finally:
+                    await upload.close()
+            paths = (
+                (app.state.import_upload_store.complete_directory(batch_id),)
+                if kind == "directory"
+                else app.state.import_upload_store.complete_batch(batch_id)
+            )
+            selection_id = app.state.import_selections.remember(session_secret, kind, paths)
+        except ImportUploadStoreError as error:
+            app.state.import_upload_store.discard_batch(batch_id)
+            raise import_task_error(error) from error
+        except Exception:
+            app.state.import_upload_store.discard_batch(batch_id)
+            raise
+        label = paths[0].name if len(paths) == 1 else f"{paths[0].name} and {len(paths) - 1} more"
+        return {"selection_id": selection_id, "label": label}
+
     @app.post("/api/import-selections/directory")
     async def select_import_directory(request: Request) -> dict[str, str | None]:
         session_secret = require_local_session(app, request)
@@ -3129,8 +3036,6 @@ def create_app(
                 app.state.import_task_service, "list_candidate_link_proposals", None
             )
             candidate_links = list_candidate_links(task_id) if list_candidate_links is not None else []
-            get_review_snapshot = getattr(app.state.import_task_service, "get_review_snapshot", None)
-            review_snapshot = get_review_snapshot(task_id) if get_review_snapshot is not None else None
             list_commit_journals = getattr(app.state.import_task_service, "list_commit_journals", None)
             commit_journals = list_commit_journals(task_id) if list_commit_journals is not None else []
             try:
@@ -3154,7 +3059,6 @@ def create_app(
                 "candidate_link_proposals": [
                     candidate_link_proposal_payload(proposal) for proposal in candidate_links
                 ],
-                "review_snapshot": review_snapshot_payload(review_snapshot) if review_snapshot else None,
                 "commit_journals": [commit_journal_payload(journal) for journal in commit_journals],
                 "index": index_health,
                 "event_cursor": event_cursor,
@@ -3184,22 +3088,6 @@ def create_app(
         require_local_session(app, request)
         try:
             return {"task": import_task_payload(app.state.import_task_service.resume(task_id))}
-        except Exception as error:
-            raise import_task_error(error) from error
-
-    @app.post("/api/import-tasks/{task_id}/parse")
-    def start_import_task_parsing(request: Request, task_id: str) -> dict[str, object]:
-        require_local_session(app, request)
-        try:
-            return {"task": import_task_payload(app.state.import_task_service.start_parsing(task_id))}
-        except Exception as error:
-            raise import_task_error(error) from error
-
-    @app.post("/api/import-tasks/{task_id}/convert")
-    def start_import_task_conversion(request: Request, task_id: str) -> dict[str, object]:
-        require_local_session(app, request)
-        try:
-            return {"task": import_task_payload(app.state.import_task_service.start_conversion(task_id))}
         except Exception as error:
             raise import_task_error(error) from error
 
@@ -3914,23 +3802,6 @@ def create_app(
         except Exception as error:
             raise vault_error(error) from error
 
-    @app.put("/api/vaults/{vault_id}/policy/mode")
-    def set_vault_policy_mode(
-        request: Request, vault_id: str, command: PolicyModeCommand
-    ) -> dict[str, object]:
-        require_local_session(app, request)
-        try:
-            policy = app.state.policy_service.set_outbound_mode(
-                vault_id, command.outbound_mode
-            )
-            return {
-                "policy": policy_payload(
-                    policy, app.state.policy_service.list_rules(vault_id)
-                )
-            }
-        except Exception as error:
-            raise vault_error(error) from error
-
     @app.post("/api/vaults/{vault_id}/policy/rules")
     def add_vault_policy_rule(
         request: Request, vault_id: str, command: ExclusionRuleCommand
@@ -3990,259 +3861,35 @@ def create_app(
         except Exception as error:
             raise vault_error(error) from error
 
-    @app.post("/api/vaults/{vault_id}/outbound-authorizations")
-    def request_outbound_authorization(
-        request: Request, vault_id: str, command: OutboundAuthorizationCommand
-    ) -> dict[str, object]:
-        require_local_session(app, request)
-        try:
-            authorization = app.state.policy_service.request_outbound_authorization(
-                vault_id,
-                provider_id=command.provider_id,
-                model_id=command.model_id,
-                operation=command.operation,
-                task_id=command.task_id,
-                scopes=[
-                    OutboundScope(
-                        source_path=scope.source_path,
-                        derived_path=scope.derived_path,
-                    )
-                    for scope in command.scopes
-                ],
-            )
-            return {"authorization": authorization_payload(authorization)}
-        except Exception as error:
-            raise vault_error(error) from error
-
-    @app.post("/api/vaults/{vault_id}/embedding-authorizations/preview")
-    def preview_embedding_authorization(
+    @app.post("/api/vaults/{vault_id}/embeddings/execute")
+    def execute_embeddings(
         request: Request, vault_id: str, command: EmbeddingBatchScopeCommand
     ) -> dict[str, object]:
         require_local_session(app, request)
         try:
-            preview = app.state.embedding_authorization_service.preview(
-                vault_id, embedding_batch_scope(command)
-            )
-            return {"preview": embedding_authorization_preview_payload(preview)}
-        except Exception as error:
-            raise vault_error(error) from error
-
-    @app.post("/api/vaults/{vault_id}/embedding-authorizations")
-    def request_embedding_authorization(
-        request: Request, vault_id: str, command: EmbeddingBatchScopeCommand
-    ) -> dict[str, object]:
-        require_local_session(app, request)
-        try:
-            preview, authorization = app.state.embedding_authorization_service.request(
-                vault_id, embedding_batch_scope(command)
-            )
-            return {
-                "preview": embedding_authorization_preview_payload(preview),
-                "authorization": authorization_payload(authorization),
-            }
-        except Exception as error:
-            raise vault_error(error) from error
-
-    @app.post(
-        "/api/vaults/{vault_id}/embedding-authorizations/{authorization_id}/confirm"
-    )
-    def confirm_embedding_authorization(
-        request: Request,
-        vault_id: str,
-        authorization_id: str,
-        command: AuthorizationConfirmationCommand,
-    ) -> dict[str, object]:
-        require_local_session(app, request)
-        try:
-            authorization = app.state.embedding_authorization_service.confirm(
-                vault_id, authorization_id, approved=command.approved
-            )
-            return {"authorization": authorization_payload(authorization)}
-        except Exception as error:
-            raise vault_error(error) from error
-
-    @app.post(
-        "/api/vaults/{vault_id}/embedding-authorizations/{authorization_id}/check"
-    )
-    def check_embedding_authorization(
-        request: Request,
-        vault_id: str,
-        authorization_id: str,
-        command: EmbeddingBatchScopeCommand,
-    ) -> dict[str, object]:
-        require_local_session(app, request)
-        try:
-            preview, authorization = app.state.embedding_authorization_service.check(
-                vault_id, authorization_id, embedding_batch_scope(command)
-            )
-            return {
-                "preview": embedding_authorization_preview_payload(preview),
-                "authorization": authorization_payload(authorization),
-            }
-        except Exception as error:
-            raise vault_error(error) from error
-
-    @app.post(
-        "/api/vaults/{vault_id}/embedding-authorizations/{authorization_id}/execute"
-    )
-    def execute_embedding_authorization(
-        request: Request,
-        vault_id: str,
-        authorization_id: str,
-        command: EmbeddingBatchScopeCommand,
-    ) -> dict[str, object]:
-        require_local_session(app, request)
-        try:
-            report = app.state.embedding_service.execute(
-                vault_id, authorization_id, embedding_batch_scope(command)
-            )
+            report = app.state.embedding_service.execute(vault_id, embedding_batch_scope(command))
             return {"report": embedding_execution_payload(report)}
         except Exception as error:
             raise vault_error(error) from error
 
-    @app.post("/api/vaults/{vault_id}/metadata-authorizations/preview")
-    def preview_metadata_authorization(
+    @app.post("/api/vaults/{vault_id}/metadata/extract")
+    def extract_metadata(
         request: Request, vault_id: str, command: EmbeddingBatchScopeCommand
     ) -> dict[str, object]:
         require_local_session(app, request)
         try:
-            preview = app.state.metadata_authorization_service.preview(
-                vault_id, metadata_batch_scope(command)
-            )
-            return {"preview": metadata_authorization_preview_payload(preview)}
-        except Exception as error:
-            raise vault_error(error) from error
-
-    @app.post("/api/vaults/{vault_id}/metadata-authorizations")
-    def request_metadata_authorization(
-        request: Request, vault_id: str, command: EmbeddingBatchScopeCommand
-    ) -> dict[str, object]:
-        require_local_session(app, request)
-        try:
-            preview, authorization = app.state.metadata_authorization_service.request(
-                vault_id, metadata_batch_scope(command)
-            )
-            return {
-                "preview": metadata_authorization_preview_payload(preview),
-                "authorization": authorization_payload(authorization),
-            }
-        except Exception as error:
-            raise vault_error(error) from error
-
-    @app.post("/api/vaults/{vault_id}/metadata-authorizations/{authorization_id}/check")
-    def check_metadata_authorization(
-        request: Request,
-        vault_id: str,
-        authorization_id: str,
-        command: EmbeddingBatchScopeCommand,
-    ) -> dict[str, object]:
-        require_local_session(app, request)
-        try:
-            authorization = app.state.metadata_authorization_service.check(
-                vault_id, authorization_id, metadata_batch_scope(command)
-            )
-            return {"authorization": authorization_payload(authorization)}
-        except Exception as error:
-            raise vault_error(error) from error
-
-    @app.post("/api/vaults/{vault_id}/metadata-authorizations/{authorization_id}/execute")
-    def execute_metadata_authorization(
-        request: Request,
-        vault_id: str,
-        authorization_id: str,
-        command: EmbeddingBatchScopeCommand,
-    ) -> dict[str, object]:
-        require_local_session(app, request)
-        try:
-            report = app.state.metadata_service.execute(
-                vault_id, authorization_id, metadata_batch_scope(command)
-            )
+            report = app.state.metadata_service.execute(vault_id, metadata_batch_scope(command))
             return {"report": metadata_execution_payload(report)}
         except Exception as error:
             raise vault_error(error) from error
 
-    @app.post("/api/vaults/{vault_id}/unit-card-authorizations/preview")
-    def preview_unit_card_authorization(
+    @app.post("/api/vaults/{vault_id}/unit-cards/build")
+    def build_unit_cards(
         request: Request, vault_id: str, command: UnitCardBatchScopeCommand
     ) -> dict[str, object]:
         require_local_session(app, request)
         try:
-            preview = app.state.unit_card_authorization_service.preview(
-                vault_id, unit_card_batch_scope(command)
-            )
-            return {"preview": unit_card_authorization_preview_payload(preview)}
-        except Exception as error:
-            raise vault_error(error) from error
-
-    @app.post("/api/vaults/{vault_id}/unit-card-authorizations")
-    def request_unit_card_authorization(
-        request: Request, vault_id: str, command: UnitCardBatchScopeCommand
-    ) -> dict[str, object]:
-        require_local_session(app, request)
-        try:
-            preview, chat_authorization, embedding_authorization = (
-                app.state.unit_card_authorization_service.request(
-                    vault_id, unit_card_batch_scope(command)
-                )
-            )
-            return {
-                "preview": unit_card_authorization_preview_payload(preview),
-                "chat_authorization": authorization_payload(chat_authorization),
-                "embedding_authorization": authorization_payload(embedding_authorization),
-            }
-        except Exception as error:
-            raise vault_error(error) from error
-
-    @app.post(
-        "/api/vaults/{vault_id}/unit-card-authorizations/{authorization_id}/confirm"
-    )
-    def confirm_unit_card_authorization(
-        request: Request,
-        vault_id: str,
-        authorization_id: str,
-        command: AuthorizationConfirmationCommand,
-    ) -> dict[str, object]:
-        require_local_session(app, request)
-        try:
-            authorization = app.state.policy_service.confirm_outbound_authorization(
-                vault_id, authorization_id, approved=command.approved
-            )
-            return {"authorization": authorization_payload(authorization)}
-        except Exception as error:
-            raise vault_error(error) from error
-
-    @app.post("/api/vaults/{vault_id}/unit-card-authorizations/check")
-    def check_unit_card_authorization(
-        request: Request, vault_id: str, command: UnitCardExecutionCommand
-    ) -> dict[str, object]:
-        require_local_session(app, request)
-        try:
-            checked = app.state.unit_card_authorization_service.checked_batch(
-                vault_id,
-                command.chat_authorization_id,
-                command.embedding_authorization_id,
-                unit_card_batch_scope(command),
-            )
-            return {
-                "preview": unit_card_authorization_preview_payload(checked.preview),
-                "chat_authorization": authorization_payload(checked.chat_authorization),
-                "embedding_authorization": authorization_payload(checked.embedding_authorization),
-            }
-        except Exception as error:
-            raise vault_error(error) from error
-
-    @app.post("/api/vaults/{vault_id}/unit-card-authorizations/execute")
-    def execute_unit_card_authorization(
-        request: Request, vault_id: str, command: UnitCardExecutionCommand
-    ) -> dict[str, object]:
-        require_local_session(app, request)
-        try:
-            report = app.state.unit_card_service.execute(
-                vault_id,
-                command.chat_authorization_id,
-                command.embedding_authorization_id,
-                unit_card_batch_scope(command),
-            )
+            report = app.state.unit_card_service.execute(vault_id, unit_card_batch_scope(command))
             return {"report": unit_card_execution_payload(report)}
         except Exception as error:
             raise vault_error(error) from error
@@ -4285,57 +3932,35 @@ def create_app(
         except Exception as error:
             raise vault_error(error) from error
 
-    @app.post(
-        "/api/vaults/{vault_id}/outbound-authorizations/{authorization_id}/confirm"
-    )
-    def confirm_outbound_authorization(
-        request: Request,
-        vault_id: str,
-        authorization_id: str,
-        command: AuthorizationConfirmationCommand,
-    ) -> dict[str, object]:
-        require_local_session(app, request)
-        try:
-            authorization = app.state.policy_service.confirm_outbound_authorization(
-                vault_id, authorization_id, approved=command.approved
-            )
-            return {"authorization": authorization_payload(authorization)}
-        except Exception as error:
-            raise vault_error(error) from error
-
-    @app.post(
-        "/api/vaults/{vault_id}/outbound-authorizations/{authorization_id}/check"
-    )
-    def check_outbound_authorization(
-        request: Request,
-        vault_id: str,
-        authorization_id: str,
-        command: OutboundAuthorizationCheckCommand,
-    ) -> dict[str, object]:
-        require_local_session(app, request)
-        try:
-            authorization = app.state.policy_service.check_outbound_authorization(
-                vault_id,
-                authorization_id,
-                provider_id=command.provider_id,
-                model_id=command.model_id,
-                operation=command.operation,
-                task_id=command.task_id,
-                scopes=[
-                    OutboundScope(
-                        source_path=scope.source_path,
-                        derived_path=scope.derived_path,
-                    )
-                    for scope in command.scopes
-                ],
-            )
-            return {"authorization": authorization_payload(authorization)}
-        except Exception as error:
-            raise vault_error(error) from error
-
     @app.get("/", include_in_schema=False)
     def workbench() -> FileResponse:
         return workbench_response(app.state.local_session)
+
+    # Import parsing, structuring, commit, and embedding now run as one workflow.
+    # Remove the former human-review commands from the public route table while
+    # retaining their SQLite records for backward-compatible database opening.
+    disabled_import_routes = {
+        "/api/import-tasks/{task_id}/metadata-tags/{item_id}/decision",
+        "/api/import-tasks/{task_id}/candidate-links/{review_item_id}/decision",
+        "/api/import-tasks/{task_id}/review-snapshot",
+        "/api/import-tasks/{task_id}/review-items/{review_item_id}/decision",
+        "/api/import-tasks/{task_id}/conversion-items/{item_id}/blocks/{block_id}/correct",
+        "/api/import-tasks/{task_id}/conversion-items/{item_id}/retry",
+        "/api/import-tasks/{task_id}/commit",
+        "/api/import-tasks/{task_id}/classifications/accept-high-confidence",
+        "/api/import-tasks/{task_id}/classifications/{item_id}/revise",
+        "/api/import-tasks/{task_id}/classifications/{item_id}/decision",
+        "/api/import-tasks/{task_id}/note-proposals/merge",
+        "/api/import-tasks/{task_id}/note-proposals/split",
+        "/api/import-tasks/{task_id}/items/{item_id}/ocr/{target_id}/retry",
+        "/api/import-tasks/{task_id}/items/{item_id}/ocr/{target_id}/correct",
+        "/api/import-tasks/{task_id}/items/{item_id}/ocr/{target_id}/exclude",
+    }
+    app.router.routes[:] = [
+        route
+        for route in app.router.routes
+        if getattr(route, "path", None) not in disabled_import_routes
+    ]
 
     app.mount("/", StaticFiles(directory=web_build_directory, html=True), name="web")
     return app

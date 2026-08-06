@@ -76,7 +76,7 @@ class UnitCardSource:
 
 @dataclass(frozen=True)
 class UnitCardPromptSource:
-    """A transient, authorized source payload. Never serialize this outside application code."""
+    """A transient source payload. Never serialize this outside application code."""
 
     source: UnitCardSource
     text: str

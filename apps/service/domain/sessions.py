@@ -33,7 +33,6 @@ RERANK_EXECUTION_STATUSES = frozenset(
     {
         "not-requested",
         "disabled",
-        "authorization-invalid",
         "blocked",
         "unavailable",
         "concurrent",
@@ -334,7 +333,7 @@ class SessionTaskSnapshot:
             or not self.model_id
             or self.policy_revision < 1
             or self.source_count != len(self.sources)
-            or self.status not in {"prepared", "preparing", "waiting-authorization", "completed", "recoverable", "failed", "invalidated"}
+            or self.status not in {"prepared", "preparing", "completed", "recoverable", "failed", "invalidated"}
         ):
             raise ValueError("Task snapshot is invalid.")
         normalize_session_scope(self.scope_kind, self.scope_path)
@@ -698,7 +697,6 @@ class SessionRetrievalResult:
     generation_duration_ms: int
     created_at: str
     evidences: tuple[SessionRetrievalEvidence, ...] = ()
-    rerank_authorization_id: str | None = None
     rerank_status: str = "not-requested"
     rerank_network_request_count: int = 0
     rerank_duration_ms: int = 0
@@ -720,14 +718,6 @@ class SessionRetrievalResult:
             or self.rerank_duration_ms < 0
         ):
             raise ValueError("Retrieval result is invalid.")
-        if self.rerank_authorization_id is not None and (
-            not isinstance(self.rerank_authorization_id, str)
-            or not self.rerank_authorization_id.strip()
-            or len(self.rerank_authorization_id) > 128
-        ):
-            raise ValueError("Retrieval rerank authorization identity is invalid.")
-        if self.rerank_network_request_count and self.rerank_authorization_id is None:
-            raise ValueError("Rerank network activity needs an authorization identity.")
         if self.rerank_status == "completed" and self.rerank_network_request_count != 1:
             raise ValueError("Completed rerank results need one network request.")
         if self.status == "completed" and not self.evidences:
@@ -819,7 +809,7 @@ class SessionCompletenessResult:
 
 
 KNOWLEDGE_ORGANIZATION_RESULT_STATUSES = frozenset(
-    {"preparing", "planned", "waiting-authorization", "completed", "failed", "recoverable"}
+    {"preparing", "planned", "completed", "failed", "recoverable"}
 )
 KNOWLEDGE_ORGANIZATION_STRUCTURE_KINDS = frozenset(
     {"summary", "classification", "comparison", "timeline", "outline", "chapter-summary"}
@@ -893,8 +883,6 @@ class SessionKnowledgeOrganizationResult:
     outcomes: tuple[SessionKnowledgeOrganizationSectionOutcome, ...] = ()
     structure_kind: str = "outline"
     completed_ordinals: tuple[int, ...] = ()
-    authorization_id: str | None = None
-    authorization_status: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -918,13 +906,8 @@ class SessionKnowledgeOrganizationResult:
         elif self.status == "completed":
             if not self.completed_ordinals or self.recovery_action is not None:
                 raise ValueError("Completed knowledge organization results need completed sections and no recovery action.")
-        elif self.status == "waiting-authorization":
-            if not self.authorization_id or self.authorization_status != "pending" or self.recovery_action is not None:
-                raise ValueError("Waiting knowledge organization results need pending authorization.")
         elif self.recovery_action is None:
             raise ValueError("Incomplete knowledge organization results need a recovery action.")
-        if self.authorization_id is None and self.authorization_status is not None:
-            raise ValueError("Knowledge organization authorization status needs an identifier.")
         if self.outcomes:
             if tuple(outcome.ordinal for outcome in self.outcomes) != tuple(
                 sorted(outcome.ordinal for outcome in self.outcomes)
@@ -950,9 +933,7 @@ class SessionKnowledgeOrganizationResult:
                 raise ValueError("Completed knowledge organization results cannot retain incomplete sections.")
 
 
-DEEP_CREATION_RESULT_STATUSES = frozenset(
-    {"preparing", "waiting-authorization", "completed", "failed", "recoverable"}
-)
+DEEP_CREATION_RESULT_STATUSES = frozenset({"preparing", "completed", "failed", "recoverable"})
 
 
 @dataclass(frozen=True)
@@ -1044,8 +1025,6 @@ class SessionDeepCreationResult:
     duration_ms: int
     created_at: str
     outcomes: tuple[SessionDeepCreationSectionOutcome, ...] = ()
-    authorization_id: str | None = None
-    authorization_status: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -1063,13 +1042,8 @@ class SessionDeepCreationResult:
         if self.status == "completed":
             if not self.completed_ordinals or self.recovery_action is not None:
                 raise ValueError("Completed deep creation results need completed sections and no recovery action.")
-        elif self.status == "waiting-authorization":
-            if not self.authorization_id or self.authorization_status != "pending" or self.recovery_action is not None:
-                raise ValueError("Waiting deep creation results need pending authorization.")
         elif self.recovery_action is None:
             raise ValueError("Incomplete deep creation results need a recovery action.")
-        if self.authorization_id is None and self.authorization_status is not None:
-            raise ValueError("Deep creation authorization status needs an identifier.")
         if self.outcomes:
             if tuple(outcome.ordinal for outcome in self.outcomes) != tuple(
                 sorted(outcome.ordinal for outcome in self.outcomes)
@@ -1106,7 +1080,7 @@ class SessionAttachment:
             raise ValueError("Attachment filename is invalid.")
         if relative_path is not None:
             relative_path = normalize_vault_relative_path(relative_path)
-        if status not in {"available", "excluded", "pending-authorization", "needs-import"}:
+        if status not in {"available", "excluded", "needs-import"}:
             raise ValueError("Attachment status is invalid.")
         if status == "needs-import" and (vault_id is not None or relative_path is not None):
             raise ValueError("External attachment cannot have a vault path.")

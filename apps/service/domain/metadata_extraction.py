@@ -6,7 +6,7 @@ import json
 from math import isfinite
 import re
 
-from domain.policies import OutboundScope, normalize_vault_relative_path
+from domain.policies import normalize_vault_relative_path
 
 
 KNOWLEDGE_KINDS = frozenset(
@@ -65,7 +65,7 @@ class MetadataBlockedDocument:
 
 
 @dataclass(frozen=True)
-class MetadataAuthorizationPreview:
+class MetadataBatchPreview:
     """Content-free, frozen-at-read-time facts for one metadata extraction batch."""
 
     vault_id: str
@@ -82,7 +82,7 @@ class MetadataAuthorizationPreview:
     blocked_block_count: int
     blocked_documents: tuple[MetadataBlockedDocument, ...]
     content_categories: tuple[str, ...]
-    scopes: tuple[OutboundScope, ...]
+    relative_paths: tuple[str, ...]
 
     def __post_init__(self) -> None:
         if (
@@ -93,9 +93,9 @@ class MetadataAuthorizationPreview:
             or not self.provider_configuration_revision
             or not self.task_id
         ):
-            raise ValueError("Metadata authorization preview identity is invalid.")
+            raise ValueError("Metadata batch preview identity is invalid.")
         if type(self.policy_revision) is not int or self.policy_revision < 1:
-            raise ValueError("Metadata authorization preview policy revision is invalid.")
+            raise ValueError("Metadata batch preview policy revision is invalid.")
         for value in (
             self.file_count,
             self.block_count,
@@ -103,16 +103,16 @@ class MetadataAuthorizationPreview:
             self.blocked_block_count,
         ):
             if type(value) is not int or value < 0:
-                raise ValueError("Metadata authorization preview counts are invalid.")
-        if self.file_count != len(self.scopes):
-            raise ValueError("Metadata authorization preview scopes must match its file count.")
+                raise ValueError("Metadata batch preview counts are invalid.")
+        if self.file_count != len(self.relative_paths):
+            raise ValueError("Metadata batch preview paths must match its file count.")
         if self.blocked_file_count < len(self.blocked_documents):
-            raise ValueError("Metadata authorization preview blocked sample is invalid.")
+            raise ValueError("Metadata batch preview blocked sample is invalid.")
         if self.content_categories != METADATA_CONTENT_CATEGORIES:
-            raise ValueError("Metadata authorization preview content categories are invalid.")
+            raise ValueError("Metadata batch preview content categories are invalid.")
 
     @property
-    def is_authorizable(self) -> bool:
+    def is_executable(self) -> bool:
         return self.file_count > 0 and self.block_count > 0
 
 
@@ -231,7 +231,6 @@ class MetadataCandidate:
 @dataclass(frozen=True)
 class MetadataExtractionReport:
     vault_id: str
-    authorization_id: str
     status: str
     file_count: int
     block_count: int
@@ -240,7 +239,7 @@ class MetadataExtractionReport:
     network_batch_count: int
 
     def __post_init__(self) -> None:
-        if not self.vault_id or not self.authorization_id or self.status not in {"completed", "failed"}:
+        if not self.vault_id or self.status not in {"completed", "failed"}:
             raise ValueError("Metadata extraction report identity is invalid.")
         for value in (
             self.file_count,

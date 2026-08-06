@@ -9,11 +9,10 @@ from domain.indexing import BlockHit
 
 
 HYBRID_CHANNELS = ("lexical", "semantic", "heading")
+RETRIEVAL_MODES = ("keyword", "semantic", "hybrid")
 RRF_K = 60
 
-_UNIT_PATTERN = re.compile(r"\b(?:unit|u)\s*0*(\d{1,2})\b", re.IGNORECASE)
-_CHINESE_UNIT_PATTERN = re.compile(r"第?\s*([一二三四五六七八九十\d]+)\s*单元")
-_CHINESE_NUMBERS = {
+_CHINESE_DIGITS = {
     "一": 1,
     "二": 2,
     "三": 3,
@@ -23,8 +22,45 @@ _CHINESE_NUMBERS = {
     "七": 7,
     "八": 8,
     "九": 9,
-    "十": 10,
 }
+_STRUCTURAL_HEADING_ALIASES = {
+    "unit": (("unit", "u"), ("单元",)),
+    "chapter": (("chapter", "ch"), ("章",)),
+    "section": (("section", "sec"), ("节",)),
+    "lesson": (("lesson",), ("课",)),
+    "part": (("part",), ("部分",)),
+    "module": (("module",), ("模块",)),
+    "project": (("project",), ("项目",)),
+    "volume": (("volume", "vol"), ("卷",)),
+    "phase": (("phase",), ("阶段",)),
+}
+_ENGLISH_STRUCTURAL_KINDS = {
+    alias: kind
+    for kind, (english_aliases, _) in _STRUCTURAL_HEADING_ALIASES.items()
+    for alias in english_aliases
+}
+_CHINESE_STRUCTURAL_KINDS = {
+    alias: kind
+    for kind, (_, chinese_aliases) in _STRUCTURAL_HEADING_ALIASES.items()
+    for alias in chinese_aliases
+}
+_ENGLISH_STRUCTURE_PATTERN = re.compile(
+    r"\b("
+    + "|".join(
+        re.escape(alias)
+        for alias in sorted(_ENGLISH_STRUCTURAL_KINDS, key=len, reverse=True)
+    )
+    + r")\s*[-:#]?\s*0*([a-z]|\d{1,3})\b",
+    re.IGNORECASE,
+)
+_CHINESE_STRUCTURE_PATTERN = re.compile(
+    r"第?\s*([一二三四五六七八九十\d]+|[A-Za-z])\s*("
+    + "|".join(
+        re.escape(alias)
+        for alias in sorted(_CHINESE_STRUCTURAL_KINDS, key=len, reverse=True)
+    )
+    + r")",
+)
 _QUESTION_SUFFIXES = ("是什么", "怎么", "如何", "哪些", "什么", "吗", "呢")
 
 
@@ -50,15 +86,7 @@ def heading_query_prefixes(value: str) -> tuple[str, ...]:
 
     if not isinstance(value, str) or not value.strip():
         raise ValueError("Heading query text is required.")
-    prefixes: list[str] = []
-    for match in _UNIT_PATTERN.finditer(value):
-        prefixes.extend((f"unit{int(match.group(1))}", f"u{int(match.group(1))}"))
-    for match in _CHINESE_UNIT_PATTERN.finditer(value):
-        number_text = match.group(1)
-        number = int(number_text) if number_text.isdigit() else _CHINESE_NUMBERS.get(number_text)
-        if number is not None:
-            prefixes.extend((f"第{number}单元", f"{number}单元"))
-        prefixes.append(match.group(0))
+    prefixes = list(heading_scope_prefixes(value))
     for phrase in re.findall(r"[\u4e00-\u9fff]{2,}", value):
         for suffix in _QUESTION_SUFFIXES:
             phrase = phrase.removesuffix(suffix)
@@ -69,6 +97,67 @@ def heading_query_prefixes(value: str) -> tuple[str, ...]:
         if normalized:
             prefixes.append(normalized)
     return tuple(dict.fromkeys(prefix for prefix in prefixes if prefix.strip()))
+
+
+def heading_scope_prefixes(value: str) -> tuple[str, ...]:
+    """Extract explicit hierarchy labels without relying on domain metadata."""
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("Heading scope text is required.")
+    prefixes = [alias for group in heading_scope_alias_groups(value) for alias in group]
+    for match in _ENGLISH_STRUCTURE_PATTERN.finditer(value):
+        prefixes.append(match.group(0).strip().casefold())
+    for match in _CHINESE_STRUCTURE_PATTERN.finditer(value):
+        prefixes.append(match.group(0).strip().casefold())
+    return tuple(dict.fromkeys(prefix for prefix in prefixes if prefix.strip()))
+
+
+def heading_scope_alias_groups(value: str) -> tuple[tuple[str, ...], ...]:
+    """Return one canonical alias group for each structural reference in the text."""
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("Heading scope text is required.")
+    groups: list[tuple[str, ...]] = []
+    for match in _ENGLISH_STRUCTURE_PATTERN.finditer(value):
+        kind = _ENGLISH_STRUCTURAL_KINDS[match.group(1).casefold()]
+        groups.append(_structural_heading_aliases(kind, match.group(2)))
+    for match in _CHINESE_STRUCTURE_PATTERN.finditer(value):
+        kind = _CHINESE_STRUCTURAL_KINDS[match.group(2)]
+        identifier = _normalized_structure_identifier(match.group(1))
+        if identifier is not None:
+            groups.append(_structural_heading_aliases(kind, identifier))
+    return tuple(dict.fromkeys(group for group in groups if group))
+
+
+def _structural_heading_aliases(kind: str, identifier: str) -> tuple[str, ...]:
+    normalized_identifier = _normalized_structure_identifier(identifier)
+    if normalized_identifier is None:
+        return ()
+    english_aliases, chinese_aliases = _STRUCTURAL_HEADING_ALIASES[kind]
+    return (
+        *(f"{alias}{normalized_identifier}" for alias in english_aliases),
+        *(f"第{normalized_identifier}{alias}" for alias in chinese_aliases),
+        *(f"{normalized_identifier}{alias}" for alias in chinese_aliases),
+    )
+
+
+def _normalized_structure_identifier(value: str) -> str | None:
+    normalized = value.strip().casefold()
+    if normalized.isdigit():
+        return str(int(normalized))
+    if len(normalized) == 1 and normalized.isascii() and normalized.isalpha():
+        return normalized
+    if normalized == "十":
+        return "10"
+    if "十" in normalized:
+        tens, _, ones = normalized.partition("十")
+        tens_value = 1 if not tens else _CHINESE_DIGITS.get(tens)
+        ones_value = 0 if not ones else _CHINESE_DIGITS.get(ones)
+        if tens_value is not None and ones_value is not None:
+            return str(tens_value * 10 + ones_value)
+        return None
+    number = _CHINESE_DIGITS.get(normalized)
+    return str(number) if number is not None else None
 
 
 def fuse_rrf(

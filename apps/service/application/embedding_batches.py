@@ -7,14 +7,13 @@ from hashlib import sha256
 from application.policies import PolicyService
 from application.providers import ProviderService, ProviderUnavailableError
 from application.vaults import VaultService
-from domain.embedding_authorization import (
+from domain.embedding_batches import (
     EMBEDDING_CONTENT_CATEGORIES,
-    EmbeddingAuthorizationPreview,
+    EmbeddingBatchPreview,
     EmbeddingBatchScope,
     EmbeddingBlockedDocument,
 )
 from domain.embeddings import EmbeddingInput, embedding_input_text
-from domain.policies import OutboundAuthorization, OutboundScope
 from ports.index_repository import IndexRepository
 
 
@@ -23,25 +22,24 @@ EMBEDDING_TASK_ID_PREFIX = "embedding-index"
 _BLOCKED_DOCUMENT_SAMPLE_LIMIT = 10
 
 
-class EmbeddingAuthorizationValidationError(ValueError):
-    """Raised when an embedding batch cannot safely be previewed or authorized."""
+class EmbeddingBatchValidationError(ValueError):
+    """Raised when an embedding batch cannot safely be executed."""
 
 
 @dataclass(frozen=True)
 class CheckedEmbeddingBatch:
-    """Authorization-approved in-memory inputs; callers must not serialize this value."""
+    """Eligible in-memory inputs; callers must not serialize this value."""
 
-    preview: EmbeddingAuthorizationPreview
-    authorization: OutboundAuthorization
+    preview: EmbeddingBatchPreview
     inputs: tuple[EmbeddingInput, ...]
 
     def __post_init__(self) -> None:
         if len(self.inputs) != self.preview.block_count:
-            raise ValueError("Embedding authorization inputs must match the approved block count.")
+            raise ValueError("Embedding batch inputs must match the selected block count.")
 
 
-class EmbeddingAuthorizationService:
-    """Build and recheck a content-free authorization snapshot for index embeddings."""
+class EmbeddingBatchService:
+    """Collect and recheck the current content-free index embedding batch."""
 
     def __init__(
         self,
@@ -55,24 +53,19 @@ class EmbeddingAuthorizationService:
         self.provider_service = provider_service
         self.index_repository = index_repository
 
-    def preview(
-        self, vault_id: str, scope: EmbeddingBatchScope
-    ) -> EmbeddingAuthorizationPreview:
-        return self._collect(vault_id, scope)[0]
-
     def _collect(
         self, vault_id: str, scope: EmbeddingBatchScope
-    ) -> tuple[EmbeddingAuthorizationPreview, tuple[EmbeddingInput, ...]]:
+    ) -> tuple[EmbeddingBatchPreview, tuple[EmbeddingInput, ...]]:
         self.vault_service.get(vault_id)
         try:
             resolved_model = self.provider_service.resolve_model("embedding")
         except ProviderUnavailableError as error:
-            raise EmbeddingAuthorizationValidationError(
-                "Choose a verified embedding Provider model before authorizing indexing."
+            raise EmbeddingBatchValidationError(
+                "Choose a verified embedding Provider model before indexing."
             ) from error
 
         policy = self.policy_service.get(vault_id)
-        scopes: list[OutboundScope] = []
+        relative_paths: list[str] = []
         frozen_documents: list[dict[str, object]] = []
         blocked_documents: list[EmbeddingBlockedDocument] = []
         block_count = 0
@@ -89,7 +82,7 @@ class EmbeddingAuthorizationService:
                 vault_id, source_path, document.relative_path, "outbound"
             )
             if evaluation.allowed:
-                scopes.append(OutboundScope(source_path, document.relative_path))
+                relative_paths.append(document.relative_path)
                 document_inputs = tuple(
                     EmbeddingInput(
                         document_id=document.document_id,
@@ -124,7 +117,7 @@ class EmbeddingAuthorizationService:
                     )
                 )
 
-        preview = EmbeddingAuthorizationPreview(
+        preview = EmbeddingBatchPreview(
             vault_id=vault_id,
             scope=scope,
             provider_id=resolved_model.provider.provider_id,
@@ -133,73 +126,27 @@ class EmbeddingAuthorizationService:
             provider_configuration_revision=resolved_model.provider.updated_at,
             task_id=_embedding_batch_task_id(scope, frozen_documents),
             policy_revision=policy.policy_revision,
-            file_count=len(scopes),
+            file_count=len(relative_paths),
             block_count=block_count,
             blocked_file_count=blocked_file_count,
             blocked_block_count=blocked_block_count,
             blocked_documents=tuple(blocked_documents),
             content_categories=EMBEDDING_CONTENT_CATEGORIES,
-            scopes=tuple(scopes),
+            relative_paths=tuple(relative_paths),
         )
         return preview, tuple(inputs)
 
-    def request(
-        self, vault_id: str, scope: EmbeddingBatchScope
-    ) -> tuple[EmbeddingAuthorizationPreview, OutboundAuthorization]:
-        preview = self.preview(vault_id, scope)
-        self._require_authorizable(preview)
-        authorization = self.policy_service.request_outbound_authorization(
-            vault_id,
-            provider_id=preview.provider_id,
-            model_id=preview.model_id,
-            operation=EMBEDDING_OPERATION,
-            task_id=preview.task_id,
-            scopes=list(preview.scopes),
-        )
-        return preview, authorization
+    def default_batch(self, vault_id: str, scope: EmbeddingBatchScope) -> CheckedEmbeddingBatch:
+        """Collect the current batch for the user-approved default outbound workflow."""
 
-    def confirm(
-        self, vault_id: str, authorization_id: str, *, approved: bool
-    ) -> OutboundAuthorization:
-        return self.policy_service.confirm_outbound_authorization(
-            vault_id, authorization_id, approved=approved
-        )
-
-    def check(
-        self, vault_id: str, authorization_id: str, scope: EmbeddingBatchScope
-    ) -> tuple[EmbeddingAuthorizationPreview, OutboundAuthorization]:
-        preview, _inputs = self._collect(vault_id, scope)
-        authorization = self._check_preview(vault_id, authorization_id, preview)
-        return preview, authorization
-
-    def checked_batch(
-        self, vault_id: str, authorization_id: str, scope: EmbeddingBatchScope
-    ) -> CheckedEmbeddingBatch:
         preview, inputs = self._collect(vault_id, scope)
-        authorization = self._check_preview(vault_id, authorization_id, preview)
-        return CheckedEmbeddingBatch(preview, authorization, inputs)
-
-    def _check_preview(
-        self,
-        vault_id: str,
-        authorization_id: str,
-        preview: EmbeddingAuthorizationPreview,
-    ) -> OutboundAuthorization:
-        authorization = self.policy_service.check_outbound_authorization(
-            vault_id,
-            authorization_id,
-            provider_id=preview.provider_id,
-            model_id=preview.model_id,
-            operation=EMBEDDING_OPERATION,
-            task_id=preview.task_id,
-            scopes=list(preview.scopes),
-        )
-        return authorization
+        self._require_executable(preview)
+        return CheckedEmbeddingBatch(preview, inputs)
 
     @staticmethod
-    def _require_authorizable(preview: EmbeddingAuthorizationPreview) -> None:
-        if not preview.is_authorizable:
-            raise EmbeddingAuthorizationValidationError(
+    def _require_executable(preview: EmbeddingBatchPreview) -> None:
+        if not preview.is_executable:
+            raise EmbeddingBatchValidationError(
                 "The selected embedding scope has no eligible indexed blocks."
             )
 

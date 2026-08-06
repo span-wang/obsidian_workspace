@@ -22,17 +22,11 @@ _WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 _LIVE_OUTPUT_DIRECTORY = _WORKSPACE_ROOT / "output" / "live-rerank"
 
 
-class _NoopAuthorizationInvalidator:
-    def invalidate_provider_authorizations(self, provider_id: str, updated_at: str) -> None:
-        return None
-
-
 def _provider_service(data_directory: Path) -> ProviderService:
     return ProviderService(
         repository=SqliteProviderRepository(data_directory / "vaults.sqlite3"),
         credentials=WindowsCredentialManager(),
         client=OpenAiCompatibleProviderClient(),
-        authorization_invalidator=_NoopAuthorizationInvalidator(),
     )
 
 

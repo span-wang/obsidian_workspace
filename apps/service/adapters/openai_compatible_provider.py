@@ -7,6 +7,7 @@ import time
 from math import isfinite
 from threading import Event
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from domain.providers import ChatGeneration, ChatUsage
@@ -19,7 +20,6 @@ class _RejectRedirects(HTTPRedirectHandler):
 
 
 class OpenAiCompatibleProviderClient:
-    _MAX_RESPONSE_BYTES = 1_000_000
     _MAX_EMBEDDING_INPUTS = 128
     _MAX_EMBEDDING_INPUT_CHARS = 200_000
     _MAX_EMBEDDING_BATCH_CHARS = 500_000
@@ -28,6 +28,10 @@ class OpenAiCompatibleProviderClient:
     _MAX_RERANK_QUERY_CHARS = 2_000
     _MAX_RERANK_DOCUMENT_CHARS = 12_000
     _MAX_RERANK_REQUEST_CHARS = 200_000
+    _FINAL_RESPONSE_ONLY_INSTRUCTION = (
+        "Return only the requested final content. Do not include reasoning, thinking, analysis, "
+        "chain-of-thought, or scratch work."
+    )
 
     def __init__(self, timeout_seconds: float = 60) -> None:
         self.timeout_seconds = timeout_seconds
@@ -69,12 +73,7 @@ class OpenAiCompatibleProviderClient:
             endpoint,
             "/chat/completions",
             secret,
-            {
-                "model": model_id,
-                "messages": [{"role": "user", "content": "ping"}],
-                "stream": True,
-                "max_tokens": 1,
-            },
+            self._chat_payload(endpoint, model_id, "ping", max_tokens=1),
         )
         deadline = self._deadline()
         try:
@@ -188,18 +187,9 @@ class OpenAiCompatibleProviderClient:
             or not 1 <= max_output_tokens <= self._MAX_GENERATION_OUTPUT_TOKENS
         ):
             raise ProviderClientError("Generation output token limit is invalid.")
-        request = self._request(
-            endpoint,
-            "/chat/completions",
-            secret,
-            {
-                "model": model_id,
-                "messages": [{"role": "user", "content": normalized_prompt}],
-                "stream": True,
-                "stream_options": {"include_usage": True},
-                "max_tokens": max_output_tokens,
-            },
-        )
+        payload = self._chat_payload(endpoint, model_id, normalized_prompt, max_tokens=max_output_tokens)
+        payload["stream_options"] = {"include_usage": True}
+        request = self._request(endpoint, "/chat/completions", secret, payload)
         deadline = self._deadline()
         content: list[str] = []
         usage: ChatUsage | None = None
@@ -249,11 +239,7 @@ class OpenAiCompatibleProviderClient:
             endpoint,
             "/chat/completions",
             secret,
-            {
-                "model": model_id,
-                "messages": [{"role": "user", "content": normalized_prompt}],
-                "stream": True,
-            },
+            self._chat_payload(endpoint, model_id, normalized_prompt),
         )
         deadline = self._deadline()
         saw_chunk = False
@@ -304,29 +290,21 @@ class OpenAiCompatibleProviderClient:
 
     def _read_response(self, response, cancel_event: Event | None, deadline: float) -> bytes:  # noqa: ANN001
         chunks: list[bytes] = []
-        total = 0
         while True:
             self._ensure_active(cancel_event, deadline)
-            chunk = response.read(min(8192, self._MAX_RESPONSE_BYTES + 1 - total))
+            chunk = response.read(8192)
             if not chunk:
                 return b"".join(chunks)
-            total += len(chunk)
-            if total > self._MAX_RESPONSE_BYTES:
-                raise ProviderClientError("Provider response exceeded the size limit.")
             chunks.append(chunk)
 
     def _stream_events(self, response, cancel_event: Event | None, deadline: float):  # noqa: ANN001
         buffered = b""
-        total = 0
         reader = getattr(response, "read1", response.read)
         while True:
             self._ensure_active(cancel_event, deadline)
             chunk = reader(4096)
             if not chunk:
                 return
-            total += len(chunk)
-            if total > self._MAX_RESPONSE_BYTES:
-                raise ProviderClientError("Provider response exceeded the size limit.")
             buffered += chunk
             deadline = self._deadline()
             while b"\n" in buffered:
@@ -490,15 +468,36 @@ class OpenAiCompatibleProviderClient:
             for field in ("reasoning_content", "reasoning")
         )
 
+    @classmethod
+    def _chat_payload(
+        cls, endpoint: str, model_id: str, prompt: str, *, max_tokens: int | None = None
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "model": model_id,
+            "messages": [
+                {"role": "system", "content": cls._FINAL_RESPONSE_ONLY_INSTRUCTION},
+                {"role": "user", "content": prompt},
+            ],
+            "stream": True,
+        }
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+        if urlparse(endpoint).hostname == "api.deepseek.com":
+            payload["thinking"] = {"type": "disabled"}
+        return payload
+
     @staticmethod
     def _request(
         endpoint: str, path: str, secret: str, payload: dict[str, object] | None = None
     ) -> Request:
         body = json.dumps(payload).encode("utf-8") if payload is not None else None
+        headers = {"Content-Type": "application/json"}
+        if secret:
+            headers["Authorization"] = f"Bearer {secret}"
         return Request(
             f"{endpoint.rstrip('/')}{path}",
             data=body,
-            headers={"Authorization": f"Bearer {secret}", "Content-Type": "application/json"},
+            headers=headers,
             method="POST" if payload is not None else "GET",
         )
 

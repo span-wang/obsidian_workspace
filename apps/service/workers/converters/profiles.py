@@ -24,6 +24,7 @@ class ConverterProfile:
     executable_path: str | None = None
     config_path: str | None = None
     model_paths: tuple[str, ...] = ()
+    backends: tuple[str, ...] = ("pipeline",)
     is_mock: bool = False
     isolation_boundary: str = "unverified"
 
@@ -35,12 +36,17 @@ class ConverterProfile:
                 raise ValueError("Converter profile hashes must be lowercase SHA-256 values.")
         if self.isolation_boundary not in {"unverified", "windows-appcontainer", "local-process"}:
             raise ValueError("Converter profiles need a recognized isolation boundary state.")
+        if not self.backends or any(not backend for backend in self.backends):
+            raise ValueError("Converter profiles need at least one backend.")
         if not self.is_mock and (
             not self.executable_path
             or not self.resource_limits
             or any(type(value) is not int or value <= 0 for value in self.resource_limits.values())
         ):
             raise ValueError("Provisioned converter profiles need an executable path and resource limits.")
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend in self.backends
 
 
 @dataclass(frozen=True)

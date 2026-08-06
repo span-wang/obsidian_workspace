@@ -35,13 +35,16 @@ def _graph_block(
     reading_order: int,
     retrieval_projection: str,
     structure: GraphProjectionChunkingStructure | None,
+    *,
+    page: int = 1,
+    confidence: float = 0.92,
 ) -> GraphProjectionBlock:
     return GraphProjectionBlock(
         block_id=block_id,
         kind=kind,
         reading_order=reading_order,
-        locators=(PdfRegionLocator(page=1, bounds=(1.0, 2.0, 30.0, 40.0)),),
-        confidence=0.92,
+        locators=(PdfRegionLocator(page=page, bounds=(1.0, 2.0, 30.0, 40.0)),),
+        confidence=confidence,
         retrieval_projection=retrieval_projection,
         chunking_structure=structure,
     )
@@ -146,6 +149,93 @@ def test_structured_projection_uses_full_heading_context_and_splits_atomic_text(
     assert all(block.retrieval_text == block.text for block in blocks)
     assert all(len(block.text) <= MAX_CHUNK_CHARACTERS for block in blocks)
     assert all(block.token_estimate > 0 for block in blocks)
+
+
+def test_structured_projection_joins_adjacent_short_atomic_paragraphs() -> None:
+    heading = _graph_block(
+        "heading-1",
+        "heading",
+        0,
+        "Grammar",
+        GraphProjectionChunkingStructure(kind="heading", heading_level=2, heading_text="Grammar"),
+    )
+    first = _graph_block(
+        "paragraph-1",
+        "paragraph",
+        1,
+        "A" * 170,
+        GraphProjectionChunkingStructure(kind="atomic"),
+        page=1,
+        confidence=0.93,
+    )
+    second = _graph_block(
+        "paragraph-2",
+        "paragraph",
+        2,
+        "B" * 180,
+        GraphProjectionChunkingStructure(kind="atomic"),
+        page=2,
+        confidence=0.81,
+    )
+    third = _graph_block(
+        "paragraph-3",
+        "paragraph",
+        3,
+        "C" * 160,
+        GraphProjectionChunkingStructure(kind="atomic"),
+    )
+    projection = _projection(heading, first, second, third)
+
+    blocks = chunk_projection_blocks(projection, (first, second, third))
+
+    assert len(blocks) == 2
+    assert blocks[0].text == f"{first.retrieval_projection}\n\n{second.retrieval_projection}"
+    assert blocks[0].retrieval_text == blocks[0].text
+    assert blocks[0].graph_block_id == first.block_id
+    assert blocks[0].reading_order == first.reading_order
+    assert blocks[0].source_locators == (*first.locators, *second.locators)
+    assert blocks[0].confidence == second.confidence
+    assert blocks[0].location == "graph:graph-1:2:paragraph-1#chunk:1"
+    assert blocks[1].text == third.retrieval_projection
+    assert all(block.heading_path == ("Grammar",) for block in blocks)
+    assert all(len(block.text) <= MAX_CHUNK_CHARACTERS for block in blocks)
+
+
+def test_structured_projection_does_not_join_short_paragraphs_across_a_heading() -> None:
+    first_heading = _graph_block(
+        "heading-1",
+        "heading",
+        0,
+        "First",
+        GraphProjectionChunkingStructure(kind="heading", heading_level=1, heading_text="First"),
+    )
+    first = _graph_block(
+        "paragraph-1",
+        "paragraph",
+        1,
+        "A" * 180,
+        GraphProjectionChunkingStructure(kind="atomic"),
+    )
+    second_heading = _graph_block(
+        "heading-2",
+        "heading",
+        2,
+        "Second",
+        GraphProjectionChunkingStructure(kind="heading", heading_level=1, heading_text="Second"),
+    )
+    second = _graph_block(
+        "paragraph-2",
+        "paragraph",
+        3,
+        "B" * 180,
+        GraphProjectionChunkingStructure(kind="atomic"),
+    )
+    projection = _projection(first_heading, first, second_heading, second)
+
+    blocks = chunk_projection_blocks(projection, (first, second))
+
+    assert [block.text for block in blocks] == [first.retrieval_projection, second.retrieval_projection]
+    assert [block.heading_path for block in blocks] == [("First",), ("Second",)]
 
 
 def test_structured_projection_falls_back_to_source_text_when_list_or_table_snapshot_mismatches() -> None:

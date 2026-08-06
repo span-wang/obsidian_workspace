@@ -28,6 +28,22 @@ def test_import_selection_is_bound_to_one_session_expires_and_is_consumed_once(t
         store.consume(expired_id, "session-a")
 
 
+def test_import_selection_cleans_up_expired_staged_paths(tmp_path: Path) -> None:
+    now = [10.0]
+    cleaned_paths: list[tuple[Path, ...]] = []
+    store = ImportSelectionStore(
+        clock=lambda: now[0], cleanup_paths=lambda paths: cleaned_paths.append(paths)
+    )
+    paths = (tmp_path / "staged" / "remote.pdf",)
+    selection_id = store.remember("session-a", "files", paths)
+
+    now[0] += 301
+
+    with pytest.raises(ImportSelectionError):
+        store.consume(selection_id, "session-a")
+    assert cleaned_paths == [paths]
+
+
 def test_import_selection_consumption_is_atomic_under_concurrent_requests(tmp_path: Path) -> None:
     class CoordinatedSelections(dict):
         def __init__(self) -> None:

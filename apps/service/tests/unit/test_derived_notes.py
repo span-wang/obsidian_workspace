@@ -97,11 +97,18 @@ def test_provenance_rejects_unknown_schema_and_invalid_locator() -> None:
         "schema_version": 1,
         "source_locators": [{"page": 1, "docx_location": "paragraph:1"}],
     }
+    spreadsheet_locator = {
+        **unknown,
+        "schema_version": 1,
+        "source_path": "platform/sources/book.xlsx",
+        "source_locators": [{"region": "sheet:Vocabulary/cell:A1"}],
+    }
 
     assert validate_platform_provenance(unknown).verifiable is False
     assert validate_platform_provenance(invalid).verifiable is False
     assert validate_platform_provenance(windows_path).verifiable is False
     assert validate_platform_provenance(mixed_locator).verifiable is False
+    assert validate_platform_provenance(spreadsheet_locator).verifiable is True
 
 
 def test_derivation_uses_heading_three_to_split_an_oversized_chapter() -> None:
@@ -248,6 +255,38 @@ def test_private_retrieval_candidates_remain_in_app_data_for_derived_and_native_
     assert derived_candidate.source_locators == (EvidenceLocator(page=1),)
     assert native_candidate.block_location == "line:1"
     assert "source_id" not in native_candidate.to_dict()
+
+
+def test_native_noise_blocks_are_not_private_retrieval_candidates() -> None:
+    from domain.derived_notes import native_markdown_proposal, private_index_candidates
+    from domain.markdown_structuring import MarkdownStructureBlock
+
+    markdown = "# Lesson\n\nWorkbook title\n\nMain content"
+    heading_end = markdown.index("\n") + 1
+    noise_start = heading_end + 1
+    noise_end = markdown.index("\n\nMain content")
+    body_start = noise_end + 2
+    proposal = native_markdown_proposal(
+        item_id=8,
+        vault_id="vault-1",
+        relative_path="notes/existing.md",
+        content_sha256="a" * 64,
+        markdown=markdown,
+        structured_blocks=(
+            MarkdownStructureBlock("unit-1", "heading", 0, heading_end, 1, 1, 1, ("Lesson",)),
+            MarkdownStructureBlock("unit-2", "noise", noise_start, noise_end, 3, 3, None, ("Lesson",)),
+            MarkdownStructureBlock(
+                "unit-3", "paragraph", body_start, len(markdown), 5, 5, None, ("Lesson",)
+            ),
+        ),
+    )
+
+    candidates = private_index_candidates(proposal)
+
+    assert [(candidate.block_location, candidate.text) for candidate in candidates] == [
+        ("line:1", "# Lesson"),
+        ("line:5", "Main content"),
+    ]
 
 
 def test_manual_split_keeps_adjacent_question_and_answer_together() -> None:

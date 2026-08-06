@@ -9,6 +9,23 @@ from domain.sessions import TASK_INTENTS
 
 _COMPLETENESS_MARKERS = ("全部", "所有", "整章", "整册", "完整", "清单", "列出", "every ")
 _KNOWLEDGE_ORGANIZATION_MARKERS = ("知识整理", "整理", "总结", "归纳", "知识点", "默写", "复习")
+KNOWLEDGE_ORGANIZATION_TOPIC_MARKERS = (
+    "重点",
+    "核心",
+    "要点",
+    "关键",
+    "概念与方法",
+    "概念和方法",
+    "知识框架",
+    "知识点",
+    "主题概览",
+    "key concepts",
+    "core concepts",
+    "key decisions and risks",
+    "key decisions",
+    "key points",
+    "overview",
+)
 _DEEP_CREATION_MARKERS = ("深度创作", "创作", "写文章", "撰写", "draft", "write an")
 _QUESTION_MARKERS = ("什么", "怎么", "如何", "为何", "为什么", "?", "？")
 _ENGLISH_QUESTION_PATTERN = re.compile(r"\b(?:what|how|why|where|when|which)\b")
@@ -73,7 +90,7 @@ def understand_query(
     """Return a stable route while preserving unresolved scopes for a confirmation step."""
 
     scope_filter, scope_confidence, scope_source = _resolve_scope(query, scope_selection)
-    intent, intent_source = _resolve_intent(query, requested_intent, scope_filter)
+    intent, intent_source = _resolve_intent(query, requested_intent)
     return QueryUnderstanding(
         intent=intent,
         intent_source=intent_source,
@@ -105,9 +122,7 @@ def _selection_is_complete(scope_selection: QueryScopeSelection) -> bool:
     return all((scope_selection.subject, scope_selection.grade_volume, scope_selection.unit_no))
 
 
-def _resolve_intent(
-    query: str, requested_intent: str, scope_filter: RetrievalMetadata
-) -> tuple[str, str]:
+def _resolve_intent(query: str, requested_intent: str) -> tuple[str, str]:
     if requested_intent != "auto":
         if requested_intent not in TASK_INTENTS:
             raise ValueError("Query understanding requested intent is invalid.")
@@ -120,8 +135,9 @@ def _resolve_intent(
         return "deep-creation", "auto"
     if _contains_marker(lowered, _KNOWLEDGE_ORGANIZATION_MARKERS):
         return "knowledge-organization", "auto"
-    if scope_filter.unit_no is not None and not _has_specific_question(lowered):
-        return "completeness", "auto"
+    if _contains_marker(lowered, KNOWLEDGE_ORGANIZATION_TOPIC_MARKERS):
+        if not _has_specific_question(lowered):
+            return "knowledge-organization", "auto"
     return "source-lookup", "auto"
 
 

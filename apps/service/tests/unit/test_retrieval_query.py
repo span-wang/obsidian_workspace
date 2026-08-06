@@ -62,12 +62,41 @@ def test_explicit_intent_overrides_auto_routing_without_changing_scope() -> None
     assert understanding.scope_filter.scope_key == ("英语", "七年级上册", 1)
 
 
-def test_scope_only_unit_without_a_specific_question_prefers_enumeration() -> None:
+def test_scope_only_unit_without_a_specific_question_does_not_imply_enumeration() -> None:
     understanding = understand_query("英语七年级上册第一单元")
 
-    assert understanding.intent == "completeness"
+    assert understanding.intent == "source-lookup"
     assert understanding.scope_filter.scope_key == ("英语", "七年级上册", 1)
     assert understanding.scope_confidence == 0.95
+
+
+def test_scoped_vocabulary_topic_routes_to_knowledge_organization() -> None:
+    understanding = understand_query("第一单元重点词汇与短语")
+
+    assert understanding.intent == "knowledge-organization"
+    assert understanding.scope_filter.unit_no == 1
+    assert understanding.scope_filter.scope_status == "recoverable"
+    assert understanding.scope_filter.reason == "incomplete-scope"
+
+
+def test_scoped_vocabulary_question_remains_a_source_lookup() -> None:
+    understanding = understand_query("第一单元重点词汇是什么？")
+
+    assert understanding.intent == "source-lookup"
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "第二章核心概念与方法",
+        "Project A key decisions and risks",
+        "第三模块主题概览",
+    ),
+)
+def test_generic_scoped_topics_route_to_knowledge_organization(query: str) -> None:
+    understanding = understand_query(query)
+
+    assert understanding.intent == "knowledge-organization"
 
 
 def test_confirmed_scope_replaces_an_incomplete_query_scope() -> None:

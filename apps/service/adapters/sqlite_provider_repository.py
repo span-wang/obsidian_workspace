@@ -9,6 +9,7 @@ from domain.tasks import utc_now
 
 
 _RERANK_MODEL_TYPE_MIGRATION_ID = "ret-09-02-provider-rerank-model-type-v1"
+_MARKDOWN_MODEL_TYPE_MIGRATION_ID = "ret-17-01-provider-markdown-model-type-v1"
 _LEGACY_MODEL_TYPES = frozenset({"chat", "embedding"})
 
 
@@ -54,6 +55,7 @@ class SqliteProviderRepository:
                 model_id TEXT NOT NULL, updated_at TEXT NOT NULL)""")
             self._migrate_legacy_default(connection)
             self._apply_rerank_model_type_migration(connection)
+            self._apply_markdown_model_type_migration(connection)
 
     @staticmethod
     def _add_model_columns(connection: sqlite3.Connection) -> None:
@@ -111,7 +113,7 @@ class SqliteProviderRepository:
                     WHERE configured_model_type IS NULL AND model_type IN ('chat', 'embedding')"""
                 )
                 connection.execute("""CREATE TABLE IF NOT EXISTS model_defaults_v2 (
-                    model_type TEXT PRIMARY KEY CHECK (model_type IN ('chat', 'embedding', 'rerank')),
+                    model_type TEXT PRIMARY KEY CHECK (model_type IN ('chat', 'embedding', 'rerank', 'markdown')),
                     provider_id TEXT NOT NULL REFERENCES providers(provider_id) ON DELETE CASCADE,
                     model_id TEXT NOT NULL, updated_at TEXT NOT NULL)""")
                 connection.execute("""INSERT INTO model_defaults_v2
@@ -129,6 +131,44 @@ class SqliteProviderRepository:
             raise
         else:
             connection.execute("RELEASE provider_rerank_model_type_migration")
+
+    @staticmethod
+    def _apply_markdown_model_type_migration(connection: sqlite3.Connection) -> None:
+        connection.execute("SAVEPOINT provider_markdown_model_type_migration")
+        try:
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS provider_schema_migrations (
+                    migration_id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"""
+            )
+            applied = connection.execute(
+                "SELECT 1 FROM provider_schema_migrations WHERE migration_id = ?",
+                (_MARKDOWN_MODEL_TYPE_MIGRATION_ID,),
+            ).fetchone()
+            table_sql = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'model_defaults_v2'"
+            ).fetchone()
+            if applied is None and table_sql is not None and "markdown" not in str(table_sql[0]).lower():
+                connection.execute("""CREATE TABLE model_defaults_v3 (
+                    model_type TEXT PRIMARY KEY CHECK (model_type IN ('chat', 'embedding', 'rerank', 'markdown')),
+                    provider_id TEXT NOT NULL REFERENCES providers(provider_id) ON DELETE CASCADE,
+                    model_id TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+                connection.execute(
+                    """INSERT INTO model_defaults_v3 (model_type, provider_id, model_id, updated_at)
+                    SELECT model_type, provider_id, model_id, updated_at FROM model_defaults_v2"""
+                )
+                connection.execute("DROP TABLE model_defaults_v2")
+                connection.execute("ALTER TABLE model_defaults_v3 RENAME TO model_defaults_v2")
+            if applied is None:
+                connection.execute(
+                    "INSERT INTO provider_schema_migrations (migration_id, applied_at) VALUES (?, ?)",
+                    (_MARKDOWN_MODEL_TYPE_MIGRATION_ID, utc_now()),
+                )
+        except Exception:
+            connection.execute("ROLLBACK TO provider_markdown_model_type_migration")
+            connection.execute("RELEASE provider_markdown_model_type_migration")
+            raise
+        else:
+            connection.execute("RELEASE provider_markdown_model_type_migration")
 
     def save(self, provider: Provider) -> None:
         with self._connect() as connection:
@@ -153,7 +193,7 @@ class SqliteProviderRepository:
                 model_type, configured_model_type, verification_ok, verification_reason, is_discovered, verified_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [(model.provider_id, model.model_id, json.dumps([]),
-                  None if model.model_type == "rerank" else model.model_type, model.model_type,
+                  None if model.model_type in {"rerank", "markdown"} else model.model_type, model.model_type,
                   int(model.verification.ok), model.verification.reason, int(model.is_discovered), model.verified_at)
                  for model in provider.models])
 

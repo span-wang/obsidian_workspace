@@ -7,9 +7,9 @@ import pytest
 
 from adapters.filesystem_vault_adapter import LocalVaultFilesystem
 from adapters.sqlite_vault_repository import SqliteVaultRepository
-from application.embedding_authorizations import EmbeddingAuthorizationService
-from application.embedding_service import EmbeddingService
-from application.policies import OutboundAuthorizationDenied, PolicyService
+from application.embedding_batches import EmbeddingBatchService
+from application.embedding_service import EmbeddingExecutionError, EmbeddingService
+from application.policies import PolicyService
 from application.vaults import VaultService
 from domain.embeddings import EmbeddingCacheEntry, EmbeddingProfileLocator
 from domain.indexing import IndexBlock, IndexedDocument
@@ -131,7 +131,7 @@ def _document(vault_id: str, *texts: str) -> IndexedDocument:
 
 def _service(
     tmp_path: Path, texts: tuple[str, ...]
-) -> tuple[EmbeddingService, EmbeddingAuthorizationService, PolicyService, str, FakeIndexRepository, FakeProviderService]:
+) -> tuple[EmbeddingService, str, FakeIndexRepository, FakeProviderService]:
     repository = SqliteVaultRepository(tmp_path / "vaults.sqlite3")
     vault_service = VaultService(repository, LocalVaultFilesystem(), repository)
     vault_path = tmp_path / "vault"
@@ -140,42 +140,30 @@ def _service(
     policy_service = PolicyService(vault_service, repository)
     index_repository = FakeIndexRepository([_document(vault.vault_id, *texts)])
     provider_service = FakeProviderService()
-    authorization_service = EmbeddingAuthorizationService(
+    batch_service = EmbeddingBatchService(
         vault_service, policy_service, provider_service, index_repository
     )
     return (
-        EmbeddingService(authorization_service, provider_service, index_repository),
-        authorization_service,
-        policy_service,
+        EmbeddingService(batch_service, provider_service, index_repository),
         vault.vault_id,
         index_repository,
         provider_service,
     )
 
 
-def _approved_authorization(
-    authorization_service: EmbeddingAuthorizationService, policy_service: PolicyService, vault_id: str
-) -> str:
-    _preview, authorization = authorization_service.request(vault_id, scope=_vault_scope())
-    return policy_service.confirm_outbound_authorization(
-        vault_id, authorization.authorization_id, approved=True
-    ).authorization_id
-
-
 def _vault_scope():
-    from domain.embedding_authorization import EmbeddingBatchScope
+    from domain.embedding_batches import EmbeddingBatchScope
 
     return EmbeddingBatchScope("vault")
 
 
 def test_embedding_service_uses_cache_hits_without_resending_block_text(tmp_path: Path) -> None:
-    service, authorization_service, policy_service, vault_id, index_repository, provider = _service(
+    service, vault_id, index_repository, provider = _service(
         tmp_path, ("First body", "Second body")
     )
-    authorization_id = _approved_authorization(authorization_service, policy_service, vault_id)
 
-    first = service.execute(vault_id, authorization_id, _vault_scope())
-    second = service.execute(vault_id, authorization_id, _vault_scope())
+    first = service.execute(vault_id, _vault_scope())
+    second = service.execute(vault_id, _vault_scope())
 
     assert first.block_count == 2
     assert first.cache_hit_block_count == 0
@@ -190,18 +178,17 @@ def test_embedding_service_uses_cache_hits_without_resending_block_text(tmp_path
     assert len(index_repository.block_vectors) == 2
 
 
-def test_embedding_service_rechecks_authorization_before_each_network_batch(tmp_path: Path) -> None:
+def test_embedding_service_rechecks_inputs_before_each_network_batch(tmp_path: Path) -> None:
     texts = tuple(f"Block {index}" for index in range(65))
-    service, authorization_service, policy_service, vault_id, index_repository, provider = _service(
+    service, vault_id, index_repository, provider = _service(
         tmp_path, texts
     )
-    authorization_id = _approved_authorization(authorization_service, policy_service, vault_id)
     provider.after_create = lambda: index_repository.documents.__setitem__(
         0, _document(vault_id, *("Changed block" if index == 64 else value for index, value in enumerate(texts)))
     )
 
-    with pytest.raises(OutboundAuthorizationDenied, match="does not match"):
-        service.execute(vault_id, authorization_id, _vault_scope())
+    with pytest.raises(EmbeddingExecutionError, match="inputs changed"):
+        service.execute(vault_id, _vault_scope())
 
     assert len(provider.calls) == 1
     assert len(provider.calls[0]) == 64

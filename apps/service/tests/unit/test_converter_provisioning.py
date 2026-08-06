@@ -8,8 +8,15 @@ from types import SimpleNamespace
 import api.main as api_main
 from api.runtime import RuntimeState
 from docx import Document as WordDocument
+from domain.derived_notes import render_document_graph
 from domain.evidence import ArtifactRef, DocumentGraph, PdfRegionLocator
-from workers.converters.launcher import _docling_blocks, _mineru_blocks, _pandoc_blocks
+from workers.converters.launcher import (
+    _adapt_graph,
+    _artifacts,
+    _docling_blocks,
+    _mineru_blocks,
+    _pandoc_blocks,
+)
 from workers.converters.profiles import require_profile
 from workers.converters.provisioning import (
     ProvisionedProfiles,
@@ -258,6 +265,204 @@ def test_pandoc_adapter_skips_layout_only_docx_paragraphs_and_supports_quotes(
     ).action == "accepted"
 
 
+def test_pandoc_adapter_expands_numbered_docx_content_and_restores_style_headings(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "numbered.docx"
+    document = WordDocument()
+    document.add_heading("Policy", level=1)
+    document.add_paragraph("Scope")
+    document.add_heading("Responsibilities", level=2)
+    document.add_paragraph("Review work")
+    document.add_table(rows=1, cols=1).cell(0, 0).text = "Record"
+    document.save(source)
+    inventory = preflight_document(source, "docx").inventory
+    raw = ArtifactRef(
+        artifact_id="raw-pandoc",
+        attempt_id="attempt-1",
+        sha256="a" * 64,
+        media_type="application/json",
+        role="converter-json",
+        private_relative_path="pending/raw-pandoc",
+        producer_object_id="pandoc.json",
+    )
+
+    blocks, issues = _pandoc_blocks(
+        {
+            "blocks": [
+                {
+                    "t": "OrderedList",
+                    "c": [
+                        [1, {"t": "Decimal"}, {"t": "DefaultDelim"}],
+                        [
+                            [
+                                {"t": "Para", "c": [{"t": "Str", "c": "Policy"}]},
+                                {"t": "Para", "c": [{"t": "Str", "c": "Scope"}]},
+                                {
+                                    "t": "OrderedList",
+                                    "c": [
+                                        [1, {"t": "Decimal"}, {"t": "DefaultDelim"}],
+                                        [[{"t": "Para", "c": [{"t": "Str", "c": "Responsibilities"}]}]],
+                                    ],
+                                },
+                                {"t": "Para", "c": [{"t": "Str", "c": "Review work"}]},
+                            ]
+                        ],
+                    ],
+                },
+                {"t": "Table", "c": [{"t": "Str", "c": "Record"}]},
+            ]
+        },
+        SimpleNamespace(input_snapshot_path=str(source)),
+        "attempt-1",
+        raw,
+    )
+
+    assert not issues
+    assert [block.kind for block in blocks] == ["heading", "list", "heading", "list", "table"]
+    assert [block.payload.to_dict().get("level") for block in blocks[:3]] == [1, None, 2]
+    assert [block.locators[0].element_path for block in blocks] == inventory["required_anchors"]
+    graph = DocumentGraph(
+        graph_id="graph-pandoc-numbered",
+        source_sha256="a" * 64,
+        input_snapshot_hash="a" * 64,
+        selected_attempt_id="attempt-1",
+        blocks=tuple(blocks),
+        assets=(),
+        issues=(),
+    )
+    assert StructuralQualityGate().evaluate(
+        graph, {"document_kind": "docx", **inventory}
+    ).action == "accepted"
+
+
+def test_pandoc_adapter_maps_standalone_docx_images_to_verified_obsidian_assets(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "figure.docx"
+    document = WordDocument()
+    document.add_paragraph("Figure placeholder")
+    document.save(source)
+    raw = ArtifactRef(
+        artifact_id="raw-pandoc",
+        attempt_id="attempt-1",
+        sha256="a" * 64,
+        media_type="application/json",
+        role="converter-json",
+        private_relative_path="pending/raw-pandoc",
+        producer_object_id="pandoc.json",
+    )
+    image = ArtifactRef(
+        artifact_id="image-artifact",
+        attempt_id="attempt-1",
+        sha256="b" * 64,
+        media_type="image/png",
+        role="image",
+        private_relative_path="pending/image-artifact",
+        producer_object_id="media/figure.png",
+    )
+    assets: list = []
+    blocks, issues = _pandoc_blocks(
+        {
+            "blocks": [
+                {
+                    "t": "Para",
+                    "c": [
+                        {
+                            "t": "Image",
+                            "c": [
+                                ["", [], []],
+                                [{"t": "Str", "c": "Figure one"}],
+                                ["media/figure.png", ""],
+                            ],
+                        }
+                    ],
+                }
+            ]
+        },
+        SimpleNamespace(input_snapshot_path=str(source)),
+        "attempt-1",
+        raw,
+        {image.producer_object_id: image},
+        assets,
+    )
+
+    assert not issues
+    assert [block.kind for block in blocks] == ["image"]
+    assert len(assets) == 1
+    graph = DocumentGraph(
+        graph_id="graph-pandoc-image",
+        source_sha256="a" * 64,
+        input_snapshot_hash="a" * 64,
+        selected_attempt_id="attempt-1",
+        blocks=tuple(blocks),
+        assets=tuple(assets),
+        issues=(),
+    )
+    assert render_document_graph(graph).markdown == f"![[{assets[0].planned_vault_path()}|Figure one]]"
+
+
+def test_pandoc_adapter_maps_absolute_windows_media_paths_to_verified_assets(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "figure.docx"
+    document = WordDocument()
+    document.add_paragraph("Figure placeholder")
+    document.save(source)
+    raw = ArtifactRef(
+        artifact_id="raw-pandoc",
+        attempt_id="attempt-1",
+        sha256="a" * 64,
+        media_type="application/json",
+        role="converter-json",
+        private_relative_path="pending/raw-pandoc",
+        producer_object_id="pandoc.json",
+    )
+    image_path = tmp_path / "media" / "figure.png"
+    image_path.parent.mkdir()
+    image_path.write_bytes(b"png-bytes")
+    image = ArtifactRef(
+        artifact_id="image-artifact",
+        attempt_id="attempt-1",
+        sha256="b" * 64,
+        media_type="image/png",
+        role="image",
+        private_relative_path="pending/image-artifact",
+        producer_object_id="media/figure.png",
+    )
+    assets: list = []
+
+    blocks, issues = _pandoc_blocks(
+        {
+            "blocks": [
+                {
+                    "t": "Para",
+                    "c": [
+                        {
+                            "t": "Image",
+                            "c": [
+                                ["", [], []],
+                                [{"t": "Str", "c": "Figure one"}],
+                                [str(image_path), ""],
+                            ],
+                        }
+                    ],
+                }
+            ]
+        },
+        SimpleNamespace(input_snapshot_path=str(source)),
+        "attempt-1",
+        raw,
+        {image.producer_object_id: image},
+        assets,
+        artifact_root=tmp_path,
+    )
+
+    assert not issues
+    assert [block.kind for block in blocks] == ["image"]
+    assert len(assets) == 1
+
+
 def test_mineru_content_list_adapter_uses_real_regions_and_raw_json_evidence() -> None:
     raw = ArtifactRef(
         artifact_id="raw-mineru",
@@ -356,6 +561,174 @@ def test_mineru_adapter_preserves_formula_and_table_while_classifying_furniture_
     assert StructuralQualityGate().evaluate(graph, {"document_kind": "pdf", "page_count": 1}).action == "accepted"
 
 
+def test_mineru_adapter_maps_lists_and_algorithms_and_keeps_images_non_blocking() -> None:
+    raw = ArtifactRef(
+        artifact_id="raw-mineru",
+        attempt_id="attempt-1",
+        sha256="a" * 64,
+        media_type="application/json",
+        role="converter-json",
+        private_relative_path="pending/raw-mineru",
+        producer_object_id="mineru/probe_content_list_v2.json",
+    )
+    blocks, issues = _mineru_blocks(
+        [[
+            {
+                "type": "list",
+                "content": {
+                    "attribute": "unordered",
+                    "list_items": [
+                        {"item_content": [{"type": "text", "content": "First"}]},
+                        {"item_content": [{"type": "text", "content": "Second"}]},
+                    ],
+                },
+                "bbox": [10, 20, 100, 60],
+            },
+            {
+                "type": "index",
+                "content": {
+                    "list_items": [
+                        {"item_content": [{"type": "text", "content": "Contents"}]},
+                    ]
+                },
+                "bbox": [10, 70, 100, 90],
+            },
+            {
+                "type": "algorithm",
+                "content": {
+                    "algorithm_content": [{"type": "text", "content": "Procedure"}],
+                },
+                "bbox": [10, 100, 100, 120],
+            },
+            {"type": "image", "content": {"image_source": {"path": "images/example.jpg"}}, "bbox": [10, 130, 100, 180]},
+        ]],
+        "attempt-1",
+        raw,
+    )
+
+    assert [block.kind for block in blocks] == ["list", "list", "paragraph"]
+    assert blocks[0].payload.to_dict()["items"] == [
+        {"inline_runs": [{"kind": "text", "text": "First"}]},
+        {"inline_runs": [{"kind": "text", "text": "Second"}]},
+    ]
+    assert [issue.code for issue in issues] == ["mineru-image-preserved-as-artifact"]
+    graph = DocumentGraph(
+        graph_id="graph-mineru-extended",
+        source_sha256="a" * 64,
+        input_snapshot_hash="a" * 64,
+        selected_attempt_id="attempt-1",
+        blocks=tuple(blocks),
+        assets=(),
+        issues=tuple(issues),
+    )
+    assert StructuralQualityGate().evaluate(graph, {"document_kind": "pdf", "page_count": 1}).action == "accepted"
+
+
+def test_mineru_image_blocks_bind_verified_artifacts_and_render_obsidian_embeds() -> None:
+    raw = ArtifactRef(
+        artifact_id="raw-mineru",
+        attempt_id="attempt-1",
+        sha256="a" * 64,
+        media_type="application/json",
+        role="converter-json",
+        private_relative_path="pending/raw-mineru",
+        producer_object_id="mineru/auto/doc_content_list_v2.json",
+    )
+    image = ArtifactRef(
+        artifact_id="image-artifact",
+        attempt_id="attempt-1",
+        sha256="b" * 64,
+        media_type="image/jpeg",
+        role="image",
+        private_relative_path="pending/image-artifact",
+        producer_object_id="mineru/auto/images/example.jpg",
+    )
+    assets: list = []
+    blocks, issues = _mineru_blocks(
+        [[
+            {
+                "type": "image",
+                "content": {
+                    "image_source": {"path": "images/example.jpg"},
+                    "image_caption": [{"type": "text", "content": "Figure one"}],
+                },
+                "bbox": [10, 20, 100, 120],
+            }
+        ]],
+        "attempt-1",
+        raw,
+        {image.producer_object_id: image},
+        assets,
+    )
+
+    assert not issues
+    assert [block.kind for block in blocks] == ["image"]
+    assert blocks[0].retrieval_projection == "Figure one"
+    assert len(assets) == 1
+    assert assets[0].artifact_ref == image
+    graph = DocumentGraph(
+        graph_id="graph-mineru-image",
+        source_sha256="a" * 64,
+        input_snapshot_hash="a" * 64,
+        selected_attempt_id="attempt-1",
+        blocks=tuple(blocks),
+        assets=tuple(assets),
+        issues=(),
+    )
+    rendered = render_document_graph(graph)
+    assert rendered.markdown == f"![[{assets[0].planned_vault_path()}|Figure one]]"
+
+
+def test_artifact_collection_marks_supported_raster_outputs_as_assets(tmp_path: Path) -> None:
+    image = tmp_path / "images" / "figure.jpg"
+    image.parent.mkdir()
+    image.write_bytes(b"jpeg-bytes")
+
+    artifacts, drafts = _artifacts("attempt-1", tmp_path)
+
+    assert len(artifacts) == len(drafts) == 1
+    assert artifacts[0].role == "image"
+    assert artifacts[0].media_type == "image/jpeg"
+
+
+def test_mineru_graph_adapter_connects_collected_image_artifacts(tmp_path: Path) -> None:
+    output = tmp_path / "mineru" / "auto" / "doc_content_list_v2.json"
+    image = tmp_path / "mineru" / "auto" / "images" / "figure.jpg"
+    image.parent.mkdir(parents=True)
+    output.write_text(
+        json.dumps(
+            [[
+                {
+                    "type": "image",
+                    "content": {"image_source": {"path": "images/figure.jpg"}},
+                    "bbox": [10, 20, 100, 120],
+                }
+            ]]
+        ),
+        encoding="utf-8",
+    )
+    image.write_bytes(b"jpeg-bytes")
+    artifacts, _ = _artifacts("attempt-1", tmp_path)
+    raw = next(
+        artifact
+        for artifact in artifacts
+        if artifact.producer_object_id == "mineru/auto/doc_content_list_v2.json"
+    )
+
+    graph = _adapt_graph(
+        "mineru",
+        output,
+        SimpleNamespace(source_sha256="a" * 64, input_snapshot_hash="a" * 64),
+        "attempt-1",
+        raw,
+        artifacts,
+    )
+
+    assert [block.kind for block in graph.blocks] == ["image"]
+    assert len(graph.assets) == 1
+    assert graph.assets[0].artifact_ref.role == "image"
+
+
 def test_mineru_empty_paragraph_becomes_a_located_review_issue() -> None:
     raw = ArtifactRef(
         artifact_id="raw-mineru",
@@ -413,6 +786,82 @@ def test_docling_empty_formula_becomes_a_located_review_issue_instead_of_raising
     assert not blocks
     assert [issue.code for issue in issues] == ["docling-formula-unresolved"]
     assert isinstance(issues[0].locator, PdfRegionLocator)
+
+
+def test_docling_adapter_omits_repeated_margin_furniture_and_derives_numbered_heading_levels() -> None:
+    raw = ArtifactRef(
+        artifact_id="raw-docling",
+        attempt_id="attempt-1",
+        sha256="a" * 64,
+        media_type="application/json",
+        role="converter-json",
+        private_relative_path="pending/raw-docling",
+        producer_object_id="docling/result.json",
+    )
+
+    def text(text: str, label: str, page: int, bottom: float, top: float) -> dict[str, object]:
+        return {
+            "self_ref": f"#/texts/{text}-{page}",
+            "label": label,
+            "text": text,
+            "prov": [{"page_no": page, "bbox": {"l": 10, "b": bottom, "r": 100, "t": top}}],
+        }
+
+    blocks, issues = _docling_blocks(
+        {
+            "pages": {
+                "1": {"size": {"height": 100}},
+                "2": {"size": {"height": 100}},
+                "3": {"size": {"height": 100}},
+            },
+            "texts": [
+                text("Controlled procedure", "section_header", 1, 91, 98),
+                text("Controlled procedure", "section_header", 2, 91, 98),
+                text("Controlled procedure", "section_header", 3, 91, 98),
+                text("Page 1 of 3", "text", 1, 2, 8),
+                text("Page 2 of 3", "text", 2, 2, 8),
+                text("Page 3 of 3", "text", 3, 2, 8),
+                text("4 Duties", "section_header", 1, 50, 58),
+                text("Work must be reviewed.", "text", 1, 38, 45),
+                text("4.1 Supervisor", "section_header", 2, 50, 58),
+                text("4.1.1 Check records", "section_header", 3, 50, 58),
+                text("continued.", "section_header", 3, 38, 45),
+            ],
+        },
+        "pdf",
+        "attempt-1",
+        raw,
+    )
+
+    assert [block.retrieval_projection for block in blocks] == [
+        "4 Duties",
+        "Work must be reviewed.",
+        "4.1 Supervisor",
+        "4.1.1 Check records",
+        "continued.",
+    ]
+    assert [block.kind for block in blocks] == ["heading", "paragraph", "heading", "heading", "paragraph"]
+    assert [block.payload.to_dict().get("level") for block in blocks if block.kind == "heading"] == [
+        1,
+        2,
+        3,
+    ]
+    assert [issue.code for issue in issues] == ["docling-page-furniture-omitted"] * 6
+    markdown = render_document_graph(
+        DocumentGraph(
+            graph_id="graph-docling-furniture",
+            source_sha256="a" * 64,
+            input_snapshot_hash="a" * 64,
+            selected_attempt_id="attempt-1",
+            blocks=tuple(blocks),
+            assets=(),
+            issues=tuple(issues),
+        )
+    ).markdown
+    assert "Controlled procedure" not in markdown
+    assert "# 4 Duties" in markdown
+    assert "## 4.1 Supervisor" in markdown
+    assert "### 4.1.1 Check records" in markdown
 
 
 def _write_manifest(root: Path, profile: dict[str, object]) -> None:

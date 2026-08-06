@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from domain.policies import OutboundScope, normalize_vault_relative_path
+from domain.policies import normalize_vault_relative_path
 
 
 EMBEDDING_CONTENT_CATEGORIES = ("contextual-prefix", "retrieval-text")
@@ -53,8 +53,8 @@ class EmbeddingBlockedDocument:
 
 
 @dataclass(frozen=True)
-class EmbeddingAuthorizationPreview:
-    """Content-free, frozen-at-read-time facts for one potential embedding batch."""
+class EmbeddingBatchPreview:
+    """Content-free, frozen-at-read-time facts for one embedding batch."""
 
     vault_id: str
     scope: EmbeddingBatchScope
@@ -70,7 +70,7 @@ class EmbeddingAuthorizationPreview:
     blocked_block_count: int
     blocked_documents: tuple[EmbeddingBlockedDocument, ...]
     content_categories: tuple[str, ...]
-    scopes: tuple[OutboundScope, ...]
+    relative_paths: tuple[str, ...]
 
     def __post_init__(self) -> None:
         if (
@@ -81,9 +81,9 @@ class EmbeddingAuthorizationPreview:
             or not self.provider_configuration_revision
             or not self.task_id
         ):
-            raise ValueError("Embedding authorization preview identity is invalid.")
+            raise ValueError("Embedding batch preview identity is invalid.")
         if type(self.policy_revision) is not int or self.policy_revision < 1:
-            raise ValueError("Embedding authorization preview policy revision is invalid.")
+            raise ValueError("Embedding batch preview policy revision is invalid.")
         for value in (
             self.file_count,
             self.block_count,
@@ -91,16 +91,16 @@ class EmbeddingAuthorizationPreview:
             self.blocked_block_count,
         ):
             if type(value) is not int or value < 0:
-                raise ValueError("Embedding authorization preview counts are invalid.")
-        if self.file_count != len(self.scopes):
-            raise ValueError("Embedding authorization preview scopes must match its file count.")
+                raise ValueError("Embedding batch preview counts are invalid.")
+        if self.file_count != len(self.relative_paths):
+            raise ValueError("Embedding batch preview paths must match its file count.")
         if self.blocked_file_count < len(self.blocked_documents):
-            raise ValueError("Embedding authorization preview blocked sample is invalid.")
+            raise ValueError("Embedding batch preview blocked sample is invalid.")
         if self.content_categories != EMBEDDING_CONTENT_CATEGORIES:
-            raise ValueError("Embedding authorization preview content categories are invalid.")
+            raise ValueError("Embedding batch preview content categories are invalid.")
 
     @property
-    def is_authorizable(self) -> bool:
+    def is_executable(self) -> bool:
         return self.file_count > 0 and self.block_count > 0
 
 

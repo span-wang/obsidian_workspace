@@ -6,8 +6,10 @@ export const VAULTS_ENDPOINT = "/api/vaults";
 export const VAULT_DIRECTORY_PICKER_ENDPOINT = "/api/vaults/select-directory";
 export const PROVIDERS_ENDPOINT = "/api/providers";
 export const SESSIONS_ENDPOINT = "/api/sessions";
+export const RETRIEVAL_MODE_ENDPOINT = "/api/retrieval/mode";
 export const IMPORT_TASKS_ENDPOINT = "/api/import-tasks";
 export const IMPORT_FILES_SELECTION_ENDPOINT = "/api/import-selections/files";
+export const IMPORT_UPLOAD_ENDPOINT = "/api/import-selections/uploads";
 export const IMPORT_DIRECTORY_SELECTION_ENDPOINT = "/api/import-selections/directory";
 export const IMPORT_TASK_EVENT_NAMES = [
   "task-update",
@@ -73,7 +75,7 @@ export const NAVIGATION_DESTINATIONS = [
 ];
 
 const VAULT_SURFACES = new Set(["workbench", "materials"]);
-const IMPORT_PROGRESS_PHASES = ["queued", "scanning", "converting", "parsing", "ocr", "deriving-markdown", "waiting-for-review", "committing", "indexing"];
+const IMPORT_PROGRESS_PHASES = ["queued", "scanning", "converting", "parsing", "ocr", "deriving-markdown", "committing", "indexing"];
 
 export function derivedMarkdownPreview(markdown) {
   const frontmatter = typeof markdown === "string"
@@ -83,6 +85,97 @@ export function derivedMarkdownPreview(markdown) {
   return markdown
     .slice(frontmatter[0].length)
     .replace(/^来源：\[\[[^\r\n\]]+\|原始资料\]\]\r?\n(?:\r?\n)?/m, "");
+}
+
+function nonEmptyText(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : "";
+}
+
+function containsInternalReference(value) {
+  return /(?:^graph:|#chunk:|(?:^|[\s:])[a-f0-9]{64}(?=$|[\s:#;])|(?:^|\s)(?:block|unit|paragraph|image|table|line|element[_ -]?path|region):\d+\b)/i.test(value);
+}
+
+export function userFacingEvidenceLocation(evidence = {}) {
+  const rawLocation = nonEmptyText(evidence.location);
+  const parsedHeading = /^heading:\s*([^;]+)/i.exec(rawLocation)?.[1]?.trim() || "";
+  const parsedPage = /(?:^|;)\s*page:\s*(\d+)/i.exec(rawLocation)?.[1];
+  const headingCandidate = nonEmptyText(evidence.heading) || parsedHeading;
+  const heading = containsInternalReference(headingCandidate) ? "" : headingCandidate;
+  const page = Number.isInteger(evidence.page) && evidence.page > 0
+    ? evidence.page
+    : parsedPage ? Number(parsedPage) : null;
+  const structuredParts = [heading, page ? `第 ${page} 页` : ""].filter(Boolean);
+  if (structuredParts.length) return structuredParts.join(" · ");
+  if (!rawLocation) return "";
+  return /^第\s*\d+\s*(?:章|节|页|部分)(?:\s*[-—].+)?$/.test(rawLocation) ? rawLocation : "";
+}
+
+export function userFacingEvidenceSource(evidence = {}) {
+  const sourcePath = nonEmptyText(evidence.source_path ?? evidence.sourcePath);
+  if (sourcePath) return `原始资料：${sourcePath}`;
+  const identityKind = evidence.identity_kind ?? evidence.identityKind;
+  if (identityKind === "derived") return "来源类型：原始资料生成的笔记";
+  if (identityKind === "native") return "来源类型：原生 Markdown";
+  return "";
+}
+
+export function applicationEvidenceAnchorId(key) {
+  // Keep fragment targets stable without exposing source identifiers in the DOM.
+  let primary = 0x811c9dc5;
+  let secondary = 0x9e3779b9;
+  for (const character of String(key)) {
+    const codePoint = character.codePointAt(0);
+    primary = Math.imul(primary ^ codePoint, 0x01000193);
+    secondary = Math.imul(secondary ^ codePoint, 0x85ebca6b);
+  }
+  return `application-evidence-${(primary >>> 0).toString(36)}-${(secondary >>> 0).toString(36)}`;
+}
+
+export async function copyPlainText(content, clipboard = globalThis.navigator?.clipboard) {
+  const text = typeof content === "string" ? content.trim() : "";
+  if (!text || typeof clipboard?.writeText !== "function") return false;
+  await clipboard.writeText(text);
+  return true;
+}
+
+export function userFacingSourceSample(source = {}) {
+  return nonEmptyText(source.source_path) || nonEmptyText(source.relative_path);
+}
+
+export function userFacingImportLocation(value) {
+  const rawLocation = nonEmptyText(value);
+  if (!rawLocation) return "";
+  const page = /(?:^|\s)(?:page|页)\s*:?\s*(\d+)/i.exec(rawLocation)?.[1]
+    || /第\s*(\d+)\s*页/.exec(rawLocation)?.[1];
+  if (page) return `第 ${page} 页`;
+  if (/docx|ooxml|word\/document|paragraph|element[_ -]?path/i.test(rawLocation)) return "DOCX 内容";
+  if (/^graph:|#chunk:|[a-f0-9]{64}|(?:^|\s)(?:block|unit):\d+/i.test(rawLocation)) return "";
+  return rawLocation === "document" ? "文档内容" : "";
+}
+
+export function userFacingImportIssue(value) {
+  const issue = nonEmptyText(value);
+  if (!issue) return "";
+  const friendlyIssue = issue
+    .replace(/^graph:[\s\S]*?#chunk:\s*\d+\s*:\s*/i, "")
+    .replace(/^(?:page\s*\d+|第\s*\d+\s*页)(?:\s+(?:box|table|paragraph|line)\s*:?\s*[\d,.-]+)?\s*:\s*/i, "")
+    .replace(/^(?:docx|ooxml|word\/document)(?:[^:]*:\s*){1,2}/i, "")
+    .replace(/^(?:block|unit|paragraph|image|table|line|element[_ -]?path|region)\s*:\s*[\d,.-]+(?:\s*\/\s*(?:row|cell|paragraph|line)\s*:\s*[\d,.-]+)*(?:\s*:\s*[\d,.-]+)*\s*:\s*/i, "");
+  return containsInternalReference(friendlyIssue) ? "" : friendlyIssue;
+}
+
+function evidenceSummaryText(evidence) {
+  return userFacingEvidenceLocation(evidence) || "来源详情";
+}
+
+function retrievalChannelText(channel) {
+  return {
+    keyword: "关键词",
+    lexical: "关键词",
+    semantic: "语义",
+    heading: "标题",
+    neighborhood: "相邻内容"
+  }[channel] || "其他方式";
 }
 
 function importLifecycleText(lifecycle) {
@@ -107,7 +200,6 @@ function importPhaseText(phase) {
     converting: "保真转换",
     ocr: "OCR",
     "deriving-markdown": "生成笔记提案",
-    "waiting-for-review": "等待审核",
     committing: "提交",
     indexing: "索引",
     failed: "失败",
@@ -129,7 +221,16 @@ function importCategoryText(category) {
 function importDocumentKindText(kind) {
   return {
     pdf: "PDF（电子/扫描待识别）",
-    docx: "DOCX",
+    doc: "Word 97-2003",
+    docx: "Word DOCX",
+    docm: "Word DOCM",
+    dotx: "Word 模板 DOTX",
+    dotm: "Word 模板 DOTM",
+    xls: "Excel 97-2003",
+    xlsx: "Excel XLSX",
+    xlsm: "Excel XLSM",
+    xltx: "Excel 模板 XLTX",
+    xltm: "Excel 模板 XLTM",
     markdown: "外部 Markdown"
   }[kind] || "未识别";
 }
@@ -138,6 +239,9 @@ function importRecoveryActionText(action) {
   return {
     cancel: "取消",
     "restart-scan": "重新扫描",
+    "restart-parse": "重新解析",
+    "restart-conversion": "重新转换",
+    "restart-derivation": "重新生成",
     "restart-ocr": "重新 OCR",
     "retry-commit": "重试提交",
     "create-new-task": "创建新任务"
@@ -167,7 +271,7 @@ function importConversionStatusText(status) {
     "not-applicable": "未转换",
     pending: "待转换",
     selected: "已选择完整转换图",
-    rejected: "转换需审核"
+    rejected: "转换失败"
   }[status] || "转换未就绪";
 }
 
@@ -178,7 +282,7 @@ function importOcrStatusText(status) {
     "ocr-processing": "OCR 中",
     "ocr-completed": "OCR 完成",
     "ocr-failed": "OCR 失败",
-    "required-check": "OCR 待审核",
+    "required-check": "OCR 需重试",
     "completed-with-confirmed-gaps": "带已确认缺口完成"
   }[status] || "待 OCR";
 }
@@ -204,7 +308,7 @@ export function conversionCorrectionDraft(draft = {}) {
   const kind = draft.kind || "paragraph";
   const retrievalProjection = draft.retrieval_projection?.trim();
   const reason = draft.reason?.trim();
-  if (!blockId) return { error: "请提供要替换的转换块 ID。" };
+  if (!blockId) return { error: "请提供要替换的转换块。" };
   if (!DOCUMENT_BLOCK_KINDS.includes(kind)) return { error: "请选择受支持的转换块类型。" };
   if (!draft.payload?.trim()) return { error: "请提供符合块类型的 JSON 内容。" };
   let payload;
@@ -223,9 +327,9 @@ export function conversionCorrectionDraft(draft = {}) {
 
 function sourceLocatorText(locator) {
   if (locator.type === "pdf-region") return `第 ${locator.page} 页`;
-  if (locator.type === "docx-ooxml") return `DOCX ${locator.element_path}`;
-  if (locator.type === "source-scope") return `来源范围：${locator.scope}`;
-  return locator.page ? `第 ${locator.page} 页` : locator.docx_location || locator.region || "未定位";
+  if (locator.type === "docx-ooxml") return "DOCX 内容";
+  if (locator.type === "source-scope") return "原始资料";
+  return locator.page ? `第 ${locator.page} 页` : "文档内容";
 }
 
 export function ConversionReviewControls({
@@ -258,7 +362,7 @@ export function ConversionReviewControls({
             value: draft.block_id || "",
             disabled: !canAct,
             onChange: (event) => onDraftChange("block_id", event.target.value),
-            "aria-label": "要修正的转换块 ID"
+            "aria-label": "要修正的转换块"
           },
           React.createElement("option", { value: "" }, "选择转换块"),
           availableBlocks.map((block) => React.createElement(
@@ -272,8 +376,8 @@ export function ConversionReviewControls({
           value: draft.block_id || "",
           disabled: !canAct,
           onChange: (event) => onDraftChange("block_id", event.target.value),
-          "aria-label": "要修正的转换块 ID",
-          placeholder: "转换块 ID"
+          "aria-label": "要修正的转换块",
+          placeholder: "转换块"
         }),
     React.createElement(
       "select",
@@ -329,6 +433,7 @@ export function ConversionReviewControls({
 
 function progressPhaseStatus(task, phase) {
   if (task.phase === phase) return "当前";
+  if (["complete", "completed-with-confirmed-gaps"].includes(task.phase)) return "已完成";
   if (task.phase === "waiting-for-next-stage") {
     return ["queued", "scanning"].includes(phase) ? "已完成" : "未开始";
   }
@@ -340,14 +445,14 @@ function progressPhaseStatus(task, phase) {
 
 function policyFor(vault) {
   return vault.policy || {
-    outbound_mode: "ask-each-task",
+    outbound_mode: "always-allow",
     policy_revision: 1,
     rules: []
   };
 }
 
-function outboundModeText(mode) {
-  return mode === "always-allow" ? "始终允许" : "每次询问";
+function outboundModeText() {
+  return "默认允许";
 }
 
 function ruleReason(kind) {
@@ -367,10 +472,11 @@ function policyEndpoint(vaultId) {
 }
 
 function requestJson(endpoint, options = {}) {
+  const isFormData = typeof globalThis.FormData !== "undefined" && options.body instanceof globalThis.FormData;
   return fetch(endpoint, {
     ...options,
     headers: {
-      ...(options.body ? { "Content-Type": "application/json" } : {}),
+      ...(options.body && !isFormData ? { "Content-Type": "application/json" } : {}),
       ...options.headers
     }
   }).then(async (response) => {
@@ -380,47 +486,8 @@ function requestJson(endpoint, options = {}) {
   });
 }
 
-async function requestEventStream(endpoint, options = {}, onEvent) {
-  const response = await fetch(endpoint, {
-    ...options,
-    headers: {
-      ...(options.body ? { "Content-Type": "application/json" } : {}),
-      Accept: "text/event-stream",
-      ...options.headers
-    }
-  });
-  if (!response.ok) {
-    const payload = await response.json().catch(() => ({}));
-    throw new Error(payload.message || "请求未完成。");
-  }
-  if (!response.body) throw new Error("流式响应不可用。");
-
-  const reader = response.body.getReader();
-  const decoder = new globalThis.TextDecoder();
-  let buffered = "";
-  const consume = (frame) => {
-    const lines = frame.split(/\r?\n/);
-    const event = lines.find((line) => line.startsWith("event:"))?.slice(6).trim() || "message";
-    const data = lines
-      .filter((line) => line.startsWith("data:"))
-      .map((line) => line.slice(5).trim())
-      .join("\n");
-    if (data) onEvent(event, JSON.parse(data));
-  };
-
-  while (true) {
-    const { done, value } = await reader.read();
-    buffered += decoder.decode(value || new Uint8Array(), { stream: !done });
-    const frames = buffered.split(/\r?\n\r?\n/);
-    buffered = frames.pop() || "";
-    frames.filter(Boolean).forEach(consume);
-    if (done) break;
-  }
-  if (buffered.trim()) consume(buffered);
-}
-
 function vaultName(vault) {
-  return vault.display_name || vault.path?.replace(/\\/g, "/").split("/").at(-1) || vault.vault_id;
+  return vault.display_name || vault.path?.replace(/\\/g, "/").split("/").at(-1) || "未命名知识库";
 }
 
 function sessionVaultName(session, vaults) {
@@ -444,7 +511,7 @@ function providerStatus(provider) {
 
 function modelOptions(providers, modelType) {
   return providers.flatMap((provider) => (
-    provider.verification.is_verified && provider.credential_configured
+    provider.verification.is_verified
       ? provider.models
         .filter((model) => model.model_type === modelType && model.verification.ok && model.is_discovered)
         .map((model) => ({ provider, model }))
@@ -456,7 +523,8 @@ function modelTypeLabel(modelType) {
   const labels = {
     chat: "对话/文本生成",
     embedding: "Embedding",
-    rerank: "Rerank（重排）"
+    rerank: "Rerank（重排）",
+    markdown: "Markdown 结构化"
   };
   return labels[modelType] || modelType;
 }
@@ -469,6 +537,36 @@ function sessionComposerContext(session) {
     provider_id: session?.selected_provider_id || "",
     model_id: session?.selected_model_id || ""
   };
+}
+
+export function conversationTurns(detail = {}) {
+  const entries = [
+    ...(detail.messages || []).map((value) => ({ kind: "message", value })),
+    ...(detail.generation_results || []).map((value) => ({ kind: "generation", value })),
+    ...(detail.retrieval_results || []).map((value) => ({ kind: "retrieval", value })),
+    ...(detail.completeness_results || []).map((value) => ({ kind: "completeness", value })),
+    ...(detail.knowledge_organization_results || []).map((value) => ({ kind: "organization", value })),
+    ...(detail.deep_creation_results || []).map((value) => ({ kind: "deep-creation", value }))
+  ]
+    .sort((first, second) => (first.value.created_at || "").localeCompare(second.value.created_at || ""))
+    .map((entry, index) => ({
+      ...entry,
+      key: `${entry.kind}:${entry.value.message_id || entry.value.result_id || entry.value.task_id || index}`
+    }));
+
+  const turns = [];
+  entries.forEach((entry) => {
+    const startsTurn = entry.kind === "message" && entry.value.role === "user";
+    if (startsTurn || !turns.length) {
+      turns.push({
+        id: `session-turn-${entry.key}`,
+        question: startsTurn ? nonEmptyText(entry.value.content) : "未命名问答",
+        entries: []
+      });
+    }
+    turns.at(-1).entries.push(entry);
+  });
+  return turns;
 }
 
 function NavigationLinks({ activeDestination, firstLinkRef, onNavigate }) {
@@ -653,7 +751,7 @@ function ConfirmationPanel({ request, error, isSubmitting, onClose, onConfirm })
         isSessionRemoval
           ? "这会删除该会话的私有消息、范围、模型记录、任务状态、引用和结果。不会删除、移动或改写已审核写入 vault 的资料、笔记或标签。"
           : isProviderRemoval
-          ? `将删除“${targetName}”的应用内配置、模型缓存和 Windows 凭据，并使关联外发授权失效。`
+          ? `将删除“${targetName}”的应用内配置、模型缓存和 Windows 凭据，并使关联外发记录失效。`
           : isRemoval
             ? `将移除“${targetName}”的应用内授权与私有状态。不会删除、移动或改写 vault 中的文件。`
             : `将停止“${targetName}”的新写入依赖操作。现有 vault 文件、应用记录和本地结果会保留。`
@@ -677,89 +775,6 @@ function ConfirmationPanel({ request, error, isSubmitting, onClose, onConfirm })
   );
 }
 
-function rerankContentCategoriesText(contentCategories) {
-  if (!Array.isArray(contentCategories)) return "未标注";
-  const labels = contentCategories.filter(
-    (category) => typeof category === "string" && category.trim()
-  );
-  return labels.length ? labels.join("、") : "未标注";
-}
-
-export function RerankAuthorizationPreview({
-  preview,
-  authorization,
-  isSubmitting,
-  onConfirm,
-  onUseLocal
-}) {
-  const canConfirm = Boolean(preview?.is_authorizable && authorization?.authorization_id && onConfirm);
-  const provider = preview?.provider_name || preview?.provider_id || "未指定";
-  const authorizationReady = authorization?.status === "approved";
-  return React.createElement(
-    "section",
-    { className: "rerank-authorization-preview", "aria-label": "点查 rerank 外发授权预览" },
-    React.createElement("strong", null, "点查 rerank 外发授权预览"),
-    React.createElement("span", null, `Provider：${provider}；Model：${preview?.model_id || "未指定"}`),
-    React.createElement(
-      "span",
-      null,
-      `候选 ${preview?.candidate_count || 0} 项；文件 ${preview?.file_count || 0} 项；输入 ${preview?.input_character_count || 0} 个字符`
-    ),
-    React.createElement(
-      "span",
-      null,
-      `已排除候选 ${preview?.blocked_candidate_count || 0} 项；文件 ${preview?.blocked_file_count || 0} 项`
-    ),
-    React.createElement("span", null, `内容类别：${rerankContentCategoriesText(preview?.content_categories)}`),
-    React.createElement(
-      "span",
-      null,
-      `Provider 配置修订：${preview?.provider_configuration_revision ?? "未提供"}`
-    ),
-    React.createElement("span", null, `外发策略修订：${preview?.policy_revision ?? "未提供"}`),
-    React.createElement(
-      "span",
-      { className: "row-note" },
-      preview?.is_authorizable
-        ? "预览不显示候选正文、绝对路径或内容哈希；确认后仅本次任务可使用该授权。"
-        : `当前候选不满足 rerank 外发条件，将只执行本地 RRF 检索。${preview?.blocking_reason ? ` 原因：${preview.blocking_reason}` : ""}`
-    ),
-    (preview?.blocked_candidate_count || preview?.blocked_file_count) && preview?.is_authorizable
-      ? React.createElement(
-          "span",
-          { className: "row-note" },
-          `已排除的候选不会发送；${preview?.blocking_reason || "只会发送剩余允许候选。"}`
-        )
-      : null,
-    React.createElement(
-      "div",
-      { className: "detail-actions rerank-authorization-actions" },
-      React.createElement(
-        "button",
-        {
-          className: "secondary-button",
-          type: "button",
-          disabled: isSubmitting,
-          onClick: onUseLocal
-        },
-        "仅本地执行"
-      ),
-      canConfirm
-        ? React.createElement(
-            "button",
-            {
-              className: "primary-button",
-              type: "button",
-              disabled: isSubmitting,
-              onClick: onConfirm
-            },
-            authorizationReady ? "执行受控 rerank" : "确认并执行 rerank"
-          )
-        : null
-    )
-  );
-}
-
 export function SessionManagement({
   sessionPage,
   filters,
@@ -777,16 +792,12 @@ export function SessionManagement({
   onDelete,
   vaults = [],
   providers = [],
-  onUpdateContext,
   onPickAttachments,
   onRemoveAttachment,
-  onPreviewTask,
-  onCreateTask,
-  onExecuteTask,
-  onPrepareRerankAuthorization,
-  onConfirmRerankAuthorization,
-  onConfirmKnowledgeOrganizationAuthorization,
-  onConfirmDeepCreationAuthorization,
+  onRun,
+  retrievalMode = { mode: "keyword", options: [] },
+  retrievalModeLoading = false,
+  onRetrievalModeChange = async () => retrievalMode,
   onLoadCompletenessCoverage,
   onEditGenerationResult,
   onReverifyGenerationResult
@@ -799,13 +810,15 @@ export function SessionManagement({
   const [context, setContext] = React.useState({ vault_id: "", scope_kind: "vault", scope_path: "", provider_id: "", model_id: "" });
   const [message, setMessage] = React.useState("");
   const [taskIntent, setTaskIntent] = React.useState("auto");
-  const [taskPreview, setTaskPreview] = React.useState(null);
-  const [rerankAuthorizationRequest, setRerankAuthorizationRequest] = React.useState(null);
-  const [streamingDeepCreation, setStreamingDeepCreation] = React.useState(null);
   const [coveragePages, setCoveragePages] = React.useState({});
   const [editingGenerationResultId, setEditingGenerationResultId] = React.useState(null);
   const [editingGenerationContent, setEditingGenerationContent] = React.useState("");
   const renameInputRef = React.useRef(null);
+  const messageListRef = React.useRef(null);
+  const renderedSessionIdRef = React.useRef(null);
+  const conversationSignatureRef = React.useRef("");
+  const shouldStickToLatestRef = React.useRef(true);
+  const [activeConversationTurnId, setActiveConversationTurnId] = React.useState(null);
   const page = sessionPage?.page || 1;
   const totalPages = sessionPage?.total_pages || 1;
   const sessions = sessionPage?.sessions || [];
@@ -819,22 +832,12 @@ export function SessionManagement({
   const completenessResults = activeDetail?.completeness_results || [];
   const knowledgeOrganizationResults = activeDetail?.knowledge_organization_results || [];
   const deepCreationResults = activeDetail?.deep_creation_results || [];
-  const streamedDeepCreationResult = streamingDeepCreation?.session_id === selectedSessionId
-    ? {
-        result_id: "stream:" + streamingDeepCreation.task_id,
-        status: "preparing",
-        summary: "正在流式生成深度创作内容。",
-        is_streaming: true,
-        sections: Object.entries(streamingDeepCreation.sections).map(([ordinal, content]) => ({
-          ordinal: Number(ordinal),
-          status: "running",
-          content
-        }))
-      }
-    : null;
   const generationResults = activeDetail?.generation_results || [];
+  const conversationTurnItems = conversationTurns(activeDetail || {});
+  const conversationSignature = conversationTurnItems.map((turn) => turn.id).join("|");
   const snapshotsById = new Map((activeDetail?.task_snapshots || []).map((snapshot) => [snapshot.snapshot_id, snapshot]));
   const vaultsById = new Map(vaults.map((vault) => [vault.vault_id, vault]));
+  const applicationEvidenceItemsByKey = new Map();
 
   React.useEffect(() => {
     setQuery(filters.query || "");
@@ -853,10 +856,37 @@ export function SessionManagement({
     setContext(sessionComposerContext(selectedSession));
     setMessage("");
     setTaskIntent("auto");
-    setTaskPreview(null);
-    setRerankAuthorizationRequest(null);
-    setStreamingDeepCreation(null);
   }, [selectedSession?.session_id]);
+
+  React.useLayoutEffect(() => {
+    const messageList = messageListRef.current;
+    if (!messageList || !activeDetail || !conversationTurnItems.length) return;
+    const sessionId = activeDetail.session.session_id;
+    const isNewSession = renderedSessionIdRef.current !== sessionId;
+    const hasNewConversationContent = conversationSignatureRef.current !== conversationSignature;
+    if (isNewSession || (hasNewConversationContent && shouldStickToLatestRef.current)) {
+      messageList.scrollTop = messageList.scrollHeight;
+      setActiveConversationTurnId(conversationTurnItems.at(-1).id);
+    }
+    renderedSessionIdRef.current = sessionId;
+    conversationSignatureRef.current = conversationSignature;
+  }, [activeDetail?.session?.session_id, conversationSignature, conversationTurnItems.length]);
+
+  React.useEffect(() => {
+    const messageList = messageListRef.current;
+    if (!messageList || !activeDetail || !conversationTurnItems.length || typeof globalThis.IntersectionObserver !== "function") return undefined;
+    const observer = new globalThis.IntersectionObserver((entries) => {
+      const visible = entries
+        .filter((entry) => entry.isIntersecting)
+        .sort((first, second) => first.boundingClientRect.top - second.boundingClientRect.top);
+      if (visible.length) setActiveConversationTurnId(visible[0].target.id);
+    }, { root: messageList, rootMargin: "-12% 0px -62%", threshold: 0 });
+    conversationTurnItems.forEach((turn) => {
+      const target = globalThis.document?.getElementById(turn.id);
+      if (target) observer.observe(target);
+    });
+    return () => observer.disconnect();
+  }, [activeDetail?.session?.session_id, conversationSignature]);
 
   function load(nextFilters) {
     setStatus("");
@@ -905,6 +935,15 @@ export function SessionManagement({
     }
   }
 
+  async function copyContent(content) {
+    try {
+      const copied = await copyPlainText(content);
+      setStatus(copied ? "已复制正文。" : "当前浏览器无法复制正文。");
+    } catch (copyError) {
+      setStatus(copyError.message || "复制正文失败。");
+    }
+  }
+
   function citationStatusText(status) {
     if (status === "stale") return "已失效";
     if (status === "pending-verification") return "待核验";
@@ -913,11 +952,11 @@ export function SessionManagement({
   }
 
   function generationStatusText(result) {
-    if (result.status === "pending-verification") return "引用待核验";
-    if (result.status === "stale") return "来源已变化";
-    if (result.status === "verifying") return "正在重新核验";
-    if (result.status === "unsupported") return "无证据内容";
-    return result.content_origin === "model-judgement" ? "模型判断" : result.content_origin === "user-content" ? "用户内容" : "本地证据摘要";
+    if (result.status === "pending-verification") return "内容待确认";
+    if (result.status === "stale") return "内容需重新确认";
+    if (result.status === "verifying") return "正在确认内容";
+    if (result.status === "unsupported") return "当前内容不可用";
+    return result.content_origin === "user-content" ? "我的内容" : "助手";
   }
 
   function messageRoleText(role) {
@@ -930,7 +969,6 @@ export function SessionManagement({
     return {
       available: "可用",
       excluded: "被排除",
-      "pending-authorization": "待授权",
       "needs-import": "待解析（需先导入）"
     }[attachmentStatus] || "待解析";
   }
@@ -945,36 +983,12 @@ export function SessionManagement({
       )).map((model) => ({ provider, model }))
       : []
   ));
-  const selectedVault = vaults.find((vault) => vault.vault_id === context.vault_id);
   const persistedContext = sessionComposerContext(selectedSession);
   const contextIsDirty = Object.keys(context).some((key) => context[key] !== persistedContext[key]);
-  const authorizationText = selectedVault
-    ? (policyFor(selectedVault).outbound_mode === "always-allow" ? "外部访问：已设为始终允许" : "外部访问：每次任务询问")
-    : "外部访问：先选择 vault";
-  const canPrepare = Boolean(
-    selectedSession && !contextIsDirty && selectedSession.selected_vault_id && selectedSession.scope_kind
-      && selectedSession.selected_provider_id && selectedSession.selected_model_id && message.trim()
+  const canSend = Boolean(
+    selectedSession && context.vault_id && context.provider_id && context.model_id && message.trim()
+      && (context.scope_kind === "vault" || context.scope_path.trim())
   );
-  const canFixTask = Boolean(taskPreview?.is_ready);
-
-  async function saveContext() {
-    if (!selectedSession) return;
-    setStatus("");
-    setIsSubmitting(true);
-    try {
-      await onUpdateContext(selectedSession.session_id, {
-        ...context,
-        scope_path: context.scope_kind === "directory" ? context.scope_path : null
-      });
-      setTaskPreview(null);
-      setStatus("会话语境已保存。");
-    } catch (requestError) {
-      setContext(sessionComposerContext(selectedSession));
-      setStatus(requestError.message);
-    } finally {
-      setIsSubmitting(false);
-    }
-  }
 
   async function pickAttachments() {
     if (!selectedSession || contextIsDirty) return;
@@ -982,7 +996,6 @@ export function SessionManagement({
     setIsSubmitting(true);
     try {
       await onPickAttachments(selectedSession.session_id);
-      setTaskPreview(null);
       setStatus("附件已添加。");
     } catch (requestError) {
       setStatus(requestError.message);
@@ -997,7 +1010,6 @@ export function SessionManagement({
     setIsSubmitting(true);
     try {
       await onRemoveAttachment(selectedSession.session_id, attachmentId);
-      setTaskPreview(null);
       setStatus("附件已移除。");
     } catch (requestError) {
       setStatus(requestError.message);
@@ -1006,154 +1018,176 @@ export function SessionManagement({
     }
   }
 
-  function taskIntentText(intent) {
-    return {
-      "source-lookup": "原文定位",
-      completeness: "完整列举",
-      "knowledge-organization": "知识整理",
-      "deep-creation": "深度创作"
-    }[intent] || "自动识别";
-  }
-
-  function taskSnapshotStatusText(snapshot) {
-    if (snapshot.status === "invalidated") return "已失效";
-    if (snapshot.status === "completed") return "已完成";
-    if (snapshot.status === "preparing") return "正在准备";
-    if (snapshot.status === "recoverable") return "待恢复";
-    if (snapshot.status === "failed") return "失败";
-    return "已准备";
+  async function changeRetrievalMode(mode) {
+    if (!selectedSession || retrievalModeLoading) return;
+    setStatus("");
+    try {
+      const next = await onRetrievalModeChange(mode);
+      setStatus(`已切换为${next.label || mode}；下一次发送立即生效。`);
+    } catch (requestError) {
+      setStatus(requestError.message);
+    }
   }
 
   function retrievalStatusText(result) {
-    if (result.is_stale || result.snapshot_status === "invalidated") return "证据已失效";
+    if (result.is_stale || result.snapshot_status === "invalidated") return "当前内容需要重新确认";
     return {
-      completed: "本地知识库证据",
-      "no-evidence": "未找到证据",
+      completed: "内容已准备",
+      "no-evidence": "当前范围内没有可回答的内容",
       excluded: "内容被排除",
-      "index-unavailable": "索引不可用",
-      "provider-model-unavailable": "Provider/Model 不可用"
-    }[result.status] || "检索状态未知";
+      "index-unavailable": "当前内容暂时不可用",
+      "provider-model-unavailable": "当前无法生成内容"
+    }[result.status] || "当前无法处理请求";
   }
 
   function retrievalResultView(result) {
     const snapshot = snapshotsById.get(result.snapshot_id);
-    const vaultId = result.vault_id || snapshot?.vault_id || null;
-    const vault = vaultId ? vaultsById.get(vaultId) : null;
-    const vaultLabel = vault ? vaultName(vault) : vaultId || "不可用";
-    const canOpenInObsidian = vault
-      && vault.authorization_status === "active"
-      && vault.access_status === "available";
     const staleReason = result.invalidation_reason || snapshot?.invalidation_reason;
-    const evidenceByOrdinal = new Map((result.evidences || []).map((evidence) => [evidence.ordinal, evidence]));
-    const sourceGroups = result.source_independence_available
-      && Array.isArray(result.source_groups) && result.source_groups.length
-      ? result.source_groups
-      : [...evidenceByOrdinal.keys()].map((ordinal) => ({ evidence_ordinals: [ordinal] }));
-    const sourceGroupView = (group, groupIndex) => {
-      const groupedEvidences = (group.evidence_ordinals || [])
-        .map((ordinal) => evidenceByOrdinal.get(ordinal))
-        .filter(Boolean);
-      if (groupedEvidences.length === 0) return null;
-      const evidenceCount = groupedEvidences.length;
-      const hasVerifiedBasis = group.basis === "vault-source-id"
-        || group.basis === "vault-content-sha256";
-      const basisText = group.basis === "vault-source-id"
-        ? "派生笔记按 vault + Source ID 计算独立来源。"
-        : group.basis === "vault-content-sha256"
-          ? "原生 Markdown 按 vault + 内容哈希计算独立来源。"
-          : "该历史结果未提供独立来源计算依据。";
-      return React.createElement(
-        "section",
-        { className: "source-comparison-group", key: `${result.result_id}:source:${groupIndex}` },
-        React.createElement(
-          "p",
-          { className: "source-comparison-heading" },
-          hasVerifiedBasis ? `来源 ${groupIndex + 1}：${basisText}` : `历史证据：${basisText}`
-        ),
-        hasVerifiedBasis && evidenceCount > 1
-          ? React.createElement(
-              "p",
-              { className: "source-comparison-note" },
-              group.basis === "vault-content-sha256"
-                ? `相同内容组中的 ${evidenceCount} 条原生 Markdown 证据只计为 1 个独立来源。`
-                : `同一来源中的 ${evidenceCount} 条证据只计为 1 个独立来源。`
-            )
-          : null,
-        groupedEvidences.map((evidence) => React.createElement(
-          "details",
-          { className: "evidence-row", key: `${result.result_id}:${evidence.ordinal}` },
-          React.createElement(
-            "summary",
-            null,
-            `${evidence.relative_path} · ${evidence.heading || evidence.location}`
-          ),
-          React.createElement("p", null, evidence.excerpt),
-          React.createElement("p", null, `vault：${vaultLabel}`),
-          evidence.identity_kind === "derived"
-            ? React.createElement("p", null, `Source ID ${evidence.source_id}；源内容哈希 ${evidence.source_content_hash}`)
-            : React.createElement("p", null, `原生 Markdown：${evidence.relative_path}；内容哈希 ${evidence.content_sha256}`),
-          evidence.source_path
-            ? React.createElement("p", null, `源文件：${evidence.source_path}；派生笔记：${evidence.relative_path}`)
-            : null,
-          React.createElement("p", null, `定位：${evidence.location}${evidence.page ? `；第 ${evidence.page} 页` : ""}`),
-          React.createElement("p", null, `召回：${(evidence.matched_channels || []).join("、") || "未标注"}`),
-          canOpenInObsidian
-            ? React.createElement(
-                "a",
-                {
-                  href: `${VAULTS_ENDPOINT}/${encodeURIComponent(vaultId)}/open?file=${encodeURIComponent(evidence.relative_path)}`,
-                  target: "_blank",
-                  rel: "noreferrer"
-                },
-                "在 Obsidian 中打开"
-              )
-            : null
-        ))
-      );
-    };
+    const hasGeneratedAnswer = retrievalResultHasGeneratedAnswer(result);
+    // The generated answer renders its own valid or re-verification status.
+    if (result.status === "completed" && hasGeneratedAnswer) return null;
+    const evidenceKeys = retrievalEvidenceKeys(result);
+    const summary = result.status === "no-evidence"
+      ? "当前范围内没有可回答的内容。"
+      : result.status === "completed"
+        ? /回答生成失败|未生成回答/.test(result.summary || "")
+          ? directSummary(result.summary, "暂未生成可用回答。")
+          : "暂未生成可用回答。"
+        : directSummary(result.summary, retrievalStatusText(result));
     return React.createElement(
       "section",
       { className: "session-retrieval-result", key: result.result_id, "aria-label": retrievalStatusText(result) },
       React.createElement("p", { className: "session-message-role" }, retrievalStatusText(result)),
-      React.createElement("p", { className: "session-retrieval-summary" }, result.summary),
-      React.createElement("p", { className: "session-retrieval-timing" }, `检索 ${result.retrieval_duration_ms} ms；生成 ${result.generation_duration_ms} ms（未调用 Model）`),
+      summary ? contentWithEvidence(summary, evidenceKeys) : null,
       staleReason
         ? React.createElement("p", { className: "form-error" }, `需重新准备：${staleReason}`)
         : null,
       result.recovery_action
         ? React.createElement("p", { className: "form-error" }, `下一步：${result.recovery_action}`)
         : null,
-      result.source_independence_available
-        ? React.createElement("p", { className: "source-comparison-summary" }, `独立来源：${result.independent_source_count}`)
-        : null,
-      result.source_independence_available && result.independent_source_count > 1
-        ? React.createElement("p", { className: "source-comparison-note" }, "系统不会自动合并、选择或判定哪一种说法正确。")
-        : null,
-      sourceGroups.map(sourceGroupView)
     );
+  }
+
+  function applicationEvidenceLinks(keys) {
+    const linkedKeys = [...new Set(keys || [])].filter((key) => applicationEvidenceItemsByKey.has(key));
+    if (!linkedKeys.length) return null;
+    return React.createElement(
+      "sup",
+      { className: "application-evidence-links", "data-copy-exclude": "true" },
+      linkedKeys.map((key, index) => {
+        const item = applicationEvidenceItemsByKey.get(key);
+        const sourceLabel = item?.relativePath || `第 ${index + 1} 条来源`;
+        return React.createElement(
+          "a",
+          {
+            className: "application-evidence-link",
+            href: `#${applicationEvidenceAnchorId(key)}`,
+            key,
+            "aria-label": `查看来源 ${sourceLabel}`,
+            title: "查看应用证据",
+            "data-copy-exclude": "true",
+            onClick: () => focusApplicationEvidence(key)
+          },
+          `[${index + 1}]`
+        );
+      })
+    );
+  }
+
+  function focusApplicationEvidence(key) {
+    const focusTarget = () => globalThis.document?.getElementById(applicationEvidenceAnchorId(key))?.focus();
+    if (typeof globalThis.requestAnimationFrame === "function") {
+      globalThis.requestAnimationFrame(focusTarget);
+    } else {
+      focusTarget();
+    }
+  }
+
+  function contentWithEvidence(content, keys) {
+    return React.createElement(
+      "p",
+      { className: "session-answer-content" },
+      React.createElement("span", { className: "session-message-content" }, content),
+      applicationEvidenceLinks(keys)
+    );
+  }
+
+  function copyContentButton(content, label = "复制正文") {
+    return React.createElement(
+      "button",
+      { className: "text-button session-copy-button", type: "button", onClick: () => copyContent(content) },
+      label
+    );
+  }
+
+  function conversationEntryView(entry) {
+    if (entry.kind === "generation") return generationResultView(entry.value);
+    if (entry.kind === "retrieval") return retrievalResultView(entry.value);
+    if (entry.kind === "completeness") return completenessResultView(entry.value);
+    if (entry.kind === "organization") return knowledgeOrganizationResultView(entry.value);
+    if (entry.kind === "deep-creation") return deepCreationResultView(entry.value);
+    return React.createElement(
+      "article",
+      { className: `session-message session-message-${entry.value.role}`, key: entry.value.message_id },
+      React.createElement("p", { className: "session-message-role" }, messageRoleText(entry.value.role)),
+      React.createElement("p", { className: "session-message-content" }, entry.value.content)
+    );
+  }
+
+  function scrollToConversationTurn(turn) {
+    const target = globalThis.document?.getElementById(turn.id);
+    if (!target) return;
+    shouldStickToLatestRef.current = false;
+    setActiveConversationTurnId(turn.id);
+    target.scrollIntoView({ behavior: "smooth", block: "start" });
+    target.focus({ preventScroll: true });
+  }
+
+  function updateConversationScroll(event) {
+    const { clientHeight, scrollHeight, scrollTop } = event.currentTarget;
+    shouldStickToLatestRef.current = scrollTop + clientHeight >= scrollHeight - 24;
+  }
+
+  function citationEvidenceKeysForResult(result) {
+    const citations = activeDetail?.citations || [];
+    const direct = citations.filter((citation) => citation.result_id === result.result_id);
+    const related = direct.length
+      ? direct
+      : citations.filter((citation) => citation.snapshot_id && citation.snapshot_id === result.snapshot_id);
+    return related.map((citation) => `citation:${citation.citation_id}`);
+  }
+
+  function retrievalEvidenceKeys(result) {
+    const citations = activeDetail?.citations || [];
+    const citedKeys = citations
+      .filter((citation) => citationBelongsToRetrievalResult(citation, result))
+      .map((citation) => `citation:${citation.citation_id}`);
+    const uncitedKeys = (result.evidences || [])
+      .filter((evidence) => !citations.some((citation) => (
+        citationBelongsToRetrievalResult(citation, result)
+        && citationMatchesEvidence(citation, evidence)
+      )))
+      .map((evidence) => retrievalEvidenceKey(result, evidence));
+    return [...new Set([...citedKeys, ...uncitedKeys])];
   }
 
   function generationResultView(result) {
     const isEditing = editingGenerationResultId === result.result_id;
-    const scope = result.scope_kind === "directory" ? result.scope_path : result.scope_kind === "vault" ? "整个 vault" : "历史范围不可用";
     const canVerify = ["pending-verification", "stale", "unsupported"].includes(result.status);
+    const evidenceKeys = citationEvidenceKeysForResult(result);
     return React.createElement(
       "article",
       { className: "session-message session-generation-result", key: result.result_id },
-      React.createElement("p", { className: "session-message-role" }, `${generationStatusText(result)} · Provider：${result.provider_id || "历史记录不可用"} · Model：${result.model_id || "历史记录不可用"}`),
-      React.createElement("p", { className: "session-generation-meta" }, `vault：${result.vault_id || "历史记录不可用"}；范围：${scope}；快照：${result.snapshot_id || "历史记录不可用"}`),
+      React.createElement("p", { className: "session-message-role" }, generationStatusText(result)),
       isEditing
         ? React.createElement("textarea", {
-            className: "session-generation-editor",
-            value: editingGenerationContent,
-            "aria-label": "编辑带引用段落",
-            disabled: isSubmitting,
-            onChange: (event) => setEditingGenerationContent(event.target.value)
-          })
-        : React.createElement("p", { className: "session-message-content" }, result.content),
-      result.context_summary
-        ? React.createElement("p", { className: "session-generation-meta" }, result.context_summary)
-        : null,
+          className: "session-generation-editor",
+          value: editingGenerationContent,
+          "aria-label": "编辑回答",
+          disabled: isSubmitting,
+          onChange: (event) => setEditingGenerationContent(event.target.value)
+        })
+        : contentWithEvidence(result.content, evidenceKeys),
       React.createElement(
         "div",
         { className: "session-generation-actions" },
@@ -1175,7 +1209,7 @@ export function SessionManagement({
                     await onEditGenerationResult(selectedSession.session_id, result.result_id, editingGenerationContent);
                     setEditingGenerationResultId(null);
                     setEditingGenerationContent("");
-                    setStatus("段落已更新，原引用已标为待核验。");
+                    setStatus("内容已更新，需重新确认。");
                   } catch (requestError) {
                     setStatus(requestError.message);
                   } finally {
@@ -1184,10 +1218,15 @@ export function SessionManagement({
                 }
               }, "保存并标为待核验")
             )
-          : React.createElement("button", {
-              className: "text-button", type: "button", disabled: isSubmitting || !result.snapshot_id,
-              onClick: () => { setEditingGenerationResultId(result.result_id); setEditingGenerationContent(result.content); }
-            }, "编辑段落"),
+          : React.createElement(
+              React.Fragment,
+              null,
+              copyContentButton(result.content),
+              React.createElement("button", {
+                className: "text-button", type: "button", disabled: isSubmitting || !result.snapshot_id,
+                onClick: () => { setEditingGenerationResultId(result.result_id); setEditingGenerationContent(result.content); }
+              }, "编辑回答")
+            ),
         canVerify
           ? React.createElement("button", {
               className: "secondary-button", type: "button", disabled: isSubmitting || !result.snapshot_id,
@@ -1197,14 +1236,14 @@ export function SessionManagement({
                 setStatus("");
                 try {
                   const verified = await onReverifyGenerationResult(selectedSession.session_id, result.result_id);
-                  setStatus(verified.status === "valid" ? "引用已通过重新检索核验。" : "当前内容未获证据支持，引用已移除。");
+                    setStatus(verified.status === "valid" ? "内容已重新确认。" : "当前内容暂时无法确认，关联记录已更新。");
                 } catch (requestError) {
                   setStatus(requestError.message);
                 } finally {
                   setIsSubmitting(false);
                 }
               }
-            }, "重新检索核验")
+            }, "重新确认")
           : null
       )
     );
@@ -1212,11 +1251,6 @@ export function SessionManagement({
 
   function completenessResultView(result) {
     const coveragePage = coveragePages[result.result_id] || result;
-    const snapshot = snapshotsById.get(result.snapshot_id);
-    const vaultId = result.vault_id || snapshot?.vault_id || null;
-    const vault = vaultId ? vaultsById.get(vaultId) : null;
-    const canOpenInObsidian = vault
-      && vault.authorization_status === "active" && vault.access_status === "available";
     const statusText = {
       complete: "完整完成",
       "completed-with-confirmed-gaps": "带已确认缺口完成",
@@ -1225,17 +1259,19 @@ export function SessionManagement({
       "source-changed": "来源已变化",
       planned: "待处理",
       processed: "已处理",
-      duplicate: "已合并重复证据"
+      duplicate: "已合并重复项"
     }[result.status] || "完整性状态未知";
     const counts = coveragePage.coverage_counts || (coveragePage.coverage || []).reduce((total, item) => {
       total[item.status] = (total[item.status] || 0) + 1;
       return total;
     }, {});
+    const evidenceKeys = completenessEvidenceKeys(result, coveragePage.coverage || []);
+    const summary = directSummary(result.summary, statusText);
     return React.createElement(
       "section",
       { className: "session-retrieval-result completeness-result", key: result.result_id, "aria-label": statusText },
       React.createElement("p", { className: "session-message-role" }, statusText),
-      React.createElement("p", { className: "session-retrieval-summary" }, result.summary),
+      contentWithEvidence(summary, evidenceKeys),
       React.createElement("div", { className: "progress-sequence", "aria-label": "覆盖进度" },
         React.createElement("span", null, `计划 ${counts.planned || 0} 项`),
         React.createElement("span", null, `已处理 ${counts.processed || 0} 项`),
@@ -1249,28 +1285,7 @@ export function SessionManagement({
       result.recovery_action
         ? React.createElement("p", { className: "form-error" }, `下一步：${result.recovery_action}`)
         : null,
-      (coveragePage.coverage || []).map((item) => React.createElement(
-        "details", { className: "evidence-row", key: `${result.result_id}:${item.ordinal}` },
-        React.createElement("summary", null, `${item.status} · ${item.relative_path} · ${item.heading || item.location}`),
-        item.excerpt ? React.createElement("p", null, item.excerpt) : null,
-        item.reason ? React.createElement("p", { className: "form-error" }, item.reason) : null,
-        React.createElement("p", null, `定位：${item.location}${item.page ? `；第 ${item.page} 页` : ""}`),
-        item.identity_kind === "derived" && item.source_id
-          ? React.createElement("p", null, `Source ID ${item.source_id}；源内容哈希 ${item.source_content_hash}`)
-          : item.identity_kind === "derived"
-            ? React.createElement("p", null, `派生笔记：${item.relative_path}；来源血缘不可核验`)
-          : React.createElement("p", null, `原生 Markdown：${item.relative_path}；内容哈希 ${item.content_sha256}`),
-        item.source_path ? React.createElement("p", null, `源文件：${item.source_path}`) : null,
-        item.status === "duplicate" && item.evidence_ordinal
-          ? React.createElement("p", null, `与覆盖项 ${item.evidence_ordinal} 合并为同一证据。`)
-          : null,
-        canOpenInObsidian
-          ? React.createElement("a", {
-              href: `${VAULTS_ENDPOINT}/${encodeURIComponent(vaultId)}/open?file=${encodeURIComponent(item.relative_path)}`,
-              target: "_blank", rel: "noreferrer"
-            }, "在 Obsidian 中打开")
-          : null
-      )),
+      copyContentButton(summary, "复制结论"),
       coveragePage.coverage_has_more && onLoadCompletenessCoverage
         ? React.createElement("button", {
             className: "secondary-button",
@@ -1302,7 +1317,7 @@ export function SessionManagement({
                 setIsSubmitting(false);
               }
             }
-          }, "加载更多覆盖项")
+          }, "加载更多")
         : null
     );
   }
@@ -1319,58 +1334,22 @@ export function SessionManagement({
     }[status] || "已计划";
   }
 
-  function knowledgeOrganizationPlanView(plan, outcomeByOrdinal = new Map()) {
-    if (!plan?.sections?.length) {
-      return React.createElement("p", { className: "organization-plan-empty" }, "当前范围没有可准备的计划段。");
-    }
-    const counts = (plan.sections || []).reduce((total, section) => {
-      const outcome = outcomeByOrdinal.get(section.ordinal);
-      const status = outcome?.status || "planned";
-      total[status] = (total[status] || 0) + 1;
-      total.evidence += section.evidence_count ?? section.evidence?.length ?? 0;
-      return total;
-    }, { evidence: 0 });
-    return React.createElement(
-      "section",
-      { className: "knowledge-organization-plan", "aria-label": "知识整理计划" },
-      React.createElement("h3", null, "知识整理计划"),
-      React.createElement("p", { className: "organization-plan-note" }, "仅使用已冻结的本地知识库证据作为事实依据；详细依据已放入右侧“引用证据”。"),
-      React.createElement("p", { className: "organization-plan-meta" }, `计划 ${plan.sections.length} 段；冻结证据 ${counts.evidence} 条。`),
-      React.createElement("p", { className: "organization-plan-meta" }, `已完成 ${counts.completed || 0} 段；已准备 ${counts.prepared || 0} 段；失败 ${counts.failed || 0} 段；待恢复 ${counts.recoverable || 0} 段。`),
-      plan.is_bounded_preview
-        ? React.createElement("p", { className: "form-error" }, "该计划仅为有界诊断预览，缩小范围后才能固定快照。")
-        : null,
-      plan.sections.map((section) => {
-        const outcome = outcomeByOrdinal.get(section.ordinal);
-        return React.createElement(
-          "p",
-          { className: "organization-plan-meta", key: `organization-section-summary:${section.ordinal}` },
-          `第 ${section.ordinal} 段：${knowledgeOrganizationSectionStatusText(outcome?.status || "planned")}；目标：${section.goal}`
-        );
-      })
-    );
-  }
-
   function knowledgeOrganizationResultView(result) {
     const statusText = {
       preparing: "正在生成整理",
       planned: "计划已准备",
-      "waiting-authorization": "等待本次授权",
       completed: "整理已完成",
       failed: "整理失败",
       recoverable: "计划待恢复",
       "source-changed": "来源已变化"
     }[result.status] || "计划状态未知";
-    const structureText = {
-      summary: "归纳", classification: "分类", comparison: "比较", timeline: "时间线",
-      outline: "大纲", "chapter-summary": "章节汇总"
-    }[result.structure_kind] || "结构化整理";
     return React.createElement(
       "section",
       { className: "session-retrieval-result knowledge-organization-result", key: result.result_id, "aria-label": statusText },
       React.createElement("p", { className: "session-message-role" }, statusText),
-      React.createElement("p", { className: "session-retrieval-summary" }, result.summary),
-      React.createElement("p", { className: "organization-plan-meta" }, `结构：${structureText}；事实依据：冻结知识库证据`),
+      result.status === "completed" ? null : React.createElement(
+        "p", { className: "session-retrieval-summary" }, directSummary(result.summary, statusText)
+      ),
       React.createElement(
         "div",
         { className: "progress-sequence", "aria-label": "知识整理计划进度" },
@@ -1383,14 +1362,6 @@ export function SessionManagement({
       result.recovery_action
         ? React.createElement("p", { className: "form-error" }, `下一步：${result.recovery_action}`)
         : null,
-      result.status === "waiting-authorization" && result.authorization_id && onConfirmKnowledgeOrganizationAuthorization
-        ? React.createElement("button", {
-          className: "primary-button",
-          type: "button",
-          disabled: isSubmitting,
-          onClick: () => confirmKnowledgeOrganizationAuthorization(result)
-        }, "授权并生成")
-        : null,
       (result.sections || []).map((section) => React.createElement(
         "section",
         { className: "organization-result-section", key: `organization-result:${result.result_id}:${section.ordinal}` },
@@ -1398,15 +1369,15 @@ export function SessionManagement({
         section.reason
           ? React.createElement("p", { className: "form-error" }, `原因：${section.reason}`)
           : null,
-        section.independent_source_count
-          ? React.createElement("p", { className: "organization-plan-meta" }, `独立来源：${section.independent_source_count}；详细依据见右侧“引用证据”。`)
-          : null,
         (section.conclusions || []).length
           ? (section.conclusions || []).map((conclusion) => React.createElement(
               "div",
               { className: "organization-conclusion", key: `organization-conclusion:${section.ordinal}:${conclusion.ordinal}` },
-              React.createElement("p", { className: "organization-conclusion-content" }, conclusion.content),
-              React.createElement("p", { className: "organization-plan-meta" }, "依据已归入右侧“引用证据”。")
+              contentWithEvidence(
+                conclusion.content,
+                organizationConclusionEvidenceKeys(result, section, conclusion)
+              ),
+              copyContentButton(conclusion.content)
             ))
           : section.status === "completed"
             ? React.createElement("p", { className: "organization-plan-meta" }, "该段暂无可显示结论。")
@@ -1426,78 +1397,29 @@ export function SessionManagement({
     }[status] || "已计划";
   }
 
-  function deepCreationPlanView(plan, outcomeByOrdinal = new Map()) {
-    if (!plan?.sections?.length) {
-      return React.createElement("p", { className: "organization-plan-empty" }, "当前范围没有可准备的深度创作段。");
-    }
-    const localEvidenceCount = plan.local_evidence_count
-      ?? plan.sections.reduce((count, section) => count + (section.local_evidence_count || 0), 0);
-    return React.createElement(
-      "section",
-      { className: "knowledge-organization-plan deep-creation-plan", "aria-label": "深度创作计划" },
-      React.createElement("h3", null, "深度创作"),
-      React.createElement("p", { className: "organization-plan-note" }, "每段使用冻结的本地证据；超出证据的内容会明确标为模型判断。"),
-      React.createElement("p", { className: "organization-plan-meta" }, "计划 " + plan.sections.length + " 段；冻结知识库证据 " + localEvidenceCount + " 条。"),
-      plan.is_bounded_preview
-        ? React.createElement("p", { className: "form-error" }, "该计划仅为有界诊断预览，缩小范围后才能固定快照。")
-        : null,
-      plan.sections.map((section) => React.createElement(
-        "p",
-        { className: "organization-plan-meta", key: "deep-creation-section-summary:" + section.ordinal },
-        "第 " + section.ordinal + " 段：" + deepCreationSectionStatusText(outcomeByOrdinal.get(section.ordinal)?.status || "planned") + "；目标：" + section.goal
-      ))
-    );
-  }
-
-  function deepCreationLocalEvidenceView(section) {
-    const evidence = section.local_evidence || [];
-    return React.createElement(
-      "details",
-      { className: "evidence-row deep-creation-evidence" },
-      React.createElement("summary", null, "知识库证据（" + evidence.length + "）"),
-      evidence.length
-        ? evidence.map((item) => React.createElement(
-            "article",
-            { className: "deep-creation-evidence-item", key: "deep-local:" + section.ordinal + ":" + item.ordinal },
-            React.createElement("p", null, item.relative_path + " · " + (item.heading || item.location)),
-            React.createElement("p", null, item.excerpt),
-            React.createElement("p", null, "定位：" + item.location + (item.page ? "；第 " + item.page + " 页" : ""))
-          ))
-        : React.createElement("p", null, "本段没有可用的冻结知识库证据。")
-    );
-  }
-
   function deepCreationResultView(result) {
     const statusText = {
       preparing: "正在准备深度创作",
-      "waiting-authorization": "等待本次授权",
       completed: "深度创作已完成",
       failed: "深度创作失败",
       recoverable: "深度创作待恢复",
       "source-changed": "来源已变化"
     }[result.status] || "深度创作状态未知";
     const statusIcon = result.status === "completed" ? "✓"
-      : result.status === "waiting-authorization" || result.status === "preparing" ? "?"
+      : result.status === "preparing" ? "?"
         : "!";
     return React.createElement(
       "section",
       { className: "session-retrieval-result deep-creation-result", key: result.result_id, "aria-label": statusText },
       React.createElement("p", { className: "status-marker deep-creation-status status-" + result.status }, statusIcon + " " + statusText),
-      React.createElement("p", { className: "session-retrieval-summary" }, result.summary),
-      React.createElement("p", { className: "organization-plan-meta" }, "知识库证据与模型判断分别呈现。"),
+      result.status === "completed" ? null : React.createElement(
+        "p", { className: "session-retrieval-summary" }, directSummary(result.summary, statusText)
+      ),
       result.invalidation_reason
         ? React.createElement("p", { className: "form-error" }, "需重新准备：" + result.invalidation_reason)
         : null,
       result.recovery_action
         ? React.createElement("p", { className: "form-error" }, "下一步：" + result.recovery_action)
-        : null,
-      result.status === "waiting-authorization" && result.authorization_id && onConfirmDeepCreationAuthorization
-        ? React.createElement("button", {
-          className: "primary-button",
-          type: "button",
-          disabled: isSubmitting,
-          onClick: () => confirmDeepCreationAuthorization(result)
-        }, "授权并创作")
         : null,
       (result.sections || []).map((section) => React.createElement(
         "section",
@@ -1507,133 +1429,33 @@ export function SessionManagement({
           ? React.createElement("p", { className: "form-error" }, "原因：" + section.reason)
           : null,
         ["completed", "running"].includes(section.status)
-          ? React.createElement("p", { className: "organization-conclusion-content" }, section.content)
-          : null,
-        result.is_streaming ? null : deepCreationLocalEvidenceView(section),
-        section.model_judgement
           ? React.createElement(
-              "section",
-              { className: "deep-creation-model-judgement", "aria-label": "模型判断" },
-              React.createElement("p", { className: "organization-plan-meta" }, "模型判断"),
-              React.createElement("p", { className: "organization-conclusion-content" }, section.model_judgement)
+              React.Fragment,
+              null,
+              contentWithEvidence(section.content, deepCreationEvidenceKeys(result, section)),
+              copyContentButton(section.content)
             )
-          : null
+          : null,
       ))
     );
   }
 
-  async function prepareTask(event) {
+  async function sendTask(event) {
     event?.preventDefault();
-    if (!canPrepare || !selectedSession || contextIsDirty) return;
+    if (!canSend || !selectedSession || !onRun) return;
     setStatus("");
     setIsSubmitting(true);
     try {
-      const preview = await onPreviewTask(selectedSession.session_id, message, taskIntent);
-      setTaskPreview(preview);
-      setStatus(
-        preview.is_ready
-          ? "范围已准备，请确认固定任务快照。"
-          : preview.blocking_reason || "当前范围不可执行。"
-      );
-    } catch (requestError) {
-      setTaskPreview(null);
-      setStatus(requestError.message);
-    } finally {
-      setIsSubmitting(false);
-    }
-  }
-
-  async function createTask() {
-    if (!canFixTask || !selectedSession || contextIsDirty) return;
-    setStatus("");
-    setIsSubmitting(true);
-    try {
-      await onCreateTask(selectedSession.session_id, message, taskIntent);
-      setMessage("");
-      setTaskPreview(null);
-      setStatus("任务快照已固定，等待后续检索执行。");
-    } catch (requestError) {
-      setStatus(requestError.message);
-    } finally {
-      setIsSubmitting(false);
-    }
-  }
-
-  async function executeTask(taskId, rerankAuthorizationId) {
-    if (!selectedSession || !onExecuteTask) return;
-    setStatus("");
-    setIsSubmitting(true);
-    const snapshot = activeDetail?.task_snapshots?.find((item) => item.task_id === taskId);
-    const isDeepCreation = snapshot?.intent === "deep-creation";
-    if (isDeepCreation) {
-      setStreamingDeepCreation({ session_id: selectedSession.session_id, task_id: taskId, sections: {} });
-    }
-    try {
-      const execution = await onExecuteTask(
-        selectedSession.session_id,
-        taskId,
-        (chunk) => setStreamingDeepCreation((current) => {
-          if (!current || current.task_id !== taskId) return current;
-          return {
-            ...current,
-            sections: {
-              ...current.sections,
-              [chunk.ordinal]: (current.sections[chunk.ordinal] || "") + chunk.content
-            }
-          };
-        }),
-        rerankAuthorizationId
-      );
+      const execution = await onRun(selectedSession.session_id, {
+        ...context,
+        scope_path: context.scope_kind === "directory" ? context.scope_path : null,
+        content: message,
+        intent: taskIntent
+      });
       if (execution?.isCurrent === false) return;
       const result = execution?.result || execution;
-      setStatus(["completed", "complete"].includes(result.status) ? "任务已完成，证据已刷新。" : result.summary);
-      setRerankAuthorizationRequest((current) => current?.taskId === taskId ? null : current);
-    } catch (requestError) {
-      setStatus(requestError.message);
-    } finally {
-      if (isDeepCreation) setStreamingDeepCreation(null);
-      setIsSubmitting(false);
-    }
-  }
-
-  async function prepareRerankAuthorization(snapshot) {
-    if (!selectedSession || !onPrepareRerankAuthorization) {
-      await executeTask(snapshot.task_id);
-      return;
-    }
-    setStatus("");
-    setIsSubmitting(true);
-    try {
-      const prepared = await onPrepareRerankAuthorization(selectedSession.session_id, snapshot.task_id);
-      const preview = prepared?.preview;
-      const authorization = prepared?.authorization;
-      if (preview?.is_authorizable && authorization?.authorization_id) {
-        setRerankAuthorizationRequest({
-          taskId: snapshot.task_id,
-          vaultId: preview.vault_id || snapshot.vault_id,
-          preview,
-          authorization
-        });
-        setStatus("请核对本次 rerank 外发范围并明确确认，或仅使用本地 RRF 检索。");
-        return;
-      }
-      await executeTask(snapshot.task_id);
-    } catch {
-      await executeTask(snapshot.task_id);
-    } finally {
-      setIsSubmitting(false);
-    }
-  }
-
-  async function confirmRerankAuthorization(request) {
-    if (!request || !onConfirmRerankAuthorization) return;
-    setStatus("");
-    setIsSubmitting(true);
-    try {
-      if (request.authorization.status !== "approved") {
-        await onConfirmRerankAuthorization(request.vaultId, request.authorization.authorization_id);
-      }
-      await executeTask(request.taskId, request.authorization.authorization_id);
+      setMessage("");
+      setStatus(["completed", "complete"].includes(result.status) ? "已完成。" : result.summary);
     } catch (requestError) {
       setStatus(requestError.message);
     } finally {
@@ -1641,70 +1463,22 @@ export function SessionManagement({
     }
   }
 
-  async function executeTaskLocally(taskId) {
-    setRerankAuthorizationRequest((current) => current?.taskId === taskId ? null : current);
-    await executeTask(taskId);
+  function directSummary(summary, fallback) {
+    const normalized = nonEmptyText(summary);
+    return /知识库|检索|证据|引用|文件|位置|编号/.test(normalized) ? fallback : normalized || fallback;
   }
 
-  async function confirmKnowledgeOrganizationAuthorization(result) {
-    if (!selectedSession || !onConfirmKnowledgeOrganizationAuthorization) return;
-    setStatus("");
-    setIsSubmitting(true);
-    try {
-      const execution = await onConfirmKnowledgeOrganizationAuthorization(
-        selectedSession.session_id, result.task_id, result.vault_id, result.authorization_id
-      );
-      const generated = execution?.result || execution;
-      setStatus(["completed", "complete"].includes(generated.status) ? "任务已完成，证据已刷新。" : generated.summary);
-    } catch (requestError) {
-      setStatus(requestError.message);
-    } finally {
-      setIsSubmitting(false);
-    }
+  function retrievalResultHasGeneratedAnswer(result) {
+    return generationResults.some((item) => (
+      item.result_id && result.task_id && item.task_id === result.task_id
+    ) || (
+      item.snapshot_id && result.snapshot_id && item.snapshot_id === result.snapshot_id
+    ));
   }
 
-  async function confirmDeepCreationAuthorization(result) {
-    if (!selectedSession || !onConfirmDeepCreationAuthorization) return;
-    setStatus("");
-    setIsSubmitting(true);
-    try {
-      const execution = await onConfirmDeepCreationAuthorization(
-        selectedSession.session_id, result.task_id, result.vault_id, result.authorization_id
-      );
-      const generated = execution?.result || execution;
-      setStatus(["completed", "complete"].includes(generated.status) ? "任务已完成，证据已刷新。" : generated.summary);
-    } catch (requestError) {
-      setStatus(requestError.message);
-    } finally {
-      setIsSubmitting(false);
-    }
-  }
-
-  function citationEvidenceItem(citation) {
-    const vault = citation.vault_id ? vaultsById.get(citation.vault_id) : null;
-    return {
-      key: `citation:${citation.citation_id}`,
-      kind: "citation",
-      label: "已记录引用",
-      status: citation.status,
-      statusText: citationStatusText(citation.status),
-      vaultId: citation.vault_id,
-      vaultLabel: vault?.display_name || citation.vault_id || "历史记录不可用",
-      relativePath: citation.relative_path,
-      location: citation.location,
-      identityKind: citation.identity_kind,
-      contentSha256: citation.content_sha256,
-      sourceId: citation.source_id,
-      sourceContentHash: citation.source_content_hash,
-      sourcePath: citation.source_path,
-      invalidationReason: citation.invalidation_reason,
-      canOpenInObsidian: vault?.authorization_status === "active" && vault?.access_status === "available"
-    };
-  }
-
-  function organizationEvidenceKey(vaultId, evidence) {
+  function evidenceRecordKey(kind, vaultId, evidence, suffix = "") {
     return [
-      "organization",
+      kind,
       vaultId || "",
       evidence.identity_kind || "",
       evidence.source_id || "",
@@ -1713,13 +1487,92 @@ export function SessionManagement({
       evidence.source_path || "",
       evidence.relative_path || "",
       evidence.location || "",
-      evidence.excerpt || ""
+      evidence.excerpt || "",
+      suffix
     ].join("|");
   }
 
-  function addOrganizationEvidence(itemsByKey, evidence, context) {
+  function resultVaultId(result) {
+    return result.vault_id || snapshotsById.get(result.snapshot_id)?.vault_id || null;
+  }
+
+  function matchingRetrievalEvidence(citation) {
+    const candidates = retrievalResults
+      .filter((result) => !citation.snapshot_id || result.snapshot_id === citation.snapshot_id)
+      .flatMap((result) => result.evidences || []);
+    return candidates.find((evidence) => citationMatchesEvidence(citation, evidence)) || null;
+  }
+
+  function citationMatchesEvidence(citation, evidence) {
+    return citation.relative_path === evidence.relative_path
+      && (!citation.location || !evidence.location || evidence.location === citation.location)
+      && (!citation.content_sha256 || !evidence.content_sha256 || evidence.content_sha256 === citation.content_sha256);
+  }
+
+  function citationBelongsToRetrievalResult(citation, result) {
+    if (citation.snapshot_id && result.snapshot_id) return citation.snapshot_id === result.snapshot_id;
+    const generationResult = generationResults.find((item) => item.result_id === citation.result_id);
+    return Boolean(generationResult && (
+      generationResult.task_id && result.task_id && generationResult.task_id === result.task_id
+    ));
+  }
+
+  function citationEvidenceItem(citation) {
+    const vault = citation.vault_id ? vaultsById.get(citation.vault_id) : null;
+    const evidence = matchingRetrievalEvidence(citation);
+    return {
+      key: `citation:${citation.citation_id}`,
+      kind: "applied-evidence",
+      label: "回答应用",
+      status: citation.status,
+      statusText: citationStatusText(citation.status),
+      vaultId: citation.vault_id,
+      vaultLabel: vault?.display_name || "历史知识库不可用",
+      relativePath: citation.relative_path,
+      location: citation.location,
+      identityKind: citation.identity_kind,
+      contentSha256: citation.content_sha256,
+      sourceId: citation.source_id,
+      sourceContentHash: citation.source_content_hash,
+      sourcePath: citation.source_path,
+      heading: evidence?.heading,
+      page: evidence?.page,
+      excerpt: evidence?.excerpt,
+      matchedChannels: evidence?.matched_channels,
+      invalidationReason: citation.invalidation_reason,
+      canOpenInObsidian: vault?.authorization_status === "active" && vault?.access_status === "available"
+    };
+  }
+
+  function organizationEvidenceKey(vaultId, evidence, association) {
+    return evidenceRecordKey("organization", vaultId, evidence, association);
+  }
+
+  function deepCreationEvidenceKey(vaultId, evidence, association) {
+    return evidenceRecordKey("deep-creation", vaultId, evidence, association);
+  }
+
+  function completenessEvidenceKey(result, evidence) {
+    return evidenceRecordKey("completeness", resultVaultId(result), evidence, `${result.result_id}:${evidence.ordinal}`);
+  }
+
+  function retrievalEvidenceKey(result, evidence) {
+    return evidenceRecordKey("source-lookup", resultVaultId(result), evidence, `${result.result_id}:${evidence.ordinal}`);
+  }
+
+  function coverageStatusText(status) {
+    return {
+      planned: "待处理",
+      processed: "已处理",
+      duplicate: "已合并重复项",
+      failed: "处理失败",
+      excluded: "已排除",
+      uncovered: "未覆盖"
+    }[status] || "已记录";
+  }
+
+  function addAppliedEvidence(itemsByKey, key, evidence, context) {
     if (!evidence?.relative_path) return;
-    const key = organizationEvidenceKey(context.vaultId, evidence);
     const vault = context.vaultId ? vaultsById.get(context.vaultId) : null;
     const existing = itemsByKey.get(key);
     const usage = existing?.usage ? [...existing.usage] : [];
@@ -1727,13 +1580,13 @@ export function SessionManagement({
     itemsByKey.set(key, {
       ...(existing || {}),
       key,
-      kind: "organization-evidence",
-      label: usage.includes("整理依据") ? "知识整理依据" : "知识整理计划证据",
-      status: "valid",
-      statusText: usage.join("；"),
+      kind: "applied-evidence",
+      label: context.label,
+      status: context.status || "valid",
+      statusText: context.statusText || usage.join("；") || "有效",
       usage,
       vaultId: context.vaultId,
-      vaultLabel: vault?.display_name || context.vaultId || "历史记录不可用",
+      vaultLabel: vault?.display_name || "历史知识库不可用",
       relativePath: evidence.relative_path,
       location: evidence.location,
       heading: evidence.heading,
@@ -1746,33 +1599,40 @@ export function SessionManagement({
       sourcePath: evidence.source_path,
       sectionLabel: context.sectionLabel,
       resultLabel: existing?.resultLabel || context.resultLabel,
+      reason: evidence.reason,
+      duplicateOrdinal: evidence.evidence_ordinal,
+      matchedChannels: evidence.matched_channels,
       canOpenInObsidian: vault?.authorization_status === "active" && vault?.access_status === "available"
     });
   }
 
-  function organizationEvidenceItems() {
+  function organizationConclusionEvidenceKeys(result, section, conclusion) {
+    const association = `result:${result.result_id}:section:${section.ordinal}:conclusion:${conclusion.ordinal}`;
+    return (conclusion.evidence || []).map((evidence) => (
+      organizationEvidenceKey(resultVaultId(result), evidence, association)
+    ));
+  }
+
+  function retrievalEvidenceItems() {
     const itemsByKey = new Map();
-    (activeDetail?.task_snapshots || [])
-      .filter((snapshot) => snapshot.intent === "knowledge-organization")
-      .forEach((snapshot) => {
-        (snapshot.knowledge_organization_plan?.sections || []).forEach((section) => {
-          (section.evidence || []).forEach((evidence) => addOrganizationEvidence(itemsByKey, evidence, {
-            vaultId: snapshot.vault_id,
-            usage: "计划证据",
-            sectionLabel: `第 ${section.ordinal} 段计划`,
-            resultLabel: `快照 ${snapshot.snapshot_id}`
-          }));
-        });
-      });
-    (knowledgeOrganizationResults || []).forEach((result) => {
-      (result.sections || []).forEach((section) => {
-        (section.conclusions || []).forEach((conclusion) => {
-          (conclusion.evidence || []).forEach((evidence) => addOrganizationEvidence(itemsByKey, evidence, {
-            vaultId: result.vault_id,
-            usage: "整理依据",
-            sectionLabel: `第 ${section.ordinal} 段结论 ${conclusion.ordinal}`,
-            resultLabel: `结果 ${result.result_id}`
-          }));
+    const citations = activeDetail?.citations || [];
+    retrievalResults.forEach((result) => {
+      const snapshot = snapshotsById.get(result.snapshot_id);
+      const isStale = result.is_stale || result.snapshot_status === "invalidated" || snapshot?.status === "invalidated";
+      (result.evidences || []).forEach((evidence) => {
+        const isAlreadyCited = citations.some((citation) => (
+          citationBelongsToRetrievalResult(citation, result)
+          && citationMatchesEvidence(citation, evidence)
+        ));
+        if (isAlreadyCited) return;
+        addAppliedEvidence(itemsByKey, retrievalEvidenceKey(result, evidence), evidence, {
+          vaultId: resultVaultId(result),
+          usage: "定位结果",
+          label: "定位应用",
+          status: isStale ? "stale" : "valid",
+          statusText: isStale ? "已失效" : "有效",
+          sectionLabel: isStale ? "当前内容需重新确认" : "定位结果",
+          resultLabel: `结果 ${result.result_id}`
         });
       });
     });
@@ -1781,47 +1641,190 @@ export function SessionManagement({
     );
   }
 
+  function organizationEvidenceItems() {
+    const itemsByKey = new Map();
+    (activeDetail?.task_snapshots || [])
+      .filter((snapshot) => snapshot.intent === "knowledge-organization")
+      .forEach((snapshot) => {
+        (snapshot.knowledge_organization_plan?.sections || []).forEach((section) => {
+          (section.evidence || []).forEach((evidence) => addAppliedEvidence(
+            itemsByKey,
+            organizationEvidenceKey(snapshot.vault_id, evidence, `snapshot:${snapshot.snapshot_id}:section:${section.ordinal}`),
+            evidence,
+            {
+            vaultId: snapshot.vault_id,
+            usage: "计划段",
+            label: "整理应用",
+            sectionLabel: `第 ${section.ordinal} 段计划`,
+            resultLabel: `快照 ${snapshot.snapshot_id}`
+            }
+          ));
+        });
+      });
+    (knowledgeOrganizationResults || []).forEach((result) => {
+      (result.sections || []).forEach((section) => {
+        (section.evidence || []).forEach((evidence) => addAppliedEvidence(
+          itemsByKey,
+          organizationEvidenceKey(resultVaultId(result), evidence, `result:${result.result_id}:section:${section.ordinal}`),
+          evidence,
+          {
+            vaultId: resultVaultId(result),
+            usage: "整理段",
+            label: "整理应用",
+            sectionLabel: `第 ${section.ordinal} 段`,
+            resultLabel: `结果 ${result.result_id}`
+          }
+        ));
+        (section.conclusions || []).forEach((conclusion) => {
+          (conclusion.evidence || []).forEach((evidence) => addAppliedEvidence(
+            itemsByKey,
+            organizationEvidenceKey(
+              resultVaultId(result),
+              evidence,
+              `result:${result.result_id}:section:${section.ordinal}:conclusion:${conclusion.ordinal}`
+            ),
+            evidence,
+            {
+              vaultId: resultVaultId(result),
+              usage: "整理结论",
+              label: "整理应用",
+              sectionLabel: `第 ${section.ordinal} 段结论 ${conclusion.ordinal}`,
+              resultLabel: `结果 ${result.result_id}`
+            }
+          ));
+        });
+      });
+    });
+    return [...itemsByKey.values()].sort((first, second) =>
+      `${first.relativePath || ""}:${first.location || ""}`.localeCompare(`${second.relativePath || ""}:${second.location || ""}`)
+    );
+  }
+
+  function deepCreationEvidenceForSection(result, section) {
+    if ((section.local_evidence || []).length) return section.local_evidence;
+    const snapshot = snapshotsById.get(result.snapshot_id);
+    return (snapshot?.deep_creation_plan?.sections || []).find(
+      (item) => item.ordinal === section.ordinal
+    )?.local_evidence || [];
+  }
+
+  function deepCreationEvidenceKeys(result, section) {
+    const vaultId = resultVaultId(result);
+    const association = `result:${result.result_id}:section:${section.ordinal}`;
+    return deepCreationEvidenceForSection(result, section).map(
+      (evidence) => deepCreationEvidenceKey(vaultId, evidence, association)
+    );
+  }
+
+  function deepCreationEvidenceItems() {
+    const itemsByKey = new Map();
+    (activeDetail?.task_snapshots || [])
+      .filter((snapshot) => snapshot.intent === "deep-creation")
+      .forEach((snapshot) => {
+        (snapshot.deep_creation_plan?.sections || []).forEach((section) => {
+          (section.local_evidence || []).forEach((evidence) => addAppliedEvidence(
+            itemsByKey,
+            deepCreationEvidenceKey(snapshot.vault_id, evidence, `snapshot:${snapshot.snapshot_id}:section:${section.ordinal}`),
+            evidence,
+            {
+              vaultId: snapshot.vault_id,
+              usage: "创作计划",
+              label: "创作应用",
+              sectionLabel: `第 ${section.ordinal} 段计划`,
+              resultLabel: `快照 ${snapshot.snapshot_id}`
+            }
+          ));
+        });
+      });
+    deepCreationResults.forEach((result) => {
+      (result.sections || []).forEach((section) => {
+        deepCreationEvidenceForSection(result, section).forEach((evidence) => addAppliedEvidence(
+          itemsByKey,
+          deepCreationEvidenceKey(
+            resultVaultId(result),
+            evidence,
+            `result:${result.result_id}:section:${section.ordinal}`
+          ),
+          evidence,
+          {
+            vaultId: resultVaultId(result),
+            usage: "创作内容",
+            label: "创作应用",
+            sectionLabel: `第 ${section.ordinal} 段`,
+            resultLabel: `结果 ${result.result_id}`
+          }
+        ));
+      });
+    });
+    return [...itemsByKey.values()].sort((first, second) =>
+      `${first.relativePath || ""}:${first.location || ""}`.localeCompare(`${second.relativePath || ""}:${second.location || ""}`)
+    );
+  }
+
+  function completenessEvidenceKeys(result, coverage) {
+    return (coverage || [])
+      .filter((item) => item.relative_path)
+      .map((item) => completenessEvidenceKey(result, item));
+  }
+
+  function completenessEvidenceItems() {
+    const itemsByKey = new Map();
+    completenessResults.forEach((result) => {
+      const coverage = coveragePages[result.result_id]?.coverage || result.coverage || [];
+      coverage.forEach((item) => addAppliedEvidence(
+        itemsByKey, completenessEvidenceKey(result, item), item, {
+          vaultId: resultVaultId(result),
+          usage: "覆盖检查",
+          label: "覆盖应用",
+          status: item.status || "valid",
+          statusText: coverageStatusText(item.status),
+          sectionLabel: `覆盖项 ${item.ordinal}`,
+          resultLabel: `结果 ${result.result_id}`
+        }
+      ));
+    });
+    return [...itemsByKey.values()].sort((first, second) =>
+      `${first.relativePath || ""}:${first.location || ""}`.localeCompare(`${second.relativePath || ""}:${second.location || ""}`)
+    );
+  }
+
   function evidencePanelItemView(item) {
     const statusClass = `session-citation-status status-${item.status || "valid"}`;
-    const summary = item.heading || item.location || "未标注位置";
+    const summary = evidenceSummaryText(item);
+    const locationText = userFacingEvidenceLocation(item);
+    const sourceText = userFacingEvidenceSource(item);
     return React.createElement(
       "article",
-      { className: "session-citation", key: item.key },
+      {
+        className: "session-citation",
+        id: applicationEvidenceAnchorId(item.key),
+        key: item.key,
+        tabIndex: -1
+      },
       React.createElement("p", { className: "session-citation-label" }, item.label),
       React.createElement("p", { className: "session-citation-path" }, item.relativePath || "未标注来源"),
-      React.createElement("p", { className: "session-citation-location" }, `vault：${item.vaultLabel}`),
-      item.kind === "organization-evidence"
-        ? React.createElement(
-            "details",
-            { className: "evidence-row citation-evidence-row" },
-            React.createElement("summary", null, `${item.statusText} · ${summary}`),
-            item.sectionLabel ? React.createElement("p", null, item.sectionLabel) : null,
-            item.excerpt ? React.createElement("p", null, item.excerpt) : null,
-            React.createElement("p", null, `定位：${item.location || "未标注位置"}${item.page ? `；第 ${item.page} 页` : ""}`),
-            item.identityKind === "derived"
-              ? React.createElement("p", null, `Source ID ${item.sourceId}；源内容哈希 ${item.sourceContentHash}`)
-              : React.createElement("p", null, `原生 Markdown：${item.relativePath}；内容哈希 ${item.contentSha256}`),
-            item.sourcePath ? React.createElement("p", null, `源文件：${item.sourcePath}`) : null,
-            item.canOpenInObsidian && item.vaultId
-              ? React.createElement("a", {
-                  href: `${VAULTS_ENDPOINT}/${encodeURIComponent(item.vaultId)}/open?file=${encodeURIComponent(item.relativePath)}`,
-                  target: "_blank", rel: "noreferrer"
-                }, "在 Obsidian 中打开")
-              : null
-          )
-        : React.createElement(
-            React.Fragment,
-            null,
-            React.createElement("p", { className: "session-citation-location" }, item.location || "未标注位置"),
-            item.identityKind === "derived"
-              ? React.createElement("p", { className: "session-citation-location" }, `Source ID ${item.sourceId}；源内容哈希 ${item.sourceContentHash}`)
-              : item.identityKind === "native"
-                ? React.createElement("p", { className: "session-citation-location" }, `原生 Markdown 内容哈希 ${item.contentSha256}`)
-                : null,
-            item.invalidationReason
-              ? React.createElement("p", { className: "form-error" }, item.invalidationReason)
-              : null
-          ),
+      React.createElement("p", { className: "session-citation-location" }, `知识库：${item.vaultLabel}`),
+      React.createElement(
+        "details",
+        { className: "evidence-row citation-evidence-row" },
+        React.createElement("summary", null, `${item.statusText} · ${summary}`),
+        item.sectionLabel ? React.createElement("p", null, item.sectionLabel) : null,
+        item.excerpt ? React.createElement("p", { className: "evidence-excerpt" }, item.excerpt) : null,
+        locationText ? React.createElement("p", { className: "evidence-location" }, `位置：${locationText}`) : null,
+        sourceText ? React.createElement("p", { className: "evidence-source" }, sourceText) : null,
+        item.matchedChannels?.length
+          ? React.createElement("p", { className: "evidence-source" }, `匹配方式：${item.matchedChannels.map(retrievalChannelText).join("、")}`)
+          : null,
+        item.reason ? React.createElement("p", { className: "form-error" }, item.reason) : null,
+        item.duplicateOrdinal ? React.createElement("p", null, `与覆盖项 ${item.duplicateOrdinal} 合并。`) : null,
+        item.invalidationReason ? React.createElement("p", { className: "form-error" }, item.invalidationReason) : null,
+        item.canOpenInObsidian && item.vaultId
+          ? React.createElement("a", {
+              href: `${VAULTS_ENDPOINT}/${encodeURIComponent(item.vaultId)}/open?file=${encodeURIComponent(item.relativePath)}`,
+              target: "_blank", rel: "noreferrer"
+            }, "在 Obsidian 中打开")
+          : null
+      ),
       React.createElement("span", { className: statusClass }, item.statusText)
     );
   }
@@ -1832,8 +1835,14 @@ export function SessionManagement({
 
   const evidencePanelItems = [
     ...(activeDetail?.citations || []).map(citationEvidenceItem),
-    ...organizationEvidenceItems()
-  ];
+    ...retrievalEvidenceItems(),
+    ...organizationEvidenceItems(),
+    ...deepCreationEvidenceItems(),
+    ...completenessEvidenceItems()
+  ].sort((first, second) => `${first.relativePath || ""}:${first.location || ""}`.localeCompare(
+    `${second.relativePath || ""}:${second.location || ""}`
+  ));
+  evidencePanelItems.forEach((item) => applicationEvidenceItemsByKey.set(item.key, item));
 
   return React.createElement(
     "section",
@@ -1961,137 +1970,55 @@ export function SessionManagement({
                 : null
             )
       ),
-      selectedSession
-        ? React.createElement("p", { className: "session-detail-meta" }, `所用 vault：${sessionVaultName(selectedSession, vaults)} · 范围：${selectedSession.scope_kind === "directory" ? selectedSession.scope_path : selectedSession.scope_kind === "vault" ? "整个 vault" : "未设置"} · Model：${selectedSession.selected_model_label || "未设置"} · ${authorizationText}`)
-        : null,
       React.createElement(
         "div",
-        { className: "session-message-list", "aria-live": "polite" },
-        isDetailLoading
-          ? React.createElement("p", { className: "empty-state", role: "status" }, "正在加载会话内容。")
-          : detailError
+        { className: "session-conversation-body" },
+        React.createElement(
+          "div",
+          { className: "session-message-list", ref: messageListRef, "aria-live": "polite", onScroll: updateConversationScroll },
+          isDetailLoading && activeDetail
+            ? React.createElement("p", { className: "session-detail-refresh-status", role: "status" }, "正在更新会话内容。")
+            : null,
+          detailError && activeDetail
             ? React.createElement("p", { className: "form-error", role: "alert" }, detailError)
-          : activeDetail?.messages?.length || generationResults.length || knowledgeOrganizationResults.length || deepCreationResults.length || streamedDeepCreationResult
-              ? React.createElement(
-                  React.Fragment,
-                  null,
-                  [...activeDetail.messages.map((message) => ({ kind: "message", value: message })),
-                    ...generationResults.map((result) => ({ kind: "generation", value: result })),
-                    ...retrievalResults.map((result) => ({ kind: "retrieval", value: result })),
-                    ...completenessResults.map((result) => ({ kind: "completeness", value: result })),
-                    ...knowledgeOrganizationResults.map((result) => ({ kind: "organization", value: result })),
-                    ...deepCreationResults.map((result) => ({ kind: "deep-creation", value: result })),
-                    ...(streamedDeepCreationResult ? [{ kind: "deep-creation", value: streamedDeepCreationResult }] : [])]
-                    .sort((first, second) => (first.value.created_at || "").localeCompare(second.value.created_at || ""))
-                    .map((entry) => {
-                      if (entry.kind === "generation") return generationResultView(entry.value);
-                      if (entry.kind === "retrieval") return retrievalResultView(entry.value);
-                      if (entry.kind === "completeness") return completenessResultView(entry.value);
-                      if (entry.kind === "organization") return knowledgeOrganizationResultView(entry.value);
-                      if (entry.kind === "deep-creation") return deepCreationResultView(entry.value);
-                      return React.createElement(
-                        "article",
-                        { className: `session-message session-message-${entry.value.role}`, key: entry.value.message_id },
-                        React.createElement("p", { className: "session-message-role" }, messageRoleText(entry.value.role)),
-                        React.createElement("p", { className: "session-message-content" }, entry.value.content)
-                      );
-                    })
-                )
-              : retrievalResults.length || completenessResults.length || knowledgeOrganizationResults.length || deepCreationResults.length
-                ? [
-                    ...retrievalResults.map(retrievalResultView),
-                    ...completenessResults.map(completenessResultView),
-                    ...knowledgeOrganizationResults.map(knowledgeOrganizationResultView),
-                    ...deepCreationResults.map(deepCreationResultView)
-                 ]
-              : selectedSession
-                ? React.createElement("p", { className: "empty-state" }, "该会话尚无已保存的消息。")
-                : React.createElement("p", { className: "empty-state" }, "从左侧选择一个会话以查看内容。")
-      ),
-      activeDetail?.task_snapshots?.length
-        ? React.createElement(
-            "div",
-            { className: "session-task-snapshot-list", "aria-label": "任务快照状态", "aria-live": "polite" },
-            activeDetail.task_snapshots.map((snapshot) => {
-              const canExecute = snapshot.status === "prepared"
-                && ["source-lookup", "knowledge-organization", "completeness", "deep-creation"].includes(snapshot.intent);
-              const frozenVault = vaultsById.get(snapshot.vault_id);
-              const isSourceLookup = snapshot.intent === "source-lookup";
-              const isKnowledgeOrganization = snapshot.intent === "knowledge-organization";
-              const isDeepCreation = snapshot.intent === "deep-creation";
-              const rerankRequest = rerankAuthorizationRequest?.taskId === snapshot.task_id
-                ? rerankAuthorizationRequest
-                : null;
-              const organizationResult = isKnowledgeOrganization
-                ? knowledgeOrganizationResults.find((result) => result.snapshot_id === snapshot.snapshot_id)
-                : null;
-              const deepCreationResult = isDeepCreation
-                ? deepCreationResults.find((result) => result.snapshot_id === snapshot.snapshot_id)
-                : null;
-              const organizationOutcomes = new Map(
-                (organizationResult?.sections || []).map((section) => [section.ordinal, section])
-              );
-              const deepCreationOutcomes = new Map(
-                (deepCreationResult?.sections || []).map((section) => [section.ordinal, section])
-              );
-              return React.createElement(
+            : null,
+          conversationTurnItems.length
+            ? conversationTurnItems.map((turn) => React.createElement(
                 "section",
-                { className: "scope-summary session-task-snapshot", key: snapshot.snapshot_id },
-                React.createElement("strong", null, `任务 ${taskIntentText(snapshot.intent)}：${taskSnapshotStatusText(snapshot)}`),
-                isKnowledgeOrganization
-                  ? React.createElement("span", null, `范围：已冻结资料范围；来源 ${snapshot.source_count} 项；详细依据见右侧“引用证据”。`)
-                  : React.createElement("span", null, `范围：${snapshot.scope_kind === "directory" ? snapshot.scope_path : "整个 vault"}；来源 ${snapshot.source_count} 项；摘要 ${snapshot.source_digest.slice(0, 12)}`),
-                isKnowledgeOrganization
-                  ? React.createElement("span", null, `索引：${snapshot.index_status}；外发：${snapshot.outbound_scope_summary}`)
-                  : React.createElement("span", null, `索引：${snapshot.index_status}；外发：${snapshot.outbound_scope_summary}`),
-                isKnowledgeOrganization
-                  ? React.createElement("span", null, `冻结 vault：${frozenVault?.display_name || snapshot.vault_id}`)
-                  : null,
-                isKnowledgeOrganization
-                  ? React.createElement("span", null, `索引版本：${snapshot.index_updated_at || "无"}；策略修订：${snapshot.policy_revision ?? "无"}`)
-                  : null,
-                isKnowledgeOrganization
-                  ? React.createElement("span", null, `排除项：${snapshot.exclusion_summary || "无"}`)
-                  : null,
-                snapshot.coverage
-                  ? React.createElement("span", null, `覆盖：计划 ${snapshot.coverage.planned_count} 项；排除 ${snapshot.coverage.excluded_count} 项；未覆盖 ${snapshot.coverage.uncovered_count} 项`)
-                  : null,
-                snapshot.knowledge_organization_plan
-                  ? knowledgeOrganizationPlanView(snapshot.knowledge_organization_plan, organizationOutcomes)
-                  : null,
-                snapshot.deep_creation_plan
-                  ? deepCreationPlanView(snapshot.deep_creation_plan, deepCreationOutcomes)
-                  : null,
-                snapshot.invalidation_reason
-                  ? React.createElement("span", { className: "form-error" }, `需重新准备：${snapshot.invalidation_reason}`)
-                  : null,
-                rerankRequest
-                  ? React.createElement(RerankAuthorizationPreview, {
-                      preview: rerankRequest.preview,
-                      authorization: rerankRequest.authorization,
-                      isSubmitting,
-                      onConfirm: () => confirmRerankAuthorization(rerankRequest),
-                      onUseLocal: () => executeTaskLocally(snapshot.task_id)
-                    })
-                  : null,
-                canExecute && !rerankRequest
-                  ? React.createElement("button", {
-                      className: "secondary-button",
-                      type: "button",
-                      disabled: isSubmitting,
-                      onClick: isSourceLookup
-                        ? () => prepareRerankAuthorization(snapshot)
-                        : () => executeTask(snapshot.task_id)
-                    }, snapshot.intent === "completeness" ? "执行完整性检索" : snapshot.intent === "knowledge-organization" ? "生成知识整理" : snapshot.intent === "deep-creation" ? "生成深度创作" : "执行检索")
-                 : null
-              );
-            })
-          )
-        : null,
+                { className: "session-turn", id: turn.id, key: turn.id, tabIndex: -1 },
+                turn.entries.map(conversationEntryView)
+              ))
+            : isDetailLoading
+              ? React.createElement("p", { className: "empty-state", role: "status" }, "正在加载会话内容。")
+              : detailError
+                ? React.createElement("p", { className: "form-error", role: "alert" }, detailError)
+                : selectedSession
+                  ? React.createElement("p", { className: "empty-state" }, "该会话尚无已保存的消息。")
+                  : React.createElement("p", { className: "empty-state" }, "从左侧选择一个会话以查看内容。")
+        ),
+        conversationTurnItems.length
+          ? React.createElement(
+              "nav",
+              { className: "session-turn-navigator", "aria-label": "问答定位" },
+              conversationTurnItems.map((turn, index) => React.createElement(
+                "button",
+                {
+                  className: "session-turn-navigator-button",
+                  type: "button",
+                  key: turn.id,
+                  "aria-label": `定位到第 ${index + 1} 轮：${turn.question || "未命名问答"}`,
+                  "aria-current": activeConversationTurnId === turn.id ? "true" : undefined,
+                  title: turn.question || "未命名问答",
+                  onClick: () => scrollToConversationTurn(turn)
+                }
+              ))
+            )
+          : null
+      ),
       selectedSession
         ? React.createElement(
             "form",
-            { className: "session-composer", "aria-label": "会话输入", onSubmit: prepareTask },
+            { className: "session-composer", "aria-label": "会话输入", onSubmit: sendTask },
             React.createElement(
               "div",
               { className: "session-attachment-list", "aria-live": "polite", "aria-relevant": "additions removals text" },
@@ -2114,50 +2041,53 @@ export function SessionManagement({
               disabled: isSubmitting,
               "aria-label": "输入问题或继续创作",
               placeholder: "输入问题，或继续创作...",
-              onChange: (event) => {
-                setMessage(event.target.value);
-                setTaskPreview(null);
-              },
+              onChange: (event) => setMessage(event.target.value),
               onKeyDown: (event) => {
                 if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
                   event.preventDefault();
-                  prepareTask();
+                  sendTask();
                 }
               }
             }),
-            taskPreview
-              ? React.createElement(
-                  "section",
-                  { className: "scope-summary session-task-preview", role: "status", "aria-live": "polite" },
-                  React.createElement("strong", null, `执行前范围：${taskIntentText(taskPreview.intent)}${taskPreview.intent_source === "auto" ? "（自动识别）" : "（已明确选择）"}`),
-                  React.createElement("span", null, `vault：${taskPreview.vault_id}；范围：${taskPreview.scope_kind === "directory" ? taskPreview.scope_path : "整个 vault"}`),
-                  React.createElement("span", null, `来源：${taskPreview.source_count} 项；来源摘要：${taskPreview.source_digest.slice(0, 12)}`),
-                  React.createElement("span", null, `索引：${taskPreview.index_status}${taskPreview.index_updated_at ? `（${taskPreview.index_updated_at}）` : ""}`),
-                  React.createElement("span", null, `排除项：${taskPreview.exclusion_summary}`),
-                  React.createElement("span", null, `Model：${taskPreview.provider_id} · ${taskPreview.model_id}`),
-                  React.createElement("span", null, `外发范围：${taskPreview.outbound_scope_summary}`),
-                  taskPreview.source_sample?.length
-                    ? React.createElement("span", null, `来源样例：${taskPreview.source_sample.map((source) => source.source_id ? `Source ID ${source.source_id} / ${source.source_content_hash?.slice(0, 12)}` : `${source.relative_path} / ${source.content_sha256.slice(0, 12)}`).join("；")}`)
-                    : null,
-                  taskPreview.knowledge_organization_plan
-                    ? knowledgeOrganizationPlanView(taskPreview.knowledge_organization_plan)
-                    : null,
-                  taskPreview.deep_creation_plan
-                    ? deepCreationPlanView(taskPreview.deep_creation_plan)
-                    : null,
-                  !taskPreview.is_ready
-                    ? React.createElement("span", { className: "form-error" }, `${taskPreview.blocking_reason} ${taskPreview.recovery_action}`)
-                    : null
-                )
-              : null,
             React.createElement(
               "div", { className: "session-composer-controls" },
               React.createElement("button", { className: "secondary-button", type: "button", disabled: isSubmitting || contextIsDirty || !selectedSession?.selected_vault_id, onClick: pickAttachments }, "添加附件"),
+              React.createElement(
+                "fieldset",
+                { className: "retrieval-mode-control", disabled: isSubmitting || retrievalModeLoading || !selectedSession },
+                React.createElement("legend", null, "查找模式"),
+                React.createElement(
+                  "div",
+                  { className: "retrieval-mode-options", role: "group", "aria-label": "检索模式" },
+                  (retrievalMode.options?.length
+                    ? retrievalMode.options
+                    : [
+                        { mode: "keyword", label: "仅关键词" },
+                        { mode: "semantic", label: "仅语义" },
+                        { mode: "hybrid", label: "关键词与语义混合" }
+                      ]
+                  ).map((option) => React.createElement(
+                    "button",
+                    {
+                      className: `retrieval-mode-button${retrievalMode.mode === option.mode ? " is-active" : ""}`,
+                      type: "button",
+                      key: option.mode,
+                      "aria-pressed": retrievalMode.mode === option.mode ? "true" : "false",
+                      onClick: () => changeRetrievalMode(option.mode)
+                    },
+                    option.label
+                  ))
+                ),
+                React.createElement("span", { className: "retrieval-mode-note" }, retrievalMode.mode === "semantic"
+                  ? "需要可用的语义索引；不可用时不会回退。"
+                  : retrievalMode.mode === "hybrid"
+                    ? "关键词、语义和标题结果会合并。"
+                    : "只在本机使用关键词索引。")
+              ),
               React.createElement("label", null, "vault",
                 React.createElement("select", {
                   value: context.vault_id, disabled: isSubmitting, "aria-label": "选择 vault",
                   onChange: (event) => {
-                    setTaskPreview(null);
                     setContext({ vault_id: event.target.value, scope_kind: "vault", scope_path: "", provider_id: "", model_id: "" });
                   }
                 }, React.createElement("option", { value: "" }, "选择 vault"), availableVaults.map((vault) => React.createElement("option", { key: vault.vault_id, value: vault.vault_id }, vaultName(vault))))
@@ -2166,14 +2096,12 @@ export function SessionManagement({
                 React.createElement("select", {
                   value: context.scope_kind, disabled: isSubmitting || !context.vault_id, "aria-label": "选择资料范围",
                   onChange: (event) => {
-                    setTaskPreview(null);
                     setContext({ ...context, scope_kind: event.target.value, scope_path: "" });
                   }
                 }, React.createElement("option", { value: "vault" }, "整个 vault"), React.createElement("option", { value: "directory" }, "指定目录"))
               ),
               context.scope_kind === "directory"
                 ? React.createElement("input", { value: context.scope_path, disabled: isSubmitting, "aria-label": "资料范围目录", placeholder: "vault 相对目录", onChange: (event) => {
-                  setTaskPreview(null);
                   setContext({ ...context, scope_path: event.target.value });
                 } })
                 : null,
@@ -2182,18 +2110,14 @@ export function SessionManagement({
                   value: JSON.stringify([context.provider_id, context.model_id]), disabled: isSubmitting || !context.vault_id, "aria-label": "选择 Model",
                   onChange: (event) => {
                     const [providerId, modelId] = JSON.parse(event.target.value);
-                    setTaskPreview(null);
                     setContext({ ...context, provider_id: providerId || "", model_id: modelId || "" });
                   }
                 }, React.createElement("option", { value: JSON.stringify(["", ""]) }, "选择已验证的 chat Model"), chatModels.map(({ provider, model }) => React.createElement("option", { key: `${provider.provider_id}:${model.model_id}`, value: JSON.stringify([provider.provider_id, model.model_id]) }, `${provider.name} · ${model.model_id}`)))
               ),
               React.createElement("label", null, "任务类型",
                 React.createElement("select", {
-                  value: taskIntent, disabled: isSubmitting || contextIsDirty, "aria-label": "选择任务类型",
-                  onChange: (event) => {
-                    setTaskIntent(event.target.value);
-                    setTaskPreview(null);
-                  }
+                  value: taskIntent, disabled: isSubmitting, "aria-label": "选择任务类型",
+                  onChange: (event) => setTaskIntent(event.target.value)
                 },
                 React.createElement("option", { value: "auto" }, "自动识别"),
                 React.createElement("option", { value: "source-lookup" }, "原文定位"),
@@ -2201,33 +2125,28 @@ export function SessionManagement({
                 React.createElement("option", { value: "knowledge-organization" }, "知识整理"),
                 React.createElement("option", { value: "deep-creation" }, "深度创作"))
               ),
-              React.createElement("span", { className: "session-authorization", role: "status" }, authorizationText),
-              React.createElement("button", { className: "secondary-button", type: "button", disabled: isSubmitting || !context.vault_id || !context.provider_id || !context.model_id || (context.scope_kind === "directory" && !context.scope_path.trim()), onClick: saveContext }, "保存语境"),
-              React.createElement("button", { className: "primary-button", type: "submit", disabled: isSubmitting || !canPrepare }, "准备任务"),
-              taskPreview?.is_ready
-                ? React.createElement("button", { className: "secondary-button", type: "button", disabled: isSubmitting || contextIsDirty || !canFixTask, onClick: createTask }, "固定快照")
-                : null
+              React.createElement("button", { className: "primary-button", type: "submit", disabled: isSubmitting || !canSend }, "发送")
             )
           )
         : null
     ),
     React.createElement(
       "aside",
-      { className: "session-evidence-pane", "aria-label": "引用证据" },
+      { className: "session-evidence-pane", "aria-label": "应用证据" },
       React.createElement(
         "header",
         { className: "session-evidence-heading" },
-        React.createElement("h2", null, "引用证据"),
+        React.createElement("h2", { id: "application-evidence-heading" }, "应用证据"),
         React.createElement("span", null, evidencePanelItems.length)
       ),
       React.createElement(
         "div",
         { className: "session-citation-list" },
-        isDetailLoading
-          ? React.createElement("p", { className: "empty-state", role: "status" }, "正在加载引用。")
+        isDetailLoading && !activeDetail
+          ? React.createElement("p", { className: "empty-state", role: "status" }, "正在加载应用证据。")
           : evidencePanelItems.length
             ? evidencePanelItems.map(evidencePanelItemView)
-            : React.createElement("p", { className: "empty-state" }, selectedSession ? "当前会话暂无引用。" : "选择会话后将在此显示引用。")
+            : React.createElement("p", { className: "empty-state" }, selectedSession ? "当前会话暂无应用证据。" : "选择会话后将在此显示应用证据。")
       )
     )
   );
@@ -2336,28 +2255,13 @@ function VaultPolicyControls({ vault, onUpdate }) {
     onUpdate({ ...vault, policy: nextPolicy });
   }
 
-  async function changeMode(event) {
-    const outboundMode = event.target.value;
-    setStatus("");
-    try {
-      const response = await requestJson(`${policyEndpoint(vault.vault_id)}/mode`, {
-        method: "PUT",
-        body: JSON.stringify({ outbound_mode: outboundMode })
-      });
-      updatePolicy(response.policy);
-      setStatus(outboundMode === "always-allow" ? "外发已设为始终允许。规则仍会阻止受限内容。" : "外发已改为每次询问；未执行授权已失效。");
-    } catch (error) {
-      setStatus(error.message);
-    }
-  }
-
   async function removeRule(rule) {
     setStatus("");
     try {
       await requestJson(`${policyEndpoint(vault.vault_id)}/rules/${rule.rule_id}`, { method: "DELETE" });
       const response = await requestJson(policyEndpoint(vault.vault_id));
       updatePolicy(response.policy);
-      setStatus("规则已删除；未执行授权已失效。");
+      setStatus("规则已删除。");
     } catch (error) {
       setStatus(error.message);
     }
@@ -2383,29 +2287,17 @@ function VaultPolicyControls({ vault, onUpdate }) {
     const response = await requestJson(policyEndpoint(vault.vault_id));
     updatePolicy(response.policy);
     setRuleForm(null);
-    setStatus("规则已保存；未执行授权已失效。");
+    setStatus("规则已保存。");
   }
 
   return React.createElement(
     "section",
     { className: "policy-controls", "aria-labelledby": "vault-policy-heading" },
-    React.createElement("h3", { id: "vault-policy-heading" }, "资料排除与外发授权"),
-    React.createElement(
-      "label",
-      { className: "policy-mode-row", htmlFor: "outbound-mode" },
-      React.createElement("span", { className: "form-label" }, "外发方式"),
-      React.createElement(
-        "select",
-        { id: "outbound-mode", value: policy.outbound_mode, onChange: changeMode },
-        React.createElement("option", { value: "ask-each-task" }, "每次询问"),
-        React.createElement("option", { value: "always-allow" }, "始终允许")
-      ),
-      React.createElement("span", { className: "form-help" }, "同时适用于 cloud Model 与 web search；绝不发送到云端的规则始终优先。")
-    ),
+    React.createElement("h3", { id: "vault-policy-heading" }, "资料排除规则"),
     React.createElement(
       "div",
       { className: "policy-summary", "aria-live": "polite" },
-      `当前：${outboundModeText(policy.outbound_mode)}；策略修订 ${policy.policy_revision}。`
+      `已验证 Provider 默认允许出网；策略修订 ${policy.policy_revision}。never-send-cloud 始终优先。`
     ),
     status ? React.createElement("p", { className: "status-line", role: "status" }, status) : null,
     React.createElement(
@@ -2423,7 +2315,7 @@ function VaultPolicyControls({ vault, onUpdate }) {
         })
       : null,
     policy.rules.length === 0 && !ruleForm
-      ? React.createElement("p", { className: "empty-state" }, "尚无排除规则。默认外发方式为每次询问。")
+      ? React.createElement("p", { className: "empty-state" }, "尚无排除规则。已验证 Provider 默认允许出网。")
       : null,
     policy.rules.map((rule) =>
       React.createElement(
@@ -2776,17 +2668,10 @@ export function MetadataExtractionPanel({ vault }) {
     setIsActing(true);
     setStatus("");
     try {
-      const requested = await requestJson(`${VAULTS_ENDPOINT}/${vault.vault_id}/metadata-authorizations`, {
+      const executed = await requestJson(`${VAULTS_ENDPOINT}/${vault.vault_id}/metadata/extract`, {
         method: "POST",
         body: JSON.stringify({ scope_kind: "vault" })
       });
-      if (requested.authorization?.status !== "approved") {
-        throw new Error("元数据授权未获批准。请检查当前 vault 的外发策略后重试。");
-      }
-      const executed = await requestJson(
-        `${VAULTS_ENDPOINT}/${vault.vault_id}/metadata-authorizations/${requested.authorization.authorization_id}/execute`,
-        { method: "POST", body: JSON.stringify({ scope_kind: "vault" }) }
-      );
       await loadCandidates();
       setStatus(`已抽取 ${executed.report.candidate_count} 项元数据候选；${executed.report.required_review_count} 项待审核。`);
     } catch (error) {
@@ -2838,7 +2723,7 @@ export function MetadataExtractionPanel({ vault }) {
       ? requiredCandidates.map((candidate) => React.createElement(
         "div",
         { className: "metadata-candidate-row", key: candidate.candidate_id },
-        React.createElement("strong", null, `${candidate.relative_path} #${candidate.sequence}`),
+        React.createElement("strong", null, candidate.relative_path),
         React.createElement(
           "span",
           { className: "row-note" },
@@ -3059,7 +2944,7 @@ export function KnowledgeGraphWorkbench({ vaults, currentVault, isLoading, onAdd
       )
       : null,
     selectedNode ? React.createElement("section", { className: "graph-detail", "aria-label": "节点详情", tabIndex: -1 }, React.createElement("h2", null, selectedNode.title), React.createElement("p", null, `路径：${selectedNode.relative_path}`), React.createElement("p", null, `标签：${selectedNode.tags.join("、") || "无"}`)) : null,
-    selectedEdge ? React.createElement("section", { className: "graph-detail", "aria-label": "关系详情", tabIndex: -1 }, React.createElement("h2", null, selectedEdge.kind === "confirmed" ? "已确认关系" : "候选关系"), React.createElement("p", null, `${selectedEdge.source_path} -> ${selectedEdge.target_path}`), selectedEdge.kind === "candidate" ? React.createElement(React.Fragment, null, React.createElement("p", null, `审核项：${selectedEdge.review_item_id}；状态：${selectedEdge.status}`), React.createElement("p", null, `理由：${selectedEdge.reason}`), React.createElement("p", null, `证据位置：${selectedEdge.evidence.map((evidence) => `${evidence.relative_path} ${evidence.location}`).join("；")}`)) : null) : null
+    selectedEdge ? React.createElement("section", { className: "graph-detail", "aria-label": "关系详情", tabIndex: -1 }, React.createElement("h2", null, selectedEdge.kind === "confirmed" ? "已确认关系" : "候选关系"), React.createElement("p", null, `${selectedEdge.source_path} -> ${selectedEdge.target_path}`), selectedEdge.kind === "candidate" ? React.createElement(React.Fragment, null, React.createElement("p", null, `状态：${selectedEdge.status}`), React.createElement("p", null, `理由：${selectedEdge.reason}`), React.createElement("p", null, `证据来源：${selectedEdge.evidence.map((evidence) => evidence.relative_path).join("；")}`)) : null) : null
   );
 }
 
@@ -3171,10 +3056,6 @@ function ProviderForm({ provider, onCancel, onComplete }) {
   async function submit(event) {
     event.preventDefault();
     const secret = secretRef.current?.value || "";
-    if (!isEditing && !secret) {
-      setStatus("请输入 Provider 凭据。");
-      return;
-    }
     setStatus("");
     setIsSubmitting(true);
     try {
@@ -3197,7 +3078,7 @@ function ProviderForm({ provider, onCancel, onComplete }) {
     "form",
     { className: "provider-form", onSubmit: submit, "aria-label": isEditing ? "编辑 Provider" : "添加 Provider" },
     React.createElement("h2", null, isEditing ? "编辑 Provider" : "添加 Provider"),
-    React.createElement("p", { className: "form-description" }, "仅支持 OpenAI-compatible 服务。凭据只保存到 Windows Credential Manager。"),
+    React.createElement("p", { className: "form-description" }, "仅支持 OpenAI-compatible 服务。API Key 可选；本地服务留空时不会发送鉴权头。"),
     React.createElement(
       "label",
       { className: "form-row", htmlFor: "provider-name" },
@@ -3214,9 +3095,9 @@ function ProviderForm({ provider, onCancel, onComplete }) {
     React.createElement(
       "label",
       { className: "form-row", htmlFor: "provider-secret" },
-      React.createElement("span", { className: "form-label" }, isEditing ? "替换凭据（可选）" : "凭据"),
+      React.createElement("span", { className: "form-label" }, isEditing ? "替换 API Key（可选）" : "API Key（可选）"),
       React.createElement("input", { id: "provider-secret", type: "password", ref: secretRef, autoComplete: "new-password", disabled: isSubmitting }),
-      React.createElement("span", { className: "form-help" }, isEditing ? "留空会保留当前凭据。提交后此字段会立即清空。" : "提交后此字段会立即清空。")
+      React.createElement("span", { className: "form-help" }, isEditing ? "留空会保留当前 API Key。提交后此字段会立即清空。" : "本地服务可留空；提交后此字段会立即清空。")
     ),
     status ? React.createElement("p", { className: "form-error", role: "alert" }, status) : null,
     React.createElement(
@@ -3402,9 +3283,23 @@ export function ProviderManagement({ providers, isLoading, modelDefaults, onOpen
       React.createElement(ModelDefaultSelector, {
         modelType: "rerank",
         label: "全局 Rerank（重排）Model",
-        description: "用于候选重排；默认关闭，只有获得单次外发授权后才会发送候选。",
+        description: "用于候选重排；默认关闭，启用后仅发送允许外发的候选。",
         providers,
         modelDefault: modelDefaults.rerank,
+        onChange: changeDefault,
+        onClear: clearDefault
+      })
+    ),
+    React.createElement(
+      "div",
+      { className: "model-default-section", "aria-labelledby": "markdown-model-heading" },
+      React.createElement("h3", { id: "markdown-model-heading" }, "Markdown 结构化模型"),
+      React.createElement(ModelDefaultSelector, {
+        modelType: "markdown",
+        label: "全局 Markdown 结构化 Model",
+        description: "用于导入任务中的长 Markdown 结构识别与安全分块。",
+        providers,
+        modelDefault: modelDefaults.markdown,
         onChange: changeDefault,
         onClear: clearDefault
       })
@@ -3420,7 +3315,7 @@ export function ProviderManagement({ providers, isLoading, modelDefaults, onOpen
       React.createElement(
         "div",
         { className: "section-row provider-row", key: provider.provider_id },
-        React.createElement("div", { className: "provider-summary" }, React.createElement("span", { className: "row-title" }, provider.name), React.createElement("span", { className: "row-meta" }, provider.endpoint), React.createElement("span", { className: "row-note" }, `凭据：${provider.credential_configured ? "已配置" : "不可用"}；${providerStatus(provider)}`)),
+        React.createElement("div", { className: "provider-summary" }, React.createElement("span", { className: "row-title" }, provider.name), React.createElement("span", { className: "row-meta" }, provider.endpoint), React.createElement("span", { className: "row-note" }, `API Key：${provider.credential_configured ? "已配置" : "未配置"}；${providerStatus(provider)}`)),
         React.createElement(
           "div",
           { className: "rule-actions" },
@@ -3444,7 +3339,8 @@ export function ProviderManagement({ providers, isLoading, modelDefaults, onOpen
               React.createElement("option", { value: "" }, "选择类型"),
               React.createElement("option", { value: "chat" }, "对话/文本生成"),
               React.createElement("option", { value: "embedding" }, "Embedding"),
-              React.createElement("option", { value: "rerank" }, "Rerank（重排）")
+              React.createElement("option", { value: "rerank" }, "Rerank（重排）"),
+              React.createElement("option", { value: "markdown" }, "Markdown 结构化")
             )
           ),
           React.createElement("span", { className: model.verification.ok ? "provider-check provider-check-ok" : "provider-check provider-check-failed" }, model.verification.ok ? "已验证" : model.verification.reason || "未验证"),
@@ -3505,7 +3401,22 @@ function VaultManagement({ activeDestination, vaults, isLoading, selectedVault, 
 function ImportTaskLauncher({ vault, onCreated }) {
   const [status, setStatus] = React.useState("");
   const [isSelecting, setIsSelecting] = React.useState(false);
+  const uploadInputRef = React.useRef(null);
+  const uploadDirectoryInputRef = React.useRef(null);
   const canImport = vault && vault.authorization_status === "active" && vault.access_status === "available";
+
+  async function createFromSelection(selection) {
+    if (!selection.selection_id) {
+      setStatus("未选择资料，未创建导入任务。");
+      return;
+    }
+    const created = await requestJson(IMPORT_TASKS_ENDPOINT, {
+      method: "POST",
+      body: JSON.stringify({ vault_id: vault.vault_id, selection_id: selection.selection_id })
+    });
+    setStatus(`已创建导入任务：${selection.label}。`);
+    onCreated(created.task);
+  }
 
   async function selectAndCreate(kind) {
     if (!canImport) return;
@@ -3519,16 +3430,31 @@ function ImportTaskLauncher({ vault, onCreated }) {
           body: JSON.stringify({ multiple: kind === "multiple" })
         }
       );
-      if (!selection.selection_id) {
-        setStatus("未选择资料，未创建导入任务。");
-        return;
-      }
-      const created = await requestJson(IMPORT_TASKS_ENDPOINT, {
+      await createFromSelection(selection);
+    } catch (error) {
+      setStatus(error.message);
+    } finally {
+      setIsSelecting(false);
+    }
+  }
+
+  async function uploadAndCreate(event, kind = "files") {
+    const files = Array.from(event.target.files || []);
+    event.target.value = "";
+    if (!canImport || files.length === 0) return;
+    setStatus(kind === "directory" ? "正在上传文件夹…" : `正在上传 ${files.length} 个文件…`);
+    setIsSelecting(true);
+    try {
+      const formData = new globalThis.FormData();
+      formData.append("kind", kind);
+      files.forEach((file) => formData.append(
+        "files", file, kind === "directory" ? file.webkitRelativePath || file.name : file.name
+      ));
+      const selection = await requestJson(IMPORT_UPLOAD_ENDPOINT, {
         method: "POST",
-        body: JSON.stringify({ vault_id: vault.vault_id, selection_id: selection.selection_id })
+        body: formData
       });
-      setStatus(`已创建导入任务：${selection.label}。`);
-      onCreated(created.task);
+      await createFromSelection(selection);
     } catch (error) {
       setStatus(error.message);
     } finally {
@@ -3545,23 +3471,55 @@ function ImportTaskLauncher({ vault, onCreated }) {
           React.Fragment,
           null,
           React.createElement("p", { className: "scope-summary" }, `目标 vault：${vaultName(vault)}`),
+          React.createElement("input", {
+            ref: uploadInputRef,
+            className: "visually-hidden",
+            type: "file",
+            multiple: true,
+            "aria-label": "上传本机资料文件",
+            onChange: uploadAndCreate
+          }),
+          React.createElement("input", {
+            ref: uploadDirectoryInputRef,
+            className: "visually-hidden",
+            type: "file",
+            multiple: true,
+            webkitdirectory: "",
+            "aria-label": "上传本机资料文件夹",
+            onChange: (event) => uploadAndCreate(event, "directory")
+          }),
           React.createElement(
             "div",
             { className: "detail-actions" },
             React.createElement(
               "button",
-              { className: "primary-button", type: "button", disabled: isSelecting, onClick: () => selectAndCreate("single") },
-              "选择文件"
+              {
+                className: "primary-button",
+                type: "button",
+                disabled: isSelecting,
+                onClick: () => uploadInputRef.current?.click()
+              },
+              "上传文件"
+            ),
+            React.createElement(
+              "button",
+              {
+                className: "primary-button",
+                type: "button",
+                disabled: isSelecting,
+                onClick: () => uploadDirectoryInputRef.current?.click()
+              },
+              "上传文件夹"
             ),
             React.createElement(
               "button",
               { className: "secondary-button", type: "button", disabled: isSelecting, onClick: () => selectAndCreate("multiple") },
-              "选择多个文件"
+              "选择服务机文件"
             ),
             React.createElement(
               "button",
               { className: "secondary-button", type: "button", disabled: isSelecting, onClick: () => selectAndCreate("directory") },
-              "选择文件夹"
+              "选择服务机文件夹"
             )
           )
         )
@@ -3572,29 +3530,29 @@ function ImportTaskLauncher({ vault, onCreated }) {
 
 function projectionSummaryText(projection) {
   const typeCounts = Object.entries(projection.locator_summary?.type_counts || {})
-    .map(([type, count]) => `${type} ${count}`)
+    .map(([type, count]) => `${{
+      "pdf-region": "PDF 内容",
+      "docx-ooxml": "DOCX 内容",
+      "source-scope": "来源范围"
+    }[type] || "其他内容"} ${count}`)
     .join("；");
   const pdfPages = projection.locator_summary?.pdf_pages || [];
   const docxPartCount = projection.locator_summary?.docx_part_count || 0;
-  return `投影块 ${projection.block_count}；可检索块 ${projection.retrievable_block_count}；定位器 ${typeCounts || "无"}；PDF 页 ${pdfPages.length ? pdfPages.join("、") : "无"}；DOCX 部件 ${docxPartCount}。`;
+  return `投影块 ${projection.block_count}；可检索块 ${projection.retrievable_block_count}；内容类型 ${typeCounts || "无"}；PDF 页 ${pdfPages.length ? pdfPages.join("、") : "无"}；DOCX 内容 ${docxPartCount} 处。`;
 }
 
 export function ProjectionRebuildVerificationPanel({ task, conversionGraphs, onTaskDeleted }) {
   const graphOptions = conversionGraphs.filter((graph) => (
     typeof graph.graph_id === "string" && Number.isInteger(graph.graph_revision)
   ));
-  const [selectedGraphKey, setSelectedGraphKey] = React.useState(() => (
-    graphOptions.length ? `${graphOptions[0].graph_id}\u0000${graphOptions[0].graph_revision}` : ""
-  ));
+  const [selectedGraphIndex, setSelectedGraphIndex] = React.useState(0);
   const [beforeProjection, setBeforeProjection] = React.useState(null);
   const [afterProjection, setAfterProjection] = React.useState(null);
   const [rebuildIndex, setRebuildIndex] = React.useState(null);
   const [confirmed, setConfirmed] = React.useState(false);
   const [status, setStatus] = React.useState("");
   const [isActing, setIsActing] = React.useState(false);
-  const selectedGraph = graphOptions.find(
-    (graph) => `${graph.graph_id}\u0000${graph.graph_revision}` === selectedGraphKey
-  ) || graphOptions[0];
+  const selectedGraph = graphOptions[selectedGraphIndex] || graphOptions[0];
 
   function summaryEndpoint(graph) {
     return `${VAULTS_ENDPOINT}/${encodeURIComponent(task.vault_id)}/graph-projections/${encodeURIComponent(graph.graph_id)}/${graph.graph_revision}`;
@@ -3634,8 +3592,8 @@ export function ProjectionRebuildVerificationPanel({ task, conversionGraphs, onT
       const rebuildSucceeded = rebuilt.index?.status === "healthy";
       setStatus(
         locatorMatches && rebuildSucceeded
-          ? "验证通过：任务已删除，索引重建成功，投影 locator 摘要保持一致。"
-          : `验证未通过：索引状态 ${rebuilt.index?.status || "未知"}；locator 摘要${locatorMatches ? "一致" : "不一致"}。`
+          ? "验证通过：任务已删除，索引重建成功，投影结构摘要保持一致。"
+          : `验证未通过：索引状态 ${rebuilt.index?.status || "未知"}；结构摘要${locatorMatches ? "一致" : "不一致"}。`
       );
     } catch (error) {
       setStatus(error.message);
@@ -3648,7 +3606,7 @@ export function ProjectionRebuildVerificationPanel({ task, conversionGraphs, onT
     "section",
     { className: "projection-rebuild-verification", "aria-label": "投影重建验证" },
     React.createElement("h3", null, "投影重建验证"),
-    React.createElement("p", { className: "row-note" }, "只读取耐久投影的身份、计数和 locator 摘要；不会显示正文、路径或转换工件。"),
+    React.createElement("p", { className: "row-note" }, "只读取耐久投影的结构摘要和计数；不会显示正文或转换工件。"),
     graphOptions.length > 1
       ? React.createElement(
         "label",
@@ -3657,15 +3615,15 @@ export function ProjectionRebuildVerificationPanel({ task, conversionGraphs, onT
         React.createElement(
           "select",
           {
-            value: selectedGraphKey,
+            value: String(selectedGraphIndex),
             disabled: isActing || Boolean(afterProjection),
-            onChange: (event) => setSelectedGraphKey(event.target.value),
+            onChange: (event) => setSelectedGraphIndex(Number(event.target.value)),
             "aria-label": "选择待验证的转换图谱"
           },
-          graphOptions.map((graph) => React.createElement(
+          graphOptions.map((graph, index) => React.createElement(
             "option",
-            { key: `${graph.graph_id}:${graph.graph_revision}`, value: `${graph.graph_id}\u0000${graph.graph_revision}` },
-            `图谱 ${graph.graph_id} · 修订 ${graph.graph_revision}`
+            { key: `${graph.graph_id}:${graph.graph_revision}`, value: String(index) },
+            `图谱 ${index + 1}`
           ))
         )
       )
@@ -3716,7 +3674,7 @@ export function ProjectionRebuildVerificationPanel({ task, conversionGraphs, onT
   );
 }
 
-function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskDeleted, onTaskSnapshot }) {
+export function LegacyReviewImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskDeleted, onTaskSnapshot }) {
   const [detail, setDetail] = React.useState(null);
   const [status, setStatus] = React.useState("");
   const [isActing, setIsActing] = React.useState(false);
@@ -4220,7 +4178,7 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskDeleted, onTask
     "section",
     { className: "import-task-detail", "aria-label": "导入任务详情" },
     React.createElement("button", { className: "back-button", type: "button", onClick: () => onBack(null) }, "返回任务列表"),
-    React.createElement("h2", null, `导入任务 ${task.task_id}`),
+    React.createElement("h2", null, "导入任务详情"),
     React.createElement("p", { className: "scope-summary" }, `目标 vault：${task.vault_label}；范围：${task.scope_label}`),
     index
       ? React.createElement(
@@ -4294,7 +4252,7 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskDeleted, onTask
             React.createElement(
               "p",
               { className: "scope-summary" },
-              `快照 ${reviewSnapshot.digest.slice(0, 12)}；目标 vault：${task.vault_label}；来源 ${reviewSnapshot.source_hashes.length}；受影响既有文件 ${reviewSnapshot.existing_file_hashes.length}`
+              `已固定提交审核范围；目标 vault：${task.vault_label}；来源 ${reviewSnapshot.source_hashes.length}；受影响既有文件 ${reviewSnapshot.existing_file_hashes.length}`
             ),
             React.createElement(
               "div",
@@ -4462,8 +4420,6 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskDeleted, onTask
               { className: "row-status" },
               `${importCategoryText(item.category)} · ${importIdentityStatusText(item.identity_status)}${item.conversion_status && item.conversion_status !== "not-applicable" ? ` · ${importConversionStatusText(item.conversion_status)}` : ""} · ${importParseStatusText(item.parse_status)} · ${importOcrStatusText(item.ocr_status)}`
             ),
-            item.source_id ? React.createElement("span", { className: "row-note" }, `来源：${item.source_id}`) : null,
-            item.content_sha256 ? React.createElement("span", { className: "row-note" }, `哈希：${item.content_sha256}`) : null,
             item.parse_confidence !== null && item.parse_confidence !== undefined
               ? React.createElement("span", { className: "row-note" }, `解析置信度：${item.parse_confidence}`)
               : null,
@@ -4473,26 +4429,26 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskDeleted, onTask
             item.conversion_fallback_reason
               ? React.createElement("span", { className: "row-note" }, item.conversion_fallback_reason)
               : null,
-            item.parse_locator_summary
-              ? React.createElement("span", { className: "row-note" }, `证据位置：${item.parse_locator_summary}`)
+            userFacingImportLocation(item.parse_locator_summary)
+              ? React.createElement("span", { className: "row-note" }, `内容位置：${userFacingImportLocation(item.parse_locator_summary)}`)
               : null,
             item.parse_issue_count
               ? React.createElement("span", { className: "row-status status-danger" }, `待审核问题 ${item.parse_issue_count}`)
               : null,
-            item.parse_issue_summary
-              ? React.createElement("span", { className: "row-note" }, item.parse_issue_summary)
+            userFacingImportIssue(item.parse_issue_summary)
+              ? React.createElement("span", { className: "row-note" }, userFacingImportIssue(item.parse_issue_summary))
               : null,
             item.ocr_confidence !== null && item.ocr_confidence !== undefined
               ? React.createElement("span", { className: "row-note" }, `OCR 置信度：${item.ocr_confidence}`)
               : null,
-            item.ocr_locator_summary
-              ? React.createElement("span", { className: "row-note" }, `OCR 位置：${item.ocr_locator_summary}`)
+            userFacingImportLocation(item.ocr_locator_summary)
+              ? React.createElement("span", { className: "row-note" }, `OCR 内容：${userFacingImportLocation(item.ocr_locator_summary)}`)
               : null,
             item.ocr_issue_count
               ? React.createElement("span", { className: "row-status status-danger" }, `OCR 待审核 ${item.ocr_issue_count}`)
               : null,
-            item.ocr_issue_summary
-              ? React.createElement("span", { className: "row-note" }, item.ocr_issue_summary)
+            userFacingImportIssue(item.ocr_issue_summary)
+              ? React.createElement("span", { className: "row-note" }, userFacingImportIssue(item.ocr_issue_summary))
               : null,
             ...(item.ocr_targets || []).map((target) => {
               const draft = ocrDrafts[`${item.item_id}:${target.target_id}`] || {};
@@ -4500,8 +4456,8 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskDeleted, onTask
               return React.createElement(
                 "div",
                 { className: "ocr-target-actions", key: `${item.item_id}:${target.target_id}` },
-                React.createElement("span", { className: "row-title" }, target.label),
-                React.createElement("span", { className: "row-meta" }, `${target.locator_summary} · ${importOcrTargetStatusText(target.status)}${target.engine ? ` · ${target.engine}` : ""}`),
+                React.createElement("span", { className: "row-title" }, userFacingImportLocation(target.locator_summary) || "待审核内容"),
+                React.createElement("span", { className: "row-meta" }, `${importOcrTargetStatusText(target.status)}${target.engine ? ` · ${target.engine}` : ""}`),
                 target.confidence !== null && target.confidence !== undefined
                   ? React.createElement("span", { className: "row-note" }, `置信度：${target.confidence}`)
                   : null,
@@ -4516,13 +4472,13 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskDeleted, onTask
                         type: "text",
                         value: draft.reason || "",
                         onChange: (event) => updateOcrDraft(item.item_id, target.target_id, "reason", event.target.value),
-                        "aria-label": `${target.label} 的处理理由`,
+                        "aria-label": `${userFacingImportLocation(target.locator_summary) || "待审核内容"} 的处理理由`,
                         placeholder: "处理理由"
                       }),
                       React.createElement("textarea", {
                         value: draft.corrected_text || "",
                         onChange: (event) => updateOcrDraft(item.item_id, target.target_id, "corrected_text", event.target.value),
-                        "aria-label": `${target.label} 的修正文本`,
+                        "aria-label": `${userFacingImportLocation(target.locator_summary) || "待审核内容"} 的修正文本`,
                         placeholder: "修正文本"
                       }),
                       React.createElement("button", { type: "button", className: "secondary-button", disabled: isActing, onClick: () => runOcrAction(item.item_id, target.target_id, "retry") }, "重试此页"),
@@ -4540,7 +4496,7 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskDeleted, onTask
                   React.createElement(
                     "span",
                     { className: "row-note" },
-                    `候选来源：${item.version_suggestion.candidate_source_id}；旧哈希：${item.version_suggestion.previous_content_sha256}；${item.version_suggestion.reason}`
+                    `可能是已有资料的新版本：${item.version_suggestion.reason}`
                   )
                 )
               : null,
@@ -4650,9 +4606,8 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskDeleted, onTask
             return React.createElement(
               "div",
               { className: "section-row review-diff-row metadata-tag-row", key: proposal.item_id },
-              React.createElement("span", { className: "row-title" }, `资料项 ${proposal.item_id}：${proposal.source_file}`),
+              React.createElement("span", { className: "row-title" }, `资料：${proposal.source_file}`),
               React.createElement("span", { className: "row-meta" }, `来源类型：${proposal.source_type}；处理状态：${proposal.processing_status}`),
-              React.createElement("span", { className: "row-note" }, `内容哈希：${proposal.content_sha256}`),
               React.createElement("span", { className: "row-note" }, `领域：${proposal.domain}；置信度：${proposal.domain_confidence}`),
               React.createElement(
                 "span",
@@ -4677,7 +4632,7 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskDeleted, onTask
                       onChange: (event) => updateMetadataTagDraft(proposal.item_id, event.target.value),
                       disabled: !canDecide,
                       placeholder: "排除理由",
-                      "aria-label": `资料项 ${proposal.item_id} 的元数据与标签决定理由`
+                        "aria-label": `${proposal.source_file} 的元数据与标签决定理由`
                     }),
                     React.createElement("button", {
                       className: "secondary-button",
@@ -4727,8 +4682,8 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskDeleted, onTask
               { className: "section-row review-diff-row candidate-link-row", key: proposal.review_item_id },
               React.createElement("span", { className: "row-title" }, `${proposal.source_path} -> ${proposal.target_path}`),
               React.createElement("span", { className: "row-note" }, `关系理由：${proposal.reason}`),
-              React.createElement("span", { className: "row-note" }, `来源证据（${proposal.source_evidence.block_location}）：${proposal.source_evidence.excerpt}`),
-              React.createElement("span", { className: "row-note" }, `目标证据（${proposal.target_evidence.block_location}）：${proposal.target_evidence.excerpt}`),
+              React.createElement("span", { className: "row-note" }, `来源证据：${proposal.source_evidence.excerpt}`),
+              React.createElement("span", { className: "row-note" }, `目标证据：${proposal.target_evidence.excerpt}`),
               React.createElement("span", { className: "row-note" }, `置信度：${proposal.confidence}`),
               proposal.is_existing_note_change
                 ? React.createElement("span", { className: "row-status" }, "既有笔记独立变更")
@@ -4824,7 +4779,7 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskDeleted, onTask
               return React.createElement(
                 "div",
                 { className: "section-row review-diff-row classification-row", key: suggestion.item_id },
-                React.createElement("span", { className: "row-title" }, `资料项 ${suggestion.item_id}：${suggestion.domain}`),
+                React.createElement("span", { className: "row-title" }, `资料：${suggestion.filename || suggestion.domain}`),
                 React.createElement("span", { className: "row-meta" }, `目标 vault：${suggestion.target_vault_label}`),
                 React.createElement("span", { className: "row-note" }, `目标文件夹：${suggestion.target_folder}`),
                 React.createElement("span", { className: "row-note" }, `文件名：${suggestion.filename}`),
@@ -4847,21 +4802,21 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskDeleted, onTask
                         value: draft.domain ?? suggestion.domain,
                         onChange: (event) => updateClassificationDraft(suggestion.item_id, "domain", event.target.value),
                         disabled: !canDecide,
-                        "aria-label": `资料项 ${suggestion.item_id} 的领域`
+                        "aria-label": `${suggestion.filename || "分类建议"} 的领域`
                       }),
                       React.createElement("input", {
                         type: "text",
                         value: draft.target_folder ?? suggestion.target_folder,
                         onChange: (event) => updateClassificationDraft(suggestion.item_id, "target_folder", event.target.value),
                         disabled: !canDecide,
-                        "aria-label": `资料项 ${suggestion.item_id} 的目标文件夹`
+                        "aria-label": `${suggestion.filename || "分类建议"} 的目标文件夹`
                       }),
                       React.createElement("input", {
                         type: "text",
                         value: draft.filename ?? suggestion.filename,
                         onChange: (event) => updateClassificationDraft(suggestion.item_id, "filename", event.target.value),
                         disabled: !canDecide,
-                        "aria-label": `资料项 ${suggestion.item_id} 的目标文件名`
+                        "aria-label": `${suggestion.filename || "分类建议"} 的目标文件名`
                       }),
                       React.createElement("input", {
                         type: "text",
@@ -4869,7 +4824,7 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskDeleted, onTask
                         onChange: (event) => updateClassificationDraft(suggestion.item_id, "reason", event.target.value),
                         disabled: !canDecide,
                         placeholder: "修正或排除理由",
-                        "aria-label": `资料项 ${suggestion.item_id} 的分类决定理由`
+                        "aria-label": `${suggestion.filename || "分类建议"} 的分类决定理由`
                       }),
                       React.createElement("button", {
                         className: "secondary-button",
@@ -4901,6 +4856,261 @@ function ImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskDeleted, onTask
   );
 }
 
+export function AutomaticMarkdownResults({ noteProposals = [] }) {
+  return React.createElement(
+    "section",
+    { className: "note-proposal-list", "aria-label": "Markdown 结果" },
+    React.createElement("h3", null, "Markdown 结果"),
+    noteProposals.length === 0
+      ? React.createElement("p", { className: "empty-state" }, "正在等待可查看的 Markdown 结果。")
+      : noteProposals.map((proposal) => React.createElement(
+        "div",
+        { className: "note-proposal", key: `${proposal.kind}:${proposal.item_id}` },
+        proposal.kind === "native"
+          ? React.createElement(
+            React.Fragment,
+            null,
+            React.createElement("p", { className: "row-title" }, "原生 Markdown"),
+            React.createElement("p", { className: "row-note" }, `位置：${proposal.relative_path}`),
+            React.createElement("pre", { className: "markdown-preview" }, proposal.markdown)
+          )
+          : React.createElement(
+            React.Fragment,
+            null,
+            React.createElement("p", { className: "row-title" }, `结构化 Markdown（版本 ${proposal.revision}）`),
+            proposal.index_note?.markdown
+              ? React.createElement(
+                React.Fragment,
+                null,
+                React.createElement("p", { className: "row-note" }, `索引：${proposal.index_note.relative_path}`),
+                React.createElement("pre", { className: "markdown-preview" }, derivedMarkdownPreview(proposal.index_note.markdown))
+              )
+              : null,
+            (proposal.notes || []).map((note) => React.createElement(
+              "div",
+              { className: "section-row note-proposal-row", key: note.note_id },
+              React.createElement("span", { className: "row-title" }, `${note.sequence}. ${note.title}`),
+              React.createElement("span", { className: "row-note" }, `位置：${note.relative_path}`),
+              React.createElement("pre", { className: "markdown-preview" }, derivedMarkdownPreview(note.markdown))
+            ))
+          )
+      ))
+  );
+}
+
+function AutomaticImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskDeleted, onTaskSnapshot }) {
+  const [detail, setDetail] = React.useState(null);
+  const [status, setStatus] = React.useState("");
+  const [isActing, setIsActing] = React.useState(false);
+  const refreshTimerRef = React.useRef(null);
+
+  const loadDetail = React.useCallback(async () => {
+    try {
+      const response = await requestJson(`${IMPORT_TASKS_ENDPOINT}/${taskId}`);
+      setDetail(response);
+      onTaskSnapshot(response.task);
+      setStatus("");
+      return response;
+    } catch (error) {
+      setStatus(error.message);
+      return null;
+    }
+  }, [onTaskSnapshot, taskId]);
+
+  const scheduleDetailRefresh = React.useCallback(() => {
+    if (refreshTimerRef.current !== null) return;
+    refreshTimerRef.current = window.setTimeout(() => {
+      refreshTimerRef.current = null;
+      void loadDetail();
+    }, 250);
+  }, [loadDetail]);
+
+  React.useEffect(() => {
+    let eventSource;
+    let disposed = false;
+    loadDetail().then((loaded) => {
+      if (!loaded || disposed) return;
+      eventSource = new window.EventSource(
+        `${IMPORT_TASKS_ENDPOINT}/${taskId}/events?after=${loaded.event_cursor || 0}`
+      );
+      for (const eventName of IMPORT_TASK_EVENT_NAMES) {
+        eventSource.addEventListener(eventName, scheduleDetailRefresh);
+      }
+    });
+    return () => {
+      disposed = true;
+      eventSource?.close();
+      if (refreshTimerRef.current !== null) {
+        window.clearTimeout(refreshTimerRef.current);
+        refreshTimerRef.current = null;
+      }
+    };
+  }, [loadDetail, scheduleDetailRefresh, taskId]);
+
+  async function runAction(action) {
+    if (isActing) return;
+    setStatus("");
+    setIsActing(true);
+    try {
+      const response = await requestJson(`${IMPORT_TASKS_ENDPOINT}/${taskId}/${action}`, { method: "POST" });
+      onTaskChanged(response.task);
+      if (response.task.task_id !== taskId) {
+        onBack(response.task.task_id);
+        return;
+      }
+      await loadDetail();
+    } catch (error) {
+      setStatus(error.message);
+    } finally {
+      setIsActing(false);
+    }
+  }
+
+  if (!detail) {
+    return React.createElement(
+      "section",
+      { className: "workspace-section", "aria-label": "导入任务详情" },
+      React.createElement("button", { className: "back-button", type: "button", onClick: () => onBack(null) }, "返回任务列表"),
+      React.createElement("p", { className: "empty-state", role: "status" }, status || "正在读取任务状态。")
+    );
+  }
+
+  const {
+    task,
+    items = [],
+    note_proposals: noteProposals = [],
+    classification_suggestions: classifications = [],
+    metadata_tag_proposals: metadataTagProposals = [],
+    candidate_link_proposals: candidateLinkProposals = [],
+    conversion_graphs: conversionGraphs = [],
+    commit_journals: commitJournals = [],
+    index = null
+  } = detail;
+  const canCancel = task.lifecycle === "running";
+  const canResume = task.lifecycle === "recoverable" || task.lifecycle === "cancelled";
+  const canVerifyProjectionRebuild = ["complete", "completed-with-confirmed-gaps"].includes(task.lifecycle)
+    && conversionGraphs.some((graph) => typeof graph.graph_id === "string" && Number.isInteger(graph.graph_revision));
+
+  return React.createElement(
+    "section",
+    { className: "import-task-detail", "aria-label": "导入任务详情" },
+    React.createElement("button", { className: "back-button", type: "button", onClick: () => onBack(null) }, "返回任务列表"),
+    React.createElement("h2", null, "导入任务详情"),
+    React.createElement("p", { className: "scope-summary" }, `目标 vault：${task.vault_label}；范围：${task.scope_label}`),
+    React.createElement(
+      "div",
+      { className: "progress-sequence", "aria-live": "polite" },
+      React.createElement("span", { className: "status-marker" }, `状态：${importLifecycleText(task.lifecycle)}`),
+      React.createElement("span", null, `当前阶段：${importPhaseText(task.phase)}`),
+      ...IMPORT_PROGRESS_PHASES.map((phase) => React.createElement(
+        "span",
+        { key: phase },
+        `${importPhaseText(phase)}：${progressPhaseStatus(task, phase)}`
+      )),
+      React.createElement("span", null, `已发现 ${task.counts.discovered}`),
+      React.createElement("span", null, `已解析 ${task.counts.parsed || 0}`),
+      React.createElement("span", null, `已生成笔记 ${task.counts.derived_notes || 0}`),
+      React.createElement("span", null, `异常 ${task.counts.failed + task.counts.parse_failed + task.counts.ocr_failed}`)
+    ),
+    index
+      ? React.createElement("p", { className: "row-note", role: "status" }, `索引：${index.status}；已索引 ${index.current_count} 项；失败 ${index.failure_count} 项。`)
+      : null,
+    task.current_item_label ? React.createElement("p", { className: "status-line" }, `当前文件：${task.current_item_label}`) : null,
+    task.failure_reason ? React.createElement("p", { className: "status-line status-danger" }, `失败原因：${task.failure_reason}`) : null,
+    React.createElement(
+      "div",
+      { className: "detail-actions" },
+      canCancel
+        ? React.createElement("button", { className: "secondary-button", type: "button", disabled: isActing, onClick: () => runAction("cancel") }, "取消")
+        : null,
+      canResume
+        ? React.createElement(
+          "button",
+          { className: "primary-button", type: "button", disabled: isActing, onClick: () => runAction("resume") },
+          task.lifecycle === "cancelled" ? "创建新任务" : "自动重试"
+        )
+        : null
+    ),
+    status ? React.createElement("p", { className: "status-line", role: "status" }, status) : null,
+    React.createElement(
+      "section",
+      { className: "import-item-list", "aria-label": "资料项" },
+      React.createElement("h3", null, "资料项"),
+      items.length === 0
+        ? React.createElement("p", { className: "empty-state" }, "正在扫描资料。")
+        : items.map((item) => React.createElement(
+          "div",
+          { className: "section-row", key: item.item_id },
+          React.createElement("span", { className: "row-title" }, item.label),
+          React.createElement("span", { className: "row-meta" }, `${importDocumentKindText(item.document_kind)}；${importCategoryText(item.category)}`),
+          React.createElement("span", { className: "row-note" }, `${importParseStatusText(item.parse_status)}；${importConversionStatusText(item.conversion_status)}；${importOcrStatusText(item.ocr_status)}`),
+          userFacingImportIssue(item.parse_issue_summary || item.ocr_issue_summary)
+            ? React.createElement("span", { className: "row-note" }, userFacingImportIssue(item.parse_issue_summary || item.ocr_issue_summary))
+            : null
+        ))
+    ),
+    React.createElement(AutomaticMarkdownResults, { noteProposals }),
+    React.createElement(
+      "section",
+      { className: "classification-list", "aria-label": "分类建议" },
+      React.createElement("h3", null, "分类建议"),
+      classifications.length === 0
+        ? React.createElement("p", { className: "empty-state" }, "暂无分类建议。")
+        : classifications.map((suggestion) => React.createElement(
+          "div",
+          { className: "section-row", key: suggestion.item_id },
+          React.createElement("span", { className: "row-title" }, suggestion.filename || suggestion.domain),
+          React.createElement("span", { className: "row-meta" }, suggestion.domain),
+          React.createElement("span", { className: "row-note" }, suggestion.reason)
+        ))
+    ),
+    React.createElement(
+      "section",
+      { className: "metadata-tag-list", "aria-label": "元数据与标签" },
+      React.createElement("h3", null, "元数据与标签"),
+      metadataTagProposals.length === 0
+        ? React.createElement("p", { className: "empty-state" }, "暂无元数据与标签。")
+        : metadataTagProposals.map((proposal) => React.createElement(
+          "div",
+          { className: "section-row", key: proposal.item_id },
+          React.createElement("span", { className: "row-title" }, proposal.source_file),
+          React.createElement("span", { className: "row-meta" }, proposal.domain),
+          React.createElement("span", { className: "row-note" }, proposal.tags.map((tag) => tag.name).join("、") || "无标签")
+        ))
+    ),
+    React.createElement(
+      "section",
+      { className: "candidate-link-list", "aria-label": "候选链接" },
+      React.createElement("h3", null, "候选链接"),
+      candidateLinkProposals.length === 0
+        ? React.createElement("p", { className: "empty-state" }, "暂无候选链接。")
+        : candidateLinkProposals.map((proposal) => React.createElement(
+          "div",
+          { className: "section-row", key: proposal.review_item_id },
+          React.createElement("span", { className: "row-title" }, `${proposal.source_path} -> ${proposal.target_path}`),
+          React.createElement("span", { className: "row-note" }, proposal.reason)
+        ))
+    ),
+    commitJournals.length
+      ? React.createElement(
+        "section",
+        { className: "commit-journal-list", "aria-label": "提交记录" },
+        React.createElement("h3", null, "提交记录"),
+        commitJournals.map((journal, index) => React.createElement(
+          "div",
+          { className: "section-row", key: `${journal.unit_id}:${index}` },
+          React.createElement("span", { className: "row-title" }, journal.source_label),
+          React.createElement("span", { className: "row-meta" }, journal.status),
+          journal.reason ? React.createElement("span", { className: "row-note" }, journal.reason) : null
+        ))
+      )
+      : null,
+    canVerifyProjectionRebuild
+      ? React.createElement(ProjectionRebuildVerificationPanel, { task, conversionGraphs, onTaskDeleted })
+      : null
+  );
+}
+
 export function ImportTaskCenter({ tasks, error, isLoading, selectedTaskId, onSelect, onTaskChanged, onTaskDeleted, onTaskSnapshot, vault }) {
   const [deleteError, setDeleteError] = React.useState("");
   const [deletingTaskId, setDeletingTaskId] = React.useState(null);
@@ -4925,7 +5135,7 @@ export function ImportTaskCenter({ tasks, error, isLoading, selectedTaskId, onSe
   }
 
   if (selectedTaskId) {
-    return React.createElement(ImportTaskDetail, {
+    return React.createElement(AutomaticImportTaskDetail, {
       taskId: selectedTaskId,
       onBack: onSelect,
       onTaskChanged,
@@ -4998,10 +5208,21 @@ export function App() {
   const [selectedSessionDetail, setSelectedSessionDetail] = React.useState(null);
   const [sessionDetailLoading, setSessionDetailLoading] = React.useState(false);
   const [sessionDetailError, setSessionDetailError] = React.useState("");
+  const [retrievalMode, setRetrievalMode] = React.useState({
+    mode: "keyword",
+    label: "仅关键词",
+    options: [
+      { mode: "keyword", label: "仅关键词" },
+      { mode: "semantic", label: "仅语义" },
+      { mode: "hybrid", label: "关键词与语义混合" }
+    ]
+  });
+  const [retrievalModeLoading, setRetrievalModeLoading] = React.useState(true);
   const [modelDefaults, setModelDefaults] = React.useState({
     chat: { default: null, status: "unconfigured", reason: "正在加载对话/文本生成 Model。" },
     embedding: { default: null, status: "unconfigured", reason: "正在加载 Embedding Model。" },
-    rerank: { default: null, status: "unconfigured", reason: "正在加载 Rerank（重排）Model。" }
+    rerank: { default: null, status: "unconfigured", reason: "正在加载 Rerank（重排）Model。" },
+    markdown: { default: null, status: "unconfigured", reason: "正在加载 Markdown 结构化 Model。" }
   });
   const [selectedVaultId, setSelectedVaultId] = React.useState(null);
   const [selectedTaskId, setSelectedTaskId] = React.useState(null);
@@ -5052,6 +5273,23 @@ export function App() {
         rerank: { default: null, status: "unavailable", reason: error.message }
       }))
   ), []);
+
+  const loadRetrievalMode = React.useCallback(() => {
+    setRetrievalModeLoading(true);
+    return requestJson(RETRIEVAL_MODE_ENDPOINT)
+      .then((response) => setRetrievalMode(response))
+      .catch(() => undefined)
+      .finally(() => setRetrievalModeLoading(false));
+  }, []);
+
+  async function changeRetrievalMode(mode) {
+    const response = await requestJson(RETRIEVAL_MODE_ENDPOINT, {
+      method: "POST",
+      body: JSON.stringify({ mode })
+    });
+    setRetrievalMode(response);
+    return response;
+  }
 
   const loadSessionDetail = React.useCallback(async (sessionId) => {
     const requestId = ++sessionDetailRequestRef.current;
@@ -5127,7 +5365,14 @@ export function App() {
       })
       .then(() => {
         setSessionStatus("本机会话已建立");
-        return Promise.all([loadVaults(), loadProviders(), loadModelDefaults(), loadTasks(), loadSessions()]);
+        return Promise.all([
+          loadVaults(),
+          loadProviders(),
+          loadModelDefaults(),
+          loadRetrievalMode(),
+          loadTasks(),
+          loadSessions()
+        ]);
       })
       .catch(() => {
         setSessionStatus("本机会话不可用");
@@ -5137,7 +5382,7 @@ export function App() {
         setSessionsLoading(false);
         setSessionsError("本机会话不可用。");
       });
-  }, [loadModelDefaults, loadProviders, loadSessions, loadTasks, loadVaults]);
+  }, [loadModelDefaults, loadProviders, loadRetrievalMode, loadSessions, loadTasks, loadVaults]);
 
   React.useEffect(() => {
     if (menuOpen) firstMenuLinkRef.current?.focus();
@@ -5245,30 +5490,6 @@ export function App() {
     return response.session;
   }
 
-  async function updatePersistentSessionContext(sessionId, context) {
-    const response = await requestJson(`${SESSIONS_ENDPOINT}/${sessionId}/context`, {
-      method: "PATCH",
-      body: JSON.stringify(context)
-    });
-    setSelectedSessionDetail((current) => (
-      current?.session.session_id === sessionId
-        ? {
-            ...current,
-            session: response.session,
-            attachments: current.session.selected_vault_id === response.session.selected_vault_id
-              ? current.attachments
-              : []
-          }
-        : current
-    ));
-    setSessionPage((current) => ({
-      ...current,
-      sessions: current.sessions.map((session) => session.session_id === sessionId ? response.session : session)
-    }));
-    await loadSessionDetail(sessionId);
-    return response.session;
-  }
-
   async function pickPersistentSessionAttachments(sessionId) {
     const selection = await requestJson(`${SESSIONS_ENDPOINT}/${sessionId}/attachments/select`, { method: "POST" });
     if (!selection.selection_id) return;
@@ -5294,79 +5515,15 @@ export function App() {
     await loadSessionDetail(sessionId);
   }
 
-  async function previewPersistentSessionTask(sessionId, content, intent) {
-    const response = await requestJson(`${SESSIONS_ENDPOINT}/${sessionId}/task-preview`, {
+  async function runPersistentSessionTask(sessionId, command) {
+    const response = await requestJson(`${SESSIONS_ENDPOINT}/${sessionId}/run`, {
       method: "POST",
-      body: JSON.stringify({ content, intent })
+      body: JSON.stringify(command)
     });
-    return response.preview;
-  }
-
-  async function createPersistentSessionTask(sessionId, content, intent) {
-    const response = await requestJson(`${SESSIONS_ENDPOINT}/${sessionId}/tasks`, {
-      method: "POST",
-      body: JSON.stringify({ content, intent })
-    });
-    await loadSessionDetail(sessionId);
-    await loadSessions(sessionFilters);
-    return response.snapshot;
-  }
-
-  async function preparePersistentRerankAuthorization(sessionId, taskId) {
-    return requestJson(`${SESSIONS_ENDPOINT}/${sessionId}/tasks/${taskId}/rerank-authorizations`, {
-      method: "POST",
-      body: JSON.stringify({})
-    });
-  }
-
-  async function confirmPersistentRerankAuthorization(vaultId, authorizationId) {
-    return requestJson(
-      `${VAULTS_ENDPOINT}/${encodeURIComponent(vaultId)}/outbound-authorizations/${encodeURIComponent(authorizationId)}/confirm`,
-      { method: "POST", body: JSON.stringify({ approved: true }) }
-    );
-  }
-
-  async function executePersistentSessionTask(sessionId, taskId, onChunk, rerankAuthorizationId) {
-    let result = null;
-    await requestEventStream(`${SESSIONS_ENDPOINT}/${sessionId}/tasks/${taskId}/execute/stream`, {
-      method: "POST",
-      body: JSON.stringify(
-        rerankAuthorizationId ? { rerank_authorization_id: rerankAuthorizationId } : {}
-      )
-    }, (event, payload) => {
-      if (event === "chunk") {
-        onChunk?.(payload);
-      } else if (event === "result") {
-        result = payload.result;
-      } else if (event === "error") {
-        throw new Error(payload.message || "任务未完成。");
-      }
-    });
-    if (!result) throw new Error("流式任务未返回结果。");
     const isCurrent = selectedSessionIdRef.current === sessionId;
     if (isCurrent) await loadSessionDetail(sessionId);
     await loadSessions(sessionFilters);
-    return { result, isCurrent };
-  }
-
-  async function confirmPersistentKnowledgeOrganizationAuthorization(
-    sessionId, taskId, vaultId, authorizationId
-  ) {
-    await requestJson(
-      `${VAULTS_ENDPOINT}/${encodeURIComponent(vaultId)}/outbound-authorizations/${encodeURIComponent(authorizationId)}/confirm`,
-      { method: "POST", body: JSON.stringify({ approved: true }) }
-    );
-    return executePersistentSessionTask(sessionId, taskId);
-  }
-
-  async function confirmPersistentDeepCreationAuthorization(
-    sessionId, taskId, vaultId, authorizationId
-  ) {
-    await requestJson(
-      `${VAULTS_ENDPOINT}/${encodeURIComponent(vaultId)}/outbound-authorizations/${encodeURIComponent(authorizationId)}/confirm`,
-      { method: "POST", body: JSON.stringify({ approved: true }) }
-    );
-    return executePersistentSessionTask(sessionId, taskId);
+    return { result: response.result, isCurrent };
   }
 
   async function editPersistentSessionGenerationResult(sessionId, resultId, content) {
@@ -5405,7 +5562,7 @@ export function App() {
     const link = document.createElement("a");
     const objectUrl = window.URL.createObjectURL(await response.blob());
     link.href = objectUrl;
-    link.download = `session-${session.session_id}.json`;
+    link.download = "会话导出.json";
     link.click();
     window.URL.revokeObjectURL(objectUrl);
   }
@@ -5544,16 +5701,12 @@ export function App() {
       onDelete: (session, trigger) => openConfirmation("session-remove", session, trigger),
       vaults,
       providers,
-      onUpdateContext: updatePersistentSessionContext,
       onPickAttachments: pickPersistentSessionAttachments,
       onRemoveAttachment: removePersistentSessionAttachment,
-      onPreviewTask: previewPersistentSessionTask,
-      onCreateTask: createPersistentSessionTask,
-      onExecuteTask: executePersistentSessionTask,
-      onPrepareRerankAuthorization: preparePersistentRerankAuthorization,
-      onConfirmRerankAuthorization: confirmPersistentRerankAuthorization,
-      onConfirmKnowledgeOrganizationAuthorization: confirmPersistentKnowledgeOrganizationAuthorization,
-      onConfirmDeepCreationAuthorization: confirmPersistentDeepCreationAuthorization,
+      onRun: runPersistentSessionTask,
+      retrievalMode,
+      retrievalModeLoading,
+      onRetrievalModeChange: changeRetrievalMode,
       onLoadCompletenessCoverage: loadPersistentCompletenessCoverage,
       onEditGenerationResult: editPersistentSessionGenerationResult,
       onReverifyGenerationResult: reverifyPersistentSessionGenerationResult

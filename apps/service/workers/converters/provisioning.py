@@ -21,6 +21,7 @@ from workers.converters.profiles import ConverterProfile
 PROFILE_MANIFEST_NAME = "converter-profiles.json"
 APPROVAL_MANIFEST_NAME = "converter-release-approval.json"
 _SUPPORTED_ENGINES = frozenset({"mineru", "pandoc", "docling"})
+_SUPPORTED_MINERU_BACKENDS = frozenset({"pipeline", "vlm-engine"})
 
 
 @dataclass(frozen=True)
@@ -144,6 +145,7 @@ def _profile_from_manifest_entry(
         executable_path=str(executable),
         config_path=str(config),
         model_paths=tuple(str(path) for path, _ in models),
+        backends=_backends(engine, entry.get("backends", ["pipeline"])),
         isolation_boundary="local-process",
     )
 
@@ -191,6 +193,18 @@ def _model_entries(entry: Mapping[str, object]) -> tuple[Mapping[str, object], .
     if not isinstance(models, list) or any(not isinstance(model, dict) for model in models):
         raise ValueError("Profile models must be a list of file hash records.")
     return tuple(models)
+
+
+def _backends(engine: str, value: object) -> tuple[str, ...]:
+    if not isinstance(value, list) or not value or any(not isinstance(backend, str) for backend in value):
+        raise ValueError("Profile backends must be a non-empty string list.")
+    backends = tuple(value)
+    if len(set(backends)) != len(backends):
+        raise ValueError("Profile backends must not repeat a backend.")
+    allowed = _SUPPORTED_MINERU_BACKENDS if engine == "mineru" else frozenset({"pipeline"})
+    if not set(backends).issubset(allowed):
+        raise ValueError("Profile backend is unsupported for this engine.")
+    return backends
 
 
 def _resource_limits(value: object) -> Mapping[str, int]:

@@ -14,9 +14,11 @@ import adapters.local_import_task_runner as local_runner_module
 from adapters.local_import_task_runner import LocalImportTaskRunner
 from domain.derived_notes import (
     UnresolvedDocumentGraphError,
+    derive_graph_markdown_proposal,
     private_index_candidates,
     proposal_from_dict,
     render_document_graph,
+    structure_graph_markdown_proposal,
 )
 from domain.evidence import (
     ArtifactRef,
@@ -47,9 +49,18 @@ from workers.converters.adapters import (
 from workers.converters.profiles import ConverterProfile
 from workers.converters.quality_gate import StructuralQualityGate
 from workers.converters.artifact_store import PrivateArtifactStore
+from workers.converters.launcher import (
+    ProvisionedConversionLauncher,
+    _coalesced_page_ranges,
+    _hybrid_pdf_graph,
+    _mineru_blocks,
+    _native_fidelity_tokens,
+    _native_page_quality,
+)
 from workers.converters.runner import (
     ConversionArtifactDraft,
     ConversionCandidate,
+    ConversionRequest,
     ConversionOutcome,
     RejectedConversionCandidate,
     conversion_items,
@@ -145,6 +156,159 @@ def _accepted_quality_decision(attempt: ConversionAttempt) -> dict[str, object]:
         "rule_ids": [],
         "issues": [],
     }
+
+
+def _hybrid_artifact(artifact_id: str, digest: str, producer: str) -> ArtifactRef:
+    return ArtifactRef(
+        artifact_id=artifact_id,
+        attempt_id="attempt-hybrid",
+        sha256=digest,
+        media_type="application/pdf",
+        role="converter-output",
+        private_relative_path=f"pending/{artifact_id}",
+        producer_object_id=producer,
+    )
+
+
+def _hybrid_block(
+    page: int, text: str, artifact: ArtifactRef, *, kind: str = "paragraph"
+) -> DocumentBlock:
+    payload = (
+        {"display_mode": True, "state": "resolved", "latex": text}
+        if kind == "formula"
+        else {"inline_runs": [{"kind": "text", "text": text}]}
+    )
+    return DocumentBlock(
+        block_id=DocumentBlock.deterministic_id("attempt-hybrid", artifact.producer_object_id or "mineru", f"page:{page}:{text}"),
+        kind=kind,
+        reading_order=0,
+        locators=(PdfRegionLocator(page, (10.0, 20.0, 100.0, 120.0)),),
+        confidence=0.9,
+        payload=BlockPayload.from_dict(kind, payload),
+        evidence_refs=(EvidenceRef(artifact.artifact_id, artifact.sha256, producer_object_id=artifact.producer_object_id),),
+        retrieval_projection=text,
+    )
+
+
+def test_pdf_hybrid_prefers_native_tokens_and_falls_back_only_for_empty_pages() -> None:
+    native_artifact = _hybrid_artifact("native", "c" * 64, "native-source.pdf")
+    mineru_artifact = _hybrid_artifact("mineru", "d" * 64, "mineru/content.json")
+    native_text = "GB15577 每15 min记录1个瞬时值"
+    native = ParseEvidence(
+        "pdf",
+        {"pages": [{"page": 1, "text": native_text}, {"page": 2, "text": ""}]},
+        (StructuredContentUnit("paragraph", native_text, EvidenceLocator(page=1)),),
+        0.95,
+        (),
+    )
+    fallback_block = _hybrid_block(2, "扫描页 2 的 42", mineru_artifact)
+    request = ConversionRequest(
+        task_id="task-hybrid",
+        item_id=1,
+        document_kind="pdf",
+        source_sha256=_HASH,
+        input_snapshot_hash=_HASH,
+        input_snapshot_path="private/source.pdf",
+        preflight_inventory={"document_kind": "pdf", "page_count": 2},
+    )
+
+    graph = _hybrid_pdf_graph(
+        native,
+        [fallback_block],
+        [],
+        request,
+        "attempt-hybrid",
+        native_artifact,
+        [],
+    )
+
+    assert [block.retrieval_projection for block in graph.blocks] == [native_text, "扫描页 2 的 42"]
+    assert graph.blocks[0].evidence_refs[0].artifact_id == "native"
+    assert graph.blocks[1].evidence_refs[0].artifact_id == "mineru"
+    assert any(issue.code == "native-page-fallback" for issue in graph.issues)
+    assert "gb" in set(_native_fidelity_tokens(native_text))
+    assert _native_page_quality(native_text, list(native.units))[0]
+
+def test_pdf_hybrid_retains_mineru_formula_on_a_native_text_page() -> None:
+    native_artifact = _hybrid_artifact("native", "c" * 64, "native-source.pdf")
+    mineru_artifact = _hybrid_artifact("mineru", "d" * 64, "mineru/content.json")
+    native = ParseEvidence(
+        "pdf",
+        {"pages": [{"page": 1, "text": "Formula 15 min"}]},
+        (StructuredContentUnit("paragraph", "Formula 15 min", EvidenceLocator(page=1)),),
+        0.95,
+        (),
+    )
+    formula = _hybrid_block(1, "x^2 + 1", mineru_artifact, kind="formula")
+    request = ConversionRequest("task-hybrid", 1, "pdf", _HASH, _HASH, "private/source.pdf", {})
+
+    graph = _hybrid_pdf_graph(native, [formula], [], request, "attempt-hybrid", native_artifact, [])
+
+    assert [block.kind for block in graph.blocks] == ["paragraph", "formula"]
+    assert graph.blocks[1].retrieval_projection == "x^2 + 1"
+
+
+def test_pdf_hybrid_falls_back_when_native_numeric_token_fidelity_fails() -> None:
+    native_artifact = _hybrid_artifact("native", "c" * 64, "native-source.pdf")
+    mineru_artifact = _hybrid_artifact("mineru", "d" * 64, "mineru/content.json")
+    native = ParseEvidence(
+        "pdf",
+        {"pages": [{"page": 1, "text": "GB15577 每15 min记录1个瞬时值"}]},
+        (StructuredContentUnit("paragraph", "GB 15 min", EvidenceLocator(page=1)),),
+        0.95,
+        (),
+    )
+    mineru = _hybrid_block(1, "GB 15577 每 15 min 记录 1 个瞬时值", mineru_artifact)
+    request = ConversionRequest("task-hybrid", 1, "pdf", _HASH, _HASH, "private/source.pdf", {})
+
+    graph = _hybrid_pdf_graph(native, [mineru], [], request, "attempt-hybrid", native_artifact, [])
+
+    assert [block.retrieval_projection for block in graph.blocks] == [mineru.retrieval_projection]
+    assert graph.blocks[0].evidence_refs[0].artifact_id == "mineru"
+    assert any(issue.code == "native-page-fallback" for issue in graph.issues)
+
+
+def test_pdf_hybrid_coalesces_vlm_fallback_ranges_and_preserves_page_offsets() -> None:
+    assert _coalesced_page_ranges((2, 4, 6, 22, 23)) == ((1, 5), (21, 22))
+
+    profile = ConverterProfile(
+        profile_id="mineru-test",
+        engine="mineru",
+        engine_version="3.4.4",
+        executable_sha256=_HASH,
+        config_hash=_CONFIG_HASH,
+        model_hashes=("c" * 64,),
+        resource_limits={"wall_clock_seconds": 60},
+        release_approved=True,
+        network_denied=True,
+        executable_path="C:/converter/mineru.exe",
+        backends=("pipeline", "vlm-engine"),
+    )
+    request = ConversionRequest("task-hybrid", 1, "pdf", _HASH, _HASH, "private/source.pdf", {})
+
+    command = ProvisionedConversionLauncher._command(
+        "mineru",
+        profile,
+        request,
+        Path("C:/private-attempt"),
+        backend="vlm-engine",
+        output_root=Path("C:/private-attempt/mineru-vlm-2-6"),
+        start_page=1,
+        end_page=5,
+    )
+
+    assert command[command.index("-b") + 1] == "vlm-engine"
+    assert command[command.index("-s") + 1] == "1"
+    assert command[command.index("-e") + 1] == "5"
+
+    blocks, issues = _mineru_blocks(
+        [[{"type": "paragraph", "content": "VLM fallback", "bbox": [1, 1, 10, 10]}]],
+        "attempt-hybrid",
+        _hybrid_artifact("vlm", "e" * 64, "mineru-vlm-22-23/content.json"),
+        page_offset=21,
+    )
+    assert not issues
+    assert getattr(blocks[0].locators[0], "page") == 22
 
 
 class _ServiceDerivationWorker:
@@ -558,9 +722,28 @@ def test_deriver_consumes_only_selected_v2_graph_and_refuses_unresolved_content(
     assert blocked_events[1]["type"] == "derivation-failed-item"
 
 
-def test_selected_conversion_graph_persists_a_rendered_review_proposal_through_service(
+def test_selected_conversion_graph_persists_a_rendered_proposal_and_automatically_reaches_commit(
     tmp_path: Path,
 ) -> None:
+    class Policy:
+        def __init__(self) -> None:
+            self.source_paths: list[str] = []
+
+        def preview(self, vault_id, source_path, derived_path, stage):
+            assert vault_id
+            assert derived_path is None
+            assert stage == "outbound"
+            self.source_paths.append(source_path)
+            return type("Evaluation", (), {"allowed": True})()
+
+    class Structurer:
+        def __init__(self) -> None:
+            self.markdown = ""
+
+        def structure(self, markdown: str) -> str:
+            self.markdown = markdown
+            return markdown
+
     source = tmp_path / "book.pdf"
     source.write_bytes(b"selected conversion source")
     source_hash = sha256(source.read_bytes()).hexdigest()
@@ -606,7 +789,15 @@ def test_selected_conversion_graph_persists_a_rendered_review_proposal_through_s
         input_snapshot_hash=source_hash,
     )
     envelope = ConversionEvidence("pdf", graph, attempt)
-    service = ImportTaskService(vault_service, repository, _ServiceDerivationWorker())
+    policy = Policy()
+    structurer = Structurer()
+    service = ImportTaskService(
+        vault_service,
+        repository,
+        _ServiceDerivationWorker(),
+        policy_service=policy,
+        markdown_structuring_service=structurer,
+    )
     repository.save(
         replace(task, lifecycle="running", phase="converting"),
         "conversion-started",
@@ -632,8 +823,14 @@ def test_selected_conversion_graph_persists_a_rendered_review_proposal_through_s
     assert proposal.graph_revision == graph.graph_revision
     assert "# Converted heading" in proposal.notes[0].markdown
     assert proposal.graph_block_locators[0][0].document_locator == graph.blocks[0].locators[0].to_dict()
-    assert completed.lifecycle == "waiting-for-review"
-    assert completed.phase == "waiting-for-review"
+    assert structurer.markdown == "# Converted heading\n\nConverted body"
+    assert proposal.provider_markdown == "# Converted heading\n\nConverted body"
+    assert proposal.structured_blocks == ()
+    assert policy.source_paths == [f"platform/sources/source-v2-{source_hash[:16]}.pdf"]
+    assert completed.lifecycle == "recoverable"
+    assert completed.phase == "failed"
+    assert completed.recovery_actions == ("retry-commit",)
+    assert completed.failure_reason == "Vault commit service is unavailable."
 
 
 def test_selected_graph_assets_and_source_snapshot_are_staged_in_one_commit_unit(tmp_path: Path) -> None:
@@ -755,7 +952,7 @@ def test_selected_graph_assets_and_source_snapshot_are_staged_in_one_commit_unit
     assert next(write.content for write in writes if write.relative_path.endswith(".png")) == image_content
 
 
-def test_conversion_review_acceptance_revisions_the_graph_and_regenerates_the_proposal(
+def test_conversion_graph_issues_do_not_create_an_interactive_review_checkpoint(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "review.pdf"
@@ -814,21 +1011,16 @@ def test_conversion_review_acceptance_revisions_the_graph_and_regenerates_the_pr
             },
     )
     service._handle_worker_event(task.task_id, {"type": "conversion-completed"})
-    snapshot = service.refresh_review_snapshot(task.task_id)
-    review_item = next(item for item in snapshot.review_items if item.object_type == "conversion")
-
-    updated = service.decide_review_item(
-        task.task_id, review_item.review_item_id, "accepted", "Coverage was reviewed."
-    )
+    updated = service.get(task.task_id)
     selected = repository.get_conversion_evidence(item.item_id)
     proposal = repository.get_note_proposal(item.item_id)
 
-    assert updated.phase == "waiting-for-review"
+    assert updated.lifecycle == "recoverable"
+    assert updated.recovery_actions == ("restart-derivation",)
     assert selected is not None
-    assert selected.graph.graph_revision == 2
-    assert selected.graph.issues[0].state == "accepted"
-    assert proposal is not None
-    assert proposal.graph_id == selected.graph.graph_id
+    assert selected.graph.graph_revision == 1
+    assert selected.graph.issues[0].state == "pending"
+    assert proposal is None
 
 
 def test_private_artifact_store_uses_verified_snapshot_and_service_owned_promotion(tmp_path: Path) -> None:
@@ -1208,3 +1400,48 @@ def test_runner_cancellation_kills_the_managed_windows_process_tree(monkeypatch)
 
     assert cancelled.set_called is True
     assert commands == [["taskkill", "/PID", "43210", "/T", "/F"]]
+
+
+def test_graph_provider_markdown_removes_only_repeated_noise_blocks_from_candidates() -> None:
+    graph = _graph(
+        replace(_block("heading", text="Unit One"), block_id="heading"),
+        replace(_block("paragraph", text="Workbook Header"), block_id="header-first"),
+        replace(_block("table"), block_id="table"),
+        replace(_block("paragraph", text="Workbook Header"), block_id="header-second"),
+        replace(_block("paragraph", text="Main body"), block_id="body"),
+    )
+    proposal = derive_graph_markdown_proposal(
+        item_id=1,
+        vault_id="vault-1",
+        source_id="source-1",
+        processing_task_id="task-1",
+        source_sha256=_HASH,
+        managed_root="platform",
+        source_suffix=".pdf",
+        source_label="Book",
+        graph=graph,
+    )
+    rendered = render_document_graph(graph).markdown
+    provider_markdown = rendered.replace("Workbook Header\n\n", "")
+
+    structured = structure_graph_markdown_proposal(
+        proposal,
+        graph=graph,
+        provider_markdown=provider_markdown,
+    )
+
+    assert structured.noise_graph_block_ids == ("header-first", "header-second")
+    assert [candidate.text for candidate in private_index_candidates(structured)] == [
+        "# Unit One",
+        "| Term | Meaning |\n| --- | --- |\n| source | evidence |",
+        "Main body",
+    ]
+    assert [candidate.block_location for candidate in private_index_candidates(structured)] == [
+        "graph:heading",
+        "graph:table",
+        "graph:body",
+    ]
+    assert proposal_from_dict(structured.to_dict()).noise_graph_block_ids == (
+        "header-first",
+        "header-second",
+    )

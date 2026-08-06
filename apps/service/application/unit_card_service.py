@@ -3,16 +3,15 @@ from __future__ import annotations
 import json
 from math import isfinite
 
-from application.policies import OutboundAuthorizationDenied
 from application.providers import ProviderService, ProviderUnavailableError
-from application.unit_card_authorizations import CheckedUnitCardBatch, UnitCardAuthorizationService
+from application.unit_card_batches import CheckedUnitCardBatch, UnitCardBatchService
 from application.vaults import utc_now
 from domain.embeddings import (
     EmbeddingCacheConsistencyError,
     EmbeddingProfile,
     EmbeddingVectorConsistencyError,
 )
-from domain.unit_card_authorization import UnitCardBatchScope, UnitCardExecutionReport
+from domain.unit_card_batches import UnitCardBatchScope, UnitCardExecutionReport
 from domain.unit_cards import (
     UnitCardBuildInput,
     UnitCard,
@@ -30,39 +29,33 @@ MAX_UNIT_CARD_EMBEDDINGS_PER_REQUEST = 64
 
 
 class UnitCardExecutionError(RuntimeError):
-    """Raised when a confirmed unit-card batch cannot safely complete."""
+    """Raised when a unit-card batch cannot safely complete."""
 
 
 class UnitCardService:
-    """Generate constrained card summaries and vectors after paired authorization checks."""
+    """Generate constrained card summaries and vectors from eligible reviewed content."""
 
     def __init__(
         self,
-        authorization_service: UnitCardAuthorizationService,
+        batch_service: UnitCardBatchService,
         provider_service: ProviderService,
         index_repository: IndexRepository,
     ) -> None:
-        self.authorization_service = authorization_service
+        self.batch_service = batch_service
         self.provider_service = provider_service
         self.index_repository = index_repository
 
     def execute(
         self,
         vault_id: str,
-        chat_authorization_id: str,
-        embedding_authorization_id: str,
         scope: UnitCardBatchScope,
     ) -> UnitCardExecutionReport:
-        initial = self._checked_batch(
-            vault_id, chat_authorization_id, embedding_authorization_id, scope
-        )
+        initial = self._checked_batch(vault_id, scope)
         cards = []
         chat_network_request_count = 0
         for card_input in initial.inputs:
             summary, requests = self._summarize(
                 vault_id,
-                chat_authorization_id,
-                embedding_authorization_id,
                 scope,
                 initial,
                 card_input,
@@ -82,9 +75,7 @@ class UnitCardService:
         vectors = []
         embedding_network_request_count = 0
         for batch in _batches(tuple(cards), MAX_UNIT_CARD_EMBEDDINGS_PER_REQUEST):
-            current = self._checked_batch(
-                vault_id, chat_authorization_id, embedding_authorization_id, scope
-            )
+            current = self._checked_batch(vault_id, scope)
             self._require_same_batch(initial, current)
             try:
                 values = self.provider_service.create_embeddings(
@@ -135,9 +126,7 @@ class UnitCardService:
             vectors.extend(batch_vectors)
             embedding_network_request_count += 1
 
-        current = self._checked_batch(
-            vault_id, chat_authorization_id, embedding_authorization_id, scope
-        )
+        current = self._checked_batch(vault_id, scope)
         self._require_same_batch(initial, current)
         try:
             self.index_repository.save_unit_cards(vault_id, tuple(cards), tuple(vectors))
@@ -145,8 +134,6 @@ class UnitCardService:
             raise UnitCardExecutionError(str(error)) from error
         return UnitCardExecutionReport(
             vault_id=vault_id,
-            chat_authorization_id=chat_authorization_id,
-            embedding_authorization_id=embedding_authorization_id,
             status="completed",
             file_count=initial.preview.file_count,
             block_count=initial.preview.block_count,
@@ -158,17 +145,13 @@ class UnitCardService:
     def _summarize(
         self,
         vault_id: str,
-        chat_authorization_id: str,
-        embedding_authorization_id: str,
         scope: UnitCardBatchScope,
         initial: CheckedUnitCardBatch,
         card_input: UnitCardBuildInput,
     ) -> tuple[UnitCardSummary, int]:
         summaries: list[UnitCardSummary] = []
         for sources in _prompt_batches(card_input):
-            current = self._checked_batch(
-                vault_id, chat_authorization_id, embedding_authorization_id, scope
-            )
+            current = self._checked_batch(vault_id, scope)
             self._require_same_batch(initial, current)
             prompt = _unit_card_prompt(card_input, sources)
             try:
@@ -193,16 +176,10 @@ class UnitCardService:
     def _checked_batch(
         self,
         vault_id: str,
-        chat_authorization_id: str,
-        embedding_authorization_id: str,
         scope: UnitCardBatchScope,
     ) -> CheckedUnitCardBatch:
         try:
-            return self.authorization_service.checked_batch(
-                vault_id, chat_authorization_id, embedding_authorization_id, scope
-            )
-        except OutboundAuthorizationDenied:
-            raise
+            return self.batch_service.default_batch(vault_id, scope)
         except ValueError as error:
             raise UnitCardExecutionError(str(error)) from error
 
@@ -210,7 +187,7 @@ class UnitCardService:
     def _require_same_batch(initial: CheckedUnitCardBatch, current: CheckedUnitCardBatch) -> None:
         if initial.preview != current.preview or initial.inputs != current.inputs:
             raise UnitCardExecutionError(
-                "Unit card authorization inputs changed. Request a new authorization."
+                "Unit card inputs changed during execution. Retry the batch."
             )
 
 

@@ -1,27 +1,19 @@
-from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
-import sqlite3
-
-import pytest
 
 from adapters.filesystem_vault_adapter import LocalVaultFilesystem
 from adapters.filesystem_vault_committer import LocalVaultCommitter
-from adapters.sqlite_index_repository import SqliteIndexRepository
 from adapters.sqlite_source_repository import SqliteSourceRepository
 from adapters.sqlite_task_repository import SqliteImportTaskRepository
 from adapters.sqlite_vault_repository import SqliteVaultRepository
 from application.import_selections import ImportSelection
-from application.ingest import ImportTaskError, ImportTaskService
-from application.indexing import IndexingService
+from application.ingest import ImportTaskService
 from application.vaults import VaultService
-from domain.evidence import EvidenceLocator, ParseEvidence, ParseIssue, PdfRegionLocator, StructuredContentUnit
-from domain.graph_projection import DurableGraphProjection, GraphProjectionBlock
-from domain.review_commits import CommitJournal
+from domain.evidence import EvidenceLocator, ParseEvidence, StructuredContentUnit
 from workers.markdown_deriver import derive_items
 
 
-class DerivingWorker:
+class AutomaticWorker:
     def start(self, task, on_event) -> None:
         source_path = task.source_paths[0]
         on_event(
@@ -43,9 +35,7 @@ class DerivingWorker:
         evidence = ParseEvidence(
             document_kind="pdf",
             raw_extraction={"pages": [{"page": 1, "text": "Private evidence."}]},
-            units=(
-                StructuredContentUnit("paragraph", "Reviewed evidence.", EvidenceLocator(page=1)),
-            ),
+            units=(StructuredContentUnit("paragraph", "Automatic evidence.", EvidenceLocator(page=1)),),
             confidence=0.9,
             issues=(),
         )
@@ -64,9 +54,6 @@ class DerivingWorker:
         on_event(task.task_id, {"type": "ocr-not-required", "item_id": items[0].item_id})
         on_event(task.task_id, {"type": "ocr-completed"})
 
-    def start_ocr_targets(self, task, items, target_ids, on_event) -> None:
-        self.start_ocr(task, items, on_event)
-
     def start_derivation(self, task, items, on_event) -> None:
         for event in derive_items(items):
             on_event(task.task_id, event)
@@ -75,312 +62,107 @@ class DerivingWorker:
         return None
 
 
+class RecordingEmbeddingService:
+    def __init__(self, error: Exception | None = None) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self.error = error
+
+    def execute(self, vault_id: str, scope) -> None:
+        self.calls.append((vault_id, scope.kind))
+        if self.error is not None:
+            raise self.error
+
+
 class FailingCommitter:
     def commit(self, vault_path, writes, managed_root_relative_path=None) -> None:
         raise OSError("simulated disk failure")
 
 
-def _service(tmp_path: Path, committer, index_service=None) -> tuple[ImportTaskService, object, Path]:
+def _service(tmp_path: Path, *, committer, embedding_service=None) -> tuple[ImportTaskService, object, Path]:
     vault_path = tmp_path / "vault"
-    vault_path.mkdir(parents=True)
+    vault_path.mkdir()
     source_file = tmp_path / "book.pdf"
     source_file.write_bytes(b"original PDF")
     vault_repository = SqliteVaultRepository(tmp_path / "vaults.sqlite3")
     vault_service = VaultService(vault_repository, LocalVaultFilesystem())
     vault = vault_service.authorize(vault_path, "platform")
     database_path = tmp_path / "tasks.sqlite3"
-    service = ImportTaskService(
-        vault_service,
-        SqliteImportTaskRepository(database_path),
-        DerivingWorker(),
-        source_repository=SqliteSourceRepository(database_path),
-        vault_committer=committer,
-        index_service=index_service,
-    )
-    return service, vault, source_file
-
-
-def _reviewable_task(service: ImportTaskService, vault, source_file: Path):
-    task = service.create(vault.vault_id, ImportSelection("session", "files", (source_file,), 999.0))
-    classification = service.list_classification_suggestions(task.task_id)[0]
-    service.decide_classification_suggestion(
-        task.task_id, classification.item_id, "accepted", "Reviewed location."
-    )
-    governance = service.list_metadata_tag_proposals(task.task_id)[0]
-    service.decide_metadata_tag_proposal(task.task_id, governance.item_id, "accepted", "Reviewed tags.")
-    snapshot = service.refresh_review_snapshot(task.task_id)
-    return task, snapshot
-
-
-def _projection(vault_id: str, source_id: str, source_sha256: str, source_path: str) -> DurableGraphProjection:
-    return DurableGraphProjection(
-        vault_id=vault_id,
-        graph_id="graph-1",
-        graph_revision=1,
-        selected_attempt_id="attempt-1",
-        source_id=source_id,
-        source_sha256=source_sha256,
-        source_path=source_path,
-        blocks=(
-            GraphProjectionBlock(
-                block_id="block-1",
-                kind="paragraph",
-                reading_order=0,
-                locators=(PdfRegionLocator(page=1, bounds=(0.0, 0.0, 10.0, 10.0)),),
-                confidence=0.9,
-                retrieval_projection="Projection text.",
-            ),
+    return (
+        ImportTaskService(
+            vault_service,
+            SqliteImportTaskRepository(database_path),
+            AutomaticWorker(),
+            source_repository=SqliteSourceRepository(database_path),
+            vault_committer=committer,
+            embedding_service=embedding_service or RecordingEmbeddingService(),
         ),
+        vault,
+        source_file,
     )
 
 
-def test_commit_writes_source_and_derived_markdown_after_a_current_review_snapshot(tmp_path: Path) -> None:
-    service, vault, source_file = _service(tmp_path, LocalVaultCommitter())
-    task, snapshot = _reviewable_task(service, vault, source_file)
+def test_import_automatically_parses_structures_commits_and_embeds(tmp_path: Path) -> None:
+    embeddings = RecordingEmbeddingService()
+    service, vault, source_file = _service(
+        tmp_path, committer=LocalVaultCommitter(), embedding_service=embeddings
+    )
+
+    task = service.create(vault.vault_id, ImportSelection("session", "files", (source_file,), 999.0))
     proposal = service.list_note_proposals(task.task_id)[0]
-    accepted_tag = service.list_metadata_tag_proposals(task.task_id)[0].tags[0].name
 
-    completed = service.commit_review(task.task_id)
-
-    assert snapshot.remaining_review_count == 0
-    assert completed.lifecycle == "complete"
+    assert task.lifecycle == "complete"
     assert (vault.path / proposal.source_relative_path).read_bytes() == b"original PDF"
     rendered = (vault.path / proposal.notes[0].relative_path).read_text(encoding="utf-8")
-    assert "tags:" in rendered
-    assert accepted_tag in rendered
+    assert "Automatic evidence." in rendered
+    assert "tags:" not in rendered
+    assert "[[platform/notes/" not in rendered
+    assert embeddings.calls == [(vault.vault_id, "vault")]
     assert [journal.status for journal in service.list_commit_journals(task.task_id)] == [
         "prepared",
         "committed",
     ]
 
 
-def test_only_a_committed_unit_triggers_private_indexing(tmp_path: Path) -> None:
-    class RecordingIndexService:
-        def __init__(self) -> None:
-            self.committed_units = []
+def test_private_suggestions_do_not_block_or_change_an_automatic_commit(tmp_path: Path) -> None:
+    service, vault, source_file = _service(tmp_path, committer=LocalVaultCommitter())
 
-        def index_committed_unit(self, vault, unit) -> None:
-            self.committed_units.append((vault.vault_id, unit.unit_id))
-
-    index_service = RecordingIndexService()
-    service, vault, source_file = _service(tmp_path, LocalVaultCommitter(), index_service)
-    task, _ = _reviewable_task(service, vault, source_file)
-
-    service.commit_review(task.task_id)
-
-    assert index_service.committed_units == [(vault.vault_id, "source-1")]
-
-    failed_index_service = RecordingIndexService()
-    failed_service, failed_vault, failed_source = _service(
-        tmp_path / "failed", FailingCommitter(), failed_index_service
-    )
-    failed_task, _ = _reviewable_task(failed_service, failed_vault, failed_source)
-    failed_service.commit_review(failed_task.task_id)
-
-    assert failed_index_service.committed_units == []
-
-
-def test_projection_backed_commit_writes_derived_documents_and_projection_together(
-    tmp_path: Path, monkeypatch
-) -> None:
-    service, vault, source_file = _service(tmp_path, LocalVaultCommitter())
-    index_repository = SqliteIndexRepository(tmp_path / "indexes.sqlite3")
-    service.index_service = IndexingService(service.vault_service, index_repository, LocalVaultFilesystem())
-    task, _ = _reviewable_task(service, vault, source_file)
+    task = service.create(vault.vault_id, ImportSelection("session", "files", (source_file,), 999.0))
     proposal = service.list_note_proposals(task.task_id)[0]
-    projection = _projection(
-        vault.vault_id, proposal.source_id, proposal.source_sha256, proposal.source_relative_path
+
+    assert task.lifecycle == "complete"
+    assert service.list_classification_suggestions(task.task_id)
+    assert service.list_metadata_tag_proposals(task.task_id)
+    assert service.list_candidate_link_proposals(task.task_id) == []
+    rendered = (vault.path / proposal.notes[0].relative_path).read_text(encoding="utf-8")
+    assert "tags:" not in rendered
+
+
+def test_automatic_embedding_failure_restores_vault_files_and_is_retryable(tmp_path: Path) -> None:
+    service, vault, source_file = _service(
+        tmp_path,
+        committer=LocalVaultCommitter(),
+        embedding_service=RecordingEmbeddingService(RuntimeError("Provider is unavailable.")),
     )
-    monkeypatch.setattr(service, "_graph_projection_for_unit", lambda *_args: projection)
 
-    completed = service.commit_review(task.task_id)
-
-    assert completed.lifecycle == "complete"
-    assert index_repository.get_graph_projection(projection.key) == projection
-    assert {document.relative_path for document in index_repository.current_documents(vault.vault_id)} == {
-        proposal.index_note.relative_path,
-        proposal.notes[0].relative_path,
-    }
-    assert [journal.status for journal in service.list_commit_journals(task.task_id)] == [
-        "prepared",
-        "committed",
-    ]
-
-
-def test_projection_index_failure_restores_the_committed_vault_files(tmp_path: Path, monkeypatch) -> None:
-    class FailingProjectionIndexService:
-        def index_committed_unit(self, vault, unit, projection) -> None:
-            raise sqlite3.IntegrityError("injected index transaction failure")
-
-        def report_failure(self, vault_id, reason, error) -> None:
-            return None
-
-    service, vault, source_file = _service(tmp_path, LocalVaultCommitter(), FailingProjectionIndexService())
-    task, _ = _reviewable_task(service, vault, source_file)
+    task = service.create(vault.vault_id, ImportSelection("session", "files", (source_file,), 999.0))
     proposal = service.list_note_proposals(task.task_id)[0]
-    monkeypatch.setattr(
-        service,
-        "_graph_projection_for_unit",
-        lambda *_args: _projection(
-            vault.vault_id, proposal.source_id, proposal.source_sha256, proposal.source_relative_path
-        ),
-    )
 
-    failed = service.commit_review(task.task_id)
-
-    assert failed.lifecycle == "recoverable"
-    assert failed.recovery_actions == ("retry-commit",)
+    assert task.lifecycle == "recoverable"
+    assert task.recovery_actions == ("retry-commit",)
     assert not (vault.path / proposal.source_relative_path).exists()
     assert not (vault.path / proposal.notes[0].relative_path).exists()
-    assert [journal.status for journal in service.list_commit_journals(task.task_id)] == ["prepared", "failed"]
-
-
-def test_index_failure_does_not_leave_a_committed_review_task_in_committing(tmp_path: Path) -> None:
-    class FailingIndexService:
-        def index_committed_unit(self, vault, unit) -> None:
-            raise OSError("index database unavailable")
-
-        def report_failure(self, vault_id, reason, error) -> None:
-            return None
-
-    service, vault, source_file = _service(tmp_path, LocalVaultCommitter(), FailingIndexService())
-    task, _ = _reviewable_task(service, vault, source_file)
-
-    completed = service.commit_review(task.task_id)
-
-    assert completed.lifecycle == "complete"
-    assert completed.phase == "complete"
-    assert [journal.status for journal in service.list_commit_journals(task.task_id)] == [
-        "prepared",
-        "committed",
-    ]
-    assert "indexing-started" in [event.event_type for event in service.events_after(task.task_id, 0)]
-    assert "indexing-failed" in [event.event_type for event in service.events_after(task.task_id, 0)]
-
-
-def test_changed_source_invalidates_the_snapshot_and_prevents_vault_writes(tmp_path: Path) -> None:
-    service, vault, source_file = _service(tmp_path, LocalVaultCommitter())
-    task, _ = _reviewable_task(service, vault, source_file)
-    source_file.write_bytes(b"changed PDF")
-
-    with pytest.raises(ImportTaskError, match="source changed"):
-        service.commit_review(task.task_id)
-
-    assert service.get(task.task_id).recovery_actions == ("restart-scan",)
-    assert {path for path in vault.managed_root.rglob("*")} == {
-        vault.source_directory,
-        vault.note_directory,
-    }
-
-
-def test_invalid_commit_selection_does_not_leave_the_task_in_committing_state(tmp_path: Path) -> None:
-    service, vault, source_file = _service(tmp_path, LocalVaultCommitter())
-    task, _ = _reviewable_task(service, vault, source_file)
-
-    with pytest.raises(ImportTaskError, match="does not belong"):
-        service.commit_review(task.task_id, ("source-not-in-snapshot",))
-
-    current = service.get(task.task_id)
-    assert current.lifecycle == "waiting-for-review"
-    assert current.phase == "waiting-for-review"
-    assert service.list_commit_journals(task.task_id) == []
-
-
-def test_failed_unit_is_journaled_without_marking_the_batch_complete(tmp_path: Path) -> None:
-    service, vault, source_file = _service(tmp_path, FailingCommitter())
-    task, _ = _reviewable_task(service, vault, source_file)
-
-    failed = service.commit_review(task.task_id)
-
-    assert failed.lifecycle == "recoverable"
-    assert failed.recovery_actions == ("retry-commit",)
-    assert "simulated disk failure" in (failed.failure_reason or "")
     assert [journal.status for journal in service.list_commit_journals(task.task_id)] == [
         "prepared",
         "failed",
     ]
+
+
+def test_automatic_vault_write_failure_is_retryable_without_partial_files(tmp_path: Path) -> None:
+    service, vault, source_file = _service(tmp_path, committer=FailingCommitter())
+
+    task = service.create(vault.vault_id, ImportSelection("session", "files", (source_file,), 999.0))
+
+    assert task.lifecycle == "recoverable"
+    assert task.recovery_actions == ("retry-commit",)
     assert list(vault.source_directory.iterdir()) == []
     assert list(vault.note_directory.iterdir()) == []
-
-
-def test_parse_required_check_needs_and_persists_an_explicit_decision(tmp_path: Path) -> None:
-    service, vault, source_file = _service(tmp_path, LocalVaultCommitter())
-    task, _ = _reviewable_task(service, vault, source_file)
-    item = service.list_items(task.task_id)[0]
-    service.repository.record_parse_evidence(
-        item.item_id,
-        ParseEvidence(
-            document_kind="pdf",
-            raw_extraction={"pages": [{"page": 1, "text": "Reviewed evidence."}]},
-            units=(
-                StructuredContentUnit("paragraph", "Reviewed evidence.", EvidenceLocator(page=1)),
-            ),
-            confidence=0.8,
-            issues=(ParseIssue("table-layout", "Table columns need review.", EvidenceLocator(page=1)),),
-        ),
-    )
-
-    snapshot = service.refresh_review_snapshot(task.task_id)
-    review_item = next(item for item in snapshot.review_items if item.object_type == "parse")
-
-    assert snapshot.commit_eligibility("source-1") == "page 1: Table columns need review."
-    service.decide_review_item(task.task_id, review_item.review_item_id, "accepted", "Reviewed table layout.")
-
-    refreshed = service.get_review_snapshot(task.task_id)
-    assert next(item for item in refreshed.review_items if item.review_item_id == review_item.review_item_id).status == "accepted"
-    assert service.commit_review(task.task_id).lifecycle == "complete"
-
-
-def test_parse_failure_without_a_proposal_stays_as_a_blocking_review_unit(tmp_path: Path) -> None:
-    service, vault, source_file = _service(tmp_path, LocalVaultCommitter())
-    task, _ = _reviewable_task(service, vault, source_file)
-    item = service.list_items(task.task_id)[0]
-    service.repository.invalidate_note_proposals(task.task_id, item.item_id)
-    service.repository.record_parse_failure(item.item_id, "Parser could not read the file.", "document")
-
-    snapshot = service.refresh_review_snapshot(task.task_id)
-
-    assert snapshot.units[0].kind == "unresolved"
-    assert snapshot.commit_eligibility(snapshot.units[0].unit_id) == "Parser could not read the file."
-    with pytest.raises(ImportTaskError, match="No fully reviewed"):
-        service.commit_review(task.task_id)
-
-
-def test_startup_recovery_restores_the_prepared_unit_backups(tmp_path: Path) -> None:
-    committer = LocalVaultCommitter()
-    service, vault, source_file = _service(tmp_path, committer)
-    task, snapshot = _reviewable_task(service, vault, source_file)
-    unit = snapshot.units[0]
-    writes = service._writes_for_unit(task, unit)
-    backups = committer.capture_backups(vault.path, writes, vault.managed_root_relative_path)
-    target = vault.path / writes[0].relative_path
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(writes[0].content)
-    service.repository.save(
-        replace(
-            service.get(task.task_id),
-            lifecycle="running",
-            phase="committing",
-            recovery_actions=(),
-        ),
-        "commit-started",
-    )
-    service.repository.record_commit_journal(
-        CommitJournal(
-            task_id=task.task_id,
-            vault_id=vault.vault_id,
-            unit_id=unit.unit_id,
-            snapshot_digest=snapshot.digest,
-            unit=unit,
-            status="prepared",
-            created_at=task.updated_at,
-            backups=backups,
-        ),
-        "commit-prepared",
-    )
-
-    recovered = service.repository.recover_interrupted_tasks()
-    service.recover_interrupted_commits(recovered)
-
-    assert not target.exists()
-    assert service.get(task.task_id).recovery_actions == ("retry-commit",)

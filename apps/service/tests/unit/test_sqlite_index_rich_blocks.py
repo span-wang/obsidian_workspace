@@ -232,10 +232,121 @@ def test_current_document_reads_can_switch_between_rich_and_legacy_blocks(tmp_pa
     assert legacy_repository.current_documents("vault-1")[0].blocks == (
         IndexBlock(1, "line:1", "A structured paragraph."),
     )
+    assert legacy_repository.current_heading_scope_documents("vault-1")[0].blocks == (rich_block,)
     assert rich_repository.health("vault-1").rich_block_read_mode == "rich"
     assert rich_repository.health("vault-1").rich_block_status == "enabled"
     assert legacy_repository.health("vault-1").rich_block_read_mode == "legacy"
     assert legacy_repository.health("vault-1").rich_block_status == "disabled"
+
+
+def test_structured_documents_use_a_legacy_heading_location_when_rich_fields_are_missing(
+    tmp_path,
+) -> None:
+    database_path = tmp_path / "legacy.sqlite3"
+    _create_legacy_index(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "UPDATE index_blocks SET location = ? WHERE document_id = ?",
+            ("heading: Unit 1; Vocabulary", "legacy-document"),
+        )
+    repository = SqliteIndexRepository(database_path, rich_block_reads_enabled=False)
+
+    documents = repository.current_heading_scope_documents("vault-1")
+
+    assert [document.document_id for document in documents] == ["legacy-document"]
+    assert documents[0].blocks == (
+        IndexBlock(1, "heading: Unit 1; Vocabulary", "Legacy note."),
+    )
+
+
+def test_structured_documents_skip_unstructured_legacy_rows_without_weakening_rich_reads(
+    tmp_path,
+) -> None:
+    database_path = tmp_path / "legacy.sqlite3"
+    _create_legacy_index(database_path)
+    repository = SqliteIndexRepository(database_path, rich_block_reads_enabled=False)
+
+    assert repository.current_documents("vault-1")[0].blocks == (
+        IndexBlock(1, "line:1", "Legacy note."),
+    )
+    assert repository.current_heading_scope_documents("vault-1") == []
+    with pytest.raises(ValueError, match="block-content-sha256-missing"):
+        repository.current_embedding_documents("vault-1")
+    with pytest.raises(ValueError, match="block-content-sha256-missing"):
+        repository.current_metadata_documents("vault-1")
+
+
+def test_structured_documents_ignore_an_unstructured_legacy_document_beside_rich_data(
+    tmp_path,
+) -> None:
+    database_path = tmp_path / "indexes.sqlite3"
+    repository = SqliteIndexRepository(database_path, rich_block_reads_enabled=False)
+    rich_block = IndexBlock(
+        1,
+        "heading: Unit 1; Vocabulary",
+        "Rich unit evidence.",
+        heading_path=("Unit 1", "Vocabulary"),
+    )
+    repository.save_document(_document(rich_block))
+    _insert_legacy_block(
+        database_path,
+        document_id="legacy-document",
+        document_kind="native",
+        location="line:1",
+        text="Unstructured legacy evidence.",
+        is_current=True,
+    )
+
+    documents = repository.current_heading_scope_documents("vault-1")
+
+    assert [document.document_id for document in documents] == ["document-1"]
+    assert documents[0].blocks == (rich_block,)
+
+
+def test_heading_scope_documents_filter_unstructured_legacy_blocks_within_a_rich_document(
+    tmp_path,
+) -> None:
+    database_path = tmp_path / "indexes.sqlite3"
+    repository = SqliteIndexRepository(database_path, rich_block_reads_enabled=False)
+    rich_block = IndexBlock(
+        1,
+        "heading: Unit 1; Vocabulary",
+        "Rich unit evidence.",
+        heading_path=("Unit 1", "Vocabulary"),
+    )
+    repository.save_document(_document(rich_block))
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO index_blocks (document_id, sequence, location, text)
+            VALUES (?, ?, ?, ?)
+            """,
+            ("document-1", 2, "line:4", "Unstructured legacy evidence."),
+        )
+
+    documents = repository.current_heading_scope_documents("vault-1")
+
+    assert len(documents) == 1
+    assert documents[0].blocks == (rich_block,)
+
+
+def test_heading_scope_documents_prefer_a_valid_rich_heading_path_over_legacy_location(
+    tmp_path,
+) -> None:
+    database_path = tmp_path / "indexes.sqlite3"
+    repository = SqliteIndexRepository(database_path, rich_block_reads_enabled=False)
+    rich_block = IndexBlock(
+        1,
+        "heading: Unit 7",
+        "Persisted structured evidence.",
+        heading_path=("Unit 1", "Vocabulary"),
+    )
+    repository.save_document(_document(rich_block))
+
+    document = repository.current_heading_scope_documents("vault-1")[0]
+
+    assert document.blocks == (rich_block,)
+    assert document.blocks[0].heading_path == ("Unit 1", "Vocabulary")
 
 
 def test_rich_reads_fail_closed_on_a_current_block_consistency_issue(tmp_path) -> None:

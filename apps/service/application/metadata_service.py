@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from application.metadata_authorizations import MetadataAuthorizationService
+from application.metadata_batches import MetadataBatchService
 from application.providers import ProviderService, ProviderUnavailableError
 from application.vaults import utc_now
 from domain.metadata_extraction import (
@@ -27,31 +27,29 @@ class MetadataExtractionError(ValueError):
 
 
 class MetadataExtractionService:
-    """Extract bounded metadata candidates after an outbound authorization check."""
+    """Extract bounded metadata candidates from eligible indexed content."""
 
     def __init__(
         self,
-        authorization_service: MetadataAuthorizationService,
+        batch_service: MetadataBatchService,
         provider_service: ProviderService,
         index_repository: IndexRepository,
     ) -> None:
-        self.authorization_service = authorization_service
+        self.batch_service = batch_service
         self.provider_service = provider_service
         self.index_repository = index_repository
 
-    def execute(
-        self, vault_id: str, authorization_id: str, scope: MetadataBatchScope
-    ) -> MetadataExtractionReport:
-        batch = self.authorization_service.checked_batch(vault_id, authorization_id, scope)
+    def execute(self, vault_id: str, scope: MetadataBatchScope) -> MetadataExtractionReport:
+        batch = self.batch_service.default_batch(vault_id, scope)
         known_concept_keys = self.index_repository.accepted_metadata_concept_keys(vault_id)
         candidates: list[MetadataCandidate] = []
         network_batch_count = 0
         for offset in range(0, len(batch.inputs), MAX_METADATA_BLOCKS_PER_REQUEST):
-            # Rebuild the frozen snapshot immediately before every Provider call.
-            current_batch = self.authorization_service.checked_batch(vault_id, authorization_id, scope)
+            # Rebuild the eligible snapshot immediately before every Provider call.
+            current_batch = self.batch_service.default_batch(vault_id, scope)
             chunk = current_batch.inputs[offset : offset + MAX_METADATA_BLOCKS_PER_REQUEST]
             if not chunk:
-                raise MetadataExtractionError("Metadata authorization input changed during execution.")
+                raise MetadataExtractionError("Metadata inputs changed during execution. Retry the batch.")
             prompt = _metadata_prompt(chunk)
             try:
                 response = self.provider_service.generate_chat(
@@ -111,7 +109,6 @@ class MetadataExtractionService:
         self.index_repository.save_metadata_candidates(vault_id, tuple(candidates))
         return MetadataExtractionReport(
             vault_id=vault_id,
-            authorization_id=authorization_id,
             status="completed",
             file_count=batch.preview.file_count,
             block_count=batch.preview.block_count,

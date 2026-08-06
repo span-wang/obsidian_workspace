@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 
 
-MODEL_TYPES = frozenset({"chat", "embedding", "rerank"})
+MODEL_TYPES = frozenset({"chat", "embedding", "rerank", "markdown"})
 
 
 @dataclass(frozen=True)

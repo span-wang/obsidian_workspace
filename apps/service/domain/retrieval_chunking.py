@@ -110,42 +110,143 @@ def chunk_projection_blocks(
 
     heading_paths, heading_levels = _projection_heading_context(projection)
     chunks: list[IndexBlock] = []
+    atomic_group: list[GraphProjectionBlock] = []
+    atomic_heading_path: tuple[str, ...] = ()
+    atomic_heading_level: int | None = None
+
+    def flush_atomic_group() -> None:
+        nonlocal atomic_group
+        if atomic_group:
+            _append_projection_atomic_group(
+                chunks,
+                projection,
+                tuple(atomic_group),
+                atomic_heading_path,
+                atomic_heading_level,
+            )
+            atomic_group = []
+
     for projected in projection.blocks:
         block = selected_by_id.get(projected.block_id)
         if block is None or not block.is_retrievable:
+            flush_atomic_group()
             continue
         if block.chunking_structure is None:
+            flush_atomic_group()
             chunks.append(_legacy_projection_block(projection, block, len(chunks) + 1))
             continue
 
         heading_path = heading_paths[block.block_id]
         heading_level = heading_levels[block.block_id]
-        fragments = _projection_fragments(block)
-        for chunk_number, fragment in enumerate(fragments, start=1):
-            if not fragment.text.strip():
-                continue
-            prefix = _contextual_prefix(heading_path)
-            chunks.append(
-                IndexBlock(
-                    sequence=len(chunks) + 1,
-                    location=(
-                        f"graph:{projection.graph_id}:{projection.graph_revision}:{block.block_id}"
-                        f"#chunk:{chunk_number}"
-                    ),
-                    text=fragment.text,
-                    block_kind=block.kind,
-                    heading_path=heading_path,
-                    heading_level=heading_level,
-                    source_locators=block.locators,
-                    graph_block_id=block.block_id,
-                    reading_order=block.reading_order,
-                    confidence=block.confidence,
-                    retrieval_text=fragment.retrieval_text,
-                    contextual_prefix=prefix,
-                    token_estimate=_token_estimate(prefix, fragment.retrieval_text),
-                )
-            )
+        if not _is_mergeable_atomic_paragraph(block):
+            flush_atomic_group()
+            _append_projection_fragments(chunks, projection, block, heading_path, heading_level)
+            continue
+
+        if atomic_group and (
+            atomic_heading_path != heading_path or atomic_heading_level != heading_level
+        ):
+            flush_atomic_group()
+        if atomic_group:
+            candidate = f"{_joined_projection_text(tuple(atomic_group))}\n\n{block.retrieval_projection}"
+            if _should_flush(_joined_projection_text(tuple(atomic_group)), candidate):
+                flush_atomic_group()
+        if not atomic_group:
+            atomic_heading_path = heading_path
+            atomic_heading_level = heading_level
+        atomic_group.append(block)
+    flush_atomic_group()
     return tuple(chunks)
+
+
+def _is_mergeable_atomic_paragraph(block: GraphProjectionBlock) -> bool:
+    return (
+        block.kind == "paragraph"
+        and block.chunking_structure is not None
+        and block.chunking_structure.kind == "atomic"
+        and len(block.retrieval_projection) <= MAX_CHUNK_CHARACTERS
+    )
+
+
+def _append_projection_atomic_group(
+    chunks: list[IndexBlock],
+    projection: DurableGraphProjection,
+    blocks: tuple[GraphProjectionBlock, ...],
+    heading_path: tuple[str, ...],
+    heading_level: int | None,
+) -> None:
+    if len(blocks) == 1:
+        _append_projection_fragments(chunks, projection, blocks[0], heading_path, heading_level)
+        return
+    first = blocks[0]
+    text = _joined_projection_text(blocks)
+    prefix = _contextual_prefix(heading_path)
+    locators = _unique_projection_locators(blocks)
+    chunks.append(
+        IndexBlock(
+            sequence=len(chunks) + 1,
+            location=f"graph:{projection.graph_id}:{projection.graph_revision}:{first.block_id}#chunk:1",
+            text=text,
+            block_kind=first.kind,
+            heading_path=heading_path,
+            heading_level=heading_level,
+            source_locators=locators,
+            graph_block_id=first.block_id,
+            reading_order=first.reading_order,
+            confidence=min(block.confidence for block in blocks),
+            retrieval_text=text,
+            contextual_prefix=prefix,
+            token_estimate=_token_estimate(prefix, text),
+        )
+    )
+
+
+def _append_projection_fragments(
+    chunks: list[IndexBlock],
+    projection: DurableGraphProjection,
+    block: GraphProjectionBlock,
+    heading_path: tuple[str, ...],
+    heading_level: int | None,
+) -> None:
+    for chunk_number, fragment in enumerate(_projection_fragments(block), start=1):
+        if not fragment.text.strip():
+            continue
+        prefix = _contextual_prefix(heading_path)
+        chunks.append(
+            IndexBlock(
+                sequence=len(chunks) + 1,
+                location=(
+                    f"graph:{projection.graph_id}:{projection.graph_revision}:{block.block_id}"
+                    f"#chunk:{chunk_number}"
+                ),
+                text=fragment.text,
+                block_kind=block.kind,
+                heading_path=heading_path,
+                heading_level=heading_level,
+                source_locators=block.locators,
+                graph_block_id=block.block_id,
+                reading_order=block.reading_order,
+                confidence=block.confidence,
+                retrieval_text=fragment.retrieval_text,
+                contextual_prefix=prefix,
+                token_estimate=_token_estimate(prefix, fragment.retrieval_text),
+            )
+        )
+
+
+def _joined_projection_text(blocks: tuple[GraphProjectionBlock, ...]) -> str:
+    return "\n\n".join(block.retrieval_projection for block in blocks)
+
+
+def _unique_projection_locators(
+    blocks: tuple[GraphProjectionBlock, ...],
+) -> tuple:
+    locators = []
+    for block in blocks:
+        for locator in block.locators:
+            if locator not in locators:
+                locators.append(locator)
+    return tuple(locators)
 
 
 def _native_sections(markdown: str) -> tuple[_NativeSection, ...]:

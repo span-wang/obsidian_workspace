@@ -5,10 +5,11 @@ from pathlib import Path
 
 import pytest
 from docx import Document
+from openpyxl import Workbook
 from pypdf import PdfWriter
 
 import workers.document_parser as document_parser
-from workers.document_parser import DocumentParseError, parse_document, parse_items
+from workers.document_parser import DocumentParseError, parse_document, parse_items, preflight_document
 
 
 def _write_pdf(path: Path, page_texts: list[list[str]]) -> None:
@@ -118,6 +119,66 @@ def test_parse_docx_without_normal_style_keeps_unstyled_paragraph(tmp_path: Path
     )
 
 
+def test_parse_excel_ooxml_keeps_sheet_and_cell_locators(tmp_path: Path) -> None:
+    source = tmp_path / "lesson.xlsx"
+    workbook = Workbook()
+    first = workbook.active
+    first.title = "Vocabulary"
+    first["A1"] = "Word"
+    first["B1"] = "Meaning"
+    first["A2"] = "source"
+    first["B2"] = "evidence"
+    second = workbook.create_sheet("Grammar")
+    second["C3"] = "present simple"
+    workbook.save(source)
+
+    evidence = parse_document(source, "xlsx")
+
+    assert evidence.document_kind == "xlsx"
+    assert [unit.text for unit in evidence.units] == [
+        "Word",
+        "Meaning",
+        "source",
+        "evidence",
+        "present simple",
+    ]
+    assert evidence.units[0].locator.region == "sheet:Vocabulary/cell:A1"
+    assert evidence.units[-1].locator.region == "sheet:Grammar/cell:C3"
+    assert evidence.raw_extraction["sheets"][0]["rows"][1]["cells"][0]["location"] == (
+        "sheet:Vocabulary/cell:A2"
+    )
+
+
+def test_word_ooxml_variants_use_the_same_local_parser(tmp_path: Path) -> None:
+    source = tmp_path / "template.docm"
+    document = Document()
+    document.add_heading("Unit One", level=1)
+    document.add_paragraph("Word content")
+    document.save(source)
+
+    evidence = parse_document(source, "docm")
+    inventory = preflight_document(source, "dotm").inventory
+
+    assert evidence.document_kind == "docm"
+    assert any(unit.text == "Word content" for unit in evidence.units)
+    assert inventory["package_part_uri"] == "/word/document.xml"
+
+
+def test_parse_legacy_word_requires_a_review_of_heuristically_recovered_text(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "lesson.doc"
+    source.write_bytes(b"legacy Word binary")
+    monkeypatch.setattr(document_parser, "_legacy_doc_text", lambda _source: ["Recovered text"])
+
+    evidence = parse_document(source, "doc")
+
+    assert evidence.document_kind == "doc"
+    assert [unit.text for unit in evidence.units] == ["Recovered text"]
+    assert evidence.issues[0].code == "legacy-word-review"
+    assert evidence.issues[0].locator.region == "document"
+
+
 def test_parse_empty_pdf_creates_a_locatable_required_check_issue(tmp_path: Path) -> None:
     source = tmp_path / "empty.pdf"
     _write_pdf(source, [[]])
@@ -128,6 +189,17 @@ def test_parse_empty_pdf_creates_a_locatable_required_check_issue(tmp_path: Path
     assert evidence.issues[0].code == "empty-page"
     assert evidence.issues[0].locator.page == 1
     assert evidence.issues[0].severity == "required-check"
+
+
+def test_pdf_preflight_records_only_pages_with_extractable_text(tmp_path: Path) -> None:
+    source = tmp_path / "mixed-pages.pdf"
+    _write_pdf(source, [["Page one"], [], ["Page three"]])
+
+    inventory = preflight_document(source, "pdf").inventory
+
+    assert inventory["page_count"] == 3
+    assert inventory["text_pages"] == 2
+    assert inventory["text_page_numbers"] == [1, 3]
 
 
 def test_parse_zero_page_pdf_uses_a_document_region_not_a_docx_locator(tmp_path: Path) -> None:

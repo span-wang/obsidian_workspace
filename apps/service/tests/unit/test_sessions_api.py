@@ -11,7 +11,6 @@ from application.policies import PolicyService
 from application.sessions import SessionService
 from application.vaults import VaultService
 from api.main import (
-    authorization_payload,
     create_app,
     session_citation_payload,
     session_completeness_result_payload,
@@ -19,17 +18,10 @@ from api.main import (
     session_deep_creation_result_payload,
     session_knowledge_organization_result_payload,
     session_retrieval_result_payload,
-    rerank_authorization_payload,
-    rerank_authorization_preview_payload,
 )
 from api.runtime import RuntimeState
 from domain.providers import Provider, ProviderModel, ProviderProbeResults, ProbeResult, ResolvedProviderModel
 from domain.indexing import BlockHit, IndexBlock, IndexedDocument, IndexHealth, LexicalQuery
-from domain.policies import OutboundAuthorization
-from domain.retrieval_rerank import (
-    RERANK_CONTENT_CATEGORIES,
-    RerankAuthorizationPreview,
-)
 from domain.sessions import (
     SessionCompletenessCoverageItem,
     SessionCompletenessResult,
@@ -92,51 +84,6 @@ def asgi_request(app, method: str, path: str, *, body: dict[str, object] | None 
     return response_start["status"], headers, response_body
 
 
-def asgi_stream_request(
-    app, method: str, path: str, *, body: dict[str, object], cookie: str
-):
-    target = urlsplit(path)
-    request_body = json.dumps(body).encode()
-    messages: list[dict[str, object]] = []
-    sent = False
-
-    async def receive() -> dict[str, object]:
-        nonlocal sent
-        if not sent:
-            sent = True
-            return {"type": "http.request", "body": request_body, "more_body": False}
-        await asyncio.Event().wait()
-        raise AssertionError("The stream receive task should be cancelled after completion.")
-
-    async def send(message: dict[str, object]) -> None:
-        messages.append(message)
-
-    asyncio.run(
-        app(
-            {
-                "type": "http",
-                "asgi": {"version": "3.0"},
-                "http_version": "1.1",
-                "method": method,
-                "scheme": "http",
-                "path": target.path,
-                "raw_path": target.path.encode(),
-                "query_string": target.query.encode(),
-                "headers": [(b"content-type", b"application/json"), (b"cookie", cookie.encode())],
-                "client": ("127.0.0.1", 10000),
-                "server": ("127.0.0.1", 6240),
-            },
-            receive,
-            send,
-        )
-    )
-    response_start = next(message for message in messages if message["type"] == "http.response.start")
-    response_body = b"".join(
-        message.get("body", b"") for message in messages if message["type"] == "http.response.body"
-    )
-    return response_start["status"], response_body
-
-
 def test_retrieval_payload_exposes_independent_source_groups_from_snapshot_vault() -> None:
     result = SessionRetrievalResult(
         "result-1", "session-1", "task-1", "snapshot-1", "completed", "本地证据。", None, 1, 0,
@@ -181,137 +128,24 @@ def test_retrieval_payload_exposes_independent_source_groups_from_snapshot_vault
     assert unavailable["source_groups"] == []
 
 
-def test_rerank_authorization_payloads_are_content_free() -> None:
-    preview = RerankAuthorizationPreview(
-        "vault-1",
-        "provider-1",
-        "Fixture Provider",
-        "chat-1",
-        "revision-1",
-        1,
-        2,
-        1,
-        321,
-        3,
-        1,
-        RERANK_CONTENT_CATEGORIES,
-        True,
-    )
-    authorization = OutboundAuthorization(
-        "authorization-1",
-        "vault-1",
-        1,
-        "provider-1",
-        "chat-1",
-        "rerank-source-lookup",
-        "rerank-source-lookup:" + "a" * 64,
-        "b" * 64,
-        "1 scoped item(s)",
-        None,
-        None,
-        "pending",
-        "now",
-        "now",
-    )
-
-    serialized_preview = rerank_authorization_preview_payload(preview)
-    serialized_authorization = rerank_authorization_payload(authorization)
-    serialized_generic_authorization = authorization_payload(authorization)
-    encoded = json.dumps(
-        {
-            "preview": serialized_preview,
-            "authorization": serialized_authorization,
-            "generic_authorization": serialized_generic_authorization,
-        }
-    )
-
-    assert serialized_preview["candidate_count"] == 2
-    assert serialized_preview["blocked_candidate_count"] == 3
-    assert serialized_authorization == {
-        "authorization_id": "authorization-1",
-        "status": "pending",
-    }
-    assert serialized_generic_authorization == serialized_authorization
-    for forbidden in (
-        "relative_path",
-        "source_path",
-        "candidateId",
-        "block_content_sha256",
-        "snapshot_digest",
-        "actual_scope_digest",
-        "rerank-source-lookup:",
-    ):
-        assert forbidden not in encoded
-
-
-def test_rerank_authorization_route_and_execute_routes_forward_the_opaque_id(tmp_path: Path) -> None:
-    authorization = OutboundAuthorization(
-        "authorization-1",
-        "vault-1",
-        1,
-        "provider-1",
-        "chat-1",
-        "rerank-source-lookup",
-        "rerank-source-lookup:" + "a" * 64,
-        "b" * 64,
-        "1 scoped item(s)",
-        None,
-        None,
-        "pending",
-        "now",
-        "now",
-    )
-    preview = RerankAuthorizationPreview(
-        "vault-1",
-        "provider-1",
-        "Fixture Provider",
-        "chat-1",
-        "revision-1",
-        1,
-        2,
-        1,
-        321,
-        0,
-        0,
-        RERANK_CONTENT_CATEGORIES,
-        True,
-    )
+def test_session_run_route_forwards_one_submission_without_a_staging_step(tmp_path: Path) -> None:
     result = SessionRetrievalResult(
-        "result-1",
-        "session-1",
-        "task-1",
-        "snapshot-1",
-        "no-evidence",
-        "No local evidence.",
-        None,
-        1,
-        0,
-        "now",
-        rerank_authorization_id=authorization.authorization_id,
-        rerank_status="authorization-invalid",
+        "result-1", "session-1", "task-1", "snapshot-1", "completed", "已生成回答。",
+        None, 1, 2, "now",
+        (
+            SessionRetrievalEvidence(
+                1, "native", "notes/unit.md", "a" * 64, None, None, None,
+                "Unit", "heading: Unit", None, "证据内容", 1.0, ("lexical",),
+            ),
+        ),
     )
 
     class Sessions:
         def __init__(self) -> None:
-            self.executions: list[tuple[str, str, str | None, bool]] = []
+            self.calls: list[tuple[str, str, dict[str, object]]] = []
 
-        @staticmethod
-        def prepare_rerank_authorization(session_id: str, task_id: str):
-            assert (session_id, task_id) == ("session-1", "task-1")
-            return preview, authorization
-
-        def execute_task(
-            self,
-            session_id: str,
-            task_id: str,
-            on_stream_chunk=None,
-            rerank_authorization_id: str | None = None,
-        ) -> SessionRetrievalResult:
-            self.executions.append(
-                (session_id, task_id, rerank_authorization_id, on_stream_chunk is not None)
-            )
-            if on_stream_chunk is not None:
-                on_stream_chunk(1, "streamed evidence")
+        def run_task(self, session_id: str, content: str, **kwargs) -> SessionRetrievalResult:
+            self.calls.append((session_id, content, kwargs))
             return result
 
         @staticmethod
@@ -320,9 +154,7 @@ def test_rerank_authorization_route_and_execute_routes_forward_the_opaque_id(tmp
             return SimpleNamespace(
                 task_snapshots=(
                     SimpleNamespace(
-                        snapshot_id="snapshot-1",
-                        vault_id="vault-1",
-                        status="prepared",
+                        snapshot_id="snapshot-1", vault_id="vault-1", status="completed",
                         invalidation_reason=None,
                     ),
                 )
@@ -335,44 +167,44 @@ def test_rerank_authorization_route_and_execute_routes_forward_the_opaque_id(tmp
     app.state.session_service = sessions
     _, root_headers, _ = asgi_request(app, "GET", "/")
     cookie = root_headers["set-cookie"].split(";", maxsplit=1)[0]
-
-    authorization_status, _, authorization_body = asgi_request(
-        app,
-        "POST",
-        "/api/sessions/session-1/tasks/task-1/rerank-authorizations",
-        body={},
-        cookie=cookie,
-    )
-    execute_status, _, execute_body = asgi_request(
-        app,
-        "POST",
-        "/api/sessions/session-1/tasks/task-1/execute",
-        body={"rerank_authorization_id": "authorization-1"},
-        cookie=cookie,
-    )
-    stream_status, stream_body = asgi_stream_request(
-        app,
-        "POST",
-        "/api/sessions/session-1/tasks/task-1/execute/stream",
-        body={"rerank_authorization_id": "authorization-2"},
-        cookie=cookie,
-    )
-
-    authorization_response = json.loads(authorization_body)
-    assert authorization_status == 200
-    assert authorization_response["authorization"] == {
-        "authorization_id": "authorization-1",
-        "status": "pending",
+    command = {
+        "vault_id": "vault-1",
+        "scope_kind": "directory",
+        "scope_path": "notes",
+        "provider_id": "provider-1",
+        "model_id": "chat-1",
+        "content": "定位证据",
+        "intent": "source-lookup",
     }
-    assert "snapshot_digest" not in authorization_body.decode()
-    assert execute_status == 200
-    assert json.loads(execute_body)["result"]["rerank_authorization_id"] == "authorization-1"
-    assert stream_status == 200
-    assert b"event: chunk" in stream_body
-    assert b"event: result" in stream_body
-    assert sessions.executions == [
-        ("session-1", "task-1", "authorization-1", False),
-        ("session-1", "task-1", "authorization-2", True),
+
+    denied_status, _, _ = asgi_request(
+        app, "POST", "/api/sessions/session-1/run", body=command
+    )
+    invalid_status, _, _ = asgi_request(
+        app, "POST", "/api/sessions/session-1/run", body={"content": "定位证据"}, cookie=cookie
+    )
+    status, _, body = asgi_request(
+        app, "POST", "/api/sessions/session-1/run", body=command, cookie=cookie
+    )
+
+    assert denied_status == 403
+    assert invalid_status == 422
+    assert status == 200
+    assert json.loads(body)["result"]["status"] == "completed"
+    assert sessions.calls == [
+        (
+            "session-1",
+            "定位证据",
+            {
+                "vault_id": "vault-1",
+                "scope_kind": "directory",
+                "scope_path": "notes",
+                "provider_id": "provider-1",
+                "model_id": "chat-1",
+                "intent": "source-lookup",
+                "query_scope": None,
+            },
+        )
     ]
 
 
@@ -466,8 +298,7 @@ def test_knowledge_organization_payload_binds_every_conclusion_to_section_eviden
                 SessionKnowledgeOrganizationConclusion(1, "词汇要点。", (1,)),
             ),
         ),),
-        structure_kind="outline", completed_ordinals=(1,), authorization_id="authorization-1",
-        authorization_status="approved",
+        structure_kind="outline", completed_ordinals=(1,),
     )
     snapshot = type("Snapshot", (), {
         "vault_id": "vault-1", "scope_kind": "directory", "scope_path": "notes/unit",
@@ -500,7 +331,6 @@ def test_deep_creation_payload_keeps_local_evidence_and_model_judgement_distinct
             1, "completed", 1, content="深度创作段落。",
             model_judgement="模型判断：本段保留了未解决的不确定性。",
         ),),
-        "authorization-1", "approved",
     )
     snapshot = type("Snapshot", (), {
         "vault_id": "vault-1", "scope_kind": "directory", "scope_path": "notes/unit",
@@ -776,6 +606,9 @@ def test_session_task_preview_and_confirmation_use_strict_private_snapshot_contr
             assert vault_id == vault.vault_id
             return self.current
 
+        def current_heading_scope_documents(self, vault_id: str) -> list:
+            return self.current_documents(vault_id)
+
         def search_lexical(self, vault_id: str, query: LexicalQuery) -> list[BlockHit]:
             assert vault_id == vault.vault_id
             return [
@@ -928,10 +761,6 @@ def test_session_task_preview_and_confirmation_use_strict_private_snapshot_contr
         f"/api/vaults/{vault.vault_id}/open?file=notes%2Funit.md",
         cookie=cookie,
     )
-    policy_service.set_outbound_mode(vault.vault_id, "ask-each-task")
-    stale_detail_status, _, stale_detail_body = asgi_request(
-        app, "GET", f"/api/sessions/{session_id}", cookie=cookie
-    )
     Providers.available = False
     unavailable_preview_status, _, unavailable_preview_body = asgi_request(
         app,
@@ -948,7 +777,7 @@ def test_session_task_preview_and_confirmation_use_strict_private_snapshot_contr
     preview = json.loads(preview_body)["preview"]
     assert preview["intent"] == "completeness"
     assert preview["intent_source"] == "auto"
-    assert preview["outbound_scope_summary"].startswith("尚未发送")
+    assert preview["outbound_scope_summary"] == "发送时仅提交本次允许外发的相关内容。"
     assert preview["query_scope"]["status"] == "recoverable"
     assert preview["query_scope"]["gaps"] == ["缺少学科。", "缺少册次。", "缺少单元。"]
     assert confirmed_preview_status == 200
@@ -957,14 +786,10 @@ def test_session_task_preview_and_confirmation_use_strict_private_snapshot_contr
     assert confirmed_scope["confidence"] == 1.0
     assert confirmed_scope["material_type"] == "textbook"
     assert confirmed_scope["gaps"] == ["确认范围内没有可用的内容块。"]
+    assert json.loads(confirmed_preview_body)["preview"]["is_ready"] is False
     assert indexes.last_scope_filter.material_type == "textbook"
-    assert confirmed_task_status == 200
-    assert json.loads(confirmed_task_body)["snapshot"]["query_scope"] == {
-        "subject": "英语",
-        "grade_volume": "七年级上册",
-        "unit_no": 1,
-        "material_type": "textbook",
-    }
+    assert confirmed_task_status == 400
+    assert "当前资料范围未找到匹配的标题内容" in confirmed_task_body.decode("utf-8")
     assert task_status == 200
     snapshot = json.loads(task_body)["snapshot"]
     assert snapshot["status"] == "prepared"
@@ -990,11 +815,6 @@ def test_session_task_preview_and_confirmation_use_strict_private_snapshot_contr
     assert execution["is_stale"] is False
     assert open_status == 307
     assert open_headers["location"] == "obsidian://open?vault=vault&file=notes/unit.md"
-    assert stale_detail_status == 200
-    stale_result = json.loads(stale_detail_body)["retrieval_results"][0]
-    assert stale_result["is_stale"] is True
-    assert stale_result["snapshot_status"] == "invalidated"
-    assert stale_result["invalidation_reason"]
     assert unavailable_preview_status == 200
     unavailable_preview = json.loads(unavailable_preview_body)["preview"]
     assert unavailable_preview["is_ready"] is False
@@ -1014,3 +834,33 @@ def test_default_session_service_receives_retrieval_runtime_switches(tmp_path: P
 
     assert app.state.session_service.lexical_retrieval_enabled is False
     assert app.state.session_service.hybrid_retrieval_enabled is True
+
+
+def test_retrieval_mode_route_switches_the_live_session_service_mode(tmp_path: Path) -> None:
+    app = create_app(
+        runtime=RuntimeState(data_directory=tmp_path / "app-data", sqlite_version="3.45.1")
+    )
+    _, root_headers, _ = asgi_request(app, "GET", "/")
+    cookie = root_headers["set-cookie"].split(";", maxsplit=1)[0]
+
+    denied_status, _, _ = asgi_request(app, "GET", "/api/retrieval/mode")
+    initial_status, _, initial_body = asgi_request(app, "GET", "/api/retrieval/mode", cookie=cookie)
+    semantic_status, _, semantic_body = asgi_request(
+        app, "POST", "/api/retrieval/mode", body={"mode": "semantic"}, cookie=cookie
+    )
+    hybrid_status, _, hybrid_body = asgi_request(
+        app, "POST", "/api/retrieval/mode", body={"mode": "hybrid"}, cookie=cookie
+    )
+    invalid_status, _, _ = asgi_request(
+        app, "POST", "/api/retrieval/mode", body={"mode": "unknown"}, cookie=cookie
+    )
+
+    assert denied_status == 403
+    assert initial_status == 200
+    assert json.loads(initial_body)["mode"] == "keyword"
+    assert semantic_status == 200
+    assert json.loads(semantic_body)["mode"] == "semantic"
+    assert hybrid_status == 200
+    assert json.loads(hybrid_body)["mode"] == "hybrid"
+    assert invalid_status == 422
+    assert app.state.session_service.get_retrieval_mode() == "hybrid"

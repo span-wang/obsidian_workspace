@@ -4,6 +4,12 @@
 
 已确认的技术选择：Embedding 走云端 OpenAI 兼容 Provider；元数据用「结构推断 + LLM 抽取」；汇总类任务按意图路由走全量枚举。检索栈由本方案给出推荐。
 
+## 对话呈现修订（2026-07-28）
+
+用户确认全部会话模式均以可直接使用的内容为优先：点查回答、知识整理、深度创作和完整性检查的主对话区不默认解释知识库、检索过程、证据、引用、文件位置或编号。检索与覆盖内容仍是模型生成和状态判断的内部依据，不得删除、放宽范围或绕过 `never-send-cloud`。
+
+每段关联内容在界面上可带一个可点击的应用证据角标。角标只用于定位右侧“应用证据”面板，且不应进入复制的正文；右侧保留用户可理解的文件、标题、页码、摘录、状态和现有打开入口。此交互修订取代本文中“每个条目在正文携带 `[证据 n]`”的展示要求，但不改变内部 citation、coverage、来源身份或可核验锚点合同。
+
 ---
 
 ## 零 审核结论（2026-07-25）
@@ -115,12 +121,11 @@ FTS5 我也实测了：沙箱 SQLite 3.37.2（比 `scripts/preflight.mjs:7` 要�
 
 **(b) 模型指纹绑定。** 向量必须记录 `embedding_profile_fingerprint`、`embedding_model_id` 与 `embedding_dimension`。endpoint、Provider 配置 revision、模型名或维度任一变化，旧向量都不可比较，必须按 vault 重建，不能混用。这一点要写进 `IndexHealth`：`domain/indexing.py:104` 已经声明了 `semantic_status` 字段，但 `adapters/sqlite_index_repository.py:346` 的 `health()` 把它硬编码成 `"unavailable"`——这个已存在的空壳字段正是 embedding 覆盖率的归宿，改造时填真值即可，无需改 API 契约。
 
-**(c) 出网授权的粒度问题——这是本方案最需要你决策的风险点。**
-现有出网管控是 `PolicyService.request_outbound_authorization`（`application/policies.py:162`），每个 scope 是一个 `OutboundScope(source_path, derived_path)`，且 `MAX_SCOPE_COUNT = 32`（`policies.py:33`，在 `_normalize_scopes` 第 317 行强制；注意第 181 行只在 `outbound_mode != "always-allow"` 时才启用该上限）。索引一册教材会产生数千个块、覆盖上百个文件路径——按现有模型逐块申请授权是不可行的。
+**(c) 默认出网与排除规则（2026-07-27 已确认）。** 已验证的 HTTPS Provider 默认允许出网，不再创建、确认或重验逐任务授权。Embedding、元数据、单元卡片、会话生成和启用后的 rerank 都直接执行；旧 SQLite 中的历史授权记录保留但运行时不读取或写入。
 
-建议：为索引阶段引入 `operation="index-embedding"` 的**批量授权**，scope 粒度提升到「vault 或目录」而非单文件，并在 `PolicyService` 里为该 operation 放开 `MAX_SCOPE_COUNT`。授权记录仍写入 `outbound_authorizations`，仍受 `policy_revision` 失效（`policies.py:288` 的 `_current_authorization` 在 revision 变更时把授权置为 `invalidated` 并抛 `OutboundAuthorizationDenied`），仍逐路径过 `preview(..., "outbound")` 排除检查。语义上诚实：告知用户「索引会把该范围内的正文分块发送到 Provider 计算向量」，一次授权覆盖整个索引批次。
+默认允许不放宽内容边界：每个候选仍须通过 `preview(..., "outbound")`。`never-send-cloud` 匹配源不得外发；`do-not-index` 与 `completely-ignore` 继续阻止对应处理。HTTPS、已验证 Provider/model、内容哈希、向量维度和 Provider 响应校验同样保持失败关闭。
 
-这是个实质性的隐私边界变化，需要你确认接受。替代方案是只对**个人整理的清单和标题/摘要层**做 embedding，教材正文只走 BM25——召回会弱一些，但出网面小得多。
+导入提交必须在当前块的向量完整持久化后才可完成。若 Provider、内容、规则或向量校验失败，恢复本次提交的文件与索引并返回可重试状态，不保留部分完成提交。
 
 ### 元数据：结构推断 + LLM 抽取（已确认）
 
@@ -307,7 +312,7 @@ def filter_blocks(self, vault_id: str, filters: BlockFilter) -> list[IndexBlockR
 
 置信度 < 0.75 或产生新 concept_key 时置 `meta_status = "required-check"`，进现有审核队列——这与 `domain/metadata_tags.py:292` 的 `suggest_metadata_tags` 已有逻辑（`"required-check" if is_new or confidence < 0.75 else "pending"`）一致，直接沿用同一门槛。
 
-注意：这一层同样要出网。授权 operation 用 `"index-metadata"`，与 embedding 分开申请，方便你只开一个。
+注意：这一层同样要出网。已验证的 HTTPS Provider 默认允许执行，但每个来源仍受 `never-send-cloud` 等排除规则约束。
 
 ### 元数据不足时的行为
 
@@ -428,7 +433,7 @@ rerank 放在最后且只对点查型生效。枚举型绝不 rerank——rerank
 
 **阶段 RET-06：Embedding 与混合检索**
 
-前置闸门：用户确认出网授权边界；Provider 指纹合同完成；Windows float32 benchmark 通过。
+前置闸门：已确认默认允许已验证 HTTPS Provider 出网，同时保留排除规则；Provider 指纹合同完成；Windows float32 benchmark 通过。
 
 产物：批量 Embedding 客户端、缓存、向量持久化、按 vault/profile 的 float32 内存矩阵与失效机制、`search_vector`、三路独立召回和 RRF。
 
@@ -460,7 +465,7 @@ rerank 放在最后且只对点查型生效。枚举型绝不 rerank——rerank
 
 **D-001 Graph 生命周期（技术默认：索引侧耐久投影）。** 不让索引依赖 import task 数据库；提交时复制检索所需的不可变投影。该建议解除 RET-01 的架构歧义，开发前只需确认保留期限与删除语义。
 
-**D-002 出网粒度（已确认）。** Embedding 按 vault/目录批次、冻结范围和显式确认执行；点查语义查询只发送用户问题，默认不发送 vault 正文。source-lookup rerank 是独立 operation：仅在逐任务授权、内容哈希和 Provider revision 重验后，才向独立的 HTTPS rerank 模型发送查询和候选块文本；默认开关保持关闭。RET-09 的真实测量仅发送固定路径和内容哈希均已校验的版本化、不可逆脱敏 fixture，必须单独给出已验证 rerank Provider/model；用户已决定不做价格或费用预算，费用明确标记为未计算，不改变生产默认开关。
+**D-002 出网粒度（2026-07-27 已更新）。** 已验证的 HTTPS Provider 默认允许出网，删除 Embedding、元数据、单元卡片、会话生成和 rerank 的逐任务授权与确认。点查与生成仅发送本次检索到且通过 outbound policy 的证据；`never-send-cloud` 一律不外发，`do-not-index` 与 `completely-ignore` 继续生效。source-lookup rerank 仍是独立 operation，默认开关保持关闭；启用后仅向独立、已验证的 HTTPS rerank 模型发送通过规则过滤的查询和候选块文本，并继续执行内容哈希、响应格式、并发和失败回退校验。旧 SQLite 历史授权记录不删除，但运行时不读取或写入。
 
 **D-003 目录规则（默认：适配真实资料，不强制迁移目录）。** RET-00 收集真实目录样本，规则由测试夹具驱动；推荐目录只作为新资料建议，不把重命名现有 vault 作为检索改造前置条件。
 

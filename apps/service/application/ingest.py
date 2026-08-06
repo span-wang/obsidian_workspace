@@ -14,9 +14,11 @@ from domain.derived_notes import (
     merge_adjacent_notes,
     native_markdown_proposal,
     proposal_from_dict,
+    render_document_graph,
     relocate_derived_proposal,
     relocate_native_proposal,
     split_note_at_unit,
+    structure_graph_markdown_proposal,
 )
 from domain.classification import (
     ClassificationSuggestion,
@@ -57,6 +59,8 @@ from domain.evidence import (
     StructuredContentUnit,
 )
 from domain.graph_projection import DurableGraphProjection
+from domain.embedding_batches import EmbeddingBatchScope
+from application.markdown_structuring import MarkdownStructuringError
 from domain.review_commits import (
     CommitBackup,
     CommitFile,
@@ -73,6 +77,7 @@ from domain.tasks import ImportTask, ImportTaskCounts, ImportTaskItem, new_impor
 from ports.source_repository import SourceRepository
 from ports.task_repository import TaskRepository
 from ports.task_worker import TaskWorker
+from ports.import_upload_store import ImportUploadStore
 from ports.vault_committer import VaultCommitError, VaultCommitter, VaultWrite
 from workers.converters.profiles import ConverterProfile, require_profile
 from workers.converters.artifact_store import PrivateArtifactStore
@@ -80,6 +85,23 @@ from workers.converters.artifact_store import PrivateArtifactStore
 
 class ImportTaskError(ValueError):
     """Raised when an import task command cannot be completed safely."""
+
+
+_CONVERSION_DOCUMENT_KINDS = frozenset({"pdf", "docx"})
+_DIRECT_PARSE_DOCUMENT_KINDS = frozenset(
+    {
+        "doc",
+        "docm",
+        "dotx",
+        "dotm",
+        "xls",
+        "xlsx",
+        "xlsm",
+        "xltx",
+        "xltm",
+    }
+)
+_PARSE_DOCUMENT_KINDS = _CONVERSION_DOCUMENT_KINDS | _DIRECT_PARSE_DOCUMENT_KINDS
 
 
 class ImportTaskService:
@@ -92,8 +114,11 @@ class ImportTaskService:
         source_repository: SourceRepository | None = None,
         vault_committer: VaultCommitter | None = None,
         index_service=None,
+        embedding_service=None,
+        markdown_structuring_service=None,
         converter_profile: ConverterProfile | Mapping[str, ConverterProfile] | None = None,
         artifact_store: PrivateArtifactStore | None = None,
+        upload_store: ImportUploadStore | None = None,
     ) -> None:
         self.vault_service = vault_service
         self.repository = repository
@@ -102,8 +127,11 @@ class ImportTaskService:
         self.source_repository = source_repository
         self.vault_committer = vault_committer
         self.index_service = index_service
+        self.embedding_service = embedding_service
+        self.markdown_structuring_service = markdown_structuring_service
         self.converter_profile = converter_profile
         self.artifact_store = artifact_store
+        self.upload_store = upload_store
         self._state_lock = threading.RLock()
 
     def create(self, vault_id: str, selection: ImportSelection) -> ImportTask:
@@ -179,6 +207,15 @@ class ImportTaskService:
             if self.artifact_store is not None:
                 self.artifact_store.remove_task(task.task_id)
             self.repository.delete(task_id)
+            if self.upload_store is not None:
+                referenced_paths = {
+                    path.absolute()
+                    for candidate in self.repository.list()
+                    for path in candidate.source_paths
+                }
+                self.upload_store.cleanup_paths(
+                    tuple(path for path in task.source_paths if path.absolute() not in referenced_paths)
+                )
 
     def start_parsing(self, task_id: str) -> ImportTask:
         with self._state_lock:
@@ -187,7 +224,7 @@ class ImportTaskService:
             if task.lifecycle != "queued" or task.phase != "waiting-for-next-stage":
                 raise ImportTaskError("Only a completed scan waiting for parsing can be started.")
             if not any(self._is_parse_candidate(item) for item in self.repository.list_items(task_id)):
-                raise ImportTaskError("This task has no verified PDF or DOCX documents available for parsing.")
+                raise ImportTaskError("This task has no verified Word, Excel, PDF, or DOCX documents available for parsing.")
             starting = replace(
                 task,
                 lifecycle="running",
@@ -263,6 +300,8 @@ class ImportTaskService:
                 )
                 self.repository.save(restarting, "derivation-restarted")
                 return self._start_derivation(restarting)
+            if "retry-commit" in task.recovery_actions:
+                return self._finish_automatically(task, "automatic-commit-retried")
             if task.lifecycle not in {"recoverable", "failed"}:
                 raise ImportTaskError("This import task does not have a safe recovery action.")
             restarted = replace(
@@ -331,7 +370,13 @@ class ImportTaskService:
                     )
                     self.repository.save(completed, "scan-completed")
                     return
-                if getattr(self.worker, "start_conversion", None) is not None:
+                if (
+                    getattr(self.worker, "start_conversion", None) is not None
+                    and any(
+                        self._is_conversion_candidate(item)
+                        for item in self.repository.list_items(task_id)
+                    )
+                ):
                     self._start_conversion(task)
                 else:
                     self._start_parsing(task)
@@ -378,7 +423,7 @@ class ImportTaskService:
                 )
                 return
             if event_type == "conversion-completed":
-                self._start_derivation(self.get(task_id))
+                self._start_parsing(self.get(task_id))
                 return
             if event_type == "conversion-cancelled":
                 self.repository.save(
@@ -394,7 +439,7 @@ class ImportTaskService:
                 )
                 return
             if event_type == "conversion-failed":
-                self._finish_waiting_for_review(self.get(task_id), "conversion-failed")
+                self._finish_automatically(self.get(task_id), "conversion-failed")
                 return
             if event_type == "parse-failed-item":
                 locator_summary = event.get("locator_summary")
@@ -568,6 +613,8 @@ class ImportTaskService:
         for item in self.repository.list_items(task.task_id):
             if not self._is_parse_candidate(item, retry_failed=retry_failed):
                 continue
+            if self.repository.get_conversion_evidence(item.item_id) is not None:
+                continue
             existing = self.repository.find_parse_evidence(
                 task.vault_id, str(item.source_id), str(item.content_sha256)
             )
@@ -580,9 +627,12 @@ class ImportTaskService:
                 candidates.append(item)
         if not candidates:
             current = self.get(task.task_id)
-            if current.counts.parsed:
+            if current.counts.parsed or any(
+                self.repository.get_conversion_evidence(item.item_id) is not None
+                for item in self.repository.list_items(task.task_id)
+            ):
                 return self._start_derivation(current)
-            return self._finish_waiting_for_review(current, "scan-completed")
+            return self._finish_automatically(current, "scan-completed")
         running = replace(
             self.get(task.task_id),
             lifecycle="running",
@@ -615,16 +665,18 @@ class ImportTaskService:
     ) -> ImportTask:
         if candidates is None:
             candidates = tuple(
-                item for item in self.repository.list_items(task.task_id) if self._is_parse_candidate(item)
+                item
+                for item in self.repository.list_items(task.task_id)
+                if self._is_conversion_candidate(item)
             )
         else:
             candidates = tuple(
                 item
                 for item in candidates
-                if item.task_id == task.task_id and self._is_parse_candidate(item)
+                if item.task_id == task.task_id and self._is_conversion_candidate(item)
             )
         if not candidates:
-            return self._finish_waiting_for_review(task, "conversion-not-required")
+            return self._finish_automatically(task, "conversion-not-required")
         eligible: list[ImportTaskItem] = []
         for item in candidates:
             engine = "mineru" if item.document_kind == "pdf" else "pandoc"
@@ -636,10 +688,16 @@ class ImportTaskService:
                 continue
             eligible.append(item)
         if not eligible:
-            return self._finish_waiting_for_review(self.get(task.task_id), "conversion-profile-rejected")
+            current = self.get(task.task_id)
+            if any(
+                item.document_kind in _DIRECT_PARSE_DOCUMENT_KINDS
+                for item in self.repository.list_items(task.task_id)
+            ):
+                return self._start_parsing(current)
+            return self._finish_automatically(current, "conversion-profile-rejected")
         start_conversion = getattr(self.worker, "start_conversion", None)
         if start_conversion is None:
-            return self._finish_waiting_for_review(task, "conversion-worker-unavailable")
+            return self._finish_automatically(task, "conversion-worker-unavailable")
         running = replace(
             self.get(task.task_id),
             lifecycle="running",
@@ -752,6 +810,29 @@ class ImportTaskService:
             self._record_source_change(task, item_id)
             return
         proposal = proposal_from_dict(dict(event["proposal"]))
+        if isinstance(proposal, DerivedMarkdownProposal) and proposal.graph_id is not None:
+            conversion = self.repository.get_conversion_evidence(item_id)
+            if conversion is None:
+                self._record_markdown_structure_failure(
+                    task, item_id, "The selected conversion graph is unavailable."
+                )
+                return
+            if not self._markdown_outbound_allowed(task, proposal.source_relative_path):
+                self._record_markdown_outbound_failure(task, item_id)
+                return
+            if self.markdown_structuring_service is not None:
+                try:
+                    provider_markdown = self.markdown_structuring_service.structure(
+                        render_document_graph(conversion.graph).markdown
+                    )
+                    proposal = structure_graph_markdown_proposal(
+                        proposal,
+                        graph=conversion.graph,
+                        provider_markdown=provider_markdown,
+                    )
+                except (MarkdownStructuringError, ValueError) as error:
+                    self._record_markdown_structure_failure(task, item_id, str(error))
+                    return
         existing = self.repository.get_note_proposal(item_id)
         if isinstance(proposal, DerivedMarkdownProposal) and isinstance(existing, DerivedMarkdownProposal):
             proposal = replace(proposal, revision=existing.revision + 1)
@@ -901,13 +982,13 @@ class ImportTaskService:
     def _start_derivation(self, task: ImportTask) -> ImportTask:
         start_derivation = getattr(self.worker, "start_derivation", None)
         if start_derivation is None:
-            return self._finish_waiting_for_review(task, "derivation-skipped")
+            return self._finish_automatically(task, "derivation-skipped")
         vault = self._available_vault(task.vault_id)
         inputs: list[dict[str, object]] = []
         for item in self.repository.list_items(task.task_id):
-            if not self._is_derivation_candidate(item):
-                conversion = self.repository.get_conversion_evidence(item.item_id)
-                if conversion is None or conversion.graph.has_blocking_unresolved_content():
+            conversion = self.repository.get_conversion_evidence(item.item_id)
+            if conversion is not None:
+                if conversion.graph.has_blocking_unresolved_content():
                     continue
                 if not self._source_matches_scanned_content(item):
                     self._record_source_change(task, item.item_id)
@@ -925,6 +1006,8 @@ class ImportTaskService:
                         "evidence": conversion.to_dict(),
                     }
                 )
+                continue
+            if not self._is_derivation_candidate(item):
                 continue
             if not self._source_matches_scanned_content(item):
                 self._record_source_change(task, item.item_id)
@@ -958,7 +1041,7 @@ class ImportTaskService:
                 }
             )
         if not inputs:
-            return self._finish_waiting_for_review(task, "derivation-completed")
+            return self._finish_automatically(task, "derivation-completed")
         running = replace(
             self.get(task.task_id),
             lifecycle="running",
@@ -989,7 +1072,7 @@ class ImportTaskService:
         task = self.get(task_id)
         if task.lifecycle != "running":
             return task
-        return self._finish_waiting_for_review(task, "derivation-completed")
+        return self._finish_automatically(task, "derivation-completed")
 
     def _evidence_with_ocr_corrections(self, item_id: int, evidence: ParseEvidence) -> ParseEvidence:
         corrections = self.repository.get_ocr_corrections(item_id)
@@ -1024,61 +1107,67 @@ class ImportTaskService:
                 return index
         return len(units)
 
-    def _finish_waiting_for_review(self, task: ImportTask, event_type: str) -> ImportTask:
+    def _finish_automatically(self, task: ImportTask, event_type: str) -> ImportTask:
         if not self._generate_native_proposals(task):
             return self.get(task.task_id)
         current = self.get(task.task_id)
-        has_conversion_required_check = any(
-            item.conversion_status == "rejected" for item in self.repository.list_items(current.task_id)
+        blockers, recovery_actions = self._automatic_blockers(current)
+        if blockers:
+            self.repository.save(
+                replace(
+                    current,
+                    lifecycle="recoverable",
+                    phase="failed",
+                    current_item_label=None,
+                    recovery_actions=recovery_actions,
+                    failure_reason="; ".join(blockers),
+                    updated_at=utc_now(),
+                ),
+                "automatic-pipeline-blocked",
+            )
+            return self.get(task.task_id)
+
+        self.repository.save(
+            replace(current, current_item_label=None, updated_at=utc_now()),
+            event_type,
         )
-        has_selected_conversion = any(
-            item.conversion_status == "selected" for item in self.repository.list_items(current.task_id)
-        )
-        proposals = self.repository.list_note_proposals(current.task_id)
+        current = self.get(task.task_id)
+
+        # These three pipelines are task-private observations. They intentionally do not
+        # participate in planning, rendering, indexing, or committing the Vault files.
+        self._ensure_classification_suggestions(current)
+        self._ensure_metadata_tag_proposals(current)
+        self._ensure_candidate_link_proposals(current)
+        return self.commit_automatically(current.task_id)
+
+    def _automatic_blockers(self, task: ImportTask) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        blockers: list[str] = []
         recovery_actions: list[str] = []
-        if current.counts.parse_failed:
+        if task.counts.parse_failed:
+            blockers.append("One or more documents could not be parsed.")
             recovery_actions.append("restart-parse")
-        if current.counts.ocr_failed:
+        if task.counts.ocr_failed:
+            blockers.append("One or more OCR targets could not be processed.")
             recovery_actions.append("restart-ocr")
-        completed = replace(
-            current,
-            lifecycle=(
-                "waiting-for-review"
-                if (
-                    current.counts.parsed
-                    or proposals
-                    or current.counts.parse_failed
-                    or current.counts.ocr_failed
-                    or has_conversion_required_check
-                    or has_selected_conversion
-                )
-                else "queued"
-            ),
-            phase=(
-                "waiting-for-review"
-                if (
-                    current.counts.parsed
-                    or proposals
-                    or current.counts.parse_failed
-                    or current.counts.ocr_failed
-                    or has_conversion_required_check
-                    or has_selected_conversion
-                )
-                else "waiting-for-next-stage"
-            ),
-            current_item_label=None,
-            recovery_actions=tuple(recovery_actions),
-            failure_reason=None,
-            updated_at=utc_now(),
-        )
-        self.repository.save(completed, event_type)
-        if completed.lifecycle == "waiting-for-review":
-            self._ensure_classification_suggestions(completed)
-            self._ensure_metadata_tag_proposals(completed)
-            self._ensure_candidate_link_proposals(completed)
-            initial_snapshot = self._build_review_snapshot(self.get(task.task_id))
-            self.repository.record_review_snapshot(initial_snapshot, "review-snapshot-created")
-        return self.get(task.task_id)
+        if any(
+            item.conversion_status == "rejected"
+            for item in self.repository.list_items(task.task_id)
+        ):
+            blockers.append("No local converter produced a complete document graph.")
+            recovery_actions.append("restart-conversion")
+        proposals = {proposal.item_id for proposal in self.repository.list_note_proposals(task.task_id)}
+        incomplete = [
+            item.label
+            for item in self.repository.list_items(task.task_id)
+            if item.category == "supported"
+            and item.identity_status in {"new", "duplicate"}
+            and item.document_kind in {"markdown", *_PARSE_DOCUMENT_KINDS}
+            and item.item_id not in proposals
+        ]
+        if incomplete:
+            blockers.append("A supported document has no verified Markdown proposal.")
+            recovery_actions.append("restart-derivation")
+        return tuple(blockers), tuple(dict.fromkeys(recovery_actions))
 
     def _generate_native_proposals(self, task: ImportTask) -> bool:
         vault = self._available_vault(task.vault_id)
@@ -1105,6 +1194,16 @@ class ImportTaskService:
             except OSError:
                 self._record_source_change(task, item.item_id)
                 return False
+            if not self._markdown_outbound_allowed(task, relative_path):
+                self._record_markdown_outbound_failure(task, item.item_id)
+                return False
+            provider_markdown = markdown
+            if self.markdown_structuring_service is not None:
+                try:
+                    provider_markdown = self.markdown_structuring_service.structure(markdown)
+                except MarkdownStructuringError as error:
+                    self._record_markdown_structure_failure(task, item.item_id, str(error))
+                    return False
             self.repository.record_note_proposal(
                 item.item_id,
                 native_markdown_proposal(
@@ -1112,7 +1211,7 @@ class ImportTaskService:
                     vault_id=task.vault_id,
                     relative_path=relative_path,
                     content_sha256=item.content_sha256,
-                    markdown=markdown,
+                    markdown=provider_markdown,
                 ),
             )
         return True
@@ -1137,9 +1236,51 @@ class ImportTaskService:
             "native-markdown-invalid",
         )
 
+    def _record_markdown_structure_failure(
+        self, task: ImportTask, item_id: int, reason: str
+    ) -> None:
+        self.repository.record_parse_failure(
+            item_id,
+            "Markdown structuring could not be completed safely.",
+            "provider",
+        )
+        current = self.get(task.task_id)
+        self.repository.save(
+            replace(
+                current,
+                lifecycle="recoverable",
+                phase="failed",
+                current_item_label=None,
+                recovery_actions=("restart-derivation",),
+                failure_reason=f"Markdown structuring failed: {reason[:200]}",
+                updated_at=utc_now(),
+            ),
+            "markdown-structure-failed",
+        )
+
+    def _record_markdown_outbound_failure(self, task: ImportTask, item_id: int) -> None:
+        self.repository.record_parse_failure(
+            item_id,
+            "Markdown structuring is blocked by the vault outbound policy.",
+            "outbound-policy",
+        )
+        current = self.get(task.task_id)
+        self.repository.save(
+            replace(
+                current,
+                lifecycle="recoverable",
+                phase="failed",
+                current_item_label=None,
+                recovery_actions=("restart-derivation",),
+                failure_reason="Markdown structuring is blocked by the vault outbound policy.",
+                updated_at=utc_now(),
+            ),
+            "markdown-outbound-blocked",
+        )
+
     def _ensure_classification_suggestions(self, task: ImportTask) -> None:
-        if task.lifecycle != "waiting-for-review":
-            return
+        # Classification is persisted for private inspection only; its target is never
+        # used to choose a Vault write path in the automatic import pipeline.
         vault = self._available_vault(task.vault_id)
         for proposal in self.repository.list_note_proposals(task.task_id):
             existing = self.repository.get_classification_suggestion(proposal.item_id)
@@ -1167,8 +1308,8 @@ class ImportTaskService:
             )
 
     def _ensure_metadata_tag_proposals(self, task: ImportTask) -> None:
-        if task.lifecycle != "waiting-for-review":
-            return
+        # Metadata/tag generation remains independent of classification decisions and
+        # never modifies the Markdown being committed by this task.
         vault = self._available_vault(task.vault_id)
         classifications = {
             suggestion.item_id: suggestion
@@ -1215,8 +1356,8 @@ class ImportTaskService:
             )
 
     def _ensure_candidate_link_proposals(self, task: ImportTask) -> None:
-        if task.lifecycle != "waiting-for-review":
-            return
+        # Candidate links are private evidence records. They are not appended to notes
+        # and cannot block, select, or alter an automatic Vault commit.
         proposals = tuple(self.repository.list_note_proposals(task.task_id))
         existing = {
             proposal.review_item_id: proposal
@@ -1246,6 +1387,14 @@ class ImportTaskService:
         if task.lifecycle == "recoverable" and "retry-commit" in task.recovery_actions:
             return
         raise ImportTaskError("Commit review needs a task waiting for review or retrying a failed commit.")
+
+    @staticmethod
+    def _require_automatic_commit_task(task: ImportTask) -> None:
+        if task.lifecycle == "running":
+            return
+        if task.lifecycle == "recoverable" and "retry-commit" in task.recovery_actions:
+            return
+        raise ImportTaskError("Automatic commit needs a running task or a failed commit retry.")
 
     def _classification_context(
         self, task_id: str, item_id: int
@@ -1504,44 +1653,36 @@ class ImportTaskService:
         except ValueError as error:
             raise ImportTaskError("The conversion review item has an invalid graph issue target.") from error
 
-    def commit_review(self, task_id: str, unit_ids: tuple[str, ...] | None = None) -> ImportTask:
+    def commit_automatically(self, task_id: str) -> ImportTask:
         with self._state_lock:
             task = self.get(task_id)
-            self._require_commit_review_task(task)
+            self._require_automatic_commit_task(task)
             vault = self._available_vault(task.vault_id)
             if self.vault_committer is None:
-                raise ImportTaskError("Vault commit service is unavailable.")
-            snapshot = self.repository.get_review_snapshot(task_id)
-            if snapshot is None:
-                raise ImportTaskError("Create an audit snapshot before committing.")
-            current_snapshot = self._build_review_snapshot(task)
-            stale_reasons = snapshot_stale_reasons(snapshot, current_snapshot)
-            if stale_reasons:
-                stale_snapshot = replace(current_snapshot, stale_reasons=stale_reasons)
-                self.repository.record_review_snapshot(stale_snapshot, "review-snapshot-stale")
-                raise ImportTaskError("; ".join(stale_reasons))
-            if snapshot.stale_reasons:
-                raise ImportTaskError("Refresh the stale review snapshot before committing.")
+                self.repository.save(
+                    replace(
+                        task,
+                        lifecycle="recoverable",
+                        phase="failed",
+                        current_item_label=None,
+                        recovery_actions=("retry-commit",),
+                        failure_reason="Vault commit service is unavailable.",
+                        updated_at=utc_now(),
+                    ),
+                    "commit-service-unavailable",
+                )
+                return self.get(task_id)
+            # The legacy ReviewSnapshot type is an immutable commit-plan carrier here.
+            # It is no longer persisted or exposed as an import-review checkpoint.
+            plan = self._build_review_snapshot(task)
             journals = self.repository.list_commit_journals(task_id)
-            committed_unit_ids = {
-                journal.unit_id for journal in journals if journal.status == "committed"
-            }
-            requested = set(unit_ids or ())
-            unknown = requested - {unit.unit_id for unit in snapshot.units}
-            if unknown:
-                raise ImportTaskError("A selected commit unit does not belong to this review snapshot.")
+            committed_unit_ids = self._committed_unit_ids(journals)
             selected = tuple(
                 unit
-                for unit in snapshot.units
+                for unit in plan.units
                 if unit.unit_id not in committed_unit_ids
-                and (unit.unit_id in requested if unit_ids is not None else snapshot.commit_eligibility(unit.unit_id) is None)
+                and unit.kind in {"source", "existing-note"}
             )
-            if not selected:
-                raise ImportTaskError("No fully reviewed commit units are available to submit.")
-            for unit in selected:
-                eligibility = snapshot.commit_eligibility(unit.unit_id)
-                if eligibility:
-                    raise ImportTaskError(f"{unit.source_label}: {eligibility}")
             prepared_work: list[
                 tuple[CommitUnit, tuple[VaultWrite, ...], tuple[CommitBackup, ...], DurableGraphProjection | None]
             ] = []
@@ -1557,8 +1698,20 @@ class ImportTaskService:
                         None if unit.kind == "existing-note" else vault.managed_root_relative_path,
                     )
                 except (ImportTaskError, VaultCommitError, OSError) as error:
-                    self._record_stale_snapshot(task, snapshot, str(error))
-                    raise ImportTaskError(str(error)) from error
+                    current = self.get(task_id)
+                    if current.lifecycle == "recoverable":
+                        return current
+                    failed = replace(
+                        current,
+                        lifecycle="recoverable",
+                        phase="failed",
+                        current_item_label=None,
+                        recovery_actions=("retry-commit",),
+                        failure_reason=str(error),
+                        updated_at=utc_now(),
+                    )
+                    self.repository.save(failed, "commit-preparation-failed")
+                    return self.get(task_id)
                 prepared_work.append((unit, writes, backups, projection))
             committing_task = replace(
                 task,
@@ -1571,14 +1724,13 @@ class ImportTaskService:
             )
             self.repository.save(committing_task, "commit-started")
             failures: list[str] = []
-            committed = 0
-            stale_failure_reason: str | None = None
+            committed_journals: list[CommitJournal] = []
             for unit, writes, backups, projection in prepared_work:
                 prepared = CommitJournal(
                     task_id=task.task_id,
                     vault_id=task.vault_id,
                     unit_id=unit.unit_id,
-                    snapshot_digest=snapshot.digest,
+                    snapshot_digest=plan.digest,
                     unit=unit,
                     status="prepared",
                     created_at=utc_now(),
@@ -1594,6 +1746,9 @@ class ImportTaskService:
                         )
                     if projection is not None:
                         self._index_committed_projection_unit(task_id, vault, unit, projection)
+                    elif self.index_service is not None:
+                        self._index_committed_unit(task_id, vault, unit)
+                    self._embed_committed_unit(task_id, vault, unit)
                 except Exception as error:
                     recovery_error = self._restore_commit_backups(
                         vault.path,
@@ -1601,43 +1756,30 @@ class ImportTaskService:
                         None if unit.kind == "existing-note" else vault.managed_root_relative_path,
                     )
                     reason = str(error) if recovery_error is None else f"{error}; recovery failed: {recovery_error}"
+                    terminal_failure = isinstance(error, (ImportTaskError, VaultCommitError))
+                    if terminal_failure:
+                        rollback_error = self._rollback_committed_units(
+                            vault,
+                            committed_journals,
+                            f"Rolled back because {unit.source_label} could not be submitted.",
+                        )
+                        if rollback_error is not None:
+                            reason = f"{reason}; committed-unit recovery failed: {rollback_error}"
+                    if recovery_error is None and self.index_service is not None:
+                        try:
+                            self.index_service.reconcile(vault.vault_id)
+                        except Exception as reconcile_error:
+                            reason = f"{reason}; index recovery failed: {reconcile_error}"
                     failed = replace(prepared, status="failed", created_at=utc_now(), reason=reason)
                     self.repository.record_commit_journal(failed, "commit-unit-failed")
                     failures.append(f"{unit.source_label}: {reason}")
-                    if isinstance(error, (ImportTaskError, VaultCommitError)):
-                        stale_failure_reason = str(error)
+                    if terminal_failure:
                         break
                     continue
-                committed += 1
                 completed = replace(prepared, status="committed", created_at=utc_now())
                 self.repository.record_commit_journal(completed, "commit-unit-committed")
-                if self.index_service is not None and projection is None:
-                    indexing_task = replace(
-                        self.get(task_id),
-                        lifecycle="running",
-                        phase="indexing",
-                        current_item_label=unit.source_label,
-                        updated_at=utc_now(),
-                    )
-                    self.repository.save(indexing_task, "indexing-started")
-                    try:
-                        self.index_service.index_committed_unit(vault, unit)
-                    except Exception as error:
-                        report_failure = getattr(self.index_service, "report_failure", None)
-                        if report_failure is not None:
-                            try:
-                                report_failure(vault.vault_id, "committed-unit", error)
-                            except Exception:
-                                pass
-                        self.repository.save(self.get(task_id), "indexing-failed")
-                    else:
-                        self.repository.save(self.get(task_id), "indexing-completed")
+                committed_journals.append(completed)
             current = self.get(task_id)
-            if stale_failure_reason:
-                refreshed = self._record_stale_snapshot(current, snapshot, stale_failure_reason)
-            else:
-                refreshed = snapshot
-                self.repository.record_review_snapshot(refreshed, "review-snapshot-created")
             if failures:
                 failed_task = replace(
                     current,
@@ -1651,22 +1793,22 @@ class ImportTaskService:
                 self.repository.save(failed_task, "commit-partial-failed")
                 return self.get(task_id)
             final_journals = self.repository.list_commit_journals(task_id)
-            final_committed = {journal.unit_id for journal in final_journals if journal.status == "committed"}
-            if any(unit.unit_id not in final_committed for unit in refreshed.units):
-                waiting = replace(
+            final_committed = self._committed_unit_ids(final_journals)
+            if any(unit.unit_id not in final_committed for unit in plan.units if unit.kind in {"source", "existing-note"}):
+                failed = replace(
                     current,
-                    lifecycle="waiting-for-review",
-                    phase="waiting-for-review",
+                    lifecycle="recoverable",
+                    phase="failed",
                     current_item_label=None,
-                    recovery_actions=(),
-                    failure_reason=None,
+                    recovery_actions=("retry-commit",),
+                    failure_reason="One or more automatic commit units were not completed.",
                     updated_at=utc_now(),
                 )
-                self.repository.save(waiting, "commit-partial-completed")
+                self.repository.save(failed, "commit-partial-failed")
                 return self.get(task_id)
             lifecycle = (
                 "completed-with-confirmed-gaps"
-                if any(unit.confirmed_gaps for unit in refreshed.units)
+                if any(unit.confirmed_gaps for unit in plan.units)
                 else "complete"
             )
             phase = lifecycle
@@ -1708,6 +1850,39 @@ class ImportTaskService:
             return str(error)
         return None
 
+    @staticmethod
+    def _committed_unit_ids(journals: list[CommitJournal]) -> set[str]:
+        latest_by_unit = {journal.unit_id: journal for journal in journals}
+        return {
+            unit_id
+            for unit_id, journal in latest_by_unit.items()
+            if journal.status == "committed"
+        }
+
+    def _rollback_committed_units(
+        self, vault, journals: list[CommitJournal], reason: str
+    ) -> str | None:
+        errors: list[str] = []
+        for journal in reversed(journals):
+            recovery_error = self._restore_commit_backups(
+                vault.path,
+                journal.backups,
+                None
+                if journal.unit.kind == "existing-note"
+                else vault.managed_root_relative_path,
+            )
+            if recovery_error is not None:
+                errors.append(f"{journal.unit.source_label}: {recovery_error}")
+                continue
+            rolled_back = replace(
+                journal,
+                status="rolled-back",
+                created_at=utc_now(),
+                reason=reason,
+            )
+            self.repository.record_commit_journal(rolled_back, "commit-unit-rolled-back")
+        return "; ".join(errors) if errors else None
+
     def _index_committed_projection_unit(
         self, task_id: str, vault, unit: CommitUnit, projection: DurableGraphProjection
     ) -> None:
@@ -1732,6 +1907,46 @@ class ImportTaskService:
             raise
         self.repository.save(self.get(task_id), "indexing-completed")
 
+    def _index_committed_unit(self, task_id: str, vault, unit: CommitUnit) -> None:
+        indexing_task = replace(
+            self.get(task_id),
+            lifecycle="running",
+            phase="indexing",
+            current_item_label=unit.source_label,
+            updated_at=utc_now(),
+        )
+        self.repository.save(indexing_task, "indexing-started")
+        try:
+            self.index_service.index_committed_unit(vault, unit)
+        except Exception as error:
+            report_failure = getattr(self.index_service, "report_failure", None)
+            if report_failure is not None:
+                try:
+                    report_failure(vault.vault_id, "committed-unit", error)
+                except Exception:
+                    pass
+            self.repository.save(self.get(task_id), "indexing-failed")
+            raise
+        self.repository.save(self.get(task_id), "indexing-completed")
+
+    def _embed_committed_unit(self, task_id: str, vault, unit: CommitUnit) -> None:
+        if self.embedding_service is None:
+            raise ImportTaskError("Embedding service is unavailable; the import cannot be submitted.")
+        embedding_task = replace(
+            self.get(task_id),
+            lifecycle="running",
+            phase="embedding",
+            current_item_label=unit.source_label,
+            updated_at=utc_now(),
+        )
+        self.repository.save(embedding_task, "embedding-started")
+        try:
+            self.embedding_service.execute(vault.vault_id, EmbeddingBatchScope("vault"))
+        except Exception as error:
+            self.repository.save(self.get(task_id), "embedding-failed")
+            raise ImportTaskError(f"Embedding failed: {error}") from error
+        self.repository.save(self.get(task_id), "embedding-completed")
+
     def _record_stale_snapshot(
         self, task: ImportTask, previous: ReviewSnapshot, fallback_reason: str
     ) -> ReviewSnapshot:
@@ -1745,15 +1960,6 @@ class ImportTaskService:
         vault = self._available_vault(task.vault_id)
         items = {item.item_id: item for item in self.repository.list_items(task.task_id)}
         proposals = {proposal.item_id: proposal for proposal in self.repository.list_note_proposals(task.task_id)}
-        classifications = {
-            suggestion.item_id: suggestion
-            for suggestion in self.repository.list_classification_suggestions(task.task_id)
-        }
-        metadata = {
-            proposal.item_id: proposal
-            for proposal in self.repository.list_metadata_tag_proposals(task.task_id)
-        }
-        candidates = self.repository.list_candidate_link_proposals(task.task_id)
         source_hashes: list[tuple[int, str]] = []
         existing_hashes: dict[str, str] = {}
         units: list[CommitUnit] = []
@@ -1774,8 +1980,6 @@ class ImportTaskService:
                 proposal,
                 item,
                 vault.path,
-                metadata.get(item_id),
-                candidates,
                 existing_hashes,
                 inside_vault,
             )
@@ -1804,27 +2008,13 @@ class ImportTaskService:
                 )
             for index, file in enumerate(existing_files, start=1):
                 existing_unit_id = f"existing-note-{item_id}-{index}"
-                context_sha256 = sha256(
-                    f"{item.content_sha256}:{file.relative_path}:{file.expected_existing_sha256}".encode("utf-8")
-                ).hexdigest()
-                existing_review = self._review_item(
-                    task.task_id,
-                    f"existing-{existing_unit_id}",
-                    existing_unit_id,
-                    "existing-note",
-                    "required-check",
-                    "Existing Markdown needs an explicit confirmation before it can be changed.",
-                    context_sha256,
-                )
-                review_items.append(existing_review)
                 units.append(
                     CommitUnit(
                         unit_id=existing_unit_id,
                         source_item_id=item_id,
                         source_label=item.label,
                         kind="existing-note",
-                        files=() if existing_review.status == "excluded" else (file,),
-                        confirmed_gaps=existing_review.status == "excluded",
+                        files=(file,),
                     )
                 )
                 review_unit_id = review_unit_id or existing_unit_id
@@ -1869,22 +2059,6 @@ class ImportTaskService:
                             target.issue_summary or f"{target.label} needs review.",
                         )
                     )
-            classification = classifications.get(item_id)
-            if classification is not None and classification.requires_review:
-                review_items.append(
-                    ReviewItem(
-                        f"classification-{item_id}", review_unit_id, "classification", "required-check", "pending",
-                        "Low-confidence classification needs an explicit decision.",
-                    )
-                )
-            governance = metadata.get(item_id)
-            if governance is not None and governance.requires_review:
-                review_items.append(
-                    ReviewItem(
-                        f"metadata-{item_id}", review_unit_id, "metadata", "required-check", "pending",
-                        "Metadata and tags need an explicit decision.",
-                    )
-                )
         for item_id, item in items.items():
             if item_id in proposal_item_ids:
                 continue
@@ -1990,26 +2164,6 @@ class ImportTaskService:
                     files=(),
                 )
             )
-        for candidate in candidates:
-            if candidate.is_legacy_isolated:
-                continue
-            unit_id = unit_ids.get(candidate.source_item_id)
-            if unit_id is None:
-                continue
-            if candidate.status == "stale":
-                review_items.append(
-                    ReviewItem(
-                        f"candidate-{candidate.review_item_id}", unit_id, "candidate-link", "blocking", "blocking",
-                        candidate.stale_reason or "A candidate link is stale.",
-                    )
-                )
-            elif candidate.requires_review:
-                review_items.append(
-                    ReviewItem(
-                        f"candidate-{candidate.review_item_id}", unit_id, "candidate-link", "required-check", "pending",
-                        "Candidate link needs an explicit decision.",
-                    )
-                )
         return build_review_snapshot(
             task_id=task.task_id,
             vault_id=task.vault_id,
@@ -2051,8 +2205,6 @@ class ImportTaskService:
         proposal,
         item: ImportTaskItem,
         vault_path: Path,
-        governance: MetadataTagProposal | None,
-        candidates: list[CandidateLinkProposal],
         existing_hashes: dict[str, str],
         inside_vault: bool,
     ) -> tuple[CommitFile, ...]:
@@ -2076,20 +2228,7 @@ class ImportTaskService:
             files.extend(self._commit_asset_files(proposal, item, vault_path))
         else:
             note_contents = [(proposal.relative_path, proposal.markdown)]
-        accepted_tags = ()
-        if governance is not None and governance.decision == "accepted":
-            accepted_tags = tuple(tag.name for tag in governance.tags if tag.status != "excluded")
-        accepted_links = [
-            candidate for candidate in candidates
-            if candidate.source_item_id == proposal.item_id and candidate.decision == "accepted"
-        ]
         for relative_path, markdown in note_contents:
-            rendered = self._render_accepted_governance(
-                markdown,
-                relative_path,
-                accepted_tags,
-                accepted_links,
-            )
             expected = None
             target = vault_path / relative_path
             if inside_vault and isinstance(proposal, NativeMarkdownProposal):
@@ -2102,8 +2241,8 @@ class ImportTaskService:
                 CommitFile(
                     relative_path=relative_path,
                     kind="markdown",
-                    content=rendered,
-                    content_sha256=sha256(rendered.encode("utf-8")).hexdigest(),
+                    content=markdown,
+                    content_sha256=sha256(markdown.encode("utf-8")).hexdigest(),
                     expected_existing_sha256=expected,
                 )
             )
@@ -2141,27 +2280,6 @@ class ImportTaskService:
                 continue
             files_by_path[relative_path] = file
         return tuple(files_by_path.values())
-
-    @staticmethod
-    def _render_accepted_governance(
-        markdown: str,
-        relative_path: str,
-        tags: tuple[str, ...],
-        candidates: list[CandidateLinkProposal],
-    ) -> str:
-        rendered = markdown
-        if tags and rendered.startswith("---\n"):
-            closing = rendered.find("\n---", 4)
-            if closing >= 0 and "\ntags:" not in rendered[:closing]:
-                tag_lines = "\ntags:\n" + "".join(f"  - {tag}\n" for tag in sorted(set(tags)))
-                rendered = rendered[:closing] + tag_lines + rendered[closing:]
-        for candidate in candidates:
-            if candidate.source_path != relative_path:
-                continue
-            link = f"[[{candidate.target_path}]]"
-            if link not in rendered:
-                rendered = rendered.rstrip() + f"\n\n{link}\n"
-        return rendered
 
     def _graph_projection_for_unit(
         self, task: ImportTask, unit: CommitUnit
@@ -2218,9 +2336,9 @@ class ImportTaskService:
                     try:
                         content = item.source_path.read_bytes()
                     except OSError as error:
-                        raise ImportTaskError("The reviewed source file is no longer available.") from error
+                        raise ImportTaskError("The source file is no longer available.") from error
                 if sha256(content).hexdigest() != file.content_sha256:
-                    raise ImportTaskError("The source content changed after the review snapshot.")
+                    raise ImportTaskError("The source content changed after the automatic processing snapshot.")
             elif file.kind == "asset":
                 content = file.binary_content()
             else:
@@ -2249,7 +2367,7 @@ class ImportTaskService:
         try:
             return sha256(target.read_bytes()).hexdigest() if target.exists() else None
         except OSError as error:
-            raise ImportTaskError("An affected vault file cannot be read for review.") from error
+            raise ImportTaskError("An affected Vault file cannot be read for automatic commit.") from error
 
     def decide_candidate_link_proposal(
         self, task_id: str, review_item_id: str, decision: str, reason: str
@@ -2682,12 +2800,23 @@ class ImportTaskService:
     def _is_parse_candidate(item: ImportTaskItem, *, retry_failed: bool = False) -> bool:
         return (
             item.category == "supported"
-            and item.document_kind in {"pdf", "docx"}
+            and item.document_kind in _PARSE_DOCUMENT_KINDS
             and item.identity_status in {"new", "duplicate"}
             and item.source_id is not None
             and item.content_sha256 is not None
             and item.parse_status != "parsed"
             and (retry_failed or item.parse_status != "parse-failed")
+        )
+
+    @staticmethod
+    def _is_conversion_candidate(item: ImportTaskItem) -> bool:
+        return (
+            item.category == "supported"
+            and item.document_kind in _CONVERSION_DOCUMENT_KINDS
+            and item.identity_status in {"new", "duplicate"}
+            and item.source_id is not None
+            and item.content_sha256 is not None
+            and item.conversion_status != "selected"
         )
 
     @staticmethod
@@ -2718,7 +2847,7 @@ class ImportTaskService:
     def _is_derivation_candidate(item: ImportTaskItem) -> bool:
         return (
             item.category == "supported"
-            and item.document_kind in {"pdf", "docx"}
+            and item.document_kind in _PARSE_DOCUMENT_KINDS
             and item.source_id is not None
             and item.content_sha256 is not None
             and item.parse_status == "parsed"
@@ -2738,7 +2867,7 @@ class ImportTaskService:
         if category != "failed" and self._is_ignored_in_target_vault(task, path):
             category = "skipped"
             reason = "Excluded by this vault's import policy."
-        elif category == "supported" and document_kind in {"pdf", "docx"}:
+        elif category == "supported" and document_kind in _PARSE_DOCUMENT_KINDS:
             if event.get("identity_error"):
                 identity_status = "identity-failed"
             else:
@@ -2786,6 +2915,12 @@ class ImportTaskService:
             return False
         evaluation = self.policy_service.preview(task.vault_id, relative_path, None, "import")
         return not evaluation.allowed
+
+    def _markdown_outbound_allowed(self, task: ImportTask, relative_path: str) -> bool:
+        if self.policy_service is None:
+            return True
+        evaluation = self.policy_service.preview(task.vault_id, relative_path, None, "outbound")
+        return evaluation.allowed
 
     def _ignored_paths(self, task: ImportTask) -> tuple[Path, ...]:
         if self.policy_service is None:

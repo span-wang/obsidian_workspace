@@ -8,7 +8,37 @@ from multiprocessing.synchronize import Event
 from pathlib import Path
 
 
-SUPPORTED_EXTENSIONS = {".pdf": "pdf", ".docx": "docx", ".md": "markdown"}
+SUPPORTED_EXTENSIONS = {
+    ".pdf": "pdf",
+    ".doc": "doc",
+    ".docx": "docx",
+    ".docm": "docm",
+    ".dot": "doc",
+    ".dotx": "dotx",
+    ".dotm": "dotm",
+    ".xls": "xls",
+    ".xlsx": "xlsx",
+    ".xlsm": "xlsm",
+    ".xltx": "xltx",
+    ".xltm": "xltm",
+    ".md": "markdown",
+}
+
+PARSE_DOCUMENT_KINDS = frozenset(
+    {
+        "pdf",
+        "doc",
+        "docx",
+        "docm",
+        "dotx",
+        "dotm",
+        "xls",
+        "xlsx",
+        "xlsm",
+        "xltx",
+        "xltm",
+    }
+)
 
 
 class ScanCancelled(Exception):
@@ -110,7 +140,7 @@ def _classify_file(path: Path, should_cancel: Callable[[], bool]) -> dict[str, o
     if _is_link_or_reparse_point(path):
         return _item(path, "skipped", reason="Symbolic links are not scanned.")
     document_kind = SUPPORTED_EXTENSIONS.get(path.suffix.casefold())
-    if document_kind in {"pdf", "docx", "markdown"}:
+    if document_kind in PARSE_DOCUMENT_KINDS or document_kind == "markdown":
         try:
             return _item(
                 path,

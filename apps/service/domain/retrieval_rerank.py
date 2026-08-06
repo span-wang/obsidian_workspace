@@ -7,12 +7,8 @@ from hashlib import sha256
 from math import isfinite
 from typing import Mapping
 
-from domain.policies import OutboundScope, normalize_outbound_scope
-
-
 MAX_RERANK_CANDIDATES = 20
 MAX_RERANK_CANDIDATE_TEXT_CHARS = 12_000
-RERANK_AUTHORIZATION_OPERATION = "rerank-source-lookup"
 RERANK_CONTENT_CATEGORIES = (
     "query",
     "block-text",
@@ -83,29 +79,6 @@ class RerankCandidate:
 
 
 @dataclass(frozen=True)
-class RerankAuthorizationInput:
-    """One transient prompt projection plus its local integrity and policy scope facts."""
-
-    candidate: RerankCandidate
-    block_content_sha256: str
-    scope: OutboundScope
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.candidate, RerankCandidate):
-            raise RerankValidationError("Rerank authorization candidate is invalid.")
-        _validate_sha256(self.block_content_sha256, "Rerank block content hash")
-        if not isinstance(self.scope, OutboundScope):
-            raise RerankValidationError("Rerank authorization scope is invalid.")
-        try:
-            normalized_scope = normalize_outbound_scope(
-                self.scope.source_path, self.scope.derived_path
-            )
-        except ValueError as error:
-            raise RerankValidationError("Rerank authorization scope is invalid.") from error
-        object.__setattr__(self, "scope", normalized_scope)
-
-
-@dataclass(frozen=True)
 class RerankScore:
     candidate_id: str
     relevance: float
@@ -139,8 +112,8 @@ class RerankResponse:
 
 
 @dataclass(frozen=True)
-class RerankAuthorizationPreview:
-    """Content-free facts shown before candidate text can leave the local session."""
+class RerankBatchPreview:
+    """Content-free facts for a candidate rerank batch."""
 
     vault_id: str
     provider_id: str
@@ -154,7 +127,7 @@ class RerankAuthorizationPreview:
     blocked_candidate_count: int
     blocked_file_count: int
     content_categories: tuple[str, ...]
-    is_authorizable: bool
+    is_executable: bool
     blocking_reason: str | None = None
 
     def __post_init__(self) -> None:
@@ -168,9 +141,9 @@ class RerankAuthorizationPreview:
                 self.provider_configuration_revision,
             )
         ):
-            raise RerankValidationError("Rerank authorization preview identity is invalid.")
+            raise RerankValidationError("Rerank batch preview identity is invalid.")
         if type(self.policy_revision) is not int or self.policy_revision < 1:
-            raise RerankValidationError("Rerank authorization preview policy is invalid.")
+            raise RerankValidationError("Rerank batch preview policy is invalid.")
         counts = (
             self.candidate_count,
             self.file_count,
@@ -179,73 +152,24 @@ class RerankAuthorizationPreview:
             self.blocked_file_count,
         )
         if any(type(value) is not int or value < 0 for value in counts):
-            raise RerankValidationError("Rerank authorization preview counts are invalid.")
+            raise RerankValidationError("Rerank batch preview counts are invalid.")
         if (
             not isinstance(self.content_categories, tuple)
             or not self.content_categories
             or any(not isinstance(value, str) or not value.strip() for value in self.content_categories)
         ):
-            raise RerankValidationError("Rerank authorization preview categories are invalid.")
-        if type(self.is_authorizable) is not bool:
-            raise RerankValidationError("Rerank authorization preview state is invalid.")
-        if self.is_authorizable:
+            raise RerankValidationError("Rerank batch preview categories are invalid.")
+        if type(self.is_executable) is not bool:
+            raise RerankValidationError("Rerank batch preview state is invalid.")
+        if self.is_executable:
             if (
                 not self.candidate_count
                 or not self.file_count
                 or self.blocking_reason is not None
             ):
-                raise RerankValidationError("Rerank authorization preview cannot be approved.")
+                raise RerankValidationError("Rerank batch preview cannot be executable.")
         elif not isinstance(self.blocking_reason, str) or not self.blocking_reason.strip():
-            raise RerankValidationError("Blocked rerank authorization previews need a reason.")
-
-
-def rerank_authorization_task_id(
-    *,
-    session_id: str,
-    task_id: str,
-    snapshot_id: str,
-    query: str,
-    inputs: tuple[RerankAuthorizationInput, ...],
-    target: RerankProviderTarget,
-) -> str:
-    """Bind one outbound approval to the exact query and ordered candidate projection."""
-
-    if not all(
-        isinstance(value, str) and value.strip()
-        for value in (session_id, task_id, snapshot_id, query)
-    ):
-        raise RerankValidationError("Rerank authorization context is invalid.")
-    if not isinstance(target, RerankProviderTarget):
-        raise RerankValidationError("Rerank Provider target is invalid.")
-    inputs = _validate_authorization_inputs(inputs)
-    projection = {
-        "candidates": [
-            {
-                "blockContentSha256": item.block_content_sha256,
-                "candidateId": item.candidate.candidate_id,
-                "fusedRank": item.candidate.fused_rank,
-                "promptProjectionSha256": rerank_candidate_projection_sha256(
-                    item.candidate
-                ),
-                "scope": {
-                    "derivedPath": item.scope.derived_path,
-                    "sourcePath": item.scope.source_path,
-                },
-            }
-            for item in inputs
-        ],
-        "provider": {
-            "configurationRevision": target.provider_configuration_revision,
-            "id": target.provider_id,
-            "modelId": target.model_id,
-        },
-        "querySha256": sha256(query.strip().encode("utf-8")).hexdigest(),
-        "sessionId": session_id,
-        "snapshotId": snapshot_id,
-        "taskId": task_id,
-    }
-    encoded = json.dumps(projection, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
-    return f"{RERANK_AUTHORIZATION_OPERATION}:{sha256(encoded.encode('utf-8')).hexdigest()}"
+            raise RerankValidationError("Blocked rerank batches need a reason.")
 
 
 def rerank_candidate_prompt_projection(candidate: RerankCandidate) -> dict[str, object]:
@@ -372,26 +296,3 @@ def validate_rerank_candidates(
     if len({candidate.candidate_id for candidate in candidates}) != len(candidates):
         raise RerankValidationError("Rerank candidates must not repeat IDs.")
     return candidates
-
-
-def _validate_authorization_inputs(
-    inputs: tuple[RerankAuthorizationInput, ...]
-) -> tuple[RerankAuthorizationInput, ...]:
-    if (
-        not isinstance(inputs, tuple)
-        or not inputs
-        or len(inputs) > MAX_RERANK_CANDIDATES
-        or any(not isinstance(item, RerankAuthorizationInput) for item in inputs)
-    ):
-        raise RerankValidationError("Rerank authorization inputs are invalid.")
-    validate_rerank_candidates(tuple(item.candidate for item in inputs))
-    return inputs
-
-
-def _validate_sha256(value: str, label: str) -> None:
-    if (
-        not isinstance(value, str)
-        or len(value) != 64
-        or any(character not in "0123456789abcdef" for character in value)
-    ):
-        raise RerankValidationError(f"{label} must be lowercase 64-hex.")

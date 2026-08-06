@@ -115,6 +115,32 @@ def _create_legacy_database(database_path: Path, default_type: str = "chat") -> 
         )
 
 
+def _create_rerank_database(database_path: Path) -> None:
+    _create_legacy_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("ALTER TABLE provider_models ADD COLUMN configured_model_type TEXT")
+        connection.execute("UPDATE provider_models SET configured_model_type = model_type")
+        connection.execute(
+            """CREATE TABLE model_defaults_v2 (
+                model_type TEXT PRIMARY KEY CHECK (model_type IN ('chat', 'embedding', 'rerank')),
+                provider_id TEXT NOT NULL REFERENCES providers(provider_id) ON DELETE CASCADE,
+                model_id TEXT NOT NULL, updated_at TEXT NOT NULL)"""
+        )
+        connection.execute(
+            """INSERT INTO model_defaults_v2 (model_type, provider_id, model_id, updated_at)
+                SELECT model_type, provider_id, model_id, updated_at FROM model_defaults"""
+        )
+        connection.execute(
+            """CREATE TABLE provider_schema_migrations (
+                migration_id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"""
+        )
+        connection.execute(
+            """INSERT INTO provider_schema_migrations (migration_id, applied_at)
+                VALUES ('ret-09-02-provider-rerank-model-type-v1', ?)""",
+            (_UPDATED_AT,),
+        )
+
+
 def test_legacy_database_keeps_old_constraints_and_persists_rerank_separately(tmp_path: Path) -> None:
     database_path = tmp_path / "providers.sqlite3"
     _create_legacy_database(database_path)
@@ -217,3 +243,52 @@ def test_failed_rerank_migration_rolls_back_and_can_be_retried(tmp_path: Path) -
     assert retried.get_default("embedding") == ModelSelection(
         "embedding", "provider-1", "embedding-model", _UPDATED_AT
     )
+
+
+def test_rerank_database_upgrades_to_markdown_defaults_and_is_idempotent(tmp_path: Path) -> None:
+    database_path = tmp_path / "providers.sqlite3"
+    _create_rerank_database(database_path)
+
+    repository = SqliteProviderRepository(database_path)
+    repository.save(_provider(_model("chat-model", "chat"), _model("markdown-model", "markdown")))
+    repository.save_default(ModelSelection("markdown", "provider-1", "markdown-model", _UPDATED_AT))
+
+    reopened = SqliteProviderRepository(database_path)
+
+    assert reopened.get_default("chat") == ModelSelection("chat", "provider-1", "chat-model", _UPDATED_AT)
+    assert reopened.get_default("markdown") == ModelSelection(
+        "markdown", "provider-1", "markdown-model", _UPDATED_AT
+    )
+    with sqlite3.connect(database_path) as connection:
+        table_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'model_defaults_v2'"
+        ).fetchone()[0]
+        assert "markdown" in table_sql.lower()
+        assert connection.execute(
+            """SELECT COUNT(*) FROM provider_schema_migrations
+                WHERE migration_id = 'ret-17-01-provider-markdown-model-type-v1'"""
+        ).fetchone()[0] == 1
+
+
+def test_failed_markdown_migration_rolls_back_and_can_be_retried(tmp_path: Path) -> None:
+    database_path = tmp_path / "providers.sqlite3"
+    _create_rerank_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE model_defaults_v3 (placeholder TEXT)")
+
+    with pytest.raises(sqlite3.OperationalError, match="already exists"):
+        SqliteProviderRepository(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'model_defaults_v2'"
+        ).fetchone()[0].lower().count("markdown") == 0
+        assert connection.execute(
+            """SELECT COUNT(*) FROM provider_schema_migrations
+                WHERE migration_id = 'ret-17-01-provider-markdown-model-type-v1'"""
+        ).fetchone()[0] == 0
+        connection.execute("DROP TABLE model_defaults_v3")
+
+    retried = SqliteProviderRepository(database_path)
+
+    assert retried.get_default("chat") == ModelSelection("chat", "provider-1", "chat-model", _UPDATED_AT)

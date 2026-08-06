@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { mkdir, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -63,7 +64,6 @@ test.beforeAll(async ({}, testInfo) => {
   });
   await waitForHealth();
 });
-
 test.afterAll(async () => {
   if (service?.exitCode === null) {
     service.kill();
@@ -430,9 +430,9 @@ test("keeps a failed removal confirmation open and shows its error", async ({ pa
   await expect(dialog.getByRole("alert")).toHaveText("移除授权未完成。");
 });
 
-test("edits vault exclusions and keeps the outbound authorization state visible", async ({ page }) => {
+test("edits vault exclusions under the default outbound policy", async ({ page }) => {
   let policy = {
-    outbound_mode: "ask-each-task",
+    outbound_mode: "always-allow",
     policy_revision: 1,
     updated_at: "2026-07-21T00:00:00+00:00",
     rules: []
@@ -460,12 +460,6 @@ test("edits vault exclusions and keeps the outbound authorization state visible"
     const method = route.request().method();
     const url = route.request().url();
     if (method === "GET") {
-      await route.fulfill({ json: { policy } });
-      return;
-    }
-    if (url.endsWith("/mode")) {
-      const payload = route.request().postDataJSON();
-      policy = { ...policy, outbound_mode: payload.outbound_mode, policy_revision: policy.policy_revision + 1 };
       await route.fulfill({ json: { policy } });
       return;
     }
@@ -512,11 +506,8 @@ test("edits vault exclusions and keeps the outbound authorization state visible"
   await page.goto("/");
   await page.getByRole("link", { name: "资料" }).click();
   await page.getByRole("button", { name: /Policy Vault/ }).click();
-  await expect(page.getByRole("heading", { name: "资料排除与外发授权" })).toBeVisible();
-  await expect(page.getByTestId("outbound-status")).toHaveText("外发：每次询问");
-
-  await page.getByLabel("外发方式").selectOption("always-allow");
-  await expect(page.getByTestId("outbound-status")).toHaveText("外发：始终允许");
+  await expect(page.getByRole("heading", { name: "资料排除规则" })).toBeVisible();
+  await expect(page.locator(".policy-summary")).toContainText("已验证 Provider 默认允许出网");
   await page.getByRole("button", { name: "添加规则" }).click();
   await page.getByLabel("规则类型").selectOption("never-send-cloud");
   await page.getByLabel("vault 相对路径").fill("private\\plans");
@@ -528,7 +519,51 @@ test("edits vault exclusions and keeps the outbound authorization state visible"
   await expect(page.getByText(/预览：Matched never-send-cloud/)).toBeVisible();
 });
 
-test("creates an import task from materials and shows its persistent scan snapshot", async ({ page }) => {
+test("sends a browser-selected folder as relative upload paths", async ({ page }, testInfo) => {
+  const folderPath = testInfo.outputPath("materials");
+  await mkdir(join(folderPath, "chapter-1"), { recursive: true });
+  await writeFile(join(folderPath, "chapter-1", "book.pdf"), "pdf");
+  const vault = {
+    vault_id: "vault-folder-upload",
+    display_name: "Import Vault",
+    authorization_status: "active",
+    access_status: "available",
+    is_current: true
+  };
+  const task = {
+    task_id: "task-folder-upload",
+    vault_id: vault.vault_id,
+    vault_label: "Import Vault",
+    scope_label: "materials",
+    lifecycle: "queued",
+    phase: "queued",
+    recovery_actions: [],
+    counts: {}
+  };
+  let uploadBody = "";
+
+  await page.route("**/api/vaults", async (route) => {
+    await route.fulfill({ json: { vaults: [vault] } });
+  });
+  await page.route("**/api/import-selections/uploads", async (route) => {
+    uploadBody = route.request().postDataBuffer()?.toString("latin1") || "";
+    await route.fulfill({ json: { selection_id: "folder-selection", label: "materials" } });
+  });
+  await page.route("**/api/import-tasks", async (route) => {
+    await route.fulfill({ json: route.request().method() === "GET" ? { tasks: [] } : { task } });
+  });
+
+  await page.goto("/");
+  await page.getByRole("link", { name: "资料", exact: true }).click();
+  const folderInput = page.getByLabel("上传本机资料文件夹");
+  await expect(folderInput).toHaveAttribute("webkitdirectory", "");
+  await folderInput.setInputFiles(folderPath);
+
+  await expect.poll(() => uploadBody).toContain('name="kind"\r\n\r\ndirectory');
+  expect(uploadBody).toContain('filename="materials/chapter-1/book.pdf"');
+});
+
+test("runs import tasks automatically and keeps suggestions read-only", async ({ page }) => {
   const vault = {
     vault_id: "vault-import",
     path: "C:\\fixture\\Import Vault",
@@ -549,8 +584,8 @@ test("creates an import task from materials and shows its persistent scan snapsh
     vault_id: vault.vault_id,
     vault_label: "Import Vault",
     scope_label: "book.pdf",
-    lifecycle: "waiting-for-review",
-    phase: "waiting-for-review",
+    lifecycle: "complete",
+    phase: "complete",
     current_item_label: null,
     counts: {
       discovered: 1,
@@ -567,7 +602,7 @@ test("creates an import task from materials and shows its persistent scan snapsh
       ocr_completed: 1,
       ocr_failed: 0,
       confirmed_gaps: 0,
-      required_check: 1,
+      required_check: 0,
       derived_notes: 1
     },
     recovery_actions: [],
@@ -577,7 +612,7 @@ test("creates an import task from materials and shows its persistent scan snapsh
     updated_at: "2026-07-21T00:00:00+00:00"
   };
 
-  await page.route("**/api/import-selections/files", async (route) => {
+  await page.route("**/api/import-selections/uploads", async (route) => {
     await route.fulfill({ json: { selection_id: "import-selection", label: "book.pdf" } });
   });
   await page.route("**/api/import-tasks", async (route) => {
@@ -602,22 +637,23 @@ test("creates an import task from materials and shows its persistent scan snapsh
           source_id: "source-new",
           identity_status: "new",
           parse_status: "parsed",
+          conversion_status: "selected",
           parse_confidence: 0.72,
           parse_issue_count: 1,
           parse_locator_summary: "page 2",
-          parse_issue_summary: "Table columns need review.",
-          ocr_status: "required-check",
-          ocr_confidence: 56,
-          ocr_issue_count: 1,
-          ocr_locator_summary: "page 2 box:10,20,60,12",
-          ocr_issue_summary: "OCR confidence needs review.",
+          parse_issue_summary: null,
+          ocr_status: "ocr-completed",
+          ocr_confidence: 0.99,
+          ocr_issue_count: 0,
+          ocr_locator_summary: null,
+          ocr_issue_summary: null,
           ocr_targets: [{
             target_id: "page:2",
             label: "Page 2",
             locator_summary: "page 2",
             engine: "paddleocr-vl-1.6",
             status: "completed",
-            confidence: 56,
+            confidence: 0.99,
             issue_count: 1,
             decision: null,
             decision_reason: null
@@ -634,7 +670,7 @@ test("creates an import task from materials and shows its persistent scan snapsh
           item_id: 1,
           revision: 1,
           source_relative_path: "platform/sources/source-new-bbbbbbbbbbbbbbbb.pdf",
-          risks: ["Table columns need review."],
+          risks: [],
           index_note: {
             relative_path: "platform/notes/source-new/index.md",
             markdown: "# Book index\n\n[[platform/notes/source-new/01-chapter-one|Chapter One]]"
@@ -685,10 +721,10 @@ test("creates an import task from materials and shows its persistent scan snapsh
           source_type: "pdf",
           source_file: "book.pdf",
           ingested_at: "2026-07-22T00:00:00+00:00",
-          processing_status: "waiting-for-review",
+          processing_status: "generated",
           domain: "unclassified",
           domain_confidence: 0.4,
-          requires_review: true,
+          requires_review: false,
           decision: null,
           decision_reason: null,
           tags: [{
@@ -724,7 +760,7 @@ test("creates an import task from materials and shows its persistent scan snapsh
             source_locations: ["page:2"]
           },
           is_existing_note_change: false,
-          requires_review: true,
+          requires_review: false,
           status: "required-check",
           decision: null,
           decision_reason: null,
@@ -757,7 +793,8 @@ test("creates an import task from materials and shows its persistent scan snapsh
           decision: null,
           decision_reason: null,
           stale_reason: "关联笔记提案已更新。"
-        }]
+        }],
+        commit_journals: [{ unit_id: "source-new", source_label: "book.pdf", status: "committed", reason: null }]
       }
     });
   });
@@ -775,65 +812,40 @@ test("creates an import task from materials and shows its persistent scan snapsh
   await page.goto("/");
   await page.getByRole("link", { name: "资料", exact: true }).click();
   await expect(page.getByText("目标 vault：Import Vault")).toBeVisible();
-  await page.getByRole("button", { name: "选择文件", exact: true }).click();
+  await page.getByLabel("上传本机资料文件", { exact: true }).setInputFiles({
+    name: "book.pdf",
+    mimeType: "application/pdf",
+    buffer: Buffer.from("pdf")
+  });
 
   await expect(page.getByRole("heading", { name: "任务", exact: true })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "导入任务 task-import" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "导入任务详情" })).toBeVisible();
   await eventSubscription;
-  await expect(page.getByText("当前阶段：等待审核")).toBeVisible();
+  await expect(page.getByText("状态：已完成")).toBeVisible();
+  await expect(page.getByText("当前阶段：完成")).toBeVisible();
   await expect(page.getByText("解析：已完成")).toBeVisible();
-  await expect(page.getByText("新资料 1")).toBeVisible();
-  await expect(page.getByText("可能版本 1")).toBeVisible();
+  await expect(page.getByText("已发现 1")).toBeVisible();
   await expect(page.getByText("已解析 1")).toBeVisible();
-  await expect(page.getByText("OCR 完成 1")).toBeVisible();
-  await expect(page.getByText("支持 · 新资料 · 已解析 · OCR 待审核")).toBeVisible();
-  await expect(page.getByLabel("Page 2 的处理理由")).toBeVisible();
-  await expect(page.getByRole("button", { name: "重试此页" })).toBeVisible();
-  await expect(page.locator(".progress-sequence").getByText("待审核问题 1")).toBeVisible();
-  await expect(page.getByText("证据位置：page 2")).toBeVisible();
-  await expect(page.getByText("Table columns need review.", { exact: true })).toBeVisible();
-  await expect(page.getByText("待审核确认")).toBeVisible();
+  await expect(page.getByText("已解析；已选择完整转换图；OCR 完成", { exact: true })).toBeVisible();
   await expect(page.getByText("PDF（电子/扫描待识别）")).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Markdown 提案" })).toBeVisible();
+  const markdownResults = page.getByLabel("Markdown 结果");
+  await expect(markdownResults.getByRole("heading", { name: "Markdown 结果" })).toBeVisible();
+  await expect(markdownResults.locator("pre.markdown-preview").nth(0)).toContainText("# Book index");
+  await expect(markdownResults.locator("pre.markdown-preview").nth(1)).toContainText("# Chapter One");
+  await expect(markdownResults.locator("pre.markdown-preview").nth(2)).toContainText("# Chapter Two");
   await expect(page.getByRole("heading", { name: "分类建议" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "元数据与标签" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "候选链接" })).toBeVisible();
-  await expect(page.getByText("审核决定仅保存在应用私有状态，尚未写入 Markdown。")).toBeVisible();
-  await expect(page.getByText("来源证据（unit:0）：Algebra equations preview.")).toBeVisible();
-  await expect(page.getByText("已陈旧，需重新生成")).toBeVisible();
-  await expect(page.getByText("陈旧原因：关联笔记提案已更新。")).toBeVisible();
-  await expect(
-    page.getByLabel("platform/notes/previous-source.md 到 platform/notes/previous-target.md 的候选链接决定理由")
-  ).toBeDisabled();
-  await expect(page.getByText("必须检查", { exact: true })).toHaveCount(2);
-  const candidateReason = page.getByLabel(
-    "platform/notes/source-new/01-chapter-one.md 到 platform/notes/source-new/02-chapter-two.md 的候选链接决定理由"
-  );
-  await candidateReason.focus();
-  await expect(candidateReason).toBeFocused();
-  await page.getByLabel("候选链接").locator("button.secondary-button:not([disabled])", { hasText: "接受" }).click();
-  await expect(page.getByText("候选链接已接受，尚未写入 Markdown。")).toBeVisible();
-  await expect(page.getByRole("button", { name: "接受标签" })).toBeVisible();
-  await expect(page.getByLabel("分类建议").getByText("必须检查", { exact: true })).toBeVisible();
-  const classificationFolder = page.getByLabel("资料项 1 的目标文件夹");
-  await expect(classificationFolder).toHaveValue("platform/notes/unclassified");
-  await expect(page.getByRole("button", { name: "接受高置信度建议" })).toBeVisible();
-  const classificationStatus = page.getByText("没有可批量接受的高置信度建议。", { exact: true });
-  await expect(classificationStatus).toBeVisible();
-  await expect(classificationStatus).toHaveAttribute("role", "status");
-  await expect(
-    page.getByLabel("分类建议").getByRole("button", { name: "确认排除" })
-  ).toBeVisible();
-  await expect(page.getByText("派生笔记提案（版本 1）")).toBeVisible();
-  await expect(page.locator(".markdown-preview").nth(1)).toContainText("Preview text");
-  const mergeButton = page.getByRole("button", { name: "合并 Chapter One 与下一篇笔记" });
-  await expect(mergeButton).toBeVisible();
-  await expect(page.getByLabel("Chapter One 的安全拆分边界")).toBeVisible();
-  await expect(page.getByRole("button", { name: "在 Chapter One 的安全边界拆分笔记" })).toBeVisible();
-  await mergeButton.focus();
-  await expect(mergeButton).toBeFocused();
-  await classificationFolder.focus();
-  await expect(classificationFolder).toBeFocused();
+  await expect(page.getByText("No supported domain terms were found in the private proposal.")).toBeVisible();
+  await expect(page.getByText("接受标签", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("提交审核", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("提交所选", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("审核决定", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "接受高置信度建议" })).toHaveCount(0);
+  await expect(page.locator("body")).not.toContainText("task-import");
+  await expect(page.locator("body")).not.toContainText("unit:0");
+  await expect(page.locator("body")).not.toContainText("page 2 box:10,20,60,12");
+  await expect(page.locator(".commit-journal-list")).toBeVisible();
 });
 
 test("verifies a durable projection after deleting its completed import task", async ({ page }) => {
@@ -959,172 +971,64 @@ test("verifies a durable projection after deleting its completed import task", a
 
   await expect.poll(() => deleted).toBe(true);
   await expect.poll(() => rebuilt).toBe(true);
-  await expect(page.getByText("验证通过：任务已删除，索引重建成功，投影 locator 摘要保持一致。")).toBeVisible();
-  await expect(page.getByTestId("projection-after-summary")).toContainText("DOCX 部件 1");
-  await expect(page.getByRole("heading", { name: "导入任务 task-projection" })).toBeVisible();
+  await expect(page.getByText("验证通过：任务已删除，索引重建成功，投影结构摘要保持一致。")).toBeVisible();
+  await expect(page.getByTestId("projection-after-summary")).toContainText("DOCX 内容 1 处");
+  await expect(page.getByRole("heading", { name: "导入任务详情" })).toBeVisible();
+  await expect(page.locator("body")).not.toContainText("graph-projection");
+  await expect(page.locator("body")).not.toContainText("docx-ooxml");
 });
 
-test("filters commit review units and submits only the explicitly selectable units", async ({ page }) => {
-  const vault = {
-    vault_id: "vault-review",
-    path: "C:\\fixture\\Review Vault",
-    managed_root_relative_path: "platform",
-    managed_root: "C:\\fixture\\Review Vault\\platform",
-    source_directory: "C:\\fixture\\Review Vault\\platform\\sources",
-    note_directory: "C:\\fixture\\Review Vault\\platform\\notes",
-    authorization_status: "active",
-    access_status: "available",
-    index_status: "not-initialized",
-    created_at: "2026-07-22T00:00:00+00:00",
-    updated_at: "2026-07-22T00:00:00+00:00",
-    is_current: true,
-    recovery_actions: []
-  };
+test("does not expose a manual commit request for an automatic import", async ({ page }) => {
   const task = {
-    task_id: "task-review",
-    vault_id: vault.vault_id,
-    vault_label: "Review Vault",
-    scope_label: "review.pdf",
-    lifecycle: "waiting-for-review",
-    phase: "waiting-for-review",
+    task_id: "task-automatic",
+    vault_id: "vault-automatic",
+    vault_label: "Automatic Vault",
+    scope_label: "book.pdf",
+    lifecycle: "complete",
+    phase: "complete",
     current_item_label: null,
-    counts: {
-      discovered: 3,
-      supported: 3,
-      skipped: 0,
-      unsupported: 0,
-      failed: 0,
-      new: 3,
-      duplicate: 0,
-      possible_version: 0,
-      identity_failed: 0,
-      parsed: 3,
-      parse_failed: 0,
-      ocr_completed: 3,
-      ocr_failed: 0,
-      confirmed_gaps: 1,
-      required_check: 2,
-      derived_notes: 3
-    },
+    counts: { discovered: 1, parsed: 1, derived_notes: 1, failed: 0, parse_failed: 0, ocr_failed: 0 },
     recovery_actions: [],
     failure_reason: null,
     parent_task_id: null,
     created_at: "2026-07-22T00:00:00+00:00",
     updated_at: "2026-07-22T00:00:00+00:00"
   };
-  const reviewSnapshot = {
-    task_id: task.task_id,
-    vault_id: vault.vault_id,
-    digest: "a".repeat(64),
-    source_hashes: [[1, "b".repeat(64)]],
-    existing_file_hashes: [],
-    review_items: [
-      {
-        review_item_id: "parse-blocked",
-        unit_id: "source-blocked",
-        object_type: "parse",
-        risk: "blocking",
-        status: "blocking",
-        reason: "解析失败，不能提交。"
-      },
-      {
-        review_item_id: "metadata-required",
-        unit_id: "existing-note-required",
-        object_type: "metadata",
-        risk: "required-check",
-        status: "pending",
-        reason: "既有笔记修改需要明确确认。"
-      }
-    ],
-    units: [
-      {
-        unit_id: "source-ready",
-        source_item_id: 1,
-        source_label: "review.pdf",
-        kind: "source",
-        eligibility_reason: null,
-        confirmed_gaps: true,
-        files: [
-          { relative_path: "platform/sources/review.pdf", kind: "source", modifies_existing: false },
-          { relative_path: "platform/notes/review.md", kind: "markdown", modifies_existing: false }
-        ]
-      },
-      {
-        unit_id: "source-retry",
-        source_item_id: 2,
-        source_label: "retry.pdf",
-        kind: "source",
-        eligibility_reason: null,
-        confirmed_gaps: false,
-        files: [{ relative_path: "platform/notes/retry.md", kind: "markdown", modifies_existing: false }]
-      },
-      {
-        unit_id: "source-blocked",
-        source_item_id: 3,
-        source_label: "blocked.pdf",
-        kind: "source",
-        eligibility_reason: "解析失败，不能提交。",
-        confirmed_gaps: false,
-        files: [{ relative_path: "platform/notes/blocked.md", kind: "markdown", modifies_existing: false }]
-      },
-      {
-        unit_id: "existing-note-required",
-        source_item_id: 4,
-        source_label: "existing.md",
-        kind: "existing-note",
-        eligibility_reason: "既有笔记修改需要明确确认。",
-        confirmed_gaps: false,
-        files: [{ relative_path: "existing.md", kind: "markdown", modifies_existing: true }]
-      }
-    ],
-    created_at: "2026-07-22T00:00:00+00:00",
-    stale_reasons: [],
-    remaining_review_count: 2
+  const vault = {
+    vault_id: task.vault_id,
+    path: "C:\\fixture\\Automatic Vault",
+    managed_root_relative_path: "platform",
+    managed_root: "C:\\fixture\\Automatic Vault\\platform",
+    source_directory: "C:\\fixture\\Automatic Vault\\platform\\sources",
+    note_directory: "C:\\fixture\\Automatic Vault\\platform\\notes",
+    authorization_status: "active",
+    access_status: "available",
+    index_status: "healthy",
+    created_at: task.created_at,
+    updated_at: task.updated_at,
+    is_current: true,
+    recovery_actions: []
   };
-  let journals = [{ unit_id: "source-retry", status: "failed", reason: "模拟写入失败" }];
-  let commitUnitIds = null;
-  let refreshed = false;
-  const detailPayload = () => ({
+  const detail = {
     task,
-    items: [],
-    note_proposals: [],
-    classification_suggestions: [],
-    metadata_tag_proposals: [],
-    candidate_link_proposals: [],
-    review_snapshot: reviewSnapshot,
-    commit_journals: journals,
+    items: [{ item_id: 1, label: "book.pdf", category: "supported", document_kind: "pdf", parse_status: "parsed", conversion_status: "selected", ocr_status: "ocr-completed" }],
+    classification_suggestions: [{ item_id: 1, filename: "book.pdf", domain: "unclassified", reason: "只读分类观察。" }],
+    metadata_tag_proposals: [{ item_id: 1, source_file: "book.pdf", domain: "unclassified", tags: [{ name: "reading" }] }],
+    candidate_link_proposals: [{ review_item_id: "candidate-1", source_path: "notes/one.md", target_path: "notes/two.md", reason: "只读链接候选。" }],
+    commit_journals: [{ unit_id: "source-1", source_label: "book.pdf", status: "committed", reason: null }],
+    index: { status: "healthy", current_count: 1, failure_count: 0 },
     event_cursor: 9
-  });
-
+  };
+  const requests = [];
+  page.on("request", (request) => requests.push(request.url()));
   await page.route("**/api/import-tasks", async (route) => {
-    if (route.request().method() === "GET") {
-      await route.fulfill({ json: { tasks: [task] } });
-      return;
-    }
-    await route.fallback();
+    await route.fulfill({ json: { tasks: [task] } });
   });
-  await page.route("**/api/import-tasks/task-review**", async (route) => {
-    const url = route.request().url();
-    if (url.includes("/events")) {
-      await route.fulfill({ contentType: "text/event-stream", body: ": keep-alive\n\n" });
-      return;
-    }
-    if (url.endsWith("/review-snapshot") && route.request().method() === "POST") {
-      refreshed = true;
-      await route.fulfill({ json: { review_snapshot: reviewSnapshot } });
-      return;
-    }
-    if (url.endsWith("/commit") && route.request().method() === "POST") {
-      commitUnitIds = route.request().postDataJSON().unit_ids;
-      journals = reviewSnapshot.units
-        .filter((unit) => commitUnitIds.includes(unit.unit_id))
-        .map((unit) => ({ unit_id: unit.unit_id, status: "committed", reason: null }));
-      task.lifecycle = "complete";
-      task.phase = "complete";
-      await route.fulfill({ json: { task, commit_journals: journals } });
-      return;
-    }
-    await route.fulfill({ json: detailPayload() });
+  await page.route("**/api/import-tasks/task-automatic", async (route) => {
+    await route.fulfill({ json: detail });
+  });
+  await page.route("**/api/import-tasks/task-automatic/events?after=9", async (route) => {
+    await route.fulfill({ contentType: "text/event-stream", body: ": keep-alive\n\n" });
   });
   await page.route("**/api/vaults", async (route) => {
     await route.fulfill({ json: { vaults: [vault] } });
@@ -1132,33 +1036,16 @@ test("filters commit review units and submits only the explicitly selectable uni
 
   await page.goto("/");
   await page.getByRole("link", { name: "任务", exact: true }).click();
-  await page.getByRole("button", { name: /^review\.pdf/ }).click();
-
-  const review = page.getByLabel("提交审核");
-  await expect(review).toHaveAttribute("aria-live", "polite");
-  await expect(page.getByText("仍有 2 个阻断或必须检查项。", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "提交所选" })).toBeDisabled();
-  await expect(page.getByLabel("选择提交单元 blocked.pdf")).toBeDisabled();
-  await expect(page.getByLabel("选择提交单元 existing.md")).toBeDisabled();
-  await expect(page.getByText("失败，可重试", { exact: true })).toBeVisible();
-  await expect(page.getByText("恢复原因：模拟写入失败", { exact: true })).toBeVisible();
-
-  await page.getByLabel("提交单元筛选").selectOption("existing-note");
-  await expect(page.getByText("existing.md", { exact: true })).toBeVisible();
-  await expect(page.getByText("review.pdf", { exact: true })).toHaveCount(0);
-  await page.getByLabel("提交单元筛选").selectOption("all");
-  await page.getByRole("button", { name: "全选可提交" }).click();
-  await expect(page.getByLabel("选择提交单元 review.pdf")).toBeChecked();
-  await expect(page.getByLabel("选择提交单元 retry.pdf")).toBeChecked();
-  await expect(page.getByRole("button", { name: "提交所选" })).toBeEnabled();
-
-  await page.getByRole("button", { name: "刷新快照" }).click();
-  await expect.poll(() => refreshed).toBe(true);
-  await expect(page.getByText("审核快照已刷新。", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "提交所选" }).click();
-  await expect.poll(() => commitUnitIds).toEqual(["source-ready", "source-retry"]);
-  await expect(page.getByText("提交结果已记录。", { exact: true })).toBeVisible();
-  await expect(page.getByText("已提交", { exact: true })).toHaveCount(2);
+  await page.getByRole("button", { name: /^book\.pdf/ }).click();
+  await expect(page.getByText("状态：已完成")).toBeVisible();
+  await expect(page.getByText("当前阶段：完成")).toBeVisible();
+  await expect(page.getByText("只读分类观察。", { exact: true })).toBeVisible();
+  await expect(page.getByText("只读链接候选。", { exact: true })).toBeVisible();
+  await expect(page.getByText("提交记录", { exact: true })).toBeVisible();
+  await expect(page.getByText("提交审核", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("提交所选", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /接受|排除|保存修正/ })).toHaveCount(0);
+  expect(requests.some((url) => url.endsWith("/commit"))).toBe(false);
 });
 
 test("shows a task loading failure instead of an empty task list", async ({ page }) => {
@@ -1190,7 +1077,7 @@ test("configures independent chat and Rerank models without requiring an Embeddi
       name: payload.name,
       endpoint: payload.endpoint,
       transport: "openai-compatible",
-      credential_configured: true,
+      credential_configured: Boolean(payload.secret),
       verification: {
         discovery: { ok: false, reason: "Not yet verified." },
         health: { ok: false, reason: "Not yet verified." },
@@ -1298,15 +1185,15 @@ test("configures independent chat and Rerank models without requiring an Embeddi
   await page.getByRole("link", { name: "设置" }).click();
   await expect(page.getByRole("heading", { name: "Provider" })).toBeVisible();
   await page.getByRole("button", { name: "添加 Provider" }).click();
-  const secret = page.getByLabel("凭据");
+  const secret = page.getByLabel("API Key（可选）");
   await expect(secret).toHaveAttribute("type", "password");
-  await page.getByLabel("名称").fill("Cloud AI");
-  await page.getByLabel("服务地址").fill("https://provider.example/v1");
-  await secret.fill("never-render-this");
+  await page.getByLabel("名称").fill("Local AI");
+  await page.getByLabel("服务地址").fill("http://127.0.0.1:11434/v1");
   await page.getByRole("button", { name: "添加 Provider" }).last().click();
 
-  await expect(page.getByText("Cloud AI")).toBeVisible();
-  await expect(page.getByLabel("凭据")).toHaveCount(0);
+  await expect(page.getByText("Local AI")).toBeVisible();
+  await expect(page.getByText("API Key：未配置")).toBeVisible();
+  await expect(page.getByLabel("API Key（可选）")).toHaveCount(0);
   await expect(page.getByText("模型发现：Not yet verified.")).toBeVisible();
   await page.getByRole("button", { name: "测试" }).click();
   await expect(page.getByText("模型发现：通过")).toBeVisible();
@@ -1404,7 +1291,12 @@ test("manages bounded private sessions without inheriting a vault or closing del
         json: {
           session,
           messages: sessionId === "session-1"
-            ? [{ message_id: "message-1", role: "assistant", content: "会话详情已加载。" }]
+            ? [
+                { message_id: "message-1", role: "user", content: "第一轮问题", created_at: "2026-07-22T00:00:00+00:00" },
+                { message_id: "message-2", role: "assistant", content: "会话详情已加载。\n".repeat(48), created_at: "2026-07-22T00:00:01+00:00" },
+                { message_id: "message-3", role: "user", content: "第二轮问题", created_at: "2026-07-22T00:00:02+00:00" },
+                { message_id: "message-4", role: "assistant", content: "第二轮回答。", created_at: "2026-07-22T00:00:03+00:00" }
+              ]
             : [],
           task_states: [],
           citations: sessionId === "session-1"
@@ -1450,8 +1342,14 @@ test("manages bounded private sessions without inheriting a vault or closing del
   await page.getByRole("link", { name: "会话", exact: true }).click();
 
   await expect(page.getByRole("button", { name: /会话 1 所用 vault：数学资料/ })).toBeVisible();
-  await expect(page.getByLabel("会话内容").getByText(/所用 vault：数学资料/)).toBeVisible();
-  await expect(page.getByText("会话详情已加载。", { exact: true })).toBeVisible();
+  await expect(page.getByLabel("会话内容").locator(".session-detail-meta")).toHaveCount(0);
+  await expect(page.getByText("会话详情已加载。")).toBeVisible();
+  const messageList = page.locator(".session-message-list");
+  const turnNavigator = page.getByLabel("问答定位");
+  await expect(turnNavigator.getByRole("button")).toHaveCount(2);
+  await expect.poll(() => messageList.evaluate((element) => element.scrollTop)).toBeGreaterThan(32);
+  await turnNavigator.getByRole("button").first().click();
+  await expect.poll(() => messageList.evaluate((element) => element.scrollTop)).toBeLessThan(32);
   await expect(page.getByText("notes/algebra.md", { exact: true })).toBeVisible();
   await expect(page.getByText("第 1 / 2 页", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "下一页" }).click();
@@ -1571,7 +1469,18 @@ test("keeps the latest session list result when an older search resolves last", 
   await expect(page.getByText("旧搜索结果", { exact: true })).toHaveCount(0);
 });
 
-test("requires a saved session context before composer actions and announces attachment changes", async ({ page }) => {
+test("submits the selected session context and question in one request", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(globalThis.navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText(value) {
+          globalThis.__copiedSessionAnswer = value;
+          return Promise.resolve();
+        }
+      }
+    });
+  });
   let session = {
     session_id: "session-1",
     title: "语境测试",
@@ -1588,10 +1497,13 @@ test("requires a saved session context before composer actions and announces att
     updated_at: "2026-07-23T00:00:00+00:00",
     last_activity_at: "2026-07-23T00:00:00+00:00"
   };
-  const attachments = [];
-  const taskSnapshots = [];
+  const messages = [];
+  const citations = [];
+  const generationResults = [];
   const retrievalResults = [];
-  let previewRequests = 0;
+  const runRequests = [];
+  const retrievalModeRequests = [];
+  const legacyRequests = [];
   const vaults = [
     { vault_id: "vault-a", display_name: "Session Vault A", managed_root_relative_path: "platform", authorization_status: "active", access_status: "available" },
     { vault_id: "vault-b", display_name: "Session Vault B", managed_root_relative_path: "platform", authorization_status: "active", access_status: "available" }
@@ -1602,6 +1514,30 @@ test("requires a saved session context before composer actions and announces att
     const url = new URL(request.url());
     if (url.pathname === "/api/health") return route.fulfill({ json: { service: "obsidian-personal-knowledge-platform" } });
     if (url.pathname === "/api/session") return route.fulfill({ json: { status: "ok" } });
+    if (url.pathname === "/api/retrieval/mode") {
+      if (request.method() === "POST") {
+        const payload = request.postDataJSON();
+        retrievalModeRequests.push(payload.mode);
+        return route.fulfill({ json: {
+          mode: payload.mode,
+          label: payload.mode === "semantic" ? "仅语义" : "关键词与语义混合",
+          options: [
+            { mode: "keyword", label: "仅关键词" },
+            { mode: "semantic", label: "仅语义" },
+            { mode: "hybrid", label: "关键词与语义混合" }
+          ]
+        } });
+      }
+      return route.fulfill({ json: {
+        mode: "keyword",
+        label: "仅关键词",
+        options: [
+          { mode: "keyword", label: "仅关键词" },
+          { mode: "semantic", label: "仅语义" },
+          { mode: "hybrid", label: "关键词与语义混合" }
+        ]
+      } });
+    }
     if (url.pathname === "/api/vaults") return route.fulfill({ json: { vaults } });
     if (url.pathname === "/api/providers/defaults") return route.fulfill({ json: { chat: {}, embedding: {} } });
     if (url.pathname === "/api/providers") {
@@ -1618,78 +1554,50 @@ test("requires a saved session context before composer actions and announces att
       return route.fulfill({ json: { sessions: [session], page: 1, page_size: 25, total: 1, total_pages: 1 } });
     }
     if (url.pathname === "/api/sessions/session-1" && request.method() === "GET") {
-      return route.fulfill({ json: { session, messages: [], task_states: [], citations: [], generation_results: [], attachments, task_snapshots: taskSnapshots, retrieval_results: retrievalResults } });
+      return route.fulfill({ json: {
+        session, messages, task_states: [], citations, generation_results: generationResults,
+        attachments: [], task_snapshots: [], retrieval_results: retrievalResults
+      } });
     }
-    if (url.pathname === "/api/sessions/session-1/context" && request.method() === "PATCH") {
-      const context = request.postDataJSON();
+    if (url.pathname === "/api/sessions/session-1/run" && request.method() === "POST") {
+      const command = request.postDataJSON();
+      runRequests.push(command);
       session = {
         ...session,
-        selected_vault_id: context.vault_id,
-        selected_vault_label: context.vault_id === "vault-b" ? "Vault B" : "Vault A",
-        selected_provider_id: context.provider_id,
+        selected_vault_id: command.vault_id,
+        selected_vault_label: command.vault_id === "vault-b" ? "Session Vault B" : "Session Vault A",
+        selected_provider_id: command.provider_id,
         selected_provider_label: "Local",
-        selected_model_id: context.model_id,
-        selected_model_label: context.model_id,
-        scope_kind: context.scope_kind,
-        scope_path: context.scope_path
+        selected_model_id: command.model_id,
+        selected_model_label: command.model_id,
+        scope_kind: command.scope_kind,
+        scope_path: command.scope_path,
+        message_count: 1
       };
-      return route.fulfill({ json: { session } });
-    }
-    if (url.pathname === "/api/sessions/session-1/attachments/select") {
-      return route.fulfill({ json: { selection_id: "selection-1", label: "handout.md" } });
-    }
-    if (url.pathname === "/api/sessions/session-1/attachments" && request.method() === "POST") {
-      const attachment = { attachment_id: "attachment-1", filename: "handout.md", status: "available" };
-      attachments.push(attachment);
-      return route.fulfill({ json: { attachments: [attachment] } });
-    }
-    if (url.pathname === "/api/sessions/session-1/attachments/attachment-1" && request.method() === "DELETE") {
-      attachments.splice(0, attachments.length);
-      return route.fulfill({ json: { status: "removed" } });
-    }
-    if (url.pathname === "/api/sessions/session-1/task-preview" && request.method() === "POST") {
-      previewRequests += 1;
-      if (previewRequests === 2) {
-        return route.fulfill({ json: { preview: {
-          intent: "source-lookup", intent_source: "auto", vault_id: session.selected_vault_id,
-          scope_kind: session.scope_kind, scope_path: session.scope_path,
-          provider_id: session.selected_provider_id, model_id: session.selected_model_id,
-          index_status: "provider-model-unavailable", index_updated_at: null,
-          exclusion_summary: "无法读取排除项。", outbound_scope_summary: "尚未发送；恢复不可用对象后重新准备任务。",
-          source_count: 0, source_digest: "a".repeat(64), source_sample: [], is_ready: false,
-          blocking_reason: "所选 Provider/Model 不可用。", recovery_action: "选择已验证的 chat Model 后重试。"
-        } } });
-      }
-      return route.fulfill({ json: { preview: {
-        intent: "source-lookup", intent_source: "auto", vault_id: session.selected_vault_id,
-        scope_kind: session.scope_kind, scope_path: session.scope_path,
-        provider_id: session.selected_provider_id, model_id: session.selected_model_id,
-        index_status: "healthy", index_updated_at: "2026-07-23T00:00:00+00:00",
-        exclusion_summary: "无排除项。", outbound_scope_summary: "尚未发送；实际检索块将在执行前按任务快照申请或核验授权。",
-        source_count: 0, source_digest: "a".repeat(64), source_sample: [], is_ready: true,
-        blocking_reason: null, recovery_action: null
-      } } });
-    }
-    if (url.pathname === "/api/sessions/session-1/tasks" && request.method() === "POST") {
-      const { content } = request.postDataJSON();
-      const snapshot = {
-        snapshot_id: "snapshot-1", task_id: "task-1", intent: "source-lookup", status: "prepared",
-        scope_kind: "vault", scope_path: null, source_count: 0, source_digest: "a".repeat(64),
-        index_status: "healthy", outbound_scope_summary: "尚未发送", content
-      };
-      taskSnapshots.push(snapshot);
-      return route.fulfill({ json: { snapshot } });
-    }
-    if (url.pathname === "/api/sessions/session-1/tasks/task-1/execute/stream" && request.method() === "POST") {
-      taskSnapshots[0].status = "completed";
+      messages.push({ message_id: "message-1", role: "user", content: command.content, created_at: "2026-07-23T00:00:01+00:00" });
+      generationResults.push({
+        result_id: "generation-1", status: "valid", content: "可直接使用的回答。",
+        task_id: "task-1", snapshot_id: "snapshot-1", provider_id: command.provider_id,
+        model_id: command.model_id, vault_id: command.vault_id, scope_kind: command.scope_kind,
+        scope_path: command.scope_path, content_origin: "model-judgement", context_summary: "", created_at: "2026-07-23T00:00:02+00:00"
+      });
       const result = {
-        result_id: "result-1", task_id: "task-1", snapshot_id: "snapshot-1", status: "no-evidence",
-        summary: "健康索引与有效范围内未找到可支持该请求的知识库证据。",
-        recovery_action: "修改问题或范围后重新准备任务。",
-        retrieval_duration_ms: 3, generation_duration_ms: 0, evidences: []
+        result_id: "result-1", task_id: "task-1", snapshot_id: "snapshot-1", vault_id: command.vault_id,
+        status: "completed", summary: "已在已确认范围内找到 1 条知识库证据；已提交给所选 Model 生成回答。",
+        recovery_action: null, retrieval_duration_ms: 3, generation_duration_ms: 2,
+        evidences: [{ ordinal: 1, identity_kind: "native", relative_path: "notes/unit.md", heading: "Unit", location: "heading: Unit", excerpt: "可提交给模型的证据", matched_channels: ["lexical"] }]
       };
+      citations.push({
+        citation_id: "citation-1", result_id: "generation-1", snapshot_id: "snapshot-1",
+        vault_id: command.vault_id, relative_path: "notes/unit.md", location: "heading: Unit",
+        identity_kind: "native", status: "valid"
+      });
       retrievalResults.push(result);
-      return route.fulfill(resultEventStream(result));
+      return route.fulfill({ json: { result } });
+    }
+    if (url.pathname.includes("/task-preview") || url.pathname.includes("/tasks")) {
+      legacyRequests.push(url.pathname);
+      return route.fulfill({ status: 500, json: { detail: "不应调用旧流程。" } });
     }
     return route.fallback();
   });
@@ -1697,6 +1605,9 @@ test("requires a saved session context before composer actions and announces att
   await page.goto("/");
   await page.getByRole("link", { name: "会话", exact: true }).click();
   await expect(page.getByLabel("会话输入")).toBeVisible();
+  await page.getByRole("button", { name: "仅语义", exact: true }).click();
+  await page.getByRole("button", { name: "关键词与语义混合", exact: true }).click();
+  expect(retrievalModeRequests).toEqual(["semantic", "hybrid"]);
   await expect(page.getByText("所用 vault：Session Vault A", { exact: true })).toBeVisible();
   await expect(page.getByLabel("选择 vault").locator("option")).toHaveText(["选择 vault", "Session Vault A", "Session Vault B"]);
 
@@ -1707,33 +1618,25 @@ test("requires a saved session context before composer actions and announces att
   await composer.press("Shift+Enter");
   await composer.pressSequentially("第二行");
   await expect(composer).toHaveValue("第一行\n第二行");
-  await expect(page.getByRole("button", { name: "准备任务", exact: true })).toBeDisabled();
-  await expect(page.getByRole("button", { name: "添加附件", exact: true })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "发送", exact: true })).toBeEnabled();
+  await expect(page.getByText(/保存语境|准备任务|固定快照|执行检索/)).toHaveCount(0);
+  await page.getByRole("button", { name: "发送", exact: true }).click();
 
-  await page.getByRole("button", { name: "保存语境", exact: true }).click();
-  await expect(page.getByText("会话语境已保存。", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "准备任务", exact: true })).toBeEnabled();
-  await page.getByRole("button", { name: "添加附件", exact: true }).click();
-  await expect(page.getByText("附件已添加。", { exact: true })).toBeVisible();
-  const removeAttachment = page.getByRole("button", { name: "移除附件 handout.md" });
-  await removeAttachment.focus();
-  await page.keyboard.press("Enter");
-  await expect(page.getByText("附件已移除。", { exact: true })).toBeVisible();
-  await expect(removeAttachment).toHaveCount(0);
-
-  await page.getByRole("button", { name: "准备任务", exact: true }).click();
-  await expect(page.getByText("执行前范围：原文定位（自动识别）", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "固定快照", exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "准备任务", exact: true }).click();
-  await expect(page.getByText("所选 Provider/Model 不可用。", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "固定快照", exact: true })).toHaveCount(0);
-  await page.getByRole("button", { name: "准备任务", exact: true }).click();
-  await page.getByRole("button", { name: "固定快照", exact: true }).click();
-  await expect(page.getByText("任务快照已固定，等待后续检索执行。", { exact: true })).toBeVisible();
-  await expect(page.getByText("任务 原文定位：已准备", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "执行检索", exact: true }).click();
-  await expect(page.getByLabel("未找到证据").getByText("健康索引与有效范围内未找到可支持该请求的知识库证据。", { exact: true })).toBeVisible();
-  await expect(page.getByText("检索 3 ms；生成 0 ms（未调用 Model）", { exact: true })).toBeVisible();
+  const conversation = page.getByLabel("会话内容");
+  await expect(conversation.locator(".session-detail-meta")).toHaveCount(0);
+  await expect(conversation).toContainText("可直接使用的回答。");
+  await expect(conversation).toContainText("[1]");
+  await expect(conversation).not.toContainText("可提交给模型的证据");
+  await expect(page.getByRole("complementary", { name: "应用证据" })).toContainText("notes/unit.md");
+  await conversation.getByRole("link", { name: "查看来源 notes/unit.md" }).click();
+  await expect.poll(() => page.evaluate(() => document.activeElement?.id || "")).toMatch(/^application-evidence-/);
+  await page.getByRole("button", { name: "复制正文", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => globalThis.__copiedSessionAnswer)).toBe("可直接使用的回答。");
+  expect(runRequests).toEqual([{
+    vault_id: "vault-b", scope_kind: "vault", scope_path: null, provider_id: "provider-1",
+    model_id: "chat-1", content: "第一行\n第二行", intent: "auto"
+  }]);
+  expect(legacyRequests).toEqual([]);
 });
 
 test("renders keyboard-accessible paragraph editing and verification controls", async ({ page }) => {
@@ -1815,27 +1718,29 @@ test("renders keyboard-accessible paragraph editing and verification controls", 
 
   await page.goto("/");
   await page.getByRole("link", { name: "会话", exact: true }).click();
-  await expect(
-    page.getByText("本地证据摘要 · Provider：provider-1 · Model：chat-1", { exact: true })
-  ).toBeVisible();
-  await expect(page.getByText("有效", { exact: true })).toBeVisible();
+  const conversation = page.getByLabel("会话内容");
+  await expect(conversation).toContainText("可追溯的本地证据摘要。");
+  await expect(conversation).toContainText("[1]");
+  await expect(conversation).not.toContainText("Provider：provider-1");
+  await expect(conversation).not.toContainText("用户约束：仅限本地资料。");
+  await expect(page.getByRole("complementary", { name: "应用证据" })).toContainText("notes/unit.md");
 
-  const editButton = page.getByRole("button", { name: "编辑段落", exact: true });
+  const editButton = page.getByRole("button", { name: "编辑回答", exact: true });
   await editButton.focus();
   await page.keyboard.press("Enter");
-  await page.getByLabel("编辑带引用段落").fill("已编辑的本地证据摘要。");
+  await page.getByLabel("编辑回答").fill("已编辑的本地证据摘要。");
   await page.getByRole("button", { name: "保存并标为待核验", exact: true }).click();
-  await expect(page.getByText("段落已更新，原引用已标为待核验。", { exact: true })).toBeVisible();
+  await expect(page.getByText("内容已更新，需重新确认。", { exact: true })).toBeVisible();
   await expect(page.getByText("待核验", { exact: true })).toBeVisible();
 
-  const reverifyButton = page.getByRole("button", { name: "重新检索核验", exact: true });
+  const reverifyButton = page.getByRole("button", { name: "重新确认", exact: true });
   await reverifyButton.focus();
   await page.keyboard.press("Enter");
-  await expect(page.getByText("引用已通过重新检索核验。", { exact: true })).toBeVisible();
+  await expect(page.getByText("内容已重新确认。", { exact: true })).toBeVisible();
   await expect(page.getByText("有效", { exact: true })).toBeVisible();
 });
 
-test("presents independent retrieval sources side by side without a preferred answer", async ({ page }) => {
+test("moves uncited source-lookup material into the application-evidence pane", async ({ page }) => {
   const session = {
     session_id: "session-1",
     title: "来源对照",
@@ -1963,15 +1868,20 @@ test("presents independent retrieval sources side by side without a preferred an
   await page.goto("/");
   await page.getByRole("link", { name: "会话", exact: true }).click();
 
-  await expect(page.getByText("独立来源：2", { exact: true })).toBeVisible();
-  await expect(page.getByText("系统不会自动合并、选择或判定哪一种说法正确。", { exact: true })).toBeVisible();
-  await expect(page.getByText("同一来源中的 2 条证据只计为 1 个独立来源。", { exact: true })).toBeVisible();
-  const evidenceRows = page.locator(".source-comparison-group .evidence-row");
-  await expect(page.locator(".source-comparison-group")).toHaveCount(2);
+  const conversation = page.getByLabel("会话内容");
+  const evidencePane = page.getByRole("complementary", { name: "应用证据" });
+  await expect(conversation).toContainText("暂未生成可用回答。");
+  await expect(conversation).toContainText("[1]");
+  await expect(conversation).not.toContainText("同一教材的第一条证据。");
+  await expect(conversation).not.toContainText("独立来源：2");
+  const evidenceRows = evidencePane.locator(".evidence-row");
+  await expect(evidencePane.locator(".session-citation")).toHaveCount(3);
   await expect(evidenceRows).toHaveCount(3);
   await evidenceRows.first().locator("summary").click();
-  await expect(evidenceRows.first()).toContainText("vault：Session Vault");
-  await expect(evidenceRows.first()).toContainText("Source ID source-lesson");
+  await expect(evidencePane).toContainText("知识库：Session Vault");
+  await expect(evidenceRows.first()).toContainText("原始资料：sources/lesson.pdf");
+  await expect(evidenceRows.first()).not.toContainText("source-lesson");
+  await expect(evidenceRows.first()).not.toContainText("b".repeat(64));
 });
 
 test("shows completeness coverage gaps and stale sources without claiming completion", async ({ page }) => {
@@ -2025,568 +1935,13 @@ test("shows completeness coverage gaps and stale sources without claiming comple
   await page.getByRole("link", { name: "会话", exact: true }).click();
   await expect(page.getByLabel("来源已变化")).toContainText("不能继续作为当前完整结果");
   await expect(page.getByText("排除 1 项", { exact: true })).toBeVisible();
-  const excluded = page.locator(".completeness-result .evidence-row").nth(1);
+  const excluded = page.getByRole("complementary", { name: "应用证据" })
+    .locator(".session-citation")
+    .filter({ hasText: "notes/excluded.md" })
+    .locator(".evidence-row");
   await excluded.locator("summary").click();
   await expect(excluded).toContainText("内容被当前排除规则确认排除。");
   await expect(page.getByText("完整完成", { exact: true })).toHaveCount(0);
-});
-
-test("generates an evidence-bound knowledge organization result from the frozen plan", async ({ page }) => {
-  const session = {
-    session_id: "session-organization", title: "英语整理", selected_vault_id: "vault-a",
-    selected_vault_label: "Session Vault", selected_provider_id: "provider-1",
-    selected_provider_label: "Local", selected_model_id: "chat-1", selected_model_label: "chat-1",
-    scope_kind: "directory", scope_path: "notes/english", message_count: 1,
-    created_at: "2026-07-23T00:00:00+00:00", updated_at: "2026-07-23T00:00:00+00:00",
-    last_activity_at: "2026-07-23T00:00:00+00:00"
-  };
-  const plan = {
-    section_count: 1,
-    local_evidence_only: true,
-    sections: [{
-      ordinal: 1, title: "notes/english", goal: "整理英语知识点", scope_path: "notes/english",
-      evidence_count: 1,
-      evidence: [{
-        ordinal: 1, source_ordinal: 1, identity_kind: "native", relative_path: "notes/english/vocabulary.md",
-        content_sha256: "a".repeat(64), source_id: null, source_content_hash: null, source_path: null,
-        heading: "Vocabulary", location: "heading: Vocabulary", page: null, excerpt: "word evidence"
-      }]
-    }]
-  };
-  let generated = false;
-  const result = {
-    result_id: "result-organization", task_id: "task-organization", snapshot_id: "snapshot-organization",
-    vault_id: "vault-a", status: "completed", summary: "已按冻结证据生成 1 个知识整理计划段。",
-    recovery_action: null, duration_ms: 2, local_evidence_only: true,
-    structure_kind: "outline", section_counts: { planned: 1, prepared: 0, running: 0, completed: 1, failed: 0, recoverable: 0 },
-    sections: [{
-      ...plan.sections[0], status: "completed", reason: null, prepared_evidence_count: 1,
-      independent_source_count: 1,
-      conclusions: [{ ordinal: 1, content: "词汇整理结论。", evidence: plan.sections[0].evidence }]
-    }]
-  };
-  const detail = () => ({
-    session, messages: [{ message_id: "message-organization", role: "user", content: "整理英语知识点" }],
-    task_states: [], citations: [], generation_results: [], attachments: [], retrieval_results: [], completeness_results: [],
-    task_snapshots: [{
-      snapshot_id: "snapshot-organization", task_id: "task-organization", vault_id: "vault-a",
-      intent: "knowledge-organization", status: generated ? "completed" : "prepared", scope_kind: "directory",
-      scope_path: "notes/english", source_count: 1, source_digest: "a".repeat(64), index_status: "healthy",
-      exclusion_summary: "无排除项", outbound_scope_summary: "仅使用已冻结的本地知识库证据；不会调用 Provider、Model 或互联网。",
-      knowledge_organization_plan: plan, invalidation_reason: null
-    }],
-    knowledge_organization_results: generated ? [result] : []
-  });
-
-  await page.route("**/api/**", async (route) => {
-    const request = route.request();
-    const pathname = new URL(request.url()).pathname;
-    if (pathname === "/api/health") return route.fulfill({ json: { service: serviceName } });
-    if (pathname === "/api/session") return route.fulfill({ json: { status: "ok" } });
-    if (pathname === "/api/vaults") return route.fulfill({ json: { vaults: [{
-      vault_id: "vault-a", display_name: "Session Vault", managed_root_relative_path: "platform",
-      authorization_status: "active", access_status: "available"
-    }] } });
-    if (pathname === "/api/providers/defaults") return route.fulfill({ json: { chat: {}, embedding: {} } });
-    if (pathname === "/api/providers") return route.fulfill({ json: { providers: [] } });
-    if (pathname === "/api/import-tasks") return route.fulfill({ json: { tasks: [] } });
-    if (pathname === "/api/sessions" && request.method() === "GET") {
-      return route.fulfill({ json: { sessions: [session], page: 1, page_size: 25, total: 1, total_pages: 1 } });
-    }
-    if (pathname === "/api/sessions/session-organization" && request.method() === "GET") {
-      return route.fulfill({ json: detail() });
-    }
-    if (pathname === "/api/sessions/session-organization/tasks/task-organization/execute/stream" && request.method() === "POST") {
-      generated = true;
-      return route.fulfill(resultEventStream(result));
-    }
-    return route.fallback();
-  });
-
-  await page.goto("/");
-  await page.getByRole("link", { name: "会话", exact: true }).click();
-  const conversation = page.getByLabel("会话内容");
-  const evidencePane = page.getByLabel("引用证据");
-  await expect(page.getByLabel("知识整理计划").first()).toContainText("冻结证据 1 条");
-  await expect(conversation).not.toContainText("notes/english/vocabulary.md");
-  await expect(conversation).not.toContainText("word evidence");
-  const evidence = evidencePane.locator(".session-citation").first();
-  await expect(evidence).toContainText("知识整理计划证据");
-  await evidence.locator("summary").focus();
-  await evidence.locator("summary").press("Enter");
-  await expect(evidence).toContainText("word evidence");
-  await expect(evidence).toContainText("原生 Markdown：notes/english/vocabulary.md");
-
-  await page.getByRole("button", { name: "生成知识整理", exact: true }).click();
-  const generatedResult = page.getByLabel("整理已完成");
-  await expect(generatedResult).toContainText("已按冻结证据生成 1 个知识整理计划段。");
-  await expect(generatedResult).toContainText("结构：大纲；事实依据：冻结知识库证据");
-  await expect(generatedResult).toContainText("词汇整理结论。");
-  await expect(generatedResult).toContainText("独立来源：1");
-  await expect(generatedResult).not.toContainText("notes/english/vocabulary.md");
-  await expect(generatedResult).not.toContainText("word evidence");
-  await expect(page.getByLabel("知识整理计划进度")).toHaveText("计划 1 段；已准备 0 段；已完成 1 段；进行中 0 段失败 0 段；待恢复 0 段");
-  const conclusionEvidence = evidencePane.locator(".session-citation").first();
-  await conclusionEvidence.locator("summary").focus();
-  await conclusionEvidence.locator("summary").press("Enter");
-  await expect(conclusionEvidence).toContainText("word evidence");
-  await expect(conclusionEvidence.getByRole("link", { name: "在 Obsidian 中打开" })).toHaveAttribute(
-    "href", "/api/vaults/vault-a/open?file=notes%2Fenglish%2Fvocabulary.md"
-  );
-});
-
-test("confirms per-task knowledge-organization authorization before generating", async ({ page }) => {
-  const session = {
-    session_id: "session-authorization", title: "需授权整理", selected_vault_id: "vault-a",
-    selected_vault_label: "Session Vault", selected_provider_id: "provider-1",
-    selected_provider_label: "Local", selected_model_id: "chat-1", selected_model_label: "chat-1",
-    scope_kind: "directory", scope_path: "notes/english", message_count: 1,
-    created_at: "2026-07-23T00:00:00+00:00", updated_at: "2026-07-23T00:00:00+00:00",
-    last_activity_at: "2026-07-23T00:00:00+00:00"
-  };
-  const evidence = [{
-    ordinal: 1, source_ordinal: 1, identity_kind: "native", relative_path: "notes/english/vocabulary.md",
-    content_sha256: "a".repeat(64), source_id: null, source_content_hash: null, source_path: null,
-    heading: "Vocabulary", location: "heading: Vocabulary", page: null, excerpt: "word evidence"
-  }];
-  const completedResult = {
-    result_id: "result-authorization", task_id: "task-authorization", snapshot_id: "snapshot-authorization",
-    vault_id: "vault-a", status: "completed", summary: "已按冻结证据生成 1 个知识整理计划段。",
-    recovery_action: null, duration_ms: 2, local_evidence_only: true, structure_kind: "outline",
-    authorization_id: "authorization-organization", authorization_status: "approved",
-    section_counts: { planned: 1, prepared: 0, running: 0, completed: 1, failed: 0, recoverable: 0 },
-    sections: [{
-      ordinal: 1, title: "notes/english", goal: "整理英语知识点", scope_path: "notes/english", evidence_count: 1,
-      evidence, status: "completed", independent_source_count: 1,
-      conclusions: [{ ordinal: 1, content: "词汇整理结论。", evidence }]
-    }]
-  };
-  const waitingResult = {
-    ...completedResult, status: "waiting-authorization", summary: "知识整理将仅发送已冻结的计划段证据，等待本次授权。",
-    authorization_status: "pending", section_counts: { planned: 1, prepared: 0, running: 0, completed: 0, failed: 0, recoverable: 0 },
-    sections: []
-  };
-  let authorized = false;
-  let generated = false;
-  let authorizationRequests = 0;
-  let executionRequests = 0;
-  const detail = () => ({
-    session, messages: [{ message_id: "message-authorization", role: "user", content: "整理英语知识点" }],
-    task_states: [], citations: [], generation_results: [], attachments: [], retrieval_results: [], completeness_results: [],
-    task_snapshots: [{
-      snapshot_id: "snapshot-authorization", task_id: "task-authorization", vault_id: "vault-a",
-      intent: "knowledge-organization", status: generated ? "completed" : "waiting-authorization", scope_kind: "directory",
-      scope_path: "notes/english", source_count: 1, source_digest: "a".repeat(64), index_status: "healthy",
-      exclusion_summary: "无排除项", outbound_scope_summary: "仅使用已冻结的计划段证据，等待本次授权。",
-      knowledge_organization_plan: { section_count: 1, local_evidence_only: true, sections: [] }, invalidation_reason: null
-    }],
-    knowledge_organization_results: [generated ? completedResult : waitingResult]
-  });
-
-  await page.route("**/api/**", async (route) => {
-    const request = route.request();
-    const pathname = new URL(request.url()).pathname;
-    if (pathname === "/api/health") return route.fulfill({ json: { service: serviceName } });
-    if (pathname === "/api/session") return route.fulfill({ json: { status: "ok" } });
-    if (pathname === "/api/vaults") return route.fulfill({ json: { vaults: [{
-      vault_id: "vault-a", display_name: "Session Vault", managed_root_relative_path: "platform",
-      authorization_status: "active", access_status: "available"
-    }] } });
-    if (pathname === "/api/providers/defaults") return route.fulfill({ json: { chat: {}, embedding: {} } });
-    if (pathname === "/api/providers") return route.fulfill({ json: { providers: [] } });
-    if (pathname === "/api/import-tasks") return route.fulfill({ json: { tasks: [] } });
-    if (pathname === "/api/sessions" && request.method() === "GET") {
-      return route.fulfill({ json: { sessions: [session], page: 1, page_size: 25, total: 1, total_pages: 1 } });
-    }
-    if (pathname === "/api/sessions/session-authorization" && request.method() === "GET") {
-      return route.fulfill({ json: detail() });
-    }
-    if (pathname === "/api/vaults/vault-a/outbound-authorizations/authorization-organization/confirm" && request.method() === "POST") {
-      expect(request.postDataJSON()).toEqual({ approved: true });
-      authorizationRequests += 1;
-      authorized = true;
-      return route.fulfill({ json: { authorization: { authorization_id: "authorization-organization", status: "approved" } } });
-    }
-    if (pathname === "/api/sessions/session-authorization/tasks/task-authorization/execute/stream" && request.method() === "POST") {
-      expect(authorized).toBe(true);
-      executionRequests += 1;
-      generated = true;
-      return route.fulfill(resultEventStream(completedResult));
-    }
-    return route.fallback();
-  });
-
-  await page.goto("/");
-  await page.getByRole("link", { name: "会话", exact: true }).click();
-  await expect(page.getByLabel("等待本次授权")).toContainText("等待本次授权");
-  await page.getByRole("button", { name: "授权并生成", exact: true }).click();
-  await expect(page.getByLabel("整理已完成")).toContainText("词汇整理结论。");
-  expect(authorizationRequests).toBe(1);
-  expect(executionRequests).toBe(1);
-});
-
-test("confirms a content-free rerank preview before sending its task authorization", async ({ page }) => {
-  const session = {
-    session_id: "session-rerank", title: "受控候选重排", selected_vault_id: "vault-rerank",
-    selected_vault_label: "Rerank Vault", selected_provider_id: "provider-rerank",
-    selected_provider_label: "Verified Chat", selected_model_id: "chat-rerank", selected_model_label: "chat-rerank",
-    scope_kind: "vault", scope_path: null, message_count: 1,
-    created_at: "2026-07-27T00:00:00+00:00", updated_at: "2026-07-27T00:00:00+00:00",
-    last_activity_at: "2026-07-27T00:00:00+00:00"
-  };
-  const authorizationId = "authorization-rerank-sensitive";
-  const candidateText = "不应展示或发送到浏览器的候选正文";
-  const absolutePath = "C:\\private\\rerank-source.md";
-  const contentHash = "f".repeat(64);
-  const preview = {
-    vault_id: "vault-rerank",
-    provider_id: "provider-rerank",
-    provider_name: "Verified Chat",
-    model_id: "chat-rerank",
-    provider_configuration_revision: "provider-revision-7",
-    policy_revision: 12,
-    file_count: 2,
-    candidate_count: 4,
-    input_character_count: 1200,
-    blocked_file_count: 1,
-    blocked_candidate_count: 1,
-    content_categories: ["source-lookup-query", "retrieval-candidate"],
-    is_authorizable: true,
-    blocking_reason: "其中一项候选命中 never-send-cloud。",
-    candidate_text: candidateText,
-    absolute_path: absolutePath,
-    content_sha256: contentHash
-  };
-  const completedResult = {
-    result_id: "result-rerank", task_id: "task-rerank", snapshot_id: "snapshot-rerank",
-    vault_id: "vault-rerank", status: "completed", summary: "已按本次确认调用候选重排。",
-    recovery_action: null, retrieval_duration_ms: 9, generation_duration_ms: 0,
-    rerank_authorization_id: authorizationId, rerank_status: "completed",
-    rerank_network_request_count: 1, rerank_duration_ms: 4, evidences: []
-  };
-  let completed = false;
-  let previewRequests = 0;
-  let confirmationRequests = 0;
-  let executionRequests = 0;
-  const previewBodies = [];
-  const confirmationBodies = [];
-  const executionBodies = [];
-  const detail = () => ({
-    session,
-    messages: [{ message_id: "message-rerank", role: "user", content: "定位语法规则" }],
-    task_states: [], citations: [], generation_results: [], attachments: [], completeness_results: [],
-    knowledge_organization_results: [], deep_creation_results: [],
-    task_snapshots: [{
-      snapshot_id: "snapshot-rerank", task_id: "task-rerank", vault_id: "vault-rerank",
-      intent: "source-lookup", status: completed ? "completed" : "prepared", scope_kind: "vault",
-      scope_path: null, source_count: 2, source_digest: "a".repeat(64), index_status: "healthy",
-      exclusion_summary: "已配置 never-send-cloud 排除项", outbound_scope_summary: "尚未发送", invalidation_reason: null
-    }],
-    retrieval_results: completed ? [completedResult] : []
-  });
-
-  await page.route("**/api/**", async (route) => {
-    const request = route.request();
-    const pathname = new URL(request.url()).pathname;
-    if (pathname === "/api/health") return route.fulfill({ json: { service: serviceName } });
-    if (pathname === "/api/session") return route.fulfill({ json: { status: "ok" } });
-    if (pathname === "/api/vaults") return route.fulfill({ json: { vaults: [{
-      vault_id: "vault-rerank", display_name: "Rerank Vault", managed_root_relative_path: "platform",
-      authorization_status: "active", access_status: "available"
-    }] } });
-    if (pathname === "/api/providers/defaults") return route.fulfill({ json: { chat: {}, embedding: {} } });
-    if (pathname === "/api/providers") return route.fulfill({ json: { providers: [] } });
-    if (pathname === "/api/import-tasks") return route.fulfill({ json: { tasks: [] } });
-    if (pathname === "/api/sessions" && request.method() === "GET") {
-      return route.fulfill({ json: { sessions: [session], page: 1, page_size: 25, total: 1, total_pages: 1 } });
-    }
-    if (pathname === "/api/sessions/session-rerank" && request.method() === "GET") {
-      return route.fulfill({ json: detail() });
-    }
-    if (pathname === "/api/sessions/session-rerank/tasks/task-rerank/rerank-authorizations" && request.method() === "POST") {
-      const body = request.postDataJSON();
-      previewBodies.push(body);
-      expect(body).toEqual({});
-      previewRequests += 1;
-      return route.fulfill({ json: {
-        preview,
-        authorization: { authorization_id: authorizationId, status: "pending" }
-      } });
-    }
-    if (pathname === `/api/vaults/vault-rerank/outbound-authorizations/${authorizationId}/confirm` && request.method() === "POST") {
-      const body = request.postDataJSON();
-      confirmationBodies.push(body);
-      expect(body).toEqual({ approved: true });
-      confirmationRequests += 1;
-      return route.fulfill({ json: { authorization: { authorization_id: authorizationId, status: "approved" } } });
-    }
-    if (pathname === "/api/sessions/session-rerank/tasks/task-rerank/execute/stream" && request.method() === "POST") {
-      const body = request.postDataJSON();
-      executionBodies.push(body);
-      expect(body).toEqual({ rerank_authorization_id: authorizationId });
-      executionRequests += 1;
-      completed = true;
-      return route.fulfill(resultEventStream(completedResult));
-    }
-    return route.fallback();
-  });
-
-  await page.goto("/");
-  await page.getByRole("link", { name: "会话", exact: true }).click();
-  await page.getByRole("button", { name: "执行检索", exact: true }).click();
-
-  const authorizationPreview = page.getByLabel("点查 rerank 外发授权预览");
-  await expect(authorizationPreview).toBeVisible();
-  await expect(authorizationPreview).toContainText("候选 4 项；文件 2 项；输入 1200 个字符");
-  await expect(authorizationPreview).toContainText("已排除的候选不会发送；其中一项候选命中 never-send-cloud。");
-  await expect(page.getByRole("button", { name: "确认并执行 rerank", exact: true })).toBeVisible();
-  expect(previewRequests).toBe(1);
-  expect(confirmationRequests).toBe(0);
-  expect(executionRequests).toBe(0);
-  expect(previewBodies).toEqual([{}]);
-
-  const previewText = await page.locator("body").innerText();
-  expect(previewText).not.toContain(candidateText);
-  expect(previewText).not.toContain(absolutePath);
-  expect(previewText).not.toContain(contentHash);
-  expect(previewText).not.toContain(authorizationId);
-
-  await page.getByRole("button", { name: "确认并执行 rerank", exact: true }).click();
-  await expect(page.getByLabel("本地知识库证据")).toContainText("已按本次确认调用候选重排。");
-  expect(confirmationRequests).toBe(1);
-  expect(executionRequests).toBe(1);
-  expect(confirmationBodies).toEqual([{ approved: true }]);
-  expect(executionBodies).toEqual([{ rerank_authorization_id: authorizationId }]);
-  for (const body of [...previewBodies, ...confirmationBodies, ...executionBodies]) {
-    const serialized = JSON.stringify(body);
-    expect(serialized).not.toContain(candidateText);
-    expect(serialized).not.toContain(absolutePath);
-    expect(serialized).not.toContain(contentHash);
-  }
-});
-
-test("blocks an oversized knowledge-organization preview before it can create a snapshot", async ({ page }) => {
-  const session = {
-    session_id: "session-budget", title: "范围预算", selected_vault_id: "vault-a",
-    selected_vault_label: "Budget Vault", selected_provider_id: "provider-1",
-    selected_provider_label: "Local", selected_model_id: "chat-1", selected_model_label: "chat-1",
-    scope_kind: "directory", scope_path: "notes/large", message_count: 0,
-    created_at: "2026-07-23T00:00:00+00:00", updated_at: "2026-07-23T00:00:00+00:00",
-    last_activity_at: "2026-07-23T00:00:00+00:00"
-  };
-  let snapshotCreateRequests = 0;
-
-  await page.route("**/api/**", async (route) => {
-    const request = route.request();
-    const pathname = new URL(request.url()).pathname;
-    if (pathname === "/api/health") return route.fulfill({ json: { service: serviceName } });
-    if (pathname === "/api/session") return route.fulfill({ json: { status: "ok" } });
-    if (pathname === "/api/vaults") return route.fulfill({ json: { vaults: [{
-      vault_id: "vault-a", display_name: "Budget Vault", managed_root_relative_path: "platform",
-      authorization_status: "active", access_status: "available"
-    }] } });
-    if (pathname === "/api/providers/defaults") return route.fulfill({ json: { chat: {}, embedding: {} } });
-    if (pathname === "/api/providers") return route.fulfill({ json: { providers: [{
-      provider_id: "provider-1", name: "Local", credential_configured: true,
-      verification: { is_verified: true },
-      models: [{ model_id: "chat-1", model_type: "chat", is_discovered: true, verification: { ok: true } }]
-    }] } });
-    if (pathname === "/api/import-tasks") return route.fulfill({ json: { tasks: [] } });
-    if (pathname === "/api/sessions" && request.method() === "GET") {
-      return route.fulfill({ json: { sessions: [session], page: 1, page_size: 25, total: 1, total_pages: 1 } });
-    }
-    if (pathname === "/api/sessions/session-budget" && request.method() === "GET") {
-      return route.fulfill({ json: {
-        session, messages: [], task_states: [], citations: [], generation_results: [], attachments: [],
-        task_snapshots: [], retrieval_results: [], completeness_results: [], knowledge_organization_results: []
-      } });
-    }
-    if (pathname === "/api/sessions/session-budget/task-preview" && request.method() === "POST") {
-      return route.fulfill({ json: { preview: {
-        intent: "knowledge-organization", intent_source: "explicit", vault_id: "vault-a",
-        scope_kind: "directory", scope_path: "notes/large", provider_id: "provider-1", model_id: "chat-1",
-        index_status: "healthy", index_updated_at: "2026-07-23T00:00:00+00:00", index_digest: "i".repeat(64),
-        policy_revision: 4, exclusion_summary: "无排除项。", outbound_mode: "ask-each-task",
-        outbound_scope_summary: "仅使用已冻结的本地知识库证据；不会调用 Provider、Model 或互联网。",
-        source_count: 501, source_digest: "s".repeat(64), source_sample: [],
-        knowledge_organization_plan: { section_count: 1, local_evidence_only: true, sections: [{
-          ordinal: 1, title: "notes/large", goal: "整理大范围资料", scope_path: "notes/large", evidence_count: 129, evidence: []
-        }] },
-        is_ready: false,
-        blocking_reason: "计划证据超出 128 条预算；请缩小范围后重新准备任务。",
-        recovery_action: "缩小范围后重新准备任务。"
-      } } });
-    }
-    if (pathname === "/api/sessions/session-budget/tasks" && request.method() === "POST") {
-      snapshotCreateRequests += 1;
-      return route.fulfill({ status: 500, json: { detail: "不得创建部分计划。" } });
-    }
-    return route.fallback();
-  });
-
-  await page.goto("/");
-  await page.getByRole("link", { name: "会话", exact: true }).click();
-  await page.getByLabel("选择任务类型").selectOption("knowledge-organization");
-  await page.getByLabel("输入问题或继续创作").fill("整理大范围资料");
-  await page.getByRole("button", { name: "准备任务", exact: true }).click();
-
-  await expect(page.getByText("计划证据超出 128 条预算；请缩小范围后重新准备任务。", { exact: true })).toBeVisible();
-  await expect(page.getByText("第 1 段：已计划；目标：整理大范围资料", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "固定快照", exact: true })).toHaveCount(0);
-  expect(snapshotCreateRequests).toBe(0);
-});
-
-test("fixes an enumeration snapshot without query scope confirmation", async ({ page }) => {
-  const session = {
-    session_id: "session-query-scope", title: "范围确认", selected_vault_id: "vault-a",
-    selected_vault_label: "Query Vault", selected_provider_id: "provider-1",
-    selected_provider_label: "Local", selected_model_id: "chat-1", selected_model_label: "chat-1",
-    scope_kind: "vault", scope_path: null, message_count: 0,
-    created_at: "2026-07-26T00:00:00+00:00", updated_at: "2026-07-26T00:00:00+00:00",
-    last_activity_at: "2026-07-26T00:00:00+00:00"
-  };
-  const taskSnapshots = [];
-  let createdTaskRequest = null;
-  const preview = () => ({
-    intent: "knowledge-organization", intent_source: "explicit", vault_id: "vault-a",
-    scope_kind: "vault", scope_path: null, provider_id: "provider-1", model_id: "chat-1",
-    index_status: "healthy", index_updated_at: "2026-07-26T00:00:00+00:00", index_digest: "i".repeat(64),
-    policy_revision: 1, exclusion_summary: "无排除项。", outbound_mode: "ask-each-task",
-    outbound_scope_summary: "仅使用本地索引范围预览；不会调用 Provider、Model 或互联网。",
-    source_count: 2, source_digest: "s".repeat(64), source_sample: [], is_ready: true,
-    blocking_reason: null, recovery_action: null,
-    query_scope: {
-      subject: "英语", grade_volume: null, unit_no: 1, material_type: null,
-      status: "recoverable", reason: "incomplete-scope", confidence: null, source: "query",
-      document_count: 0, block_count: 0, material_types: [], gaps: ["缺少册次。"], is_confirmed: false
-    }
-  });
-
-  await page.route("**/api/**", async (route) => {
-    const request = route.request();
-    const pathname = new URL(request.url()).pathname;
-    if (pathname === "/api/health") return route.fulfill({ json: { service: serviceName } });
-    if (pathname === "/api/session") return route.fulfill({ json: { status: "ok" } });
-    if (pathname === "/api/vaults") return route.fulfill({ json: { vaults: [{
-      vault_id: "vault-a", display_name: "Query Vault", managed_root_relative_path: "platform",
-      authorization_status: "active", access_status: "available"
-    }] } });
-    if (pathname === "/api/providers/defaults") return route.fulfill({ json: { chat: {}, embedding: {} } });
-    if (pathname === "/api/providers") return route.fulfill({ json: { providers: [{
-      provider_id: "provider-1", name: "Local", credential_configured: true,
-      verification: { is_verified: true },
-      models: [{ model_id: "chat-1", model_type: "chat", is_discovered: true, verification: { ok: true } }]
-    }] } });
-    if (pathname === "/api/import-tasks") return route.fulfill({ json: { tasks: [] } });
-    if (pathname === "/api/sessions" && request.method() === "GET") {
-      return route.fulfill({ json: { sessions: [session], page: 1, page_size: 25, total: 1, total_pages: 1 } });
-    }
-    if (pathname === "/api/sessions/session-query-scope" && request.method() === "GET") {
-      return route.fulfill({ json: {
-        session, messages: [], task_states: [], citations: [], generation_results: [], attachments: [],
-        task_snapshots: taskSnapshots, retrieval_results: [], completeness_results: [], knowledge_organization_results: []
-      } });
-    }
-    if (pathname === "/api/sessions/session-query-scope/task-preview" && request.method() === "POST") {
-      return route.fulfill({ json: { preview: preview() } });
-    }
-    if (pathname === "/api/sessions/session-query-scope/tasks" && request.method() === "POST") {
-      createdTaskRequest = request.postDataJSON();
-      taskSnapshots.push({
-        snapshot_id: "snapshot-query-scope", task_id: "task-query-scope", vault_id: "vault-a",
-        intent: "knowledge-organization", status: "prepared", scope_kind: "vault", scope_path: null,
-        source_count: 2, source_digest: "s".repeat(64), index_status: "healthy",
-        outbound_scope_summary: "仅使用冻结本地证据。"
-      });
-      return route.fulfill({ json: { snapshot: taskSnapshots[0] } });
-    }
-    return route.fallback();
-  });
-
-  await page.goto("/");
-  await page.getByRole("link", { name: "会话", exact: true }).click();
-  await page.getByLabel("选择任务类型").selectOption("knowledge-organization");
-  await page.getByLabel("输入问题或继续创作").fill("整理英语第一单元知识点");
-  await page.getByRole("button", { name: "准备任务", exact: true }).click();
-
-  await expect(page.getByLabel("查询范围预览")).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "固定快照", exact: true })).toBeEnabled();
-  await page.getByRole("button", { name: "固定快照", exact: true }).click();
-
-  expect(createdTaskRequest).toEqual({ content: "整理英语第一单元知识点", intent: "knowledge-organization" });
-});
-
-test("shows restored frozen bindings and never calls an interrupted plan prepared", async ({ page }) => {
-  const session = {
-    session_id: "session-restored-organization", title: "恢复整理", selected_vault_id: "vault-current",
-    selected_vault_label: "Current Vault", selected_provider_id: "provider-1",
-    selected_provider_label: "Local", selected_model_id: "chat-1", selected_model_label: "chat-1",
-    scope_kind: "vault", scope_path: null, message_count: 0,
-    created_at: "2026-07-23T00:00:00+00:00", updated_at: "2026-07-23T00:00:00+00:00",
-    last_activity_at: "2026-07-23T00:00:00+00:00"
-  };
-  const plan = {
-    section_count: 2, local_evidence_only: true,
-    sections: [
-      { ordinal: 1, title: "notes/unit", goal: "整理已完成主题", scope_path: "notes/unit", evidence_count: 1, evidence: [] },
-      { ordinal: 2, title: "notes/review", goal: "整理待恢复主题", scope_path: "notes/review", evidence_count: 1, evidence: [] }
-    ]
-  };
-  const result = {
-    result_id: "result-restored-organization", task_id: "task-restored-organization", snapshot_id: "snapshot-restored-organization",
-    vault_id: "vault-frozen", status: "recoverable", summary: "准备被中断，已知段落已保留。",
-    recovery_action: "恢复索引后重新准备任务。", duration_ms: 2, local_evidence_only: true,
-    section_counts: { planned: 2, prepared: 1, failed: 0, recoverable: 1 },
-    sections: [
-      { ...plan.sections[0], status: "prepared", prepared_evidence_count: 1, reason: null },
-      { ...plan.sections[1], status: "recoverable", prepared_evidence_count: 0, reason: "服务在准备此段前中断。" }
-    ]
-  };
-
-  await page.route("**/api/**", async (route) => {
-    const request = route.request();
-    const pathname = new URL(request.url()).pathname;
-    if (pathname === "/api/health") return route.fulfill({ json: { service: serviceName } });
-    if (pathname === "/api/session") return route.fulfill({ json: { status: "ok" } });
-    if (pathname === "/api/vaults") return route.fulfill({ json: { vaults: [
-      { vault_id: "vault-current", display_name: "Current Vault", managed_root_relative_path: "platform", authorization_status: "active", access_status: "available" },
-      { vault_id: "vault-frozen", display_name: "Frozen Vault", managed_root_relative_path: "platform", authorization_status: "active", access_status: "available" }
-    ] } });
-    if (pathname === "/api/providers/defaults") return route.fulfill({ json: { chat: {}, embedding: {} } });
-    if (pathname === "/api/providers") return route.fulfill({ json: { providers: [] } });
-    if (pathname === "/api/import-tasks") return route.fulfill({ json: { tasks: [] } });
-    if (pathname === "/api/sessions" && request.method() === "GET") {
-      return route.fulfill({ json: { sessions: [session], page: 1, page_size: 25, total: 1, total_pages: 1 } });
-    }
-    if (pathname === "/api/sessions/session-restored-organization" && request.method() === "GET") {
-      return route.fulfill({ json: {
-        session, messages: [], task_states: [], citations: [], generation_results: [], attachments: [], retrieval_results: [], completeness_results: [],
-        task_snapshots: [{
-          snapshot_id: "snapshot-restored-organization", task_id: "task-restored-organization", vault_id: "vault-frozen",
-          intent: "knowledge-organization", status: "recoverable", scope_kind: "directory", scope_path: "notes/unit",
-          source_count: 2, source_digest: "s".repeat(64), index_status: "healthy", index_updated_at: "2026-07-23T00:00:00+00:00", index_digest: "i".repeat(64),
-          policy_revision: 9, exclusion_summary: "排除规则 1 项：never-send-cloud: notes/private",
-          outbound_scope_summary: "仅使用已冻结的本地知识库证据；不会调用 Provider、Model 或互联网。",
-          knowledge_organization_plan: plan, invalidation_reason: null
-        }],
-        knowledge_organization_results: [result]
-      } });
-    }
-    return route.fallback();
-  });
-
-  await page.goto("/");
-  await page.getByRole("link", { name: "会话", exact: true }).click();
-
-  await expect(page.getByText("冻结 vault：Frozen Vault", { exact: true })).toBeVisible();
-  await expect(page.getByText("范围：已冻结资料范围；来源 2 项；详细依据见右侧“引用证据”。", { exact: true })).toBeVisible();
-  await expect(page.getByText("索引版本：2026-07-23T00:00:00+00:00；策略修订：9", { exact: true })).toBeVisible();
-  await expect(page.getByText("排除项：排除规则 1 项：never-send-cloud: notes/private", { exact: true })).toBeVisible();
-  await expect(page.getByLabel("计划待恢复")).toContainText("准备被中断，已知段落已保留。");
-  await expect(page.getByLabel("知识整理计划进度")).toHaveText("计划 2 段；已准备 1 段；已完成 0 段；进行中 0 段失败 0 段；待恢复 1 段");
-  await expect(page.getByLabel("计划待恢复")).toContainText("第 2 段：待恢复");
-  await expect(page.getByLabel("计划待恢复")).toContainText("服务在准备此段前中断。");
-  await expect(page.getByRole("button", { name: "准备计划段", exact: true })).toHaveCount(0);
 });
 
 test("keeps the current session detail when an earlier selection resolves last", async ({ page }) => {
@@ -2641,90 +1996,4 @@ test("keeps the current session detail when an earlier selection resolves last",
   await expect(page.getByText("B 的内容", { exact: true })).toBeVisible();
   await expect(page.getByText("A 的内容", { exact: true })).toHaveCount(0);
   await expect(page.locator(".context-location")).toContainText("Vault B");
-});
-
-test("keeps the newly selected session visible when an earlier execution finishes", async ({ page }) => {
-  const session = (sessionId, title, vault) => ({
-    session_id: sessionId,
-    title,
-    selected_vault_id: vault.toLowerCase().replace(" ", "-"),
-    selected_vault_label: vault,
-    selected_provider_id: "provider-1",
-    selected_provider_label: "Local",
-    selected_model_id: "chat-1",
-    selected_model_label: "chat-1",
-    scope_kind: "vault",
-    scope_path: null,
-    message_count: 1,
-    created_at: "2026-07-23T00:00:00+00:00",
-    updated_at: "2026-07-23T00:00:00+00:00",
-    last_activity_at: "2026-07-23T00:00:00+00:00"
-  });
-  const first = session("session-a", "会话 A", "Vault A");
-  const second = session("session-b", "会话 B", "Vault B");
-  const detail = (item, content, snapshots = []) => ({
-    session: item,
-    messages: [{ message_id: `message-${item.session_id}`, role: "assistant", content }],
-    task_states: [],
-    citations: [],
-    generation_results: [],
-    attachments: [],
-    task_snapshots: snapshots,
-    retrieval_results: []
-  });
-  const firstSnapshot = {
-    snapshot_id: "snapshot-a",
-    task_id: "task-a",
-    vault_id: "vault-a",
-    intent: "source-lookup",
-    status: "prepared",
-    scope_kind: "vault",
-    source_count: 1,
-    source_digest: "a".repeat(64),
-    index_status: "healthy",
-    outbound_scope_summary: "尚未发送"
-  };
-  let releaseExecution;
-
-  await page.route("**/api/sessions**", async (route) => {
-    const request = route.request();
-    const pathname = new URL(request.url()).pathname;
-    if (request.method() === "GET" && pathname === "/api/sessions") {
-      return route.fulfill({ json: { sessions: [first, second], page: 1, page_size: 25, total: 2, total_pages: 1 } });
-    }
-    if (request.method() === "GET" && pathname === "/api/sessions/session-a") {
-      return route.fulfill({ json: detail(first, "A 的内容", [firstSnapshot]) });
-    }
-    if (request.method() === "GET" && pathname === "/api/sessions/session-b") {
-      return route.fulfill({ json: detail(second, "B 的内容") });
-    }
-    if (request.method() === "POST" && pathname === "/api/sessions/session-a/tasks/task-a/execute/stream") {
-      await new Promise((resolve) => {
-        releaseExecution = async () => {
-          await route.fulfill(resultEventStream({
-            result_id: "result-a", task_id: "task-a", snapshot_id: "snapshot-a", status: "no-evidence",
-            summary: "健康索引与有效范围内未找到可支持该请求的知识库证据。",
-            recovery_action: "修改问题或范围后重新准备任务。",
-            retrieval_duration_ms: 1, generation_duration_ms: 0, evidences: []
-          }));
-          resolve();
-        };
-      });
-      return;
-    }
-    return route.fallback();
-  });
-
-  await page.goto("/");
-  await page.getByRole("link", { name: "会话", exact: true }).click();
-  await expect(page.getByText("A 的内容", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "执行检索", exact: true }).click();
-  await expect.poll(() => Boolean(releaseExecution)).toBe(true);
-  await page.getByRole("button", { name: /会话 B/ }).click();
-  await expect(page.getByText("B 的内容", { exact: true })).toBeVisible();
-  await releaseExecution();
-
-  await expect(page.getByText("B 的内容", { exact: true })).toBeVisible();
-  await expect(page.getByText("A 的内容", { exact: true })).toHaveCount(0);
-  await expect(page.getByText("检索已完成，证据已刷新。", { exact: true })).toHaveCount(0);
 });

@@ -9,10 +9,9 @@ from application.policies import PolicyService
 from application.providers import ProviderService, ProviderUnavailableError
 from application.vaults import VaultService
 from domain.metadata_extraction import MetadataCandidate, metadata_input_text
-from domain.policies import OutboundAuthorization, OutboundScope
-from domain.unit_card_authorization import (
+from domain.unit_card_batches import (
     UNIT_CARD_CONTENT_CATEGORIES,
-    UnitCardAuthorizationPreview,
+    UnitCardBatchPreview,
     UnitCardBatchScope,
     UnitCardBlockedDocument,
 )
@@ -25,25 +24,23 @@ UNIT_CARD_TASK_ID_PREFIX = "unit-card"
 _BLOCKED_DOCUMENT_SAMPLE_LIMIT = 10
 
 
-class UnitCardAuthorizationValidationError(ValueError):
-    """Raised when a unit-card batch cannot be previewed or safely rechecked."""
+class UnitCardBatchValidationError(ValueError):
+    """Raised when a unit-card batch cannot be safely rechecked."""
 
 
 @dataclass(frozen=True)
 class CheckedUnitCardBatch:
-    """The two approved Provider contracts plus transient card-generation inputs."""
+    """Eligible Provider inputs for one transient card-generation batch."""
 
-    preview: UnitCardAuthorizationPreview
-    chat_authorization: OutboundAuthorization
-    embedding_authorization: OutboundAuthorization
+    preview: UnitCardBatchPreview
     inputs: tuple[UnitCardBuildInput, ...]
 
     def __post_init__(self) -> None:
         if len(self.inputs) != self.preview.card_count:
-            raise ValueError("Unit card authorization inputs must match the approved card count.")
+            raise ValueError("Unit card batch inputs must match the selected card count.")
 
 
-class UnitCardAuthorizationService:
+class UnitCardBatchService:
     """Freeze and revalidate the reviewed source inputs used to create unit cards."""
 
     def __init__(
@@ -58,63 +55,14 @@ class UnitCardAuthorizationService:
         self.provider_service = provider_service
         self.index_repository = index_repository
 
-    def preview(self, vault_id: str, scope: UnitCardBatchScope) -> UnitCardAuthorizationPreview:
-        return self._collect(vault_id, scope)[0]
-
-    def request(
-        self, vault_id: str, scope: UnitCardBatchScope
-    ) -> tuple[UnitCardAuthorizationPreview, OutboundAuthorization, OutboundAuthorization]:
-        preview = self.preview(vault_id, scope)
-        self._require_authorizable(preview)
-        chat = self.policy_service.request_outbound_authorization(
-            vault_id,
-            provider_id=preview.chat_provider_id,
-            model_id=preview.chat_model_id,
-            operation=UNIT_CARD_OPERATION,
-            task_id=_provider_task_id(preview, "chat"),
-            scopes=list(preview.scopes),
-        )
-        embedding = self.policy_service.request_outbound_authorization(
-            vault_id,
-            provider_id=preview.embedding_provider_id,
-            model_id=preview.embedding_model_id,
-            operation=UNIT_CARD_OPERATION,
-            task_id=_provider_task_id(preview, "embedding"),
-            scopes=list(preview.scopes),
-        )
-        return preview, chat, embedding
-
-    def checked_batch(
-        self,
-        vault_id: str,
-        chat_authorization_id: str,
-        embedding_authorization_id: str,
-        scope: UnitCardBatchScope,
-    ) -> CheckedUnitCardBatch:
+    def default_batch(self, vault_id: str, scope: UnitCardBatchScope) -> CheckedUnitCardBatch:
         preview, inputs = self._collect(vault_id, scope)
-        chat = self.policy_service.check_outbound_authorization(
-            vault_id,
-            chat_authorization_id,
-            provider_id=preview.chat_provider_id,
-            model_id=preview.chat_model_id,
-            operation=UNIT_CARD_OPERATION,
-            task_id=_provider_task_id(preview, "chat"),
-            scopes=list(preview.scopes),
-        )
-        embedding = self.policy_service.check_outbound_authorization(
-            vault_id,
-            embedding_authorization_id,
-            provider_id=preview.embedding_provider_id,
-            model_id=preview.embedding_model_id,
-            operation=UNIT_CARD_OPERATION,
-            task_id=_provider_task_id(preview, "embedding"),
-            scopes=list(preview.scopes),
-        )
-        return CheckedUnitCardBatch(preview, chat, embedding, inputs)
+        self._require_executable(preview)
+        return CheckedUnitCardBatch(preview, inputs)
 
     def _collect(
         self, vault_id: str, scope: UnitCardBatchScope
-    ) -> tuple[UnitCardAuthorizationPreview, tuple[UnitCardBuildInput, ...]]:
+    ) -> tuple[UnitCardBatchPreview, tuple[UnitCardBuildInput, ...]]:
         self.vault_service.get(vault_id)
         chat_model, embedding_model = self._resolved_models()
         policy = self.policy_service.get(vault_id)
@@ -127,7 +75,7 @@ class UnitCardAuthorizationService:
         candidates = self.index_repository.list_metadata_candidates(vault_id, statuses=("accepted",))
         selected = _latest_candidates_by_block(candidates)
         inputs_by_scope: dict[UnitCardScope, list[UnitCardPromptSource]] = {}
-        scopes: dict[str, OutboundScope] = {}
+        relative_paths: dict[str, str] = {}
         blocked: dict[str, UnitCardBlockedDocument] = {}
         blocked_relative_paths: set[str] = set()
         blocked_block_count = 0
@@ -182,7 +130,7 @@ class UnitCardAuthorizationService:
                     ),
                 )
             )
-            scopes[document.document_id] = OutboundScope(source_path, document.relative_path)
+            relative_paths[document.document_id] = document.relative_path
 
         inputs = tuple(
             UnitCardBuildInput(
@@ -223,7 +171,7 @@ class UnitCardAuthorizationService:
             }
             for item in inputs
         ]
-        preview = UnitCardAuthorizationPreview(
+        preview = UnitCardBatchPreview(
             vault_id=vault_id,
             scope=scope,
             chat_provider_id=chat_model.provider.provider_id,
@@ -241,14 +189,14 @@ class UnitCardAuthorizationService:
                 frozen_documents,
             ),
             policy_revision=policy.policy_revision,
-            file_count=len(scopes),
+            file_count=len(relative_paths),
             block_count=sum(len(item.sources) for item in inputs),
             card_count=len(inputs),
             blocked_file_count=len(blocked_relative_paths),
             blocked_block_count=blocked_block_count,
             blocked_documents=tuple(blocked.values()),
             content_categories=UNIT_CARD_CONTENT_CATEGORIES,
-            scopes=tuple(scopes.values()),
+            relative_paths=tuple(relative_paths.values()),
         )
         return preview, inputs
 
@@ -257,22 +205,22 @@ class UnitCardAuthorizationService:
             chat_model = self.provider_service.resolve_model("chat")
             embedding_model = self.provider_service.resolve_model("embedding")
         except ProviderUnavailableError as error:
-            raise UnitCardAuthorizationValidationError(
+            raise UnitCardBatchValidationError(
                 "Choose verified chat and embedding Provider models before building unit cards."
             ) from error
         if any(
             urlparse(model.provider.endpoint).scheme != "https"
             for model in (chat_model, embedding_model)
         ):
-            raise UnitCardAuthorizationValidationError(
+            raise UnitCardBatchValidationError(
                 "Unit card Provider requests require HTTPS endpoints."
             )
         return chat_model, embedding_model
 
     @staticmethod
-    def _require_authorizable(preview: UnitCardAuthorizationPreview) -> None:
-        if not preview.is_authorizable:
-            raise UnitCardAuthorizationValidationError(
+    def _require_executable(preview: UnitCardBatchPreview) -> None:
+        if not preview.is_executable:
+            raise UnitCardBatchValidationError(
                 "The selected scope has no reviewed, eligible blocks for a unit card."
             )
 
@@ -321,9 +269,3 @@ def _unit_card_task_id(
         sort_keys=True,
     ).encode("utf-8")
     return f"{UNIT_CARD_TASK_ID_PREFIX}:{sha256(encoded).hexdigest()}"
-
-
-def _provider_task_id(preview: UnitCardAuthorizationPreview, kind: str) -> str:
-    if kind not in {"chat", "embedding"}:
-        raise ValueError("Unit card Provider authorization kind is invalid.")
-    return f"{preview.task_id}:{kind}"

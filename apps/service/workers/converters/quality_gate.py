@@ -151,6 +151,11 @@ def _is_pdf_inventory(inventory: dict[str, object]) -> bool:
 
 
 def _expected_pdf_pages(inventory: dict[str, object]) -> set[int]:
+    text_page_numbers = inventory.get("text_page_numbers")
+    if isinstance(text_page_numbers, list) and all(
+        type(page) is int and page > 0 for page in text_page_numbers
+    ):
+        return set(text_page_numbers)
     known_pages = inventory.get("known_pages")
     if isinstance(known_pages, list) and all(type(page) is int and page > 0 for page in known_pages):
         return set(known_pages)

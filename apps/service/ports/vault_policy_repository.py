@@ -1,6 +1,6 @@
 from typing import Protocol
 
-from domain.policies import ExclusionRule, OutboundAuthorization, VaultPolicy
+from domain.policies import ExclusionRule, VaultPolicy
 from domain.vaults import Vault
 
 
@@ -17,10 +17,6 @@ class VaultPolicyRepository(Protocol):
 
     def save_policy(self, policy: VaultPolicy) -> None: ...
 
-    def set_outbound_mode_and_bump(
-        self, vault_id: str, outbound_mode: str, updated_at: str
-    ) -> VaultPolicy: ...
-
     def bump_policy_revision(self, vault_id: str, updated_at: str) -> VaultPolicy: ...
 
     def list_rules(self, vault_id: str) -> list[ExclusionRule]: ...
@@ -36,17 +32,3 @@ class VaultPolicyRepository(Protocol):
     def delete_rule_and_bump(
         self, vault_id: str, rule_id: str, updated_at: str
     ) -> VaultPolicy: ...
-
-    def get_authorization(self, authorization_id: str) -> OutboundAuthorization: ...
-
-    def save_authorization(self, authorization: OutboundAuthorization) -> None: ...
-
-    def resolve_pending_authorization(
-        self, authorization: OutboundAuthorization
-    ) -> bool: ...
-
-    def record_authorization_execution(
-        self, authorization: OutboundAuthorization
-    ) -> bool: ...
-
-    def invalidate_provider_authorizations(self, provider_id: str, updated_at: str) -> None: ...

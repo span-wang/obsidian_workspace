@@ -1,7 +1,7 @@
 {
   "projectName": "Obsidian Personal Knowledge Platform",
   "initiativeName": "Retrieval Redesign",
-  "updatedOn": "2026-07-27",
+  "updatedOn": "2026-08-05",
   "planDocument": "docs/retrieval-redesign.md",
   "generatedFile": "docs/retrieval-progress.md",
   "sourceFiles": [
@@ -83,6 +83,56 @@
       "id": "RET-09",
       "label": "真实 Provider 测量",
       "goal": "只以脱敏 fixture 在明确隐私与请求上限内测量真实 rerank Provider；费用按用户决定明确未计算，默认开关保持关闭。"
+    },
+    {
+      "id": "RET-10",
+      "label": "用户界面收敛",
+      "goal": "让检索、引用和导入结果只展示用户可理解的信息，同时保留内部可核验身份。"
+    },
+    {
+      "id": "RET-11",
+      "label": "分块聚合与派生目录去重",
+      "goal": "消除短原子块和平台生成目录造成的重复覆盖单元，同时保留可核验来源。"
+    },
+    {
+      "id": "RET-12",
+      "label": "默认出网与导入向量门禁",
+      "goal": "删除逐次出网授权，让已验证 Provider 默认可用，并使导入提交必须先完成向量化。"
+    },
+    {
+      "id": "RET-13",
+      "label": "查询范围闭合",
+      "goal": "修正自动意图与显式标题范围的冲突，禁止未解析范围扩大为整个 vault。"
+    },
+    {
+      "id": "RET-14",
+      "label": "问答输出与应用证据",
+      "goal": "让全部会话模式输出可直接使用的内容，并将可核验证据统一分层到应用证据面板。"
+    },
+    {
+      "id": "RET-15",
+      "label": "会话阅读体验",
+      "goal": "稳定会话详情刷新和滚动位置，并提供按问答轮次定位的紧凑导航。"
+    },
+    {
+      "id": "RET-16",
+      "label": "远程资料上传",
+      "goal": "让非服务机浏览器可将资料安全暂存到服务机，并复用既有导入与 Vault 提交流程。"
+    },
+    {
+      "id": "RET-17",
+      "label": "Markdown Provider 结构化",
+      "goal": "以独立 Provider 模型为原生 Markdown 导入生成可核验结构，并在长文分块时保持标题上下文与原文结构。"
+    },
+    {
+      "id": "RET-18",
+      "label": "自动化导入提交",
+      "goal": "将导入解析、结构化、提交、索引和向量化串成无需人工审核的可恢复流水线，并隔离任务私有建议。"
+    },
+    {
+      "id": "RET-19",
+      "label": "PDF 原生优先解析",
+      "goal": "按页优先使用原生 PDF 文本，原生文本为空或质量不通过时回退 MinerU，同时保留数字、图片和公式。"
     }
   ],
   "trackingRules": [

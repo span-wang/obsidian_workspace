@@ -11,6 +11,11 @@ def test_recursive_scan_classifies_supported_and_unsupported_files_without_writi
     nested.mkdir(parents=True)
     (imports / "book.PDF").write_bytes(b"pdf")
     (nested / "outline.docx").write_bytes(b"docx")
+    (nested / "outline.docm").write_bytes(b"docm")
+    (nested / "legacy.doc").write_bytes(b"doc")
+    (nested / "table.xlsx").write_bytes(b"xlsx")
+    (nested / "macro.xlsm").write_bytes(b"xlsm")
+    (nested / "legacy.xls").write_bytes(b"xls")
     (nested / "notes.Md").write_text("note", encoding="utf-8")
     (imports / "ignore.txt").write_text("skip", encoding="utf-8")
 
@@ -21,6 +26,11 @@ def test_recursive_scan_classifies_supported_and_unsupported_files_without_writi
     assert items_by_label["book.PDF"]["category"] == "supported"
     assert items_by_label["book.PDF"]["document_kind"] == "pdf"
     assert items_by_label["outline.docx"]["document_kind"] == "docx"
+    assert items_by_label["outline.docm"]["document_kind"] == "docm"
+    assert items_by_label["legacy.doc"]["document_kind"] == "doc"
+    assert items_by_label["table.xlsx"]["document_kind"] == "xlsx"
+    assert items_by_label["macro.xlsm"]["document_kind"] == "xlsm"
+    assert items_by_label["legacy.xls"]["document_kind"] == "xls"
     assert items_by_label["notes.Md"]["document_kind"] == "markdown"
     assert items_by_label["ignore.txt"]["category"] == "unsupported"
     assert events[-1]["type"] == "completed"

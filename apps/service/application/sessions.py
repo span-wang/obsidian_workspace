@@ -43,23 +43,31 @@ from domain.sessions import (
     new_session,
     utc_now,
 )
-from domain.policies import OutboundScope
 from domain.indexing import BlockFilter, HeadingQuery, LexicalQuery, VectorQuery
 from domain.retrieval_enumeration import AtomicKnowledgePlan, build_atomic_knowledge_plan
-from domain.retrieval_hybrid import HybridBlockHit, fuse_rrf, heading_query_prefixes
+from domain.retrieval_hybrid import (
+    HybridBlockHit,
+    RETRIEVAL_MODES,
+    fuse_rrf,
+    heading_query_prefixes,
+    heading_scope_alias_groups,
+    heading_scope_prefixes,
+)
 from domain.retrieval_metadata import RetrievalMetadata
-from domain.retrieval_query import QueryScopeSelection, QueryUnderstanding, understand_query
+from domain.retrieval_query import (
+    KNOWLEDGE_ORGANIZATION_TOPIC_MARKERS,
+    QueryScopeSelection,
+    QueryUnderstanding,
+    understand_query,
+)
 from domain.retrieval_rerank import (
     MAX_RERANK_CANDIDATES,
-    RERANK_AUTHORIZATION_OPERATION,
     RERANK_CONTENT_CATEGORIES,
-    RerankAuthorizationInput,
-    RerankAuthorizationPreview,
+    RerankBatchPreview,
     RerankCandidate,
     RerankProviderTarget,
     RerankResponse,
     RerankValidationError,
-    rerank_authorization_task_id,
     rerank_input_character_count,
     validate_rerank_response,
 )
@@ -92,6 +100,112 @@ _KNOWLEDGE_KIND_MARKERS = (
     ("sentence-pattern", ("sentence patterns", "sentence pattern", "句型", "句式")),
     ("exercise", ("exercises", "exercise", "练习", "习题")),
 )
+_TITLE_SCOPE_QUERY_NOISE = (
+    "当前vault",
+    "整个vault",
+    "全vault",
+    "当前知识库",
+    "整个知识库",
+    "全知识库",
+    "当前目录",
+    "整个目录",
+    "全目录",
+    "知识整理",
+    "写文章",
+    "发给我",
+    "列出",
+    "展示",
+    "整理",
+    "总结",
+    "归纳",
+    "创作",
+    "撰写",
+    "全部",
+    "所有",
+    "完整",
+    "资料",
+    "内容",
+    "给我",
+    "请",
+    "将",
+    "把",
+    "的",
+)
+_ENGLISH_GLOBAL_SCOPE_PATTERN = re.compile(
+    r"\b(?:current|entire|whole|selected|all)\s+"
+    r"(?:vault|knowledge\s+base|directory)\b",
+    re.IGNORECASE,
+)
+_CHINESE_GLOBAL_SCOPE_PATTERN = re.compile(r"(?:当前|整个|全)\s*(?:vault|知识库|目录)", re.IGNORECASE)
+_ENGLISH_WHOLE_CONTENT_PATTERN = re.compile(
+    r"\s*(?:(?:could|would|can)\s+you\s+)?(?:please\s+)?(?:help\s+me\s+)?"
+    r"(?:(?:list|show|organize|organise|summarize|summarise)\s+)?"
+    r"(?:all\s+(?:notes?|materials?|documents?|files?|contents?)|"
+    r"every\s+(?:note|material|document|file))"
+    r"(?:\s+(?:in|from)\s+(?:the\s+)?(?:(?:current|entire|whole|selected|this)\s+)?"
+    r"(?:vault|knowledge\s+base|directory))?\s*[.!?]?\s*",
+    re.IGNORECASE,
+)
+_CHINESE_WHOLE_CONTENT_PATTERN = re.compile(
+    r"\s*(?:请\s*)?(?:帮我\s*)?(?:(?:列出|展示|整理|总结|归纳)\s*)?"
+    r"(?:(?:(?:当前|整个|全)?\s*(?:vault|知识库|目录)\s*"
+    r"(?:中|里|内|范围内)?\s*的?\s*)?(?:全部|所有|完整|全量)\s*"
+    r"(?:资料|内容|笔记|文档|文件))\s*[。！？]?\s*",
+    re.IGNORECASE,
+)
+_ORGANIZATION_SCOPE_COMMAND_PATTERN = re.compile(
+    r"(?:知识整理|整理|总结|归纳)|\b(?:organize|organise|summarize|summarise)\b",
+    re.IGNORECASE,
+)
+_ENGLISH_TITLE_SCOPE_NOISE_PATTERN = re.compile(
+    r"\b(?:please|list|show|organize|organise|summarize|summarise|all|every|complete|"
+    r"materials?|contents?|the|of|from|in)\b",
+    re.IGNORECASE,
+)
+_EXPLICIT_TITLE_SCOPE_PATTERNS = (
+    re.compile(
+        r"(?:知识整理|整理|总结|归纳)\s*(?P<scope>.+?)\s*的\s*"
+        r"(?:重点|核心|要点|关键|概念与方法|概念和方法|知识框架|知识点|主题概览)"
+        r"(?:[。！？]|$)"
+    ),
+    re.compile(
+        r"(?:列出|展示|整理|总结|归纳|创作|撰写)\s*(?P<scope>.+?)\s*的\s*"
+        r"(?:全部|所有|完整)?\s*(?:资料|内容)(?:[。！？]|$)"
+    ),
+    re.compile(
+        r"(?:列出|展示|整理|总结|归纳|创作|撰写)\s*(?P<scope>.+?)\s*"
+        r"(?:全部|所有|完整)\s*(?:资料|内容)(?:[。！？]|$)"
+    ),
+    re.compile(
+        r"(?:列出|展示)\s*(?!全部|所有|完整)(?P<scope>(?=[^。！？\r\n]*[^\W_])"
+        r"[^。！？\r\n]+?)\s*(?:资料|内容)(?:[。！？]|$)"
+    ),
+    re.compile(
+        r"\b(?:list|show|organize|organise|summarize|summarise)\s+"
+        r"(?P<scope>.+?)\s+(?:all|every|complete)\s+(?:materials?|contents?|notes?)"
+        r"\s*[.!?]?\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:list|show|organize|organise|summarize|summarise)\s+"
+        r"(?:all|every|complete)\s+(?:materials?|contents?|notes?)\s+"
+        r"(?:in|from|under|for)\s+(?P<scope>.+?)\s*[.!?]?\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:list|show)\s+(?!all\b|every\b|complete\b)(?P<scope>.+?)\s+"
+        r"(?:materials?|contents?|notes?)\s*[.!?]?\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:list|show)\s+(?:materials?|contents?|notes?)\s+"
+        r"(?:in|from|under|for)\s+(?P<scope>.+?)\s*[.!?]?\s*$",
+        re.IGNORECASE,
+    ),
+)
+_QUOTED_TITLE_SCOPE_PATTERN = re.compile(
+    r"[\"'“”‘’「」『』《》](?P<scope>[^\"'“”‘’「」『』《》]+)[\"'“”‘’「」『』《》]"
+)
 _RERANK_ABSOLUTE_PATH_PATTERN = re.compile(
     r"""(?ix)
     file://[^\s\"'`]+
@@ -102,6 +216,12 @@ _RERANK_ABSOLUTE_PATH_PATTERN = re.compile(
     | (?<![a-z0-9_:/]) / [^\s/\"'`]+ (?:/[^\s/\"'`]+)*
     """
 )
+
+
+@dataclass(frozen=True)
+class _HeadingScopeResolution:
+    paths: tuple[tuple[str, ...], ...]
+    requested: bool
 
 
 @dataclass(frozen=True)
@@ -161,19 +281,10 @@ class QueryScopePreview:
 
 @dataclass(frozen=True)
 class _RerankCandidateBundle:
-    inputs: tuple[RerankAuthorizationInput, ...]
+    candidates: tuple[RerankCandidate, ...]
     candidate_hits: tuple[HybridBlockHit, ...]
-    preview: RerankAuthorizationPreview
-    authorization_task_id: str | None
+    preview: RerankBatchPreview
     target: RerankProviderTarget
-
-    @property
-    def candidates(self) -> tuple[RerankCandidate, ...]:
-        return tuple(item.candidate for item in self.inputs)
-
-    @property
-    def scopes(self) -> tuple[OutboundScope, ...]:
-        return tuple(dict.fromkeys(item.scope for item in self.inputs))
 
     def hit_by_candidate_id(self) -> dict[str, HybridBlockHit]:
         return {
@@ -196,6 +307,7 @@ class SessionService:
         self.index_repository = index_repository
         self.lexical_retrieval_enabled = lexical_retrieval_enabled
         self.hybrid_retrieval_enabled = hybrid_retrieval_enabled
+        self._retrieval_mode: str | None = None
         self.unit_card_retrieval_enabled = unit_card_retrieval_enabled
         self.reranker = reranker
         self.rerank_retrieval_enabled = rerank_retrieval_enabled
@@ -207,6 +319,26 @@ class SessionService:
         self._reranking_snapshot_guard = RLock()
         self._rerank_task_execution_counts: dict[str, int] = {}
         self._rerank_task_execution_guard = RLock()
+
+    def get_retrieval_mode(self) -> str:
+        """Return the live mode, preserving the legacy environment switches by default."""
+
+        if self._retrieval_mode is not None:
+            return self._retrieval_mode
+        if self.hybrid_retrieval_enabled:
+            return "hybrid"
+        if self.lexical_retrieval_enabled:
+            return "keyword"
+        return "disabled"
+
+    def set_retrieval_mode(self, mode: str) -> str:
+        normalized = mode.strip().casefold() if isinstance(mode, str) else ""
+        if normalized not in RETRIEVAL_MODES:
+            raise SessionValidationError("检索模式必须是 keyword、semantic 或 hybrid。")
+        self._retrieval_mode = normalized
+        self.lexical_retrieval_enabled = normalized in {"keyword", "hybrid"}
+        self.hybrid_retrieval_enabled = normalized in {"semantic", "hybrid"}
+        return normalized
 
     def create(self, title: str | None = None) -> PersistentSession:
         session = new_session(self._normalize_title(title, default="未命名会话"))
@@ -356,9 +488,7 @@ class SessionService:
                 outbound = self.policy_service.preview(vault.vault_id, relative_path, None, "outbound")
             except Exception as error:
                 raise SessionValidationError(str(error)) from error
-            status = "excluded" if not retrieval.allowed else (
-                "pending-authorization" if not outbound.allowed else "available"
-            )
+            status = "available" if retrieval.allowed and outbound.allowed else "excluded"
             attachment = SessionAttachment.new(
                 session_id, filename, vault_id=vault.vault_id, relative_path=relative_path, status=status
             )
@@ -462,64 +592,39 @@ class SessionService:
         )
         return snapshot
 
-    def prepare_rerank_authorization(
-        self, session_id: str, task_id: str
-    ) -> tuple[RerankAuthorizationPreview, object | None]:
-        """Freeze an outbound approval against the current local RRF candidate projection."""
+    def run_task(
+        self,
+        session_id: str,
+        content: str,
+        *,
+        vault_id: str,
+        scope_kind: str,
+        scope_path: str | None,
+        provider_id: str,
+        model_id: str,
+        intent: str = "auto",
+        query_scope: QueryScopeSelection | None = None,
+    ):
+        """Persist this turn's selections and execute it without a user-facing staging step."""
 
-        if not self._rerank_is_enabled():
-            raise SessionValidationError("候选重排未启用，未请求外发授权。")
-        try:
-            detail = self.repository.get_detail(session_id)
-        except KeyError as error:
-            raise SessionNotFoundError(session_id) from error
-        task_state = next((item for item in detail.task_states if item.task_id == task_id), None)
-        snapshot = next((item for item in detail.task_snapshots if item.task_id == task_id), None)
-        if task_state is None or snapshot is None or task_state.snapshot_id != snapshot.snapshot_id:
-            raise SessionValidationError("The selected task is unavailable. Prepare a new task.")
-        query = self._revalidated_source_lookup_query(detail, snapshot, task_state)
-        allowed_documents, eligible_document_count, excluded_count = self._allowed_retrieval_documents(
-            snapshot
+        self.update_context(
+            session_id,
+            vault_id=vault_id,
+            scope_kind=scope_kind,
+            scope_path=scope_path,
+            provider_id=provider_id,
+            model_id=model_id,
         )
-        if eligible_document_count and excluded_count == eligible_document_count:
-            raise SessionValidationError("确认范围内的内容当前均被排除，无法请求候选重排授权。")
-        if not allowed_documents:
-            raise SessionValidationError("当前范围没有可供候选重排的本地证据。")
-        allowed_paths = tuple(document.relative_path for document in allowed_documents)
-        fused, _unit_card_hits, _semantic_query_sent, _semantic_unavailable = self._hybrid_fused_candidates(
-            snapshot.vault_id,
-            query,
-            allowed_paths,
-            include_unit_cards=False,
-            limit=MAX_RERANK_CANDIDATES,
-        )
-        bundle = self._rerank_candidate_bundle(
-            snapshot,
-            query,
-            fused,
-            {document.document_id: document for document in allowed_documents},
-        )
-        if not bundle.preview.is_authorizable or bundle.authorization_task_id is None:
-            return bundle.preview, None
-        try:
-            authorization = self.policy_service.request_outbound_authorization(
-                snapshot.vault_id,
-                provider_id=bundle.target.provider_id,
-                model_id=bundle.target.model_id,
-                operation=RERANK_AUTHORIZATION_OPERATION,
-                task_id=bundle.authorization_task_id,
-                scopes=list(bundle.scopes),
-            )
-        except Exception as error:
-            raise SessionValidationError("无法请求候选重排授权。") from error
-        return bundle.preview, authorization
+        snapshot = self.create_task(session_id, content, intent=intent, query_scope=query_scope)
+        return self.execute_task(session_id, snapshot.task_id, generate_answer=True)
 
     def execute_task(
         self,
         session_id: str,
         task_id: str,
         on_stream_chunk: Callable[[int, str], None] | None = None,
-        rerank_authorization_id: str | None = None,
+        *,
+        generate_answer: bool = False,
     ):
         started = perf_counter()
         try:
@@ -544,9 +649,7 @@ class SessionService:
             )
             if existing is not None and snapshot.status in {"completed", "recoverable", "failed"}:
                 return existing
-            if task_state.status not in {"prepared", "waiting-authorization"} or snapshot.status not in {
-                "prepared", "waiting-authorization"
-            }:
+            if task_state.status != "prepared" or snapshot.status != "prepared":
                 raise SessionValidationError("The selected task is no longer ready. Prepare a new task.")
             if self._context_changed(
                 detail.session,
@@ -586,55 +689,6 @@ class SessionService:
                 (message.content for message in detail.messages if message.message_id == snapshot.message_id),
                 "基于已确认资料进行深度创作。",
             )
-            scopes = self._deep_creation_outbound_scopes(snapshot)
-            if snapshot.status == "waiting-authorization":
-                if existing is None or not existing.authorization_id:
-                    raise SessionValidationError("The selected task authorization is unavailable. Prepare a new task.")
-                authorization_id = existing.authorization_id
-            else:
-                try:
-                    authorization = self.policy_service.request_outbound_authorization(
-                        snapshot.vault_id,
-                        provider_id=snapshot.provider_id,
-                        model_id=snapshot.model_id,
-                        operation="deep-creation",
-                        task_id=snapshot.task_id,
-                        scopes=scopes,
-                    )
-                except Exception as error:
-                    return self._persist_unavailable_deep_creation_execution(
-                        snapshot, task_state, started, str(error) or "无法请求深度创作授权。",
-                        "检查外发授权和排除规则后重新准备任务。",
-                    )
-                authorization_id = authorization.authorization_id
-                if authorization.status == "pending":
-                    waiting = SessionDeepCreationResult(
-                        str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id,
-                        "waiting-authorization", "深度创作将发送本次请求和冻结本地证据摘要，等待本次授权。",
-                        None, (), int((perf_counter() - started) * 1000), utc_now(), (),
-                        authorization_id, "pending",
-                    )
-                    return self._persist_deep_creation_execution(
-                        replace(snapshot, status="waiting-authorization", updated_at=utc_now()),
-                        replace(task_state, status="waiting-authorization", updated_at=utc_now()),
-                        waiting,
-                        expected_status="prepared",
-                    )
-            try:
-                self.policy_service.check_outbound_authorization(
-                    snapshot.vault_id,
-                    authorization_id,
-                    provider_id=snapshot.provider_id,
-                    model_id=snapshot.model_id,
-                    operation="deep-creation",
-                    task_id=snapshot.task_id,
-                    scopes=scopes,
-                )
-            except Exception as error:
-                return self._persist_unavailable_deep_creation_execution(
-                    snapshot, task_state, started, str(error) or "深度创作授权不可用。",
-                    "确认本次授权后重试。",
-                )
             self._begin_deep_creation_execution(snapshot.snapshot_id)
             try:
                 return self._execute_deep_creation(
@@ -642,7 +696,6 @@ class SessionService:
                     task_state,
                     started,
                     content,
-                    authorization_id,
                     on_stream_chunk=on_stream_chunk,
                 )
             finally:
@@ -665,9 +718,7 @@ class SessionService:
                 )
             if existing is not None and snapshot.status in {"completed", "recoverable", "failed"}:
                 return existing
-            if task_state.status not in {"prepared", "waiting-authorization"} or snapshot.status not in {
-                "prepared", "waiting-authorization"
-            }:
+            if task_state.status != "prepared" or snapshot.status != "prepared":
                 raise SessionValidationError("The selected task is no longer ready. Prepare a new task.")
             if self._context_changed(
                 detail.session,
@@ -713,60 +764,10 @@ class SessionService:
                 (message.content for message in detail.messages if message.message_id == snapshot.message_id),
                 "整理已确认资料。",
             )
-            scopes = self._knowledge_organization_outbound_scopes(snapshot)
-            authorization_id: str
-            if snapshot.status == "waiting-authorization":
-                if existing is None or not existing.authorization_id:
-                    raise SessionValidationError("The selected task authorization is unavailable. Prepare a new task.")
-                authorization_id = existing.authorization_id
-            else:
-                try:
-                    authorization = self.policy_service.request_outbound_authorization(
-                        snapshot.vault_id,
-                        provider_id=snapshot.provider_id,
-                        model_id=snapshot.model_id,
-                        operation="knowledge-organization",
-                        task_id=snapshot.task_id,
-                        scopes=scopes,
-                    )
-                except Exception as error:
-                    return self._persist_unavailable_knowledge_organization_execution(
-                        snapshot, task_state, started, str(error) or "无法请求知识整理授权。",
-                        "检查外发授权和排除规则后重新准备任务。",
-                    )
-                authorization_id = authorization.authorization_id
-                if authorization.status == "pending":
-                    waiting = SessionKnowledgeOrganizationResult(
-                        str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id,
-                        "waiting-authorization", "知识整理将仅发送已冻结的计划段证据，等待本次授权。",
-                        None, (), int((perf_counter() - started) * 1000), utc_now(), (),
-                        self._knowledge_organization_structure_kind(content), (), authorization_id, "pending",
-                    )
-                    return self._persist_knowledge_organization_execution(
-                        replace(snapshot, status="waiting-authorization", updated_at=utc_now()),
-                        replace(task_state, status="waiting-authorization", updated_at=utc_now()),
-                        waiting,
-                        expected_status="prepared",
-                    )
-            try:
-                self.policy_service.check_outbound_authorization(
-                    snapshot.vault_id,
-                    authorization_id,
-                    provider_id=snapshot.provider_id,
-                    model_id=snapshot.model_id,
-                    operation="knowledge-organization",
-                    task_id=snapshot.task_id,
-                    scopes=scopes,
-                )
-            except Exception as error:
-                return self._persist_unavailable_knowledge_organization_execution(
-                    snapshot, task_state, started, str(error) or "知识整理授权不可用。",
-                    "确认本次授权后重试。",
-                )
             self._begin_knowledge_organization_preparation(snapshot.snapshot_id)
             try:
                 return self._execute_knowledge_organization(
-                    snapshot, task_state, started, content, authorization_id
+                    snapshot, task_state, started, content
                 )
             finally:
                 self._end_knowledge_organization_preparation(snapshot.snapshot_id)
@@ -795,7 +796,7 @@ class SessionService:
                     replace(task_state, status="recoverable", updated_at=utc_now()),
                     SessionCompletenessResult(
                         str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id,
-                        "recoverable", preview.blocking_reason or "索引不可用，未执行完整性检索。",
+                        "recoverable", preview.blocking_reason or "当前无法处理清单。",
                         preview.recovery_action or "恢复索引后重新准备任务。", (),
                         int((perf_counter() - started) * 1000), utc_now(),
                     ),
@@ -811,7 +812,7 @@ class SessionService:
                 snapshot.task_id,
                 snapshot.snapshot_id,
                 status,
-                preview.blocking_reason or "索引不可用，未执行检索。",
+                preview.blocking_reason or "当前无法处理该请求。",
                 preview.recovery_action,
                 int((perf_counter() - started) * 1000),
                 0,
@@ -843,123 +844,32 @@ class SessionService:
         if snapshot.intent == "completeness":
             return self._execute_completeness(snapshot, task_state, started)
         rerank_execution_reserved = False
-        if rerank_authorization_id is not None and self._rerank_is_enabled():
+        if self._rerank_is_enabled():
             if not self._begin_rerank_task_execution(snapshot.snapshot_id):
                 raise SessionValidationError("该任务正在执行候选重排，请等待当前执行完成。")
             rerank_execution_reserved = True
         try:
-            result = (
-                self._retrieve(snapshot, query, started)
-                if rerank_authorization_id is None
-                else self._retrieve(
-                    snapshot,
-                    query,
-                    started,
-                    rerank_authorization_id=rerank_authorization_id,
-                )
-            )
+            result = self._retrieve(snapshot, query, started)
             timestamp = utc_now()
             completed_snapshot = replace(snapshot, status="completed", updated_at=timestamp)
             completed_state = replace(task_state, status=result.status, updated_at=timestamp)
-            generation_results, citations = self._evidence_turn_records(completed_snapshot, detail, result)
+            generation_results, citations, generation_duration_ms, generation_error = (
+                self._evidence_turn_records(
+                    completed_snapshot, detail, result, generate_answer=generate_answer
+                )
+            )
+            if generate_answer and result.status == "completed":
+                result = replace(
+                    result,
+                    generation_duration_ms=generation_duration_ms,
+                    summary="回答已生成。" if generation_results else generation_error or "未生成回答。",
+                )
             return self._persist_retrieval_execution(
                 completed_snapshot, completed_state, result, generation_results, citations
             )
         finally:
             if rerank_execution_reserved:
                 self._end_rerank_task_execution(snapshot.snapshot_id)
-
-    def confirm_knowledge_organization_authorization(
-        self, session_id: str, task_id: str, authorization_id: str, *, approved: bool
-    ) -> SessionKnowledgeOrganizationResult:
-        try:
-            detail = self.repository.get_detail(session_id)
-        except KeyError as error:
-            raise SessionNotFoundError(session_id) from error
-        snapshot = next((item for item in detail.task_snapshots if item.task_id == task_id), None)
-        task_state = next((item for item in detail.task_states if item.task_id == task_id), None)
-        result = next(
-            (
-                item
-                for item in detail.knowledge_organization_results
-                if item.task_id == task_id and item.snapshot_id == (snapshot.snapshot_id if snapshot else None)
-            ),
-            None,
-        )
-        if (
-            snapshot is None
-            or task_state is None
-            or result is None
-            or snapshot.status != "waiting-authorization"
-            or result.status != "waiting-authorization"
-            or result.authorization_id != authorization_id
-        ):
-            raise SessionValidationError("The selected task authorization is unavailable. Prepare a new task.")
-        authorization = self.policy_service.confirm_outbound_authorization(
-            snapshot.vault_id, authorization_id, approved=approved
-        )
-        if authorization.status != "approved":
-            failed = replace(
-                result,
-                status="failed",
-                summary="本次知识整理授权被拒绝，未发送任何资料。",
-                recovery_action="重新准备任务并确认外发授权。",
-                authorization_status=authorization.status,
-            )
-            timestamp = utc_now()
-            return self._persist_knowledge_organization_execution(
-                replace(snapshot, status="failed", updated_at=timestamp),
-                replace(task_state, status="failed", updated_at=timestamp),
-                failed,
-                expected_status="waiting-authorization",
-            )
-        return self.execute_task(session_id, task_id)
-
-    def confirm_deep_creation_authorization(
-        self, session_id: str, task_id: str, authorization_id: str, *, approved: bool
-    ) -> SessionDeepCreationResult:
-        try:
-            detail = self.repository.get_detail(session_id)
-        except KeyError as error:
-            raise SessionNotFoundError(session_id) from error
-        snapshot = next((item for item in detail.task_snapshots if item.task_id == task_id), None)
-        task_state = next((item for item in detail.task_states if item.task_id == task_id), None)
-        result = next(
-            (
-                item
-                for item in detail.deep_creation_results
-                if item.task_id == task_id and item.snapshot_id == (snapshot.snapshot_id if snapshot else None)
-            ),
-            None,
-        )
-        if (
-            snapshot is None
-            or task_state is None
-            or result is None
-            or snapshot.status != "waiting-authorization"
-            or result.status != "waiting-authorization"
-            or result.authorization_id != authorization_id
-        ):
-            raise SessionValidationError("The selected task authorization is unavailable. Prepare a new task.")
-        authorization = self.policy_service.confirm_outbound_authorization(
-            snapshot.vault_id, authorization_id, approved=approved
-        )
-        if authorization.status != "approved":
-            failed = replace(
-                result,
-                status="failed",
-                summary="本次深度创作授权被拒绝，未发送任何资料或执行互联网检索。",
-                recovery_action="重新准备任务并确认外发授权。",
-                authorization_status=authorization.status,
-            )
-            timestamp = utc_now()
-            return self._persist_deep_creation_execution(
-                replace(snapshot, status="failed", updated_at=timestamp),
-                replace(task_state, status="failed", updated_at=timestamp),
-                failed,
-                expected_status="waiting-authorization",
-            )
-        return self.execute_task(session_id, task_id)
 
     def edit_generation_result(
         self, session_id: str, result_id: str, content: str, content_origin: str = "user-content"
@@ -1148,7 +1058,7 @@ class SessionService:
             session.selected_vault_id, session.scope_kind, session.selected_provider_id,
             session.selected_model_id,
         )):
-            raise SessionValidationError("Choose vault, scope, Provider, and Model before preparing a task.")
+            raise SessionValidationError("Choose vault, scope, Provider, and Model before sending.")
         try:
             vault = self.vault_service.get(session.selected_vault_id)
         except KeyError:
@@ -1176,23 +1086,58 @@ class SessionService:
         sources = self._snapshot_sources(session, vault.vault_id)
         scope_preview = self._query_scope_preview(vault.vault_id, query_understanding, sources)
         coverage_items = ()
+        completeness_scope_missing = False
         if resolved_intent == "completeness":
-            coverage_items = (
-                self._scoped_completeness_coverage_items(
-                    vault.vault_id, query_understanding.scope_filter, sources
+            heading_scope = _HeadingScopeResolution((), False)
+            if self._should_inspect_heading_scope(normalized_content):
+                documents = sorted(
+                    self.index_repository.current_heading_scope_documents(vault.vault_id),
+                    key=lambda document: document.relative_path,
                 )
-                if query_understanding.scope_filter.is_resolved
-                else self._completeness_coverage_items(session, vault.vault_id)
-            )
-        organization_sections, organization_evidence_count, organization_budget_exceeded = (
+                source_ordinals = self._snapshot_source_ordinals(sources)
+                heading_scope = self._resolve_heading_scope(
+                    normalized_content,
+                    documents,
+                    source_ordinals,
+                    fail_closed_on_unmatched=self._has_explicit_heading_scope_reference(
+                        normalized_content
+                    ),
+                )
+            if not heading_scope.requested or heading_scope.paths:
+                coverage_items = (
+                    self._scoped_completeness_coverage_items(
+                        vault.vault_id,
+                        query_understanding.scope_filter,
+                        sources,
+                        heading_scope_paths=heading_scope.paths,
+                    )
+                    if query_understanding.scope_filter.is_resolved
+                    else self._completeness_coverage_items(
+                        session,
+                        vault.vault_id,
+                        heading_scope_paths=heading_scope.paths,
+                    )
+                )
+            completeness_scope_missing = heading_scope.requested and not coverage_items
+        (
+            organization_sections,
+            organization_evidence_count,
+            organization_budget_exceeded,
+            organization_scope_missing,
+        ) = (
             self._knowledge_organization_sections(session, vault.vault_id, normalized_content, sources)
             if resolved_intent == "knowledge-organization"
-            else ((), 0, False)
+            else ((), 0, False, False)
         )
-        deep_creation_sections, deep_creation_evidence_count, deep_creation_budget_exceeded = (
+        (
+            deep_creation_sections,
+            deep_creation_evidence_count,
+            deep_creation_budget_exceeded,
+            deep_creation_scope_missing,
+        ) = (
             self._deep_creation_sections(session, vault.vault_id, normalized_content, sources)
             if resolved_intent == "deep-creation"
-            else ((), 0, False)
+            else ((), 0, False, False)
         )
         source_digest = self._digest([
             {
@@ -1219,25 +1164,42 @@ class SessionService:
             health.status == "healthy"
             and not organization_budget_exceeded
             and not deep_creation_budget_exceeded
+            and not completeness_scope_missing
+            and not organization_scope_missing
+            and not deep_creation_scope_missing
         )
         blocking_reason = (
             f"索引不可用：{health.status}。"
             if health.status != "healthy"
             else (
-                f"知识整理范围超出固定上限（{MAX_KNOWLEDGE_ORGANIZATION_SOURCES} 项来源或 "
-                f"{MAX_KNOWLEDGE_ORGANIZATION_EVIDENCES} 条证据）。"
+                "当前资料范围未找到匹配的标题内容。"
+                if (
+                    completeness_scope_missing
+                    or organization_scope_missing
+                    or deep_creation_scope_missing
+                )
+                else (
+                f"知识整理范围超出固定上限（{MAX_KNOWLEDGE_ORGANIZATION_SOURCES} 项资料或 "
+                f"{MAX_KNOWLEDGE_ORGANIZATION_EVIDENCES} 段内容）。"
                 if organization_budget_exceeded
                 else (
-                    f"深度创作范围超出固定上限（{MAX_DEEP_CREATION_SOURCES} 项来源或 "
-                    f"{MAX_DEEP_CREATION_EVIDENCES} 条证据）。"
+                f"深度创作范围超出固定上限（{MAX_DEEP_CREATION_SOURCES} 项资料或 "
+                f"{MAX_DEEP_CREATION_EVIDENCES} 段内容）。"
                     if deep_creation_budget_exceeded
                     else None
+                )
                 )
             )
         )
         recovery_action = (
             self._index_recovery_action(health.status)
             if health.status != "healthy"
+            else "检查标题名称或调整资料范围后重新准备任务。"
+            if (
+                completeness_scope_missing
+                or organization_scope_missing
+                or deep_creation_scope_missing
+            )
             else "缩小资料范围后重新准备任务。"
             if organization_budget_exceeded or deep_creation_budget_exceeded
             else None
@@ -1247,7 +1209,7 @@ class SessionService:
             session.scope_kind, session.scope_path, session.selected_provider_id,
             session.selected_model_id, health.status, health.updated_at, index_digest,
             policy.policy_revision, exclusion_summary, policy.outbound_mode,
-            "尚未发送；实际检索块将在执行前按任务快照申请或核验授权。",
+            "发送时仅提交本次允许外发的相关内容。",
             len(sources), source_digest, sources, coverage_items, is_ready, blocking_reason, recovery_action,
             organization_sections, organization_evidence_count, organization_budget_exceeded,
             deep_creation_sections, deep_creation_evidence_count, deep_creation_budget_exceeded,
@@ -1330,7 +1292,6 @@ class SessionService:
         task_state: SessionTaskState,
         started: float,
         content: str,
-        authorization_id: str,
     ) -> SessionKnowledgeOrganizationResult:
         timestamp = utc_now()
         expected_status = snapshot.status
@@ -1339,8 +1300,8 @@ class SessionService:
         structure_kind = self._knowledge_organization_structure_kind(content)
         result = SessionKnowledgeOrganizationResult(
             str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id, "preparing",
-            "正在按冻结计划段生成可追溯的知识整理。", "若生成中断，请恢复任务以保留已完成段。",
-            (), 0, timestamp, (), structure_kind, (), authorization_id, "approved",
+            "正在生成知识整理内容。", "若生成中断，请恢复任务以保留已完成段。",
+            (), 0, timestamp, (), structure_kind, (),
         )
         persisted = self._persist_knowledge_organization_execution(
             executing_snapshot, executing_state, result, expected_status=expected_status
@@ -1353,7 +1314,7 @@ class SessionService:
             if not section.evidence:
                 outcomes.append(
                     SessionKnowledgeOrganizationSectionOutcome(
-                        section.ordinal, "recoverable", 0, "计划范围内没有可用的结构化索引块。"
+                        section.ordinal, "recoverable", 0, "计划范围内没有可用内容。"
                     )
                 )
                 break
@@ -1408,11 +1369,11 @@ class SessionService:
             recovery_action = "修复 Provider 或失败段后重新准备任务。"
         elif recoverable or not outcomes:
             final_status = "recoverable"
-            summary = "计划范围内缺少可用的结构化证据，未生成完整整理结果。"
+            summary = "计划范围内没有可用内容，未生成知识整理结果。"
             recovery_action = "确认范围并修复索引后重新准备任务。"
         else:
             final_status = "completed"
-            summary = f"已按冻结证据生成 {len(completed)} 个知识整理计划段。"
+            summary = f"已生成 {len(completed)} 个知识整理段。"
             recovery_action = None
         final_result = replace(
             result,
@@ -1447,33 +1408,23 @@ class SessionService:
         return "outline"
 
     @staticmethod
-    def _knowledge_organization_outbound_scopes(
-        snapshot: SessionTaskSnapshot,
-    ) -> list[OutboundScope]:
-        scopes: list[OutboundScope] = []
-        for section in snapshot.organization_sections:
-            for evidence in section.evidence:
-                candidate = OutboundScope(evidence.source_path or evidence.relative_path, evidence.relative_path)
-                if candidate not in scopes:
-                    scopes.append(candidate)
-        return scopes
-
-    @staticmethod
     def _knowledge_organization_prompt(
         snapshot: SessionTaskSnapshot,
         section: SessionKnowledgeOrganizationPlanSection,
         request: str,
         structure_kind: str,
     ) -> str:
-        evidence = "\n\n".join(
-            f"[证据 {item.ordinal}] 文件：{item.relative_path}；位置：{item.location}\n{item.excerpt}"
+        material = "\n\n".join(
+            f"<内部材料>\n{item.excerpt}\n</内部材料>"
             for item in section.evidence
         )
         return (
-            "仅依据以下冻结知识库证据生成一个中文知识整理段。不得使用外部资料、先前对话或模型常识；"
-            "证据不足时明确说明，冲突说法必须并列保留。不要添加引用编号以外无法由证据支撑的事实。\n"
+            "请直接生成可直接使用的中文知识整理内容。下列材料仅作内部参考，不要在输出中提及材料的存在；"
+            "不要在输出中提及知识库、检索、证据、引用、文件、位置或编号，也不要添加脚注、角标或来源说明。"
+            "只根据内部材料陈述事实；信息不足时直接说明无法确定的具体部分，冲突时并列呈现，"
+            "不要补充未给出的事实。\n"
             f"用户请求：{request[:2_000]}\n结构类型：{structure_kind}\n段目标：{section.goal}\n"
-            f"快照：{snapshot.snapshot_id}\n\n{evidence}"
+            f"\n{material}"
         )
 
     @staticmethod
@@ -1514,33 +1465,21 @@ class SessionService:
         )
 
     @staticmethod
-    def _deep_creation_outbound_scopes(
-        snapshot: SessionTaskSnapshot,
-    ) -> list[OutboundScope]:
-        scopes: list[OutboundScope] = []
-        for section in snapshot.deep_creation_sections:
-            for evidence in section.local_evidence:
-                candidate = OutboundScope(evidence.source_path or evidence.relative_path, evidence.relative_path)
-                if candidate not in scopes:
-                    scopes.append(candidate)
-        return scopes
-
-    @staticmethod
     def _deep_creation_prompt(
         snapshot: SessionTaskSnapshot,
         section: SessionDeepCreationPlanSection,
         request: str,
     ) -> str:
-        local = "\n\n".join(
-            f"[知识库证据 {item.ordinal}] 文件：{item.relative_path}；位置：{item.location}\n{item.excerpt}"
+        material = "\n\n".join(
+            f"<内部材料>\n{item.excerpt}\n</内部材料>"
             for item in section.local_evidence
         )
         return (
-            "请生成一个中文深度创作段落。必须清楚区分：知识库证据和模型判断。"
-            "事实性内容优先依据冻结知识库证据；可以补充模型知识或推断，"
-            "但无法由证据支持的内容必须标为模型判断，不得伪装成引用事实。\n"
-            f"用户请求：{request[:2_000]}\n快照：{snapshot.snapshot_id}\n段目标：{section.goal}\n\n"
-            f"{local}"
+            "请直接生成可直接使用的中文内容，贴合用户请求。下列材料仅作内部参考，"
+            "不要在输出中提及材料的存在；不要在输出中提及知识库、检索、证据、引用、文件、位置或编号，"
+            "也不要添加脚注、角标或来源说明。可以重新组织和扩展表达，但不得补充未给出的事实性信息；"
+            "信息不足时使用审慎、具体的表述，不要编造。\n"
+            f"用户请求：{request[:2_000]}\n段目标：{section.goal}\n\n{material}"
         )
 
     def _execute_deep_creation(
@@ -1549,7 +1488,6 @@ class SessionService:
         task_state: SessionTaskState,
         started: float,
         content: str,
-        authorization_id: str,
         *,
         on_stream_chunk: Callable[[int, str], None] | None = None,
     ) -> SessionDeepCreationResult:
@@ -1559,9 +1497,9 @@ class SessionService:
         executing_state = replace(task_state, status="preparing", updated_at=timestamp)
         result = SessionDeepCreationResult(
             str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id, "preparing",
-            "正在按冻结计划段进行深度创作并保留模型判断。",
+            "正在生成深度创作内容。",
             "若生成中断，请恢复任务以保留已完成段。", (),
-            0, timestamp, (), authorization_id, "approved",
+            0, timestamp, (),
         )
         persisted = self._persist_deep_creation_execution(
             executing_snapshot, executing_state, result, expected_status=expected_status
@@ -1574,7 +1512,7 @@ class SessionService:
             if not section.local_evidence:
                 outcomes.append(
                     SessionDeepCreationSectionOutcome(
-                        section.ordinal, "recoverable", 0, "计划范围内没有可用的冻结知识库证据。"
+                        section.ordinal, "recoverable", 0, "计划范围内没有可用内容。"
                     )
                 )
                 break
@@ -1599,10 +1537,7 @@ class SessionService:
                     "completed",
                     len(section.local_evidence),
                     content=generated,
-                    model_judgement=(
-                        f"模型判断：本段基于 {len(section.local_evidence)} 条冻结知识库证据"
-                        "生成；无法由知识库证据支持的内容已作为模型判断保留。"
-                    ),
+                    model_judgement="已完成本段内容生成。",
                 )
             except Exception as error:
                 outcomes.append(
@@ -1637,11 +1572,11 @@ class SessionService:
             recovery_action = "修复 Provider 或失败段后重新准备任务。"
         elif not outcomes:
             final_status = "recoverable"
-            summary = "计划范围内缺少可用证据，未生成深度创作结果。"
+            summary = "计划范围内没有可用内容，未生成深度创作结果。"
             recovery_action = "确认范围并修复索引后重新准备任务。"
         else:
             final_status = "completed"
-            summary = f"已按冻结证据和模型判断生成 {len(completed)} 个深度创作段。"
+            summary = f"已生成 {len(completed)} 个深度创作段。"
             recovery_action = None
         final_result = replace(
             result,
@@ -1726,8 +1661,6 @@ class SessionService:
             known_outcomes,
             previous.structure_kind if previous is not None else "outline",
             completed,
-            previous.authorization_id if previous is not None else None,
-            previous.authorization_status if previous is not None else None,
         )
         return self._persist_knowledge_organization_execution(
             replace(snapshot, status="recoverable", updated_at=timestamp),
@@ -1777,7 +1710,7 @@ class SessionService:
             return self._deep_creation_snapshot_counts.get(snapshot_id, 0) > 0
 
     def _begin_rerank_execution(self, snapshot_id: str) -> bool:
-        """Reserve one snapshot for the external reranker before its authorization is checked."""
+        """Reserve one snapshot for the external reranker before its request is sent."""
 
         with self._reranking_snapshot_guard:
             if self._reranking_snapshot_counts.get(snapshot_id, 0):
@@ -1818,14 +1751,14 @@ class SessionService:
         if failed:
             result = SessionCompletenessResult(
                 str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id, "failed",
-                f"{len(failed)} 个覆盖单元处理失败，不能宣称完整完成。",
+                f"{len(failed)} 个内容单元处理失败，无法完成清单。",
                 "修复失败项后重新准备任务。", processed, duration, utc_now(), outcomes,
                 candidate_duplicate_clusters,
             )
         elif uncovered:
             result = SessionCompletenessResult(
                 str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id, "recoverable",
-                "覆盖清单存在未覆盖项，不能宣称完整完成。",
+                "内容清单存在未处理项，无法完成清单。",
                 "修复索引或范围缺口后重新准备任务。", processed, duration, utc_now(), outcomes,
                 candidate_duplicate_clusters,
             )
@@ -1833,21 +1766,21 @@ class SessionService:
             result = SessionCompletenessResult(
                 str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id,
                 "completed-with-confirmed-gaps",
-                f"已处理 {len(processed)} 个覆盖单元；{len(excluded)} 项已确认排除，结果带已确认缺口。",
+                f"已处理 {len(processed)} 个内容单元；{len(excluded)} 项受当前规则限制。",
                 "检查排除规则后重新准备任务。", processed, duration, utc_now(), outcomes,
                 candidate_duplicate_clusters,
             )
         elif not planned:
             result = SessionCompletenessResult(
                 str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id, "recoverable",
-                "范围内没有可处理的覆盖单元，不能宣称完整完成。",
+                "范围内没有可处理的内容。",
                 "确认范围并修复索引后重新准备任务。", (), duration, utc_now(), outcomes,
                 candidate_duplicate_clusters,
             )
         else:
             result = SessionCompletenessResult(
                 str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id, "complete",
-                f"完整完成：已逐项处理覆盖清单中的 {len(processed)} 个内容单元。",
+                f"已处理清单中的 {len(processed)} 个内容单元。",
                 None, processed, duration, utc_now(), outcomes, candidate_duplicate_clusters,
             )
         timestamp = utc_now()
@@ -1905,7 +1838,7 @@ class SessionService:
     @staticmethod
     def _extract_completeness_item(item: SessionCompletenessCoverageItem) -> str:
         if not item.excerpt:
-            raise ValueError("覆盖单元缺少可处理的索引内容。")
+            raise ValueError("内容单元为空，无法处理。")
         return item.excerpt
 
     def _retrieve(
@@ -1913,37 +1846,28 @@ class SessionService:
         snapshot: SessionTaskSnapshot,
         content: str,
         started: float,
-        *,
-        rerank_authorization_id: str | None = None,
     ) -> SessionRetrievalResult:
         allowed_documents, eligible_document_count, excluded_count = self._allowed_retrieval_documents(
             snapshot
         )
         duration = int((perf_counter() - started) * 1000)
-        rerank_requested = rerank_authorization_id is not None
-        rerank_status = (
-            "disabled"
-            if rerank_requested and not self._rerank_is_enabled()
-            else "not-requested"
-        )
+        retrieval_mode = self.get_retrieval_mode()
+        rerank_requested = self._rerank_is_enabled()
+        rerank_status = "not-requested" if rerank_requested else "disabled"
         rerank_network_request_count = 0
         rerank_duration_ms = 0
         if eligible_document_count and excluded_count == eligible_document_count:
             return SessionRetrievalResult(
                 str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id,
-                "excluded", "确认范围内的内容当前均被排除，未执行检索。",
-                "检查排除规则后重新准备任务。", duration, 0, utc_now(),
-                rerank_authorization_id=rerank_authorization_id,
+                "excluded", "当前范围内的内容已被规则排除，无法生成回答。",
+                "检查排除规则后重新发送。", duration, 0, utc_now(),
                 rerank_status=rerank_status,
             )
-        if allowed_documents and not (
-            self.lexical_retrieval_enabled or self.hybrid_retrieval_enabled
-        ):
+        if allowed_documents and retrieval_mode == "disabled":
             return SessionRetrievalResult(
                 str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id,
-                "no-evidence", "本机词法检索已关闭，未执行检索。",
-                "启用本机词法检索后重新准备任务。", duration, 0, utc_now(),
-                rerank_authorization_id=rerank_authorization_id,
+                "no-evidence", "当前无法查找相关内容。",
+                "启用内容查找后重新发送。", duration, 0, utc_now(),
                 rerank_status=rerank_status,
             )
 
@@ -1964,11 +1888,58 @@ class SessionService:
                     ),
                 )
             )
-            if allowed_paths and use_unit_cards and self.lexical_retrieval_enabled
+            if allowed_paths and use_unit_cards and retrieval_mode in {"keyword", "hybrid"}
             else ()
         )
         unit_card_semantic_hits = ()
-        if allowed_paths and self.hybrid_retrieval_enabled:
+        if allowed_paths and retrieval_mode == "semantic":
+            health = self.index_repository.health(snapshot.vault_id)
+            if health.semantic_status not in {"available", "partial"}:
+                return SessionRetrievalResult(
+                    str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id,
+                    "index-unavailable", "语义索引尚不可用，无法执行仅语义检索。",
+                    "配置 Embedding 模型并完成向量化后重试。", duration, 0, utc_now(),
+                    rerank_status=rerank_status,
+                )
+            (
+                semantic_hits,
+                unit_card_semantic_hits,
+                semantic_query_sent,
+                semantic_unavailable,
+            ) = self._semantic_candidates(
+                snapshot.vault_id, content, allowed_paths, include_unit_cards=use_unit_cards
+            )
+            if semantic_unavailable or not semantic_query_sent:
+                return SessionRetrievalResult(
+                    str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id,
+                    "provider-model-unavailable" if semantic_unavailable else "index-unavailable",
+                    "Embedding 模型暂不可用，无法执行仅语义检索。"
+                    if semantic_unavailable
+                    else "语义索引尚不可用，无法执行仅语义检索。",
+                    "检查 Embedding Provider 和索引覆盖率后重试。",
+                    duration, 0, utc_now(), rerank_status=rerank_status,
+                )
+            primary_hits = tuple(
+                semantic_hits[
+                    : MAX_RERANK_CANDIDATES
+                    if rerank_requested
+                    else MAX_HYBRID_PRIMARY_EVIDENCES
+                ]
+            )
+            primary_hits = tuple(
+                hit
+                for hit in primary_hits
+                if hit.document_id in allowed_documents_by_id
+                and allowed_documents_by_id[hit.document_id].relative_path == hit.relative_path
+            )
+            ranked = self._expand_retrieval_neighborhoods(
+                tuple(
+                    HybridBlockHit(hit, hit.score, ("semantic",))
+                    for hit in primary_hits
+                ),
+                allowed_documents_by_id,
+            )
+        elif allowed_paths and retrieval_mode == "hybrid":
             candidate_limit = (
                 MAX_RERANK_CANDIDATES
                 if rerank_requested and self._rerank_is_enabled()
@@ -1993,15 +1964,14 @@ class SessionService:
                     rerank_status,
                     rerank_network_request_count,
                     rerank_duration_ms,
-                ) = self._apply_authorized_rerank(
+                ) = self._apply_rerank(
                     snapshot,
                     content,
                     fused,
                     allowed_documents_by_id,
-                    rerank_authorization_id,
                 )
             ranked = self._expand_retrieval_neighborhoods(primary_hits, allowed_documents_by_id)
-        elif allowed_paths:
+        elif allowed_paths and retrieval_mode == "keyword":
             for hit in self.index_repository.search_lexical(
                 snapshot.vault_id,
                 LexicalQuery(content, limit=MAX_RETRIEVAL_EVIDENCES, allowed_relative_paths=allowed_paths),
@@ -2061,18 +2031,18 @@ class SessionService:
 
         if evidences:
             summary = (
-                f"已在已确认范围内找到 {len(evidences)} 条知识库证据；"
-                "已将当前点查问题发送给默认 Embedding Provider。"
+                "已找到相关内容。已使用语义匹配。"
                 if semantic_query_sent
-                else f"已在已确认范围内找到 {len(evidences)} 条本地知识库证据；"
-                "默认 Embedding 模型不可用，已使用本地召回通道。"
-                if self.hybrid_retrieval_enabled and semantic_unavailable
-                else f"已在已确认范围内找到 {len(evidences)} 条本地知识库证据；未调用 Model。"
+                else "已找到相关内容。已使用本地匹配。"
+                if retrieval_mode == "hybrid" and semantic_unavailable
+                else "已找到相关内容。已使用关键词匹配。"
+                if retrieval_mode == "keyword"
+                else "已找到相关内容。"
             )
             if rerank_status == "completed":
-                summary += " 已按本次确认调用候选重排。"
+                summary += " 已优化内容排序。"
             elif rerank_status not in {"not-requested", "disabled"}:
-                summary += " 候选重排未执行，已保留本地 RRF 排序。"
+                summary += " 内容排序未优化，已保留当前顺序。"
             return SessionRetrievalResult(
                 str(uuid4()),
                 snapshot.session_id,
@@ -2085,16 +2055,14 @@ class SessionService:
                 0,
                 utc_now(),
                 tuple(evidences),
-                rerank_authorization_id=rerank_authorization_id,
                 rerank_status=rerank_status,
                 rerank_network_request_count=rerank_network_request_count,
                 rerank_duration_ms=rerank_duration_ms,
             )
         return SessionRetrievalResult(
             str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id,
-            "no-evidence", "健康索引与有效范围内未找到可支持该请求的知识库证据。",
-            "修改问题或范围后重新准备任务。", duration, 0, utc_now(), (),
-            rerank_authorization_id=rerank_authorization_id,
+            "no-evidence", "当前范围内没有可用于回答的内容。",
+            "修改问题或范围后重新发送。", duration, 0, utc_now(), (),
             rerank_status=rerank_status,
             rerank_network_request_count=rerank_network_request_count,
             rerank_duration_ms=rerank_duration_ms,
@@ -2200,40 +2168,25 @@ class SessionService:
             semantic_unavailable,
         )
 
-    def _apply_authorized_rerank(
+    def _apply_rerank(
         self,
         snapshot: SessionTaskSnapshot,
         query: str,
         fused_hits: tuple[HybridBlockHit, ...],
         documents_by_id: dict[str, object],
-        authorization_id: str,
     ) -> tuple[tuple[HybridBlockHit, ...], str, int, int]:
         local_fallback = fused_hits[:MAX_HYBRID_PRIMARY_EVIDENCES]
         if not self._rerank_is_enabled():
             return local_fallback, "disabled", 0, 0
-        if not isinstance(authorization_id, str) or not authorization_id.strip():
-            return local_fallback, "authorization-invalid", 0, 0
         try:
             bundle = self._rerank_candidate_bundle(snapshot, query, fused_hits, documents_by_id)
         except Exception:
             return local_fallback, "unavailable", 0, 0
-        if not bundle.preview.is_authorizable or bundle.authorization_task_id is None:
+        if not bundle.preview.is_executable:
             return local_fallback, "blocked", 0, 0
         if not self._begin_rerank_execution(snapshot.snapshot_id):
             return local_fallback, "concurrent", 0, 0
         try:
-            try:
-                self.policy_service.check_outbound_authorization(
-                    snapshot.vault_id,
-                    authorization_id,
-                    provider_id=bundle.target.provider_id,
-                    model_id=bundle.target.model_id,
-                    operation=RERANK_AUTHORIZATION_OPERATION,
-                    task_id=bundle.authorization_task_id,
-                    scopes=list(bundle.scopes),
-                )
-            except Exception:
-                return local_fallback, "authorization-invalid", 0, 0
             rerank_started = perf_counter()
             try:
                 response = self.reranker.rerank(
@@ -2295,7 +2248,7 @@ class SessionService:
             resolved.model.model_id,
             resolved.provider.updated_at,
         )
-        inputs: list[RerankAuthorizationInput] = []
+        candidates: list[RerankCandidate] = []
         candidate_hits: list[HybridBlockHit] = []
         blocked_source_paths: set[str] = set()
         blocked_candidate_count = 0
@@ -2303,7 +2256,7 @@ class SessionService:
         for fused_rank, hybrid_hit in enumerate(fused_hits, start=1):
             document = documents_by_id.get(hybrid_hit.hit.document_id)
             if document is None or document.relative_path != hybrid_hit.hit.relative_path:
-                raise SessionValidationError("候选重排的本地证据已变化。")
+                raise SessionValidationError("候选内容已变化。")
             block = hybrid_hit.hit.block
             candidate_text = block.retrieval_text.strip() or block.text
             source_path = document.source_path or document.relative_path
@@ -2326,37 +2279,29 @@ class SessionService:
                 continue
             try:
                 candidate = RerankCandidate(
-                    f"candidate{len(inputs) + 1:02d}",
+                    f"candidate{len(candidates) + 1:02d}",
                     fused_rank,
                     block.heading_path,
                     block.block_kind,
                     candidate_text,
                     allowed_tags,
                 )
-                inputs.append(
-                    RerankAuthorizationInput(
-                        candidate,
-                        block.block_content_sha256,
-                        OutboundScope(source_path, document.relative_path),
-                    )
-                )
+                candidates.append(candidate)
             except (RerankValidationError, ValueError):
                 blocked_candidate_count += 1
                 blocked_source_paths.add(source_path)
                 continue
             candidate_hits.append(hybrid_hit)
-        input_tuple = tuple(inputs)
-        candidate_tuple = tuple(item.candidate for item in input_tuple)
-        scopes = tuple(dict.fromkeys(item.scope for item in input_tuple))
-        is_authorizable = bool(input_tuple) and query_is_safe
+        candidate_tuple = tuple(candidates)
+        is_executable = bool(candidate_tuple) and query_is_safe
         blocking_reason = (
             None
-            if is_authorizable
+            if is_executable
             else "查询包含不允许外发的绝对路径。"
             if not query_is_safe
             else "当前候选均不允许外发。"
         )
-        preview = RerankAuthorizationPreview(
+        preview = RerankBatchPreview(
             snapshot.vault_id,
             target.provider_id,
             resolved.provider.name,
@@ -2364,30 +2309,18 @@ class SessionService:
             target.provider_configuration_revision,
             self.policy_service.get(snapshot.vault_id).policy_revision,
             len(candidate_tuple),
-            len({scope.source_path for scope in scopes}),
+            len({hit.hit.relative_path for hit in candidate_hits}),
             rerank_input_character_count(query, candidate_tuple) if candidate_tuple else 0,
             blocked_candidate_count,
             len(blocked_source_paths),
             RERANK_CONTENT_CATEGORIES,
-            is_authorizable,
+            is_executable,
             blocking_reason,
         )
         return _RerankCandidateBundle(
-            input_tuple,
+            candidate_tuple,
             tuple(candidate_hits),
             preview,
-            (
-                rerank_authorization_task_id(
-                    session_id=snapshot.session_id,
-                    task_id=snapshot.task_id,
-                    snapshot_id=snapshot.snapshot_id,
-                    query=query,
-                    inputs=input_tuple,
-                    target=target,
-                )
-                if input_tuple
-                else None
-            ),
             target,
         )
 
@@ -2447,7 +2380,11 @@ class SessionService:
         return query
 
     def _rerank_is_enabled(self) -> bool:
-        return self.rerank_retrieval_enabled and self.hybrid_retrieval_enabled and self.reranker is not None
+        return (
+            self.rerank_retrieval_enabled
+            and self.get_retrieval_mode() == "hybrid"
+            and self.reranker is not None
+        )
 
     def _persist_retrieval_execution(
         self,
@@ -2543,7 +2480,7 @@ class SessionService:
     ) -> tuple[tuple, tuple, bool, bool]:
         health = self.index_repository.health(vault_id)
         if health.semantic_status not in {"available", "partial"}:
-            return (), (), False, False
+            return (), (), False, True
         try:
             resolved = self.provider_service.resolve_model("embedding")
             vectors = self.provider_service.create_embeddings(
@@ -2658,10 +2595,67 @@ class SessionService:
         snapshot: SessionTaskSnapshot,
         detail: SessionDetail,
         retrieval: SessionRetrievalResult,
-    ) -> tuple[tuple[SessionGenerationResult, ...], tuple[SessionCitation, ...]]:
+        *,
+        generate_answer: bool,
+    ) -> tuple[
+        tuple[SessionGenerationResult, ...], tuple[SessionCitation, ...], int, str | None
+    ]:
         if retrieval.status != "completed":
-            return (), ()
+            return (), (), 0, None
         context_summary = self._context_summary(snapshot, detail)
+        if generate_answer:
+            evidences = tuple(
+                evidence
+                for evidence in retrieval.evidences
+                if self.policy_service.preview(
+                    snapshot.vault_id,
+                    evidence.source_path or evidence.relative_path,
+                    evidence.relative_path,
+                    "outbound",
+                ).allowed
+            )
+            if not evidences:
+                return (), (), 0, "当前范围内的内容无法用于生成回答。"
+            started = perf_counter()
+            try:
+                generated = self.provider_service.generate_chat(
+                    snapshot.provider_id,
+                    snapshot.model_id,
+                    self._retrieval_answer_prompt(
+                        next(
+                            (
+                                message.content
+                                for message in detail.messages
+                                if message.message_id == snapshot.message_id
+                            ),
+                            "请直接回答用户问题。",
+                        ),
+                        evidences,
+                    ),
+                )
+            except Exception:
+                return (), (), int((perf_counter() - started) * 1000), "回答生成失败，请稍后重试。"
+            result = SessionGenerationResult.new(
+                snapshot.session_id,
+                "valid",
+                generated,
+                task_id=snapshot.task_id,
+                snapshot_id=snapshot.snapshot_id,
+                message_id=snapshot.message_id,
+                provider_id=snapshot.provider_id,
+                model_id=snapshot.model_id,
+                vault_id=snapshot.vault_id,
+                scope_kind=snapshot.scope_kind,
+                scope_path=snapshot.scope_path,
+                content_origin="model-judgement",
+                context_summary=context_summary,
+            )
+            return (
+                (result,),
+                self._citations_for_result(result, snapshot, evidences),
+                int((perf_counter() - started) * 1000),
+                None,
+            )
         generation_results = tuple(
             SessionGenerationResult.new(
                 snapshot.session_id,
@@ -2684,7 +2678,22 @@ class SessionService:
             for result, evidence in zip(generation_results, retrieval.evidences)
             for citation in self._citations_for_result(result, snapshot, (evidence,))
         )
-        return generation_results, citations
+        return generation_results, citations, 0, None
+
+    @staticmethod
+    def _retrieval_answer_prompt(
+        request: str, evidences: tuple[SessionRetrievalEvidence, ...]
+    ) -> str:
+        material = "\n\n".join(
+            f"<内部材料>\n{item.excerpt}\n</内部材料>"
+            for item in evidences
+        )
+        return (
+            "请直接用中文给出用户可直接使用的回答。下列材料仅作内部参考，不要在回答中提及材料的存在；"
+            "不要在回答中提及知识库、检索、证据、引用、文件、位置或编号，也不要添加脚注、角标或来源说明。"
+            "只根据内部材料陈述事实；信息不足时直接说明无法确定的具体部分，不要补充无法确认的内容。\n"
+            f"用户问题：{request[:2_000]}\n\n{material}"
+        )
 
     @staticmethod
     def _context_summary(snapshot: SessionTaskSnapshot, detail: SessionDetail) -> str:
@@ -2707,16 +2716,22 @@ class SessionService:
             f"引用身份/状态：{citations}。未决问题：{snapshot.intent}。"
         )
 
-    @staticmethod
+    @classmethod
     def _conversation_query(
-        detail: SessionDetail, content: str, message_id: str | None = None
+        cls, detail: SessionDetail, content: str, message_id: str | None = None
     ) -> str:
+        normalized_content = content.strip()
+        # An explicit heading/unit in the current turn is a hard retrieval boundary.
+        # Older turns may still provide context for pronoun-style follow-ups, but must
+        # not reintroduce a previously requested unit into this turn's query.
+        if cls._has_explicit_heading_scope_reference(normalized_content):
+            return normalized_content
         history = [
             message.content.strip()[:160]
             for message in detail.messages
             if message.role == "user" and message.message_id != message_id
         ][-3:]
-        return "\n".join((*history, content.strip()))
+        return "\n".join((*history, normalized_content))
 
     @staticmethod
     def _supporting_evidences(
@@ -2840,11 +2855,20 @@ class SessionService:
         return tuple(sources)
 
     def _completeness_coverage_items(
-        self, session: PersistentSession, vault_id: str
+        self,
+        session: PersistentSession,
+        vault_id: str,
+        *,
+        heading_scope_paths: tuple[tuple[str, ...], ...] = (),
     ) -> tuple[SessionCompletenessCoverageItem, ...]:
         items: list[SessionCompletenessCoverageItem] = []
+        document_reader = (
+            self.index_repository.current_heading_scope_documents
+            if heading_scope_paths
+            else self.index_repository.current_documents
+        )
         documents = sorted(
-            self.index_repository.current_documents(vault_id), key=lambda document: document.relative_path
+            document_reader(vault_id), key=lambda document: document.relative_path
         )
         for document in documents:
             if not self._in_scope(document.relative_path, session.scope_kind, session.scope_path):
@@ -2854,6 +2878,13 @@ class SessionService:
             )
             blocks = document.blocks or (None,)
             for block in blocks:
+                if heading_scope_paths and (
+                    block is None
+                    or not self._heading_scope_matches(
+                        self._block_heading_path(block), heading_scope_paths
+                    )
+                ):
+                    continue
                 heading, page = (
                     self._evidence_location(document, block.location)
                     if block is not None
@@ -2889,6 +2920,7 @@ class SessionService:
         sources: tuple[SessionTaskSnapshotSource, ...],
         *,
         coverage_item_budget: int | None = None,
+        heading_scope_paths: tuple[tuple[str, ...], ...] = (),
     ) -> tuple[SessionCompletenessCoverageItem, ...]:
         """Freeze every metadata-matched block; a caller-supplied budget becomes an explicit gap."""
 
@@ -2917,6 +2949,10 @@ class SessionService:
             source = source_by_path.get(reference.relative_path)
             if source is None:
                 raise SessionValidationError("范围枚举结果不属于已确认的任务来源。")
+            if heading_scope_paths and not self._heading_scope_matches(
+                self._block_heading_path(reference.block), heading_scope_paths
+            ):
+                continue
             heading, page = self._evidence_location(reference, reference.block.location)
             excerpt = self._bounded_excerpt(reference.block.text, MAX_RETRIEVAL_BLOCK_CHARS)
             within_budget = coverage_item_budget is None or len(items) < coverage_item_budget
@@ -2956,18 +2992,8 @@ class SessionService:
         vault_id: str,
         content: str,
         sources: tuple[SessionTaskSnapshotSource, ...],
-    ) -> tuple[tuple[SessionKnowledgeOrganizationPlanSection, ...], int, bool]:
-        source_ordinals = {
-            (
-                source.identity_kind,
-                source.relative_path,
-                source.content_sha256,
-                source.source_id,
-                source.source_content_hash,
-                source.source_path,
-            ): source.ordinal
-            for source in sources
-        }
+    ) -> tuple[tuple[SessionKnowledgeOrganizationPlanSection, ...], int, bool, bool]:
+        source_ordinals = self._snapshot_source_ordinals(sources)
         grouped: dict[str, list[SessionKnowledgeOrganizationEvidence]] = {}
         bounded_source_ordinals = {
             source.ordinal for source in sources[:MAX_KNOWLEDGE_ORGANIZATION_SOURCES]
@@ -2975,9 +3001,35 @@ class SessionService:
         planned_evidence_count = 0
         evidence_count = 0
         evidence_budget_exceeded = False
-        documents = sorted(
-            self.index_repository.current_documents(vault_id), key=lambda document: document.relative_path
+        inspect_title_structure = self._should_inspect_heading_scope(content)
+        title_documents = (
+            sorted(
+                self.index_repository.current_heading_scope_documents(vault_id),
+                key=lambda document: document.relative_path,
+            )
+            if inspect_title_structure
+            else []
         )
+        heading_scope = (
+            self._resolve_heading_scope(
+                content,
+                title_documents,
+                source_ordinals,
+                fail_closed_on_unmatched=self._has_explicit_heading_scope_reference(content),
+            )
+            if inspect_title_structure
+            else _HeadingScopeResolution((), False)
+        )
+        documents = (
+            title_documents
+            if heading_scope.requested
+            else sorted(
+                self.index_repository.current_documents(vault_id),
+                key=lambda document: document.relative_path,
+            )
+        )
+        title_scope_requested = heading_scope.requested
+        title_scope_match_count = 0
         for document in documents:
             identity = (
                 document.document_kind,
@@ -2991,6 +3043,14 @@ class SessionService:
             if source_ordinal is None:
                 continue
             for block in document.blocks:
+                if title_scope_requested and (
+                    not heading_scope.paths
+                    or not self._heading_scope_matches(
+                        self._block_heading_path(block), heading_scope.paths
+                    )
+                ):
+                    continue
+                title_scope_match_count += 1
                 excerpt = self._bounded_excerpt(block.text, MAX_RETRIEVAL_BLOCK_CHARS)
                 if not excerpt:
                     continue
@@ -3028,7 +3088,7 @@ class SessionService:
         source_scopes = {
             source.relative_path.rpartition("/")[0] or source.relative_path
             for source in sources[:MAX_KNOWLEDGE_ORGANIZATION_SOURCES]
-        }
+        } if not title_scope_requested else set(grouped)
         sections: list[SessionKnowledgeOrganizationPlanSection] = []
         for scope_path in sorted(source_scopes):
             evidence = tuple(grouped.get(scope_path, ()))
@@ -3045,6 +3105,7 @@ class SessionService:
             tuple(sections),
             evidence_count,
             len(sources) > MAX_KNOWLEDGE_ORGANIZATION_SOURCES or evidence_budget_exceeded,
+            title_scope_requested and title_scope_match_count == 0,
         )
 
     def _deep_creation_sections(
@@ -3053,15 +3114,15 @@ class SessionService:
         vault_id: str,
         content: str,
         sources: tuple[SessionTaskSnapshotSource, ...],
-    ) -> tuple[tuple[SessionDeepCreationPlanSection, ...], int, bool]:
-        sections, evidence_count, budget_exceeded = self._knowledge_organization_sections(
+    ) -> tuple[tuple[SessionDeepCreationPlanSection, ...], int, bool, bool]:
+        sections, evidence_count, budget_exceeded, title_scope_missing = self._knowledge_organization_sections(
             session, vault_id, content, sources
         )
         deep_sections = tuple(
             SessionDeepCreationPlanSection(
                 section.ordinal,
                 section.title,
-                f"基于冻结知识库证据和显式模型判断进行深度创作：{content[:200]}",
+                f"根据请求进行深度创作：{content[:200]}",
                 section.scope_path,
                 section.evidence,
             )
@@ -3073,7 +3134,272 @@ class SessionService:
             len(sources) > MAX_DEEP_CREATION_SOURCES
             or evidence_count > MAX_DEEP_CREATION_EVIDENCES
             or budget_exceeded,
+            title_scope_missing,
         )
+
+    @staticmethod
+    def _snapshot_source_ordinals(
+        sources: tuple[SessionTaskSnapshotSource, ...],
+    ) -> dict[tuple[object, ...], int]:
+        return {
+            (
+                source.identity_kind,
+                source.relative_path,
+                source.content_sha256,
+                source.source_id,
+                source.source_content_hash,
+                source.source_path,
+            ): source.ordinal
+            for source in sources
+        }
+
+    @classmethod
+    def _resolve_heading_scope(
+        cls,
+        content: str,
+        documents,
+        source_ordinals: dict[tuple[object, ...], int],
+        *,
+        fail_closed_on_unmatched: bool,
+    ) -> _HeadingScopeResolution:
+        explicit_scope_values = cls._explicit_heading_scope_values(content)
+        inferred_scope_reference = cls._has_inferred_heading_scope_reference(content)
+        normalized_content = (
+            cls._normalized_heading_value(" ".join(explicit_scope_values))
+            if explicit_scope_values
+            else cls._normalized_title_scope_candidate(content)
+        )
+        query_structural_groups = heading_scope_alias_groups(content)
+        candidates: list[
+            tuple[tuple[str, ...], frozenset[str], frozenset[int], int]
+        ] = []
+        exact_constraints: set[str] = set()
+        for document in documents:
+            identity = (
+                document.document_kind,
+                document.relative_path,
+                document.content_sha256,
+                document.source_id,
+                document.source_sha256,
+                document.source_path,
+            )
+            if identity not in source_ordinals:
+                continue
+            for block in document.blocks:
+                heading_path = cls._block_heading_path(block)
+                matched_indexes: list[int] = []
+                exact_matches: set[str] = set()
+                structural_matches: set[int] = set()
+                for index, heading in enumerate(heading_path):
+                    normalized_heading = cls._normalized_heading_value(heading)
+                    exact_match = (
+                        len(normalized_heading) >= 2
+                        and normalized_heading in normalized_content
+                    )
+                    heading_aliases = (
+                        set(heading_scope_prefixes(heading))
+                        if query_structural_groups
+                        else set()
+                    )
+                    heading_structural_matches = {
+                        group_index
+                        for group_index, aliases in enumerate(query_structural_groups)
+                        if heading_aliases.intersection(aliases)
+                    }
+                    if exact_match:
+                        exact_matches.add(normalized_heading)
+                    structural_matches.update(heading_structural_matches)
+                    if exact_match or heading_structural_matches:
+                        matched_indexes.append(index)
+                if matched_indexes:
+                    exact_constraints.update(exact_matches)
+                    candidates.append(
+                        (
+                            heading_path[: max(matched_indexes) + 1],
+                            frozenset(exact_matches),
+                            frozenset(structural_matches),
+                            len(matched_indexes),
+                        )
+                    )
+        required_exact_constraints = frozenset(
+            constraint
+            for constraint in exact_constraints
+            if not any(
+                constraint != other and constraint in other for other in exact_constraints
+            )
+        )
+        required_structural_constraints = frozenset(range(len(query_structural_groups)))
+        strict_scope_reference = bool(explicit_scope_values or inferred_scope_reference)
+        scope_values_to_validate = explicit_scope_values or (normalized_content,)
+        if strict_scope_reference and any(
+            cls._unmatched_heading_scope_value(
+                value,
+                required_exact_constraints,
+                heading_scope_prefixes(content),
+            )
+            for value in scope_values_to_validate
+        ):
+            return _HeadingScopeResolution((), True)
+        eligible_candidates = [
+            candidate
+            for candidate in candidates
+            if required_structural_constraints.issubset(candidate[2])
+            and required_exact_constraints.issubset(candidate[1])
+        ]
+        if not eligible_candidates:
+            return _HeadingScopeResolution(
+                (),
+                fail_closed_on_unmatched
+                or bool(
+                    explicit_scope_values
+                    or inferred_scope_reference
+                    or query_structural_groups
+                    or required_exact_constraints
+                ),
+            )
+        best_match_score = max(
+            (len(exact_matches), len(structural_matches), matched_count)
+            for _, exact_matches, structural_matches, matched_count in eligible_candidates
+        )
+        paths: dict[tuple[str, ...], tuple[str, ...]] = {}
+        for path, exact_matches, structural_matches, matched_count in eligible_candidates:
+            if (
+                len(exact_matches),
+                len(structural_matches),
+                matched_count,
+            ) != best_match_score:
+                continue
+            normalized_path = tuple(cls._normalized_heading_value(heading) for heading in path)
+            paths.setdefault(normalized_path, path)
+        return _HeadingScopeResolution(tuple(paths.values()), True)
+
+    @classmethod
+    def _normalized_title_scope_candidate(cls, content: str) -> str:
+        candidate_text = _ENGLISH_GLOBAL_SCOPE_PATTERN.sub("", content.casefold())
+        candidate_text = _ENGLISH_TITLE_SCOPE_NOISE_PATTERN.sub("", candidate_text)
+        candidate = cls._normalized_heading_value(candidate_text)
+        for noise in _TITLE_SCOPE_QUERY_NOISE:
+            candidate = candidate.replace(cls._normalized_heading_value(noise), "")
+        return candidate
+
+    @classmethod
+    def _has_generic_title_scope_signal(cls, content: str) -> bool:
+        return bool(cls._normalized_title_scope_candidate(content))
+
+    @classmethod
+    def _unmatched_heading_scope_value(
+        cls,
+        value: str,
+        exact_constraints: frozenset[str],
+        structural_prefixes: tuple[str, ...],
+    ) -> str:
+        residual = cls._normalized_heading_value(value)
+        for constraint in sorted(exact_constraints, key=len, reverse=True):
+            residual = residual.replace(constraint, "")
+        for prefix in sorted(
+            {
+                cls._normalized_heading_value(prefix)
+                for prefix in structural_prefixes
+            },
+            key=len,
+            reverse=True,
+        ):
+            residual = residual.replace(prefix, "")
+        for topic_marker in sorted(
+            {
+                cls._normalized_heading_value(marker)
+                for marker in KNOWLEDGE_ORGANIZATION_TOPIC_MARKERS
+            },
+            key=len,
+            reverse=True,
+        ):
+            residual = residual.replace(topic_marker, "")
+        for connector in ("and", "与", "和", "及", "的"):
+            residual = residual.replace(connector, "")
+        return residual
+
+    @classmethod
+    def _has_inferred_heading_scope_reference(cls, content: str) -> bool:
+        if not _ORGANIZATION_SCOPE_COMMAND_PATTERN.search(content):
+            return False
+        residual = cls._unmatched_heading_scope_value(
+            cls._normalized_title_scope_candidate(content),
+            frozenset(),
+            heading_scope_prefixes(content),
+        )
+        return bool(residual) and any(
+            character.isascii() and character.isalnum() for character in residual
+        )
+
+    @classmethod
+    def _should_inspect_heading_scope(cls, content: str) -> bool:
+        if _ENGLISH_WHOLE_CONTENT_PATTERN.fullmatch(
+            content
+        ) or _CHINESE_WHOLE_CONTENT_PATTERN.fullmatch(content):
+            return False
+        if cls._has_generic_title_scope_signal(content):
+            return True
+        if not cls._has_explicit_heading_scope_reference(content):
+            return False
+        return not (
+            _ENGLISH_GLOBAL_SCOPE_PATTERN.search(content)
+            or _CHINESE_GLOBAL_SCOPE_PATTERN.search(content)
+        )
+
+    @staticmethod
+    def _explicit_heading_scope_values(content: str) -> tuple[str, ...]:
+        values: list[str] = []
+        for pattern in _EXPLICIT_TITLE_SCOPE_PATTERNS:
+            if match := pattern.search(content):
+                values.append(match.group("scope").strip())
+                break
+        values.extend(
+            match.group("scope").strip()
+            for match in _QUOTED_TITLE_SCOPE_PATTERN.finditer(content)
+        )
+        return tuple(dict.fromkeys(value for value in values if value))
+
+    @classmethod
+    def _has_explicit_heading_scope_reference(cls, content: str) -> bool:
+        return bool(
+            heading_scope_alias_groups(content)
+            or cls._explicit_heading_scope_values(content)
+            or cls._has_inferred_heading_scope_reference(content)
+        )
+
+    @staticmethod
+    def _heading_scope_matches(
+        heading_path: tuple[str, ...], scope_paths: tuple[tuple[str, ...], ...]
+    ) -> bool:
+        return any(
+            len(heading_path) >= len(scope_path)
+            and all(
+                SessionService._heading_values_are_equivalent(actual, expected)
+                for actual, expected in zip(
+                    heading_path[: len(scope_path)], scope_path, strict=True
+                )
+            )
+            for scope_path in scope_paths
+        )
+
+    @staticmethod
+    def _heading_values_are_equivalent(actual: str, expected: str) -> bool:
+        return SessionService._normalized_heading_value(
+            actual
+        ) == SessionService._normalized_heading_value(expected)
+
+    @staticmethod
+    def _block_heading_path(block) -> tuple[str, ...]:
+        if block.heading_path:
+            return block.heading_path
+        if not block.location.startswith("heading:"):
+            return ()
+        heading = block.location.removeprefix("heading:").split(";", maxsplit=1)[0].strip()
+        return (heading,) if heading else ()
+
+    @staticmethod
+    def _normalized_heading_value(value: str) -> str:
+        return "".join(character for character in value.casefold() if character.isalnum())
 
     @staticmethod
     def _is_snapshot_source_eligible(document) -> bool:
@@ -3167,7 +3493,7 @@ class SessionService:
         task_states = {state.snapshot_id: state for state in detail.task_states if state.snapshot_id}
         invalidated_snapshots: list[SessionTaskSnapshot] = []
         invalidated_states: list[SessionTaskState] = []
-        statuses = {"prepared", "waiting-authorization"}
+        statuses = {"prepared"}
         if include_completed:
             statuses.add("completed")
         for snapshot in detail.task_snapshots:
@@ -3193,7 +3519,7 @@ class SessionService:
             return
         task_states = {state.snapshot_id: state for state in detail.task_states if state.snapshot_id}
         for snapshot in detail.task_snapshots:
-            if snapshot.status not in {"prepared", "preparing", "waiting-authorization", "completed"}:
+            if snapshot.status not in {"prepared", "preparing", "completed"}:
                 continue
             if snapshot.intent == "knowledge-organization" and snapshot.status == "preparing":
                 if self._knowledge_organization_preparation_is_active(snapshot.snapshot_id):

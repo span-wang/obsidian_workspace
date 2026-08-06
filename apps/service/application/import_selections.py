@@ -1,6 +1,7 @@
 import hmac
 import secrets
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
@@ -22,8 +23,13 @@ class ImportSelection:
 
 
 class ImportSelectionStore:
-    def __init__(self, clock=time.monotonic) -> None:
+    def __init__(
+        self,
+        clock=time.monotonic,
+        cleanup_paths: Callable[[tuple[Path, ...]], None] | None = None,
+    ) -> None:
         self._clock = clock
+        self._cleanup_paths = cleanup_paths
         self._selections: dict[str, ImportSelection] = {}
         self._lock = Lock()
 
@@ -58,4 +64,6 @@ class ImportSelectionStore:
             if selection.expires_at <= now
         ]
         for selection_id in expired_ids:
-            self._selections.pop(selection_id, None)
+            selection = self._selections.pop(selection_id, None)
+            if selection is not None and self._cleanup_paths is not None:
+                self._cleanup_paths(selection.paths)

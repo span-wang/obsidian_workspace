@@ -1,5 +1,5 @@
 {
-  "updatedOn": "2026-07-27",
+  "updatedOn": "2026-08-05",
   "risks": [
     {
       "id": "RET-R001",
@@ -13,11 +13,11 @@
     {
       "id": "RET-R002",
       "severity": "高",
-      "status": "开放",
+      "status": "已关闭",
       "title": "索引正文批量出网扩大隐私边界",
       "impact": "教材和个人笔记正文可能按 vault 或目录批量发送给云端 Provider。",
-      "mitigation": "RET-00-02 已确认按选定目录或 vault 批次、显式确认的 D-002。RET-06-01 已实现仅本机可见的 Provider/文件/块数预览、逐文件 never-send-cloud 排除、即使 always-allow 也逐批次确认，以及覆盖选定范围、文件集合、块序号和内容哈希的执行前核验。RET-06-02 已在每个 create_embeddings 网络批次前重验该快照；policy revision、Provider/model、范围、文件、块哈希或待发送 retrieval/contextual text 变化都会停止后续请求。Provider 配置 revision 在持锁调用前再次核验，Embedding 只允许 HTTPS endpoint，缓存命中不出网。用户已确认 RET-06-04 的点查查询可默认、无感发送；混合开关关闭时不出网，开启后只向已验证的默认 HTTPS embedding Provider 发送当前用户问题，不发送 vault 正文、索引块或绝对路径。2026-07-27 用户确认 index-metadata 默认批准；RET-07-01 已为每次执行冻结范围、重验 never-send-cloud、policy、Provider/model 与内容哈希，并保持与 index-embedding 独立。2026-07-27 用户确认 index-unit-card：RET-07-02 为 chat 摘要和卡片 Embedding 分别创建 pending 授权，均需确认；仅发送 current、可核验、非 stale、非 pending 且人工 accepted 的源块。每次 Provider 调用前重验 never-send-cloud、范围、来源哈希、policy 和 Provider revision；仅 HTTPS Provider 可用，配置或默认变更会清除卡片投影。RET-09-01 仅允许明确确认的 synthetic-deidentified rerank fixture；命令在读取 Provider 凭据和建立网络连接前要求确认、HTTPS、显式独立 rerank Provider/model 与最多两条请求，且不读取 vault 或会话数据。2026-07-27 已以 BAAI/bge-reranker-v2-m3 完成两条固定 fixture 的原生 /rerank 测量；报告不含正文、路径、endpoint、secret 或 token，费用按用户决定明确未计算，默认开关仍关闭。",
-      "ownerTaskId": "RET-07-02"
+      "mitigation": "2026-07-27 用户明确确认默认允许出网，2026-08-05 再次明确确认可将 PDF/DOCX 解析得到的、格式保留的 Markdown 正文发送给 Markdown Provider 做结构化。RET-12-01 已删除运行时的逐任务授权、确认和执行前授权核验；会话 /run 在同一请求中保存选择、检索并仅将 outbound policy 允许的证据提交给所选 Model。never-send-cloud 证据不进入提示词；do-not-index、completely-ignore、HTTPS、已验证 Provider/model、内容哈希、响应和向量校验保持失败关闭。旧 SQLite 授权历史保留但运行时不读取或写入。默认出网的隐私范围已由用户接受。",
+      "ownerTaskId": "RET-12-01"
     },
     {
       "id": "RET-R003",
@@ -77,10 +77,89 @@
       "id": "RET-R009",
       "severity": "高",
       "status": "已关闭",
-      "title": "点查 rerank 候选正文绕过外发授权",
-      "impact": "若直接在 source-lookup 中启用云端 rerank，候选块正文、标题或标签可能在没有逐任务范围、内容哈希和 policy 重验的情况下发送给 Provider。",
-      "mitigation": "RET-08-01 已在 source-lookup 生产链路建立 rerank-source-lookup 的逐任务授权快照与本机会话确认；预览和通用确认响应均不返回候选正文、路径、内容哈希或任务摘要。授权不可逆绑定查询哈希、候选顺序、待发送投影哈希、源块哈希、范围、policy revision 与独立 rerank Provider/model/config revision；每次实际调用前均重验这些条件、HTTPS 与 never-send-cloud。RET-09-02 已将生产重排目标独立为 rerank 模型类型与原生 POST /rerank，不能复用 chat/DeepSeek 模型。仅在默认关闭的 feature flag 开启且授权有效时，rerank 才位于 RRF 与邻域扩展之间；任何拒绝、失效、预检、Provider 或并发失败均保留本地 RRF，并记录不含正文的请求数和延迟。单元、API、集成与浏览器回归已覆盖授权前不执行、确认后执行及敏感字段不出现在 UI/请求体。RET-09-01 已记录固定脱敏 fixture 的真实 Provider 延迟与质量，但更多样本与人工复核完成前不改变默认关闭结论。",
-      "ownerTaskId": "RET-08-01"
+      "title": "默认出网的 rerank 候选正文范围扩大",
+      "impact": "启用 rerank 时，候选块正文、标题或标签会在没有逐任务确认的情况下发送给已验证 Provider。",
+      "mitigation": "2026-07-27 用户明确确认默认允许出网。RET-12-01 已移除 rerank 授权快照；默认 feature flag 仍关闭，启用后仅调用独立的已验证 HTTPS rerank Provider，并继续逐候选执行 never-send-cloud、绝对路径投影、响应格式、并发和失败回退校验。默认出网范围已由用户接受。",
+      "ownerTaskId": "RET-12-01"
+    },
+    {
+      "id": "RET-R010",
+      "severity": "高",
+      "status": "已关闭",
+      "title": "短原子块和派生目录重复放大全量枚举范围",
+      "impact": "解析产生的十几字符 atomic paragraph 不能达到预期检索粒度；平台生成的 index.md 又按相同 projection 入索引，会使完整列举重复处理同一来源内容并放大本地索引、Embedding 和模型处理预算。",
+      "mitigation": "RET-11-01 已在同一标题上下文内确定性聚合相邻 short paragraph atomic projection，保留全部 source locator、起始 graph block identity、阅读顺序和最小置信度；带有效 platform_provenance 的派生 index.md 已在普通索引、提交期索引和重建中失效。回归覆盖结构边界、reconcile、提交期索引和 rebuild；当前 vault 已从 4 个索引文档 / 776 块重建为 2 个正文文档 / 49 个唯一块。",
+      "ownerTaskId": "RET-11-01"
+    },
+    {
+      "id": "RET-R011",
+      "severity": "高",
+      "status": "已关闭",
+      "title": "自动向量化与导入提交出现部分完成态",
+      "impact": "若 Provider 调用或向量持久化失败后仍提交派生文档，会造成提交内容不可被完整语义检索。",
+      "mitigation": "RET-12-01 已在提交完成前自动执行 Embedding；Embedding 服务缺失、Provider、内容、规则或向量校验失败都会恢复本次提交中的全部已写入文件，reconcile 当前索引，记录 failed/rolled-back journal，并使任务保持 retry-commit 可重试状态。提交门禁回归覆盖自动执行、Provider 失败恢复、跨资料整体回滚和不完成提交。",
+      "ownerTaskId": "RET-12-01"
+    },
+    {
+      "id": "RET-R012",
+      "severity": "高",
+      "status": "已关闭",
+      "title": "标题范围请求退化为全范围证据",
+      "impact": "用户指定“第一单元”等标题范围时，知识整理或深度创作可能混入其他标题（如 Unit 7）的证据并生成错误结论。",
+      "mitigation": "RET-05-05 已以 IndexBlock.heading_path 锚定当前允许来源中的标题与子标题，并对旧块的既有 heading: location 只读兼容。中文“第一单元”匹配 Unit 1、不匹配 Unit 7；用户文本中出现的任意现有标题同样可作为范围。明确范围无命中时在 Provider 调用前失败关闭。服务回归覆盖知识整理、深度创作、Unit 1/Unit 7、通用 Project A 标题与无命中范围。",
+      "ownerTaskId": "RET-05-05"
+    },
+    {
+      "id": "RET-R013",
+      "severity": "高",
+      "status": "已关闭",
+      "title": "未解析或局部命中的标题路径扩大检索范围",
+      "impact": "用户指定任意父子标题或结构路径时，局部命中、共享子标题、结构别名或命令噪声可能把兄弟标题乃至整个 vault 的内容冻结并发送给 Provider，生成错误结论。",
+      "mitigation": "RET-13-01 已将标题范围改为基于实际 heading_path 的联合约束：请求中的结构引用全部必须命中同一路径，显式标题短语不得留下未解析残余，完整标题优先于结构别名，最终过滤只接受已解析实际路径前缀。章、节、课、部分、模块、项目、卷、阶段和单元使用统一中英文结构别名；重点、核心、要点、关键、概念与方法等通用主题进入知识整理而不依赖词汇特例。任一显式范围无匹配均在任务持久化和 Provider 调用前失败关闭；all notes、当前 vault 等整库表达保持全范围语义。",
+      "ownerTaskId": "RET-13-01"
+    },
+    {
+      "id": "RET-R014",
+      "severity": "中",
+      "status": "已关闭",
+      "title": "会话详情刷新清空内容并丢失阅读位置",
+      "impact": "用户在长会话中执行发送、编辑或重新核验后，会先看到空白加载区并被重置到首条消息，难以继续当前阅读位置。",
+      "mitigation": "RET-15-01 保留与当前会话匹配的已加载详情和应用证据，刷新时只叠加轻量状态；首次加载定位最新轮次，后续内容更新仅在用户仍位于底部时跟随。问答导航按用户问题及后续输出分组，支持点击定位和可访问名称。前端静态回归验证刷新状态不移除正文；浏览器回归验证初始位置和定位条点击。",
+      "ownerTaskId": "RET-15-01"
+    },
+    {
+      "id": "RET-R015",
+      "severity": "高",
+      "status": "开放",
+      "title": "远程上传扩大公开 Tunnel 的文件接收面",
+      "impact": "非服务机文件会经公网进入服务机；公开 Tunnel 当前没有独立身份认证，超大或未清理暂存文件也可能耗尽磁盘。",
+      "mitigation": "2026-08-04 用户已明确确认允许非服务机文件经公网传输并在服务端暂存，并追加要求支持多文件与文件夹。RET-16-01 已保持同源会话校验、512 MiB 单文件限制、随机私有暂存、文件名/相对路径规范化，以及选择过期、任务创建失败或最后一个引用删除后的清理；文件夹层级暂存和既有递归扫描回归已完成。公开 Tunnel 的独立身份认证、配额和可恢复上传仍不在本步范围内，因此风险保持开放。",
+      "ownerTaskId": "RET-16-01"
+    },
+    {
+      "id": "RET-R016",
+      "severity": "中",
+      "status": "开放",
+      "mitigation": "RET-17-01 在发送原生和 PDF/DOCX 转换 Markdown 前复用 vault outbound policy，命中 never-send-cloud 或 completely-ignore 时不调用 Provider；Provider 直接返回最终 Markdown，服务拒绝 JSON、空响应和不保留任何源内容的响应，并按结构安全分块拼接。标题、列表、表格、引用和代码围栏不跨 Provider 分块，后续块携带继承标题上下文。仅重复出现且不承载正文的页眉、页脚、页码、广告等分页伪影可由 Provider 移除；Provider 依据语义和上下文保留标题文字并优化标题层级，不凭空创建标题。PDF/DOCX 只有能回链的重复图块才从私有候选排除，原始文件、图块 ID、定位和审核语义仍保留。模型发生正常 Markdown 重排时保留原图块用于审核与候选溯源，最终 Provider Markdown 用于生成提案；Provider 或响应核验失败会保持任务可恢复，不写入不完整提案。真实 PDF 任务已验证 182 个图块、10 个 noise 图块和 0 个 noise 候选行；语义质量仍需后续脱敏样本评估，因此风险保持开放。",
+      "ownerTaskId": "RET-17-01"
+    },
+    {
+      "id": "RET-R017",
+      "severity": "高",
+      "status": "开放",
+      "title": "自动导入跳过人工审核后采纳错误建议",
+      "impact": "分类建议、元数据标签或候选链接若与源内容不符，人工不再能在提交前修正；错误产出可能降低后续人工整理质量。",
+      "mitigation": "RET-18-01 将三类建议限制为任务私有、不可阻塞的观察性产出：它们不再写回 Markdown、不移动文件、不改变已提交内容、索引范围或检索排序。自动提交继续受 vault 相对路径验证、原子提交、索引与 Embedding 完整性门禁及失败回滚保护。任何将建议自动采纳为可见或不可逆变更的需求，必须另立带质量门槛和回滚的任务。",
+      "ownerTaskId": "RET-18-01"
+    },
+    {
+      "id": "RET-R018",
+      "severity": "高",
+      "status": "开放",
+      "title": "PDF 原生文字层与 MinerU 解析结果不一致",
+      "impact": "MinerU pipeline 可能丢失行内数字和标准号；整份文档回退又会牺牲原生文字层，导致 GB15577、15 min、1 等证据缺失或重复。",
+      "mitigation": "RET-19-01 已按页优先使用 pypdf 原生文字层，并以数字/英文 token 完整性校验决定页面级 MinerU VLM 回退；混合 DocumentGraph 保留原始 PDF、pipeline/VLM artifact、图片和公式溯源。真实 23 页样例中 18 个文字页走原生，第 2、4、6、22、23 页走 VLM；第 12 页的 GB15577、15 min、1 均保留。该样例的 2、6、22、23 页是实际空白分隔页，VLM artifact 保留但没有伪造正文。仍需以更多脱敏的扫描 PDF 样本评估 VLM 的非空页 OCR 质量。",
+      "ownerTaskId": "RET-19-01"
     }
   ]
 }

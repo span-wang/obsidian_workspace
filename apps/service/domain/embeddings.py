@@ -28,7 +28,7 @@ def embedding_input_sha256(value: str) -> str:
 
 
 def embedding_input_text(contextual_prefix: str, retrieval_text: str, block_text: str) -> str:
-    """Build the exact normalized text authorized for a rich index block embedding."""
+    """Build the exact normalized text sent for a rich index block embedding."""
 
     if not all(isinstance(value, str) for value in (contextual_prefix, retrieval_text, block_text)):
         raise ValueError("Embedding block retrieval fields must be text.")
@@ -150,7 +150,7 @@ class EmbeddingCacheEntry:
 
 @dataclass(frozen=True)
 class EmbeddingInput:
-    """One in-memory authorized block input. It must never enter an API response."""
+    """One in-memory block input. It must never enter an API response."""
 
     document_id: str
     sequence: int
@@ -219,7 +219,6 @@ class EmbeddingExecutionReport:
     """Content-free local result for a successfully completed embedding batch."""
 
     vault_id: str
-    authorization_id: str
     file_count: int
     block_count: int
     cache_hit_block_count: int
@@ -231,8 +230,6 @@ class EmbeddingExecutionReport:
     def __post_init__(self) -> None:
         if not isinstance(self.vault_id, str) or not self.vault_id:
             raise ValueError("Embedding execution report vault identity is invalid.")
-        if not isinstance(self.authorization_id, str) or not self.authorization_id:
-            raise ValueError("Embedding execution report authorization identity is invalid.")
         counts = (
             self.file_count,
             self.block_count,

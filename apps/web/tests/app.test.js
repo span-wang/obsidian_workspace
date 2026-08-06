@@ -6,11 +6,16 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import {
   App,
+  applicationEvidenceAnchorId,
+  AutomaticMarkdownResults,
+  conversationTurns,
+  copyPlainText,
   ConversionReviewControls,
   derivedMarkdownPreview,
   HEALTH_ENDPOINT,
   IMPORT_DIRECTORY_SELECTION_ENDPOINT,
   IMPORT_FILES_SELECTION_ENDPOINT,
+  IMPORT_UPLOAD_ENDPOINT,
   ImportTaskCenter,
   IMPORT_TASK_EVENT_NAMES,
   IMPORT_TASKS_ENDPOINT,
@@ -21,13 +26,51 @@ import {
   ProjectionRebuildVerificationPanel,
   ProviderManagement,
   PROVIDERS_ENDPOINT,
-  RerankAuthorizationPreview,
+  RETRIEVAL_MODE_ENDPOINT,
   SESSIONS_ENDPOINT,
   SessionManagement,
   TagManagement,
+  userFacingEvidenceLocation,
+  userFacingEvidenceSource,
+  userFacingImportIssue,
+  userFacingImportLocation,
+  userFacingSourceSample,
   VaultIndexStatus,
   VAULTS_ENDPOINT
 } from "../src/app.js";
+
+function visibleText(markup) {
+  return markup.replace(/<[^>]*>/g, "");
+}
+
+test("formats source metadata for readers without exposing internal identity", () => {
+  const internalLocation = "graph:745b58a99c49033e041e15dbef498fafb0a24a450ff32ac6d087c996ed60aec1:1:f50de8acf3da3b02d96907d440f394d268753f4b4409bcc2e631814fe9fb263c#chunk:1";
+
+  assert.equal(userFacingEvidenceLocation({ heading: "第一单元", page: 3, location: internalLocation }), "第一单元 · 第 3 页");
+  assert.equal(userFacingEvidenceLocation({ page: 3, location: internalLocation }), "第 3 页");
+  assert.equal(userFacingEvidenceLocation({ location: internalLocation }), "");
+  assert.equal(userFacingEvidenceLocation({ heading: internalLocation }), "");
+  assert.equal(userFacingEvidenceLocation({ location: "chunk:12" }), "");
+  assert.equal(userFacingEvidenceLocation({ location: "block:7" }), "");
+  assert.equal(userFacingEvidenceLocation({ location: "word/document.xml:42" }), "");
+  assert.equal(userFacingEvidenceLocation({ location: "line:42" }), "");
+  assert.equal(userFacingEvidenceLocation({ location: "第 2 节" }), "第 2 节");
+  assert.equal(userFacingEvidenceSource({ identity_kind: "derived", source_path: "sources/book.pdf" }), "原始资料：sources/book.pdf");
+  assert.equal(userFacingEvidenceSource({ identity_kind: "native" }), "来源类型：原生 Markdown");
+  assert.equal(userFacingSourceSample({ source_path: "sources/book.pdf", relative_path: "notes/book.md" }), "sources/book.pdf");
+  assert.equal(userFacingSourceSample({ relative_path: "notes/native.md" }), "notes/native.md");
+  assert.equal(userFacingImportLocation("page 2 box:10,20,60,12"), "第 2 页");
+  assert.equal(userFacingImportLocation("word/document.xml:42"), "DOCX 内容");
+  assert.equal(userFacingImportLocation("graph:internal#chunk:2"), "");
+  assert.equal(userFacingImportLocation("line:42"), "");
+  assert.equal(userFacingImportLocation("region:body"), "");
+  assert.equal(userFacingImportIssue("page 1 table:1: Table columns need review."), "Table columns need review.");
+  assert.equal(userFacingImportIssue("word/document.xml:42: DOCX content needs review."), "DOCX content needs review.");
+  assert.equal(userFacingImportIssue(`${internalLocation}: Internal locator needs review.`), "Internal locator needs review.");
+  assert.equal(userFacingImportIssue("paragraph:1: Paragraph needs review."), "Paragraph needs review.");
+  assert.equal(userFacingImportIssue("image:1: Image description needs review."), "Image description needs review.");
+  assert.equal(userFacingImportIssue("table:1/row:1/cell:1: Table needs review."), "Table needs review.");
+});
 
 test("hides derived-note provenance frontmatter from Markdown previews", () => {
   const markdown = [
@@ -45,6 +88,57 @@ test("hides derived-note provenance frontmatter from Markdown previews", () => {
 
   assert.equal(derivedMarkdownPreview(markdown), "# Final Markdown\n\nOnly this content is shown.");
   assert.equal(derivedMarkdownPreview("# Native Markdown"), "# Native Markdown");
+});
+
+test("renders automatic Markdown results as read-only previews", () => {
+  const markup = renderToStaticMarkup(React.createElement(AutomaticMarkdownResults, {
+    noteProposals: [
+      { kind: "native", item_id: 1, revision: 1, relative_path: "notes/native.md", markdown: "# Native result" },
+      {
+        kind: "derived",
+        item_id: 2,
+        revision: 3,
+        index_note: { relative_path: "notes/book/index.md", markdown: "# Book index" },
+        notes: [{ note_id: "note-1", sequence: 1, title: "Chapter One", relative_path: "notes/book/01.md", markdown: "# Chapter One\n\nParsed body" }]
+      }
+    ]
+  }));
+
+  assert.match(markup, /Markdown 结果/);
+  assert.match(markup, /# Native result/);
+  assert.match(markup, /# Book index/);
+  assert.match(markup, /# Chapter One/);
+  assert.match(markup, /Parsed body/);
+  assert.doesNotMatch(markup, /提交审核|接受|保存修正/);
+});
+
+test("copies only direct answer content without application-evidence markers", async () => {
+  const writes = [];
+  const clipboard = { writeText: async (value) => writes.push(value) };
+
+  assert.equal(await copyPlainText("可直接使用的内容。\n", clipboard), true);
+  assert.deepEqual(writes, ["可直接使用的内容。"]);
+  assert.doesNotMatch(writes[0], /\[1\]/);
+  assert.equal(await copyPlainText("", clipboard), false);
+});
+
+test("groups each user question with its following session output for navigation", () => {
+  const turns = conversationTurns({
+    messages: [
+      { message_id: "question-1", role: "user", content: "先解释概念", created_at: "2026-08-04T01:00:00+00:00" },
+      { message_id: "answer-1", role: "assistant", content: "概念解释", created_at: "2026-08-04T01:00:01+00:00" },
+      { message_id: "question-2", role: "user", content: "再给一个例子", created_at: "2026-08-04T01:01:00+00:00" }
+    ],
+    generation_results: [
+      { result_id: "generation-2", content: "例子说明", created_at: "2026-08-04T01:01:01+00:00" }
+    ]
+  });
+
+  assert.equal(turns.length, 2);
+  assert.equal(turns[0].question, "先解释概念");
+  assert.deepEqual(turns[0].entries.map((entry) => entry.key), ["message:question-1", "message:answer-1"]);
+  assert.equal(turns[1].question, "再给一个例子");
+  assert.deepEqual(turns[1].entries.map((entry) => entry.key), ["message:question-2", "generation:generation-2"]);
 });
 
 test("renders the five-destination local workbench shell", () => {
@@ -66,8 +160,10 @@ test("uses relative same-origin endpoints for health and local session checks", 
   assert.equal(VAULTS_ENDPOINT, "/api/vaults");
   assert.equal(PROVIDERS_ENDPOINT, "/api/providers");
   assert.equal(SESSIONS_ENDPOINT, "/api/sessions");
+  assert.equal(RETRIEVAL_MODE_ENDPOINT, "/api/retrieval/mode");
   assert.equal(IMPORT_TASKS_ENDPOINT, "/api/import-tasks");
   assert.equal(IMPORT_FILES_SELECTION_ENDPOINT, "/api/import-selections/files");
+  assert.equal(IMPORT_UPLOAD_ENDPOINT, "/api/import-selections/uploads");
   assert.equal(IMPORT_DIRECTORY_SELECTION_ENDPOINT, "/api/import-selections/directory");
   assert.deepEqual(IMPORT_TASK_EVENT_NAMES, [
     "task-update",
@@ -126,13 +222,13 @@ test("uses relative same-origin endpoints for health and local session checks", 
   ]);
 });
 
-test("renders an independent Rerank model type and default selector", () => {
+test("renders independent Rerank and Markdown model type selectors", () => {
   const markup = renderToStaticMarkup(React.createElement(ProviderManagement, {
     providers: [{
       provider_id: "provider-1",
       name: "Rerank Provider",
       endpoint: "https://rerank.example/v1",
-      credential_configured: true,
+      credential_configured: false,
       verification: { is_verified: true, discovery: { ok: true }, health: { ok: true } },
       models: [{
         model_id: "rerank-1",
@@ -145,7 +241,8 @@ test("renders an independent Rerank model type and default selector", () => {
     modelDefaults: {
       chat: { default: null, status: "unconfigured", reason: null },
       embedding: { default: null, status: "unconfigured", reason: null },
-      rerank: { default: null, status: "unconfigured", reason: null }
+      rerank: { default: null, status: "unconfigured", reason: null },
+      markdown: { default: null, status: "unconfigured", reason: null }
     },
     onOpenForm: () => {},
     onUpdate: () => {},
@@ -155,72 +252,13 @@ test("renders an independent Rerank model type and default selector", () => {
 
   assert.match(markup, /Rerank（重排）模型/);
   assert.match(markup, /全局 Rerank（重排）Model/);
-  assert.match(markup, /默认关闭，只有获得单次外发授权后才会发送候选。/);
+  assert.match(markup, /默认关闭，启用后仅发送允许外发的候选。/);
   assert.match(markup, /<option value="rerank" selected="">Rerank（重排）<\/option>/);
+  assert.match(markup, /Markdown 结构化模型/);
+  assert.match(markup, /全局 Markdown 结构化 Model/);
+  assert.match(markup, /<option value="markdown">Markdown 结构化<\/option>/);
   assert.match(markup, /Rerank Provider \/ rerank-1/);
-});
-
-test("renders a rerank authorization preview without candidate content or identity", () => {
-  const markup = renderToStaticMarkup(React.createElement(RerankAuthorizationPreview, {
-    preview: {
-      vault_id: "vault-1",
-      provider_id: "provider-1",
-      provider_name: "已验证 Chat Provider",
-      model_id: "chat-1",
-      provider_configuration_revision: 7,
-      policy_revision: 11,
-      candidate_count: 20,
-      file_count: 5,
-      input_character_count: 4800,
-      blocked_candidate_count: 2,
-      blocked_file_count: 1,
-      content_categories: ["教材", "个人笔记"],
-      is_authorizable: true,
-      blocking_reason: "部分候选命中 never-send-cloud。",
-      candidate_text: "不应显示的候选正文",
-      absolute_path: "C:\\private\\lesson.md",
-      content_sha256: "deadbeef"
-    },
-    authorization: { authorization_id: "authorization-secret", status: "pending" },
-    isSubmitting: false,
-    onConfirm: () => {},
-    onUseLocal: () => {}
-  }));
-
-  assert.match(markup, /点查 rerank 外发授权预览/);
-  assert.match(markup, /已验证 Chat Provider；Model：chat-1/);
-  assert.match(markup, /候选 20 项；文件 5 项；输入 4800 个字符/);
-  assert.match(markup, /已排除候选 2 项；文件 1 项/);
-  assert.match(markup, /内容类别：教材、个人笔记/);
-  assert.match(markup, /外发策略修订：11/);
-  assert.match(markup, /确认并执行 rerank/);
-  assert.match(markup, /仅本地执行/);
-  assert.match(markup, /已排除的候选不会发送；部分候选命中 never-send-cloud。/);
-  assert.doesNotMatch(markup, /不应显示的候选正文|C:\\private|deadbeef|authorization-secret/);
-});
-
-test("keeps rerank unavailable previews local only", () => {
-  const markup = renderToStaticMarkup(React.createElement(RerankAuthorizationPreview, {
-    preview: {
-      candidate_count: 0,
-      file_count: 0,
-      input_character_count: 0,
-      blocked_candidate_count: 1,
-      blocked_file_count: 1,
-      content_categories: ["retrieval-candidate"],
-      is_authorizable: false,
-      blocking_reason: "所有候选均被 never-send-cloud 排除。"
-    },
-    authorization: null,
-    isSubmitting: false,
-    onConfirm: () => {},
-    onUseLocal: () => {}
-  }));
-
-  assert.match(markup, /当前候选不满足 rerank 外发条件，将只执行本地 RRF 检索。/);
-  assert.match(markup, /所有候选均被 never-send-cloud 排除。/);
-  assert.match(markup, /仅本地执行/);
-  assert.doesNotMatch(markup, /确认并执行 rerank|执行受控 rerank/);
+  assert.match(markup, /API Key：未配置/);
 });
 
 test("renders a bounded three-pane session workspace with a context composer", () => {
@@ -248,7 +286,28 @@ test("renders a bounded three-pane session workspace with a context composer", (
       selectedDetail: {
         session,
         messages: [{ message_id: "message-1", role: "assistant", content: "先复习二次方程。" }],
-        citations: [{ citation_id: "citation-1", relative_path: "notes/algebra.md", location: "第 2 节", status: "valid" }],
+        citations: [{
+          citation_id: "citation-1",
+          result_id: "answer-1",
+          snapshot_id: "snapshot-1",
+          vault_id: "vault-2",
+          identity_kind: "derived",
+          source_id: "source-1",
+          source_content_hash: "b".repeat(64),
+          content_sha256: "a".repeat(64),
+          source_path: "sources/algebra.pdf",
+          relative_path: "notes/algebra.md",
+          location: "graph:745b58a99c49033e041e15dbef498fafb0a24a450ff32ac6d087c996ed60aec1:1:f50de8acf3da3b02d96907d440f394d268753f4b4409bcc2e631814fe9fb263c#chunk:1",
+          status: "valid"
+        }],
+        generation_results: [{
+          result_id: "answer-1",
+          task_id: "task-1",
+          snapshot_id: "snapshot-1",
+          status: "valid",
+          content: "二次方程可用求根公式求解。",
+          content_origin: "model-judgement"
+        }],
         task_snapshots: [{
           snapshot_id: "snapshot-1",
           task_id: "task-1",
@@ -266,7 +325,7 @@ test("renders a bounded three-pane session workspace with a context composer", (
           task_id: "task-1",
           snapshot_id: "snapshot-1",
           status: "completed",
-          summary: "已在已确认范围内找到 1 条本地知识库证据；未调用 Model。",
+          summary: "已在已确认范围内找到 1 条知识库证据；已提交给所选 Model 生成回答。",
           recovery_action: null,
           retrieval_duration_ms: 12,
           generation_duration_ms: 0,
@@ -298,9 +357,9 @@ test("renders a bounded three-pane session workspace with a context composer", (
             source_content_hash: "b".repeat(64),
             source_path: "sources/algebra.pdf",
             heading: "二次方程",
-            location: "heading: 二次方程; page: 2",
+            location: "graph:745b58a99c49033e041e15dbef498fafb0a24a450ff32ac6d087c996ed60aec1:1:f50de8acf3da3b02d96907d440f394d268753f4b4409bcc2e631814fe9fb263c#chunk:1",
             page: 2,
-            excerpt: "二次方程有两个根。",
+            excerpt: "原始段落摘录。",
             matched_channels: ["keyword", "semantic"]
           }, {
             ordinal: 2,
@@ -331,7 +390,7 @@ test("renders a bounded three-pane session workspace with a context composer", (
           }]
         }]
       },
-      isDetailLoading: false,
+      isDetailLoading: true,
       detailError: "",
       onLoad: () => {},
       onSelect: () => {},
@@ -349,13 +408,9 @@ test("renders a bounded three-pane session workspace with a context composer", (
         verification: { is_verified: true },
         models: [{ model_id: "chat-1", model_type: "chat", is_discovered: true, verification: { ok: true } }]
       }],
-      onUpdateContext: async () => {},
       onPickAttachments: async () => {},
       onRemoveAttachment: async () => {},
-      onSendMessage: async () => {},
-      onPreviewTask: async () => ({}),
-      onCreateTask: async () => ({}),
-      onExecuteTask: async () => ({})
+      onRun: async () => ({})
     })
   );
 
@@ -363,12 +418,31 @@ test("renders a bounded three-pane session workspace with a context composer", (
   assert.match(markup, /aria-label="搜索会话"/);
   assert.match(markup, /aria-label="会话历史"/);
   assert.match(markup, /aria-label="会话内容"/);
-  assert.match(markup, /aria-label="引用证据"/);
+  assert.match(markup, /aria-label="问答定位"/);
+  assert.match(markup, /class="session-turn-navigator-button"/);
+  const conversationMarkup = markup.slice(
+    markup.indexOf('class="session-conversation-pane"'),
+    markup.indexOf('class="session-evidence-pane"')
+  );
+  const evidenceMarkup = markup.slice(markup.indexOf('class="session-evidence-pane"'));
+  const evidenceId = applicationEvidenceAnchorId("citation:citation-1");
+  const conversationText = visibleText(conversationMarkup);
+
+  assert.match(markup, /aria-label="应用证据"/);
   assert.match(markup, /代数复习/);
   assert.match(markup, /所用 vault：English/);
   assert.doesNotMatch(markup, /所用 vault：platform/);
   assert.match(markup, /先复习二次方程。/);
-  assert.match(markup, /notes\/algebra\.md/);
+  assert.match(conversationMarkup, /二次方程可用求根公式求解。/);
+  assert.match(conversationMarkup, /正在更新会话内容。/);
+  assert.match(conversationMarkup, /\[1\]/);
+  assert.ok(conversationMarkup.includes(`href="#${evidenceId}"`));
+  assert.match(conversationMarkup, /复制正文/);
+  assert.doesNotMatch(conversationMarkup, /所用 vault：English|范围：整个 vault|Model：chat-1/);
+  assert.doesNotMatch(conversationText, /原始段落摘录。|notes\/algebra\.md|知识库|检索|证据|引用/);
+  assert.ok(evidenceMarkup.includes(`id="${evidenceId}"`));
+  assert.match(evidenceMarkup, /notes\/algebra\.md/);
+  assert.match(evidenceMarkup, /原始段落摘录。/);
   assert.match(markup, /上一页/);
   assert.match(markup, /下一页/);
   assert.match(markup, /第 1 \/ 2 页/);
@@ -382,16 +456,18 @@ test("renders a bounded three-pane session workspace with a context composer", (
   assert.match(markup, /自动识别/);
   assert.match(markup, /aria-label="输入问题或继续创作"/);
   assert.match(markup, /session-composer/);
-  assert.match(markup, /执行检索/);
-  assert.match(markup, /本地知识库证据/);
-  assert.match(markup, /检索 12 ms；生成 0 ms（未调用 Model）/);
-  assert.match(markup, /Source ID source-1/);
-  assert.match(markup, /在 Obsidian 中打开/);
-  assert.match(markup, /vault：Mathematics/);
-  assert.match(markup, /\/api\/vaults\/vault-2\/open\?file=notes%2Falgebra.md/);
-  assert.match(markup, /独立来源：2/);
-  assert.match(markup, /系统不会自动合并、选择或判定哪一种说法正确。/);
-  assert.match(markup, /同一来源中的 2 条证据只计为 1 个独立来源。/);
+  assert.match(markup, /仅关键词/);
+  assert.match(markup, /仅语义/);
+  assert.match(markup, /关键词与语义混合/);
+  assert.match(markup, /发送/);
+  assert.doesNotMatch(markup, /保存语境|准备任务|固定快照|任务快照状态|执行检索/);
+  assert.match(evidenceMarkup, /二次方程 · 第 2 页/);
+  assert.match(evidenceMarkup, /原始资料：sources\/algebra\.pdf/);
+  assert.doesNotMatch(evidenceMarkup, /Source ID|源内容哈希|内容哈希|来源摘要|graph:/);
+  assert.doesNotMatch(evidenceMarkup, /[a-f0-9]{64}/i);
+  assert.match(evidenceMarkup, /在 Obsidian 中打开/);
+  assert.match(evidenceMarkup, /知识库：Mathematics/);
+  assert.match(evidenceMarkup, /\/api\/vaults\/vault-2\/open\?file=notes%2Falgebra.md/);
 });
 
 test("renders completeness coverage with explicit gaps and stale source status", () => {
@@ -401,14 +477,28 @@ test("renders completeness coverage with explicit gaps and stale source status",
     selectedDetail: {
       session: { session_id: "session-1", title: "英语" }, messages: [], citations: [], retrieval_results: [],
       task_snapshots: [{ snapshot_id: "snapshot-1", task_id: "task-1", vault_id: "vault-1", intent: "completeness", status: "invalidated", scope_kind: "vault", source_count: 1, source_digest: "a".repeat(64), index_status: "healthy", outbound_scope_summary: "尚未发送", coverage: { planned_count: 1, excluded_count: 1, uncovered_count: 0 } }],
-      completeness_results: [{ result_id: "result-1", snapshot_id: "snapshot-1", status: "source-changed", summary: "来源已变化", recovery_action: "重新准备", invalidation_reason: "索引已变化", coverage_total: 3, coverage_has_more: true, coverage_counts: { planned: 1, processed: 1, duplicate: 0, failed: 0, excluded: 1, uncovered: 0 }, coverage: [{ ordinal: 1, status: "processed", relative_path: "notes/unit.md", content_sha256: "a".repeat(64), identity_kind: "native", location: "heading: Unit", excerpt: "word" }, { ordinal: 2, status: "excluded", relative_path: "notes/excluded.md", content_sha256: "b".repeat(64), identity_kind: "native", location: "heading: Excluded", reason: "内容被排除" }] }]
+      completeness_results: [{ result_id: "result-1", snapshot_id: "snapshot-1", status: "source-changed", summary: "根据检索证据，来源已变化", recovery_action: "重新准备", invalidation_reason: "索引已变化", coverage_total: 3, coverage_has_more: true, coverage_counts: { planned: 1, processed: 1, duplicate: 0, failed: 0, excluded: 1, uncovered: 0 }, coverage: [{ ordinal: 1, status: "processed", relative_path: "notes/unit.md", content_sha256: "a".repeat(64), identity_kind: "native", heading: "Unit", location: "graph:graph-hash:1:block-hash#chunk:1", excerpt: "word" }, { ordinal: 2, status: "excluded", relative_path: "notes/excluded.md", content_sha256: "b".repeat(64), identity_kind: "native", heading: "Excluded", location: "graph:graph-hash:1:block-hash#chunk:2", reason: "内容被排除" }] }]
     }, vaults: [{ vault_id: "vault-1", display_name: "英语资料", authorization_status: "active", access_status: "available" }], onLoadCompletenessCoverage: async () => ({})
   }));
 
-  assert.match(markup, /来源已变化/);
-  assert.match(markup, /排除 1 项/);
-  assert.match(markup, /内容被排除/);
-  assert.match(markup, /加载更多覆盖项/);
+  const conversationMarkup = markup.slice(
+    markup.indexOf('class="session-conversation-pane"'),
+    markup.indexOf('class="session-evidence-pane"')
+  );
+  const evidenceMarkup = markup.slice(markup.indexOf('class="session-evidence-pane"'));
+  const conversationText = visibleText(conversationMarkup);
+
+  assert.match(conversationMarkup, /来源已变化/);
+  assert.match(conversationText, /\[1\]\[2\]/);
+  assert.match(conversationMarkup, /排除 1 项/);
+  assert.match(conversationMarkup, /复制结论/);
+  assert.match(conversationMarkup, /加载更多/);
+  assert.doesNotMatch(conversationText, /根据检索证据|word|内容被排除|notes\/|知识库|检索|证据|引用/);
+  assert.match(evidenceMarkup, /应用证据/);
+  assert.match(evidenceMarkup, /notes\/unit\.md/);
+  assert.match(evidenceMarkup, /word/);
+  assert.match(evidenceMarkup, /内容被排除/);
+  assert.doesNotMatch(evidenceMarkup, /graph:|内容哈希|[ab]{64}/);
 });
 
 test("renders an evidence-bound knowledge organization conclusion with expandable evidence", () => {
@@ -431,21 +521,22 @@ test("renders an evidence-bound knowledge organization conclusion with expandabl
     markup.indexOf('class="session-evidence-pane"')
   );
   const evidenceMarkup = markup.slice(markup.indexOf('class="session-evidence-pane"'));
+  const conversationText = visibleText(conversationMarkup);
 
-  assert.match(conversationMarkup, /已按冻结证据生成 1 个知识整理计划段。/);
   assert.match(conversationMarkup, /词汇要点。/);
-  assert.match(conversationMarkup, /独立来源：1；详细依据见右侧“引用证据”/);
+  assert.match(conversationMarkup, /\[1\]/);
+  assert.match(conversationMarkup, /复制正文/);
   assert.match(conversationMarkup, /计划 1 段；已准备 0 段；已完成 1 段；进行中 0 段/);
-  assert.doesNotMatch(conversationMarkup, /notes\/unit\/vocabulary\.md/);
-  assert.doesNotMatch(conversationMarkup, /word evidence/);
-  assert.doesNotMatch(conversationMarkup, /内容哈希/);
-  assert.match(evidenceMarkup, /知识整理依据/);
+  assert.doesNotMatch(conversationText, /已按冻结证据|notes\/unit\/vocabulary\.md|word evidence|内容哈希|知识库|检索|证据|引用/);
+  assert.match(evidenceMarkup, /应用证据/);
+  assert.match(evidenceMarkup, /整理应用/);
   assert.match(evidenceMarkup, /在 Obsidian 中打开/);
   assert.match(evidenceMarkup, /notes\/unit\/vocabulary\.md/);
   assert.match(evidenceMarkup, /word evidence/);
+  assert.doesNotMatch(evidenceMarkup, /内容哈希|Source ID|graph:|a{64}/);
 });
 
-test("renders deep creation result with local evidence and model judgement", () => {
+test("renders deep creation as direct content with application evidence in the side pane", () => {
   const markup = renderToStaticMarkup(React.createElement(SessionManagement, {
     sessionPage: { sessions: [{ session_id: "session-1", title: "英语", message_count: 0 }], page: 1, page_size: 25, total: 1, total_pages: 1 },
     filters: { query: "", sort: "updated_at", order: "desc" }, isLoading: false, error: "", selectedSessionId: "session-1",
@@ -464,11 +555,68 @@ test("renders deep creation result with local evidence and model judgement", () 
     vaults: [{ vault_id: "vault-1", display_name: "英语资料", authorization_status: "active", access_status: "available" }]
   }));
 
-  assert.match(markup, /深度创作/);
-  assert.match(markup, /知识库证据/);
-  assert.match(markup, /word evidence/);
-  assert.match(markup, /模型判断/);
-  assert.doesNotMatch(markup, /互联网证据/);
+  const conversationMarkup = markup.slice(
+    markup.indexOf('class="session-conversation-pane"'),
+    markup.indexOf('class="session-evidence-pane"')
+  );
+  const evidenceMarkup = markup.slice(markup.indexOf('class="session-evidence-pane"'));
+  const conversationText = visibleText(conversationMarkup);
+
+  assert.match(conversationMarkup, /深度创作已完成/);
+  assert.match(conversationMarkup, /深度创作段落。/);
+  assert.match(conversationMarkup, /\[1\]/);
+  assert.match(conversationMarkup, /复制正文/);
+  assert.doesNotMatch(conversationText, /word evidence|模型判断|notes\/unit\/vocabulary\.md|知识库|检索|证据|引用/);
+  assert.match(evidenceMarkup, /应用证据/);
+  assert.match(evidenceMarkup, /创作应用/);
+  assert.match(evidenceMarkup, /notes\/unit\/vocabulary\.md/);
+  assert.match(evidenceMarkup, /word evidence/);
+  assert.doesNotMatch(evidenceMarkup, /互联网证据/);
+});
+
+test("keeps reused evidence scoped to each organization and creation result", () => {
+  const session = { session_id: "session-1", title: "英语", message_count: 0 };
+  const evidence = {
+    ordinal: 1,
+    relative_path: "notes/unit/vocabulary.md",
+    heading: "Vocabulary",
+    location: "heading: Vocabulary",
+    excerpt: "word evidence",
+    identity_kind: "native",
+    content_sha256: "a".repeat(64)
+  };
+  const markup = renderToStaticMarkup(React.createElement(SessionManagement, {
+    sessionPage: { sessions: [session], page: 1, page_size: 25, total: 1, total_pages: 1 },
+    filters: { query: "", sort: "updated_at", order: "desc" }, isLoading: false, error: "", selectedSessionId: "session-1",
+    selectedDetail: {
+      session, messages: [], citations: [], retrieval_results: [], completeness_results: [], task_snapshots: [],
+      knowledge_organization_results: ["organization-a", "organization-b"].map((resultId, index) => ({
+        result_id: resultId, vault_id: "vault-1", status: "completed", section_counts: {},
+        sections: [{
+          ordinal: 1, status: "completed", conclusions: [{
+            ordinal: 1, content: `整理内容 ${index + 1}。`, evidence: [evidence]
+          }]
+        }]
+      })),
+      deep_creation_results: ["creation-a", "creation-b"].map((resultId, index) => ({
+        result_id: resultId, vault_id: "vault-1", status: "completed", section_counts: {},
+        sections: [{ ordinal: 1, status: "completed", content: `创作内容 ${index + 1}。`, local_evidence: [evidence] }]
+      }))
+    },
+    vaults: [{ vault_id: "vault-1", display_name: "英语资料", authorization_status: "active", access_status: "available" }]
+  }));
+
+  const conversationMarkup = markup.slice(
+    markup.indexOf('class="session-conversation-pane"'),
+    markup.indexOf('class="session-evidence-pane"')
+  );
+  const evidenceMarkup = markup.slice(markup.indexOf('class="session-evidence-pane"'));
+  const targetIds = [...conversationMarkup.matchAll(/href="#(application-evidence-[^"]+)"/g)].map((match) => match[1]);
+
+  assert.equal(targetIds.length, 4);
+  assert.equal(new Set(targetIds).size, 4);
+  targetIds.forEach((targetId) => assert.ok(evidenceMarkup.includes(`id="${targetId}"`)));
+  assert.equal((evidenceMarkup.match(/class="session-citation"/g) || []).length, 4);
 });
 
 test("renders restored knowledge-organization bindings and recoverable progress truthfully", () => {
@@ -480,7 +628,7 @@ test("renders restored knowledge-organization bindings and recoverable progress 
       messages: [], citations: [], retrieval_results: [], completeness_results: [],
       task_snapshots: [{
         snapshot_id: "snapshot-restore", task_id: "task-restore", vault_id: "vault-frozen", intent: "knowledge-organization", status: "recoverable", scope_kind: "directory", scope_path: "notes/unit", source_count: 2, source_digest: "s".repeat(64),
-        index_status: "healthy", index_updated_at: "2026-07-23T00:00:00+00:00", index_digest: "i".repeat(64), policy_revision: 9, exclusion_summary: "排除规则 1 项：never-send-cloud: notes/private", outbound_scope_summary: "仅使用已冻结的本地知识库证据；不会调用 Provider、Model 或互联网。",
+        index_status: "healthy", index_updated_at: "2026-07-23T00:00:00+00:00", index_digest: "i".repeat(64), policy_revision: 9, exclusion_summary: "排除规则 1 项：never-send-cloud: notes/private", outbound_scope_summary: "本次检索仅使用本地知识库证据。",
         knowledge_organization_plan: { section_count: 2, local_evidence_only: true, sections: [
           { ordinal: 1, title: "notes/unit", goal: "整理已完成主题", scope_path: "notes/unit", evidence_count: 1, evidence: [] },
           { ordinal: 2, title: "notes/review", goal: "整理待恢复主题", scope_path: "notes/review", evidence_count: 1, evidence: [] }
@@ -488,7 +636,7 @@ test("renders restored knowledge-organization bindings and recoverable progress 
         invalidation_reason: null
       }],
       knowledge_organization_results: [{
-        result_id: "result-restore", snapshot_id: "snapshot-restore", status: "recoverable", summary: "准备被中断，已知段落已保留。", recovery_action: "恢复索引后重新准备任务。", local_evidence_only: true,
+        result_id: "result-restore", snapshot_id: "snapshot-restore", status: "recoverable", summary: "本次生成被中断，已知段落已保留。", recovery_action: "恢复索引后重新发送。", local_evidence_only: true,
         section_counts: { planned: 2, prepared: 1, failed: 0, recoverable: 1 },
         sections: [
           { ordinal: 1, title: "notes/unit", goal: "整理已完成主题", scope_path: "notes/unit", status: "prepared", prepared_evidence_count: 1, evidence: [] },
@@ -502,11 +650,12 @@ test("renders restored knowledge-organization bindings and recoverable progress 
     ]
   }));
 
-  assert.match(markup, /任务 知识整理：待恢复/);
-  assert.match(markup, /冻结 vault：冻结资料/);
-  assert.match(markup, /范围：已冻结资料范围；来源 2 项；详细依据见右侧“引用证据”/);
-  assert.match(markup, /索引版本：2026-07-23T00:00:00\+00:00；策略修订：9/);
-  assert.match(markup, /排除项：排除规则 1 项：never-send-cloud: notes\/private/);
+  assert.match(markup, /计划待恢复/);
+  assert.match(markup, /本次生成被中断，已知段落已保留。/);
+  assert.match(markup, /下一步：恢复索引后重新发送。/);
+  assert.match(markup, /第 1 段：已准备/);
+  assert.match(markup, /第 2 段：待恢复/);
+  assert.doesNotMatch(markup, /任务 知识整理|冻结知识库|已冻结资料范围|策略修订|准备任务/);
   assert.match(markup, /计划待恢复/);
   assert.match(markup, /计划 2 段；已准备 1 段；已完成 0 段；进行中 0 段/);
   assert.match(markup, /失败 0 段；待恢复 1 段/);
@@ -514,7 +663,7 @@ test("renders restored knowledge-organization bindings and recoverable progress 
   assert.match(markup, /服务在准备此段前中断。/);
 });
 
-test("renders a pending citation paragraph with its historical scope and verification action", () => {
+test("keeps pending-answer citations in the application-evidence pane", () => {
   const session = { session_id: "session-1", title: "英语", message_count: 1 };
   const markup = renderToStaticMarkup(React.createElement(SessionManagement, {
     sessionPage: { sessions: [session], page: 1, page_size: 25, total: 1, total_pages: 1 },
@@ -529,15 +678,26 @@ test("renders a pending citation paragraph with its historical scope and verific
     vaults: [], providers: [], onEditGenerationResult: async () => ({}), onReverifyGenerationResult: async () => ({ status: "valid" })
   }));
 
-  assert.match(markup, /引用待核验/);
-  assert.match(markup, /范围：notes/);
-  assert.match(markup, /Provider：provider-history/);
-  assert.match(markup, /vault：vault-history/);
-  assert.match(markup, /重新检索核验/);
-  assert.match(markup, /待核验/);
+  const conversationMarkup = markup.slice(
+    markup.indexOf('class="session-conversation-pane"'),
+    markup.indexOf('class="session-evidence-pane"')
+  );
+  const evidenceMarkup = markup.slice(markup.indexOf('class="session-evidence-pane"'));
+  const conversationText = visibleText(conversationMarkup);
+
+  assert.match(conversationMarkup, /内容待确认/);
+  assert.match(conversationMarkup, /已编辑的段落/);
+  assert.match(conversationMarkup, /\[1\]/);
+  assert.match(conversationMarkup, /复制正文/);
+  assert.match(conversationMarkup, /重新确认/);
+  assert.doesNotMatch(conversationText, /引用待核验|范围：notes|Provider：provider-history|用户约束|vault-history|notes\/unit\.md|知识库|检索|证据|引用/);
+  assert.match(evidenceMarkup, /应用证据/);
+  assert.match(evidenceMarkup, /知识库：历史知识库不可用/);
+  assert.match(evidenceMarkup, /notes\/unit\.md/);
+  assert.match(evidenceMarkup, /待核验/);
 });
 
-test("marks stale evidence and keeps its original vault identity", () => {
+test("keeps uncited stale source-lookup evidence in the application-evidence pane", () => {
   const session = {
     session_id: "session-1",
     title: "当前会话",
@@ -635,16 +795,73 @@ test("marks stale evidence and keeps its original vault identity", () => {
     })
   );
 
-  assert.match(markup, /证据已失效/);
-  assert.match(markup, /需重新准备：来源已改变。/);
-  assert.match(markup, /vault：证据 vault/);
-  assert.match(markup, /\/api\/vaults\/vault-2\/open\?file=notes%2Fevidence.md/);
-  assert.match(markup, /历史证据：该历史结果未提供独立来源计算依据。/);
-  assert.match(markup, /notes\/other-evidence.md/);
-  assert.equal((markup.match(/source-comparison-group/g) || []).length, 2);
-  assert.doesNotMatch(markup, /来源 1：/);
-  assert.doesNotMatch(markup, /同一来源中的 2 条证据只计为 1 个独立来源。/);
-  assert.doesNotMatch(markup, /aria-label="本地知识库证据"/);
+  const conversationMarkup = markup.slice(
+    markup.indexOf('class="session-conversation-pane"'),
+    markup.indexOf('class="session-evidence-pane"')
+  );
+  const evidenceMarkup = markup.slice(markup.indexOf('class="session-evidence-pane"'));
+  const conversationText = visibleText(conversationMarkup);
+
+  assert.match(conversationMarkup, /当前内容需要重新确认/);
+  assert.match(conversationMarkup, /需重新准备：来源已改变。/);
+  assert.doesNotMatch(conversationText, /历史证据|notes\/evidence\.md|notes\/other-evidence\.md|知识库|检索|引用/);
+  assert.match(evidenceMarkup, /应用证据/);
+  assert.match(evidenceMarkup, /定位应用/);
+  assert.match(evidenceMarkup, /已失效/);
+  assert.match(evidenceMarkup, /知识库：证据 vault/);
+  assert.match(evidenceMarkup, /\/api\/vaults\/vault-2\/open\?file=notes%2Fevidence.md/);
+  assert.match(evidenceMarkup, /历史证据。/);
+  assert.match(evidenceMarkup, /notes\/other-evidence.md/);
+});
+
+test("keeps a stale generated answer instead of showing an empty source-lookup fallback", () => {
+  const session = { session_id: "session-1", title: "当前会话", message_count: 0 };
+  const markup = renderToStaticMarkup(React.createElement(SessionManagement, {
+    sessionPage: { sessions: [session], page: 1, page_size: 25, total: 1, total_pages: 1 },
+    filters: { query: "", sort: "updated_at", order: "desc" }, isLoading: false, error: "", selectedSessionId: "session-1",
+    selectedDetail: {
+      session,
+      messages: [],
+      citations: [{
+        citation_id: "citation-1", result_id: "answer-old", snapshot_id: "snapshot-old", vault_id: "vault-1",
+        relative_path: "notes/unit.md", location: "heading: Unit", identity_kind: "native", status: "stale"
+      }],
+      generation_results: [{
+        result_id: "answer-old", task_id: "task-old", snapshot_id: "snapshot-old", vault_id: "vault-1",
+        status: "stale", content: "保留的回答。", content_origin: "model-judgement"
+      }],
+      task_snapshots: [{
+        snapshot_id: "snapshot-old", task_id: "task-old", vault_id: "vault-1", intent: "source-lookup",
+        status: "invalidated", scope_kind: "vault", source_count: 1, source_digest: "a".repeat(64),
+        index_status: "healthy", outbound_scope_summary: "尚未发送", invalidation_reason: "来源已改变。"
+      }],
+      retrieval_results: [{
+        result_id: "result-old", task_id: "task-old", snapshot_id: "snapshot-old", vault_id: "vault-1",
+        status: "completed", is_stale: true, invalidation_reason: "来源已改变。",
+        summary: "已在已确认范围内找到 1 条本地知识库证据；已生成回答。", recovery_action: null,
+        evidences: [{
+          ordinal: 1, identity_kind: "native", relative_path: "notes/unit.md", content_sha256: "a".repeat(64),
+          heading: "Unit", location: "heading: Unit", excerpt: "关联摘录。"
+        }]
+      }],
+      completeness_results: []
+    },
+    vaults: [{ vault_id: "vault-1", display_name: "英语资料", authorization_status: "active", access_status: "available" }]
+  }));
+
+  const conversationMarkup = markup.slice(
+    markup.indexOf('class="session-conversation-pane"'),
+    markup.indexOf('class="session-evidence-pane"')
+  );
+  const evidenceMarkup = markup.slice(markup.indexOf('class="session-evidence-pane"'));
+  const conversationText = visibleText(conversationMarkup);
+
+  assert.match(conversationMarkup, /内容需重新确认/);
+  assert.match(conversationMarkup, /保留的回答。/);
+  assert.doesNotMatch(conversationMarkup, /暂未生成可用回答。/);
+  assert.doesNotMatch(conversationText, /关联摘录。|notes\/unit\.md|知识库|检索|证据|引用/);
+  assert.match(evidenceMarkup, /notes\/unit\.md/);
+  assert.match(evidenceMarkup, /关联摘录。/);
 });
 
 test("renders conversion retry and typed correction controls only for conversion review items", () => {
@@ -745,6 +962,32 @@ test("shows all identity counts in task center rows", () => {
   assert.match(markup, /识别失败 1/);
   assert.match(markup, /已解析 1/);
   assert.match(markup, /待审核问题 1/);
+});
+
+test("offers browser file and folder uploads for an available vault", () => {
+  const markup = renderToStaticMarkup(
+    React.createElement(ImportTaskCenter, {
+      tasks: [],
+      error: "",
+      isLoading: false,
+      selectedTaskId: null,
+      onSelect: () => {},
+      onTaskChanged: () => {},
+      onTaskDeleted: () => {},
+      onTaskSnapshot: () => {},
+      vault: {
+        vault_id: "vault-1",
+        display_name: "Import Vault",
+        authorization_status: "active",
+        access_status: "available"
+      }
+    })
+  );
+
+  assert.match(markup, /aria-label="上传本机资料文件"/);
+  assert.match(markup, /aria-label="上传本机资料文件夹"/);
+  assert.match(markup, /webkitdirectory=""/);
+  assert.match(markup, />上传文件夹<\/button>/);
 });
 
 test("offers an accessible deletion action only for non-running import tasks", () => {

@@ -306,14 +306,24 @@ class SqliteSessionRepository:
                     retrieval_duration_ms INTEGER NOT NULL,
                     generation_duration_ms INTEGER NOT NULL,
                     created_at TEXT NOT NULL,
-                    rerank_authorization_id TEXT,
                     rerank_status TEXT NOT NULL DEFAULT 'not-requested',
                     rerank_network_request_count INTEGER NOT NULL DEFAULT 0,
                     rerank_duration_ms INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(session_id, task_id)
                 )"""
             )
-            self._apply_retrieval_rerank_migration(connection)
+            self._ensure_table_column(
+                connection, "session_retrieval_results", "rerank_status",
+                "TEXT NOT NULL DEFAULT 'not-requested'",
+            )
+            self._ensure_table_column(
+                connection, "session_retrieval_results", "rerank_network_request_count",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._ensure_table_column(
+                connection, "session_retrieval_results", "rerank_duration_ms",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS session_retrieval_evidences (
                     result_id TEXT NOT NULL REFERENCES session_retrieval_results(result_id) ON DELETE CASCADE,
@@ -388,12 +398,6 @@ class SqliteSessionRepository:
                 connection, "session_knowledge_organization_results", "completed_ordinals_json",
                 "TEXT NOT NULL DEFAULT '[]'",
             )
-            self._ensure_table_column(
-                connection, "session_knowledge_organization_results", "authorization_id", "TEXT",
-            )
-            self._ensure_table_column(
-                connection, "session_knowledge_organization_results", "authorization_status", "TEXT",
-            )
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS session_deep_creation_results (
                     result_id TEXT PRIMARY KEY,
@@ -407,8 +411,6 @@ class SqliteSessionRepository:
                     outcomes_json TEXT NOT NULL DEFAULT '[]',
                     duration_ms INTEGER NOT NULL,
                     created_at TEXT NOT NULL,
-                    authorization_id TEXT,
-                    authorization_status TEXT,
                     UNIQUE(session_id, task_id)
                 )"""
             )
@@ -553,46 +555,6 @@ class SqliteSessionRepository:
             raise
         finally:
             connection.execute("RELEASE session_completeness_candidates")
-
-    @classmethod
-    def _apply_retrieval_rerank_migration(cls, connection: sqlite3.Connection) -> None:
-        migration_id = "ret-08-01-session-retrieval-rerank-audit-v1"
-        if connection.execute(
-            "SELECT 1 FROM session_repository_migrations WHERE migration_id = ?", (migration_id,)
-        ).fetchone():
-            return
-        connection.execute("SAVEPOINT session_retrieval_rerank_audit")
-        try:
-            cls._ensure_table_column(
-                connection, "session_retrieval_results", "rerank_authorization_id", "TEXT"
-            )
-            cls._ensure_table_column(
-                connection,
-                "session_retrieval_results",
-                "rerank_status",
-                "TEXT NOT NULL DEFAULT 'not-requested'",
-            )
-            cls._ensure_table_column(
-                connection,
-                "session_retrieval_results",
-                "rerank_network_request_count",
-                "INTEGER NOT NULL DEFAULT 0",
-            )
-            cls._ensure_table_column(
-                connection,
-                "session_retrieval_results",
-                "rerank_duration_ms",
-                "INTEGER NOT NULL DEFAULT 0",
-            )
-            connection.execute(
-                "INSERT INTO session_repository_migrations (migration_id, applied_at) VALUES (?, ?)",
-                (migration_id, utc_now()),
-            )
-        except Exception:
-            connection.execute("ROLLBACK TO session_retrieval_rerank_audit")
-            raise
-        finally:
-            connection.execute("RELEASE session_retrieval_rerank_audit")
 
     def create(self, session: PersistentSession) -> None:
         with self._connect() as connection:
@@ -1086,8 +1048,8 @@ class SqliteSessionRepository:
                 """INSERT INTO session_knowledge_organization_results (
                     result_id, session_id, task_id, snapshot_id, status, summary, recovery_action,
                     prepared_ordinals_json, outcomes_json, duration_ms, created_at,
-                    structure_kind, completed_ordinals_json, authorization_id, authorization_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    structure_kind, completed_ordinals_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id, task_id) DO UPDATE SET
                     result_id = excluded.result_id,
                     snapshot_id = excluded.snapshot_id,
@@ -1099,9 +1061,7 @@ class SqliteSessionRepository:
                     duration_ms = excluded.duration_ms,
                     created_at = excluded.created_at,
                     structure_kind = excluded.structure_kind,
-                    completed_ordinals_json = excluded.completed_ordinals_json,
-                    authorization_id = excluded.authorization_id,
-                    authorization_status = excluded.authorization_status""",
+                    completed_ordinals_json = excluded.completed_ordinals_json""",
                 (
                     result.result_id, result.session_id, result.task_id, result.snapshot_id,
                     result.status, result.summary, result.recovery_action,
@@ -1124,8 +1084,7 @@ class SqliteSessionRepository:
                         for outcome in result.outcomes
                     ]),
                     result.duration_ms, result.created_at, result.structure_kind,
-                    json.dumps(result.completed_ordinals), result.authorization_id,
-                    result.authorization_status,
+                    json.dumps(result.completed_ordinals),
                 ),
             )
             self._touch_session(connection, snapshot.session_id, task_state.updated_at)
@@ -1148,9 +1107,8 @@ class SqliteSessionRepository:
             connection.execute(
                 """INSERT INTO session_deep_creation_results (
                     result_id, session_id, task_id, snapshot_id, status, summary, recovery_action,
-                    completed_ordinals_json, outcomes_json, duration_ms, created_at,
-                    authorization_id, authorization_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    completed_ordinals_json, outcomes_json, duration_ms, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id, task_id) DO UPDATE SET
                     result_id = excluded.result_id,
                     snapshot_id = excluded.snapshot_id,
@@ -1160,9 +1118,7 @@ class SqliteSessionRepository:
                     completed_ordinals_json = excluded.completed_ordinals_json,
                     outcomes_json = excluded.outcomes_json,
                     duration_ms = excluded.duration_ms,
-                    created_at = excluded.created_at,
-                    authorization_id = excluded.authorization_id,
-                    authorization_status = excluded.authorization_status""",
+                    created_at = excluded.created_at""",
                 (
                     result.result_id, result.session_id, result.task_id, result.snapshot_id,
                     result.status, result.summary, result.recovery_action,
@@ -1189,7 +1145,6 @@ class SqliteSessionRepository:
                         for outcome in result.outcomes
                     ]),
                     result.duration_ms, result.created_at,
-                    result.authorization_id, result.authorization_status,
                 ),
             )
             self._touch_session(connection, snapshot.session_id, task_state.updated_at)
@@ -1413,9 +1368,9 @@ class SqliteSessionRepository:
         connection.execute(
             """INSERT INTO session_retrieval_results (
                 result_id, session_id, task_id, snapshot_id, status, summary, recovery_action,
-                retrieval_duration_ms, generation_duration_ms, created_at, rerank_authorization_id,
-                rerank_status, rerank_network_request_count, rerank_duration_ms
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                retrieval_duration_ms, generation_duration_ms, created_at, rerank_status,
+                rerank_network_request_count, rerank_duration_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 result.result_id,
                 result.session_id,
@@ -1427,7 +1382,6 @@ class SqliteSessionRepository:
                 result.retrieval_duration_ms,
                 result.generation_duration_ms,
                 result.created_at,
-                result.rerank_authorization_id,
                 result.rerank_status,
                 result.rerank_network_request_count,
                 result.rerank_duration_ms,
@@ -1748,7 +1702,6 @@ class SqliteSessionRepository:
                 )
                 for evidence in evidence_rows
             ),
-            row["rerank_authorization_id"],
             row["rerank_status"],
             int(row["rerank_network_request_count"]),
             int(row["rerank_duration_ms"]),
@@ -1791,7 +1744,6 @@ class SqliteSessionRepository:
                 for outcome in json.loads(row["outcomes_json"])
             ),
             row["structure_kind"], tuple(json.loads(row["completed_ordinals_json"])),
-            row["authorization_id"], row["authorization_status"],
         )
 
     @staticmethod
@@ -1821,8 +1773,6 @@ class SqliteSessionRepository:
                 )
                 for outcome in json.loads(row["outcomes_json"])
             ),
-            row["authorization_id"],
-            row["authorization_status"],
         )
 
     @staticmethod

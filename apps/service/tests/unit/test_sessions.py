@@ -39,7 +39,7 @@ from domain.indexing import (
     LexicalQuery,
     VectorQuery,
 )
-from domain.policies import OutboundAuthorization, OutboundScope, PolicyEvaluation
+from domain.policies import PolicyEvaluation
 from domain.providers import Provider, ProviderModel, ProviderProbeResults, ProbeResult, ResolvedProviderModel
 from domain.retrieval_metadata import RetrievalMetadata
 from domain.retrieval_query import QueryScopeSelection
@@ -95,15 +95,15 @@ def task_service_fixture(
                 raise ValueError("Model unavailable")
             assert (provider_id, model_id) == ("provider-1", "chat-1")
             self.generated_prompts.append(prompt)
-            return "基于已冻结证据的结构化结论。"
+            return "整理后的可直接使用内容。"
 
         def stream_chat(self, provider_id, model_id, prompt):
             if not self.available:
                 raise ValueError("Model unavailable")
             assert (provider_id, model_id) == ("provider-1", "chat-1")
             self.generated_prompts.append(prompt)
-            yield "基于已冻结"
-            yield "证据的结构化结论。"
+            yield "整理后的"
+            yield "可直接使用内容。"
 
         def resolve_model(self, model_type):
             assert model_type in {"embedding", "rerank"}
@@ -120,7 +120,6 @@ def task_service_fixture(
     class Policies:
         policy_revision = 1
         outbound_mode = "always-allow"
-        authorizations = {}
 
         def get(self, _vault_id):
             return type("Policy", (), {
@@ -133,37 +132,6 @@ def task_service_fixture(
         def preview(self, _vault_id, _source_path, _derived_path, stage):
             return PolicyEvaluation(True, stage, (), (), "fixture")
 
-        def request_outbound_authorization(
-            self, vault_id, *, provider_id, model_id, operation, task_id, scopes
-        ):
-            authorization = OutboundAuthorization(
-                f"authorization-{len(self.authorizations) + 1}", vault_id, self.policy_revision,
-                provider_id, model_id, operation, task_id, "a" * 64,
-                f"{len(scopes)} scoped item(s)", None, None,
-                "approved" if self.outbound_mode == "always-allow" else "pending", "now", "now",
-            )
-            self.authorizations[authorization.authorization_id] = authorization
-            return authorization
-
-        def confirm_outbound_authorization(self, vault_id, authorization_id, *, approved):
-            authorization = self.authorizations[authorization_id]
-            assert authorization.vault_id == vault_id
-            confirmed = replace(authorization, status="approved" if approved else "rejected")
-            self.authorizations[authorization_id] = confirmed
-            return confirmed
-
-        def check_outbound_authorization(
-            self, vault_id, authorization_id, *, provider_id, model_id, operation, task_id, scopes
-        ):
-            authorization = self.authorizations[authorization_id]
-            assert authorization.vault_id == vault_id
-            assert authorization.status == "approved"
-            assert (provider_id, model_id, operation, task_id) == (
-                authorization.provider_id, authorization.model_id,
-                authorization.operation, authorization.task_id,
-            )
-            assert all(isinstance(scope, OutboundScope) for scope in scopes)
-            return replace(authorization, actual_scope_summary=f"{len(scopes)} scoped item(s)", actual_scope_digest="b" * 64)
 
     class Indexes:
         def __init__(self) -> None:
@@ -183,6 +151,9 @@ def task_service_fixture(
             return IndexHealth(vault_id, "healthy", "now", len(self.current), 0, 0, self.semantic_status)
 
         def current_documents(self, _vault_id):
+            return self.current
+
+        def current_heading_scope_documents(self, _vault_id):
             return self.current
 
         def search_lexical(self, vault_id, query):
@@ -570,7 +541,7 @@ def test_session_context_and_attachment_metadata_survive_reopen_without_paths(tm
         "practice.pdf",
         vault_id="vault-english",
         relative_path="notes/unit-1/practice.pdf",
-        status="pending-authorization",
+        status="excluded",
     )
     repository.append_attachment(attachment)
 
@@ -579,7 +550,7 @@ def test_session_context_and_attachment_metadata_survive_reopen_without_paths(tm
     assert detail.session.scope_kind == "directory"
     assert detail.session.scope_path == "notes/unit-1"
     assert [(item.filename, item.relative_path, item.status) for item in detail.attachments] == [
-        ("practice.pdf", "notes/unit-1/practice.pdf", "pending-authorization")
+        ("practice.pdf", "notes/unit-1/practice.pdf", "excluded")
     ]
     updated_at = detail.session.updated_at
     repository.delete_attachment(session.session_id, attachment.attachment_id)
@@ -631,7 +602,7 @@ def test_session_context_accepts_only_a_verified_chat_model_and_keeps_external_a
 
     assert updated.scope_path == "notes"
     assert updated.selected_vault_label == vault_path.name
-    assert attachment.status == "pending-authorization"
+    assert attachment.status == "excluded"
     assert attachment.relative_path == "notes/unit.md"
     assert external.status == "needs-import"
     assert external.relative_path is None
@@ -675,7 +646,7 @@ def test_task_preview_classifies_intent_and_confirms_an_immutable_source_snapsho
     class Policies:
         def get(self, vault_id):
             assert vault_id == vault.vault_id
-            return type("Policy", (), {"policy_revision": 7, "outbound_mode": "ask-each-task"})()
+            return type("Policy", (), {"policy_revision": 7, "outbound_mode": "always-allow"})()
 
         def list_rules(self, vault_id):
             assert vault_id == vault.vault_id
@@ -701,6 +672,9 @@ def test_task_preview_classifies_intent_and_confirms_an_immutable_source_snapsho
                     (IndexBlock(1, "heading:1", "fixture"),), "now",
                 ),
             ]
+
+        def current_heading_scope_documents(self, vault_id):
+            return self.current_documents(vault_id)
 
     service = SessionService(
         SqliteSessionRepository(tmp_path / "sessions.sqlite3"),
@@ -938,6 +912,49 @@ def test_completeness_records_explicit_gaps_when_a_planning_budget_is_exceeded(t
     assert items[1].reason == "超出本次处理预算，尚未覆盖。"
 
 
+def test_resolved_completeness_also_applies_the_explicit_title_scope(tmp_path) -> None:
+    blocks = (
+        IndexBlock(1, "heading: Unit 1", "unit one evidence", heading_path=("Unit 1",)),
+        IndexBlock(2, "heading: Unit 7", "unit seven evidence", heading_path=("Unit 7",)),
+    )
+    document = IndexedDocument(
+        "native-1",
+        "vault-1",
+        "notes/textbook.md",
+        "a" * 64,
+        "native",
+        (),
+        (),
+        (),
+        blocks,
+        "now",
+        block_metadata=tuple(
+            IndexBlockMetadata(
+                block.sequence,
+                "英语",
+                "七年级上册",
+                1,
+                "textbook",
+                "rule",
+                0.95,
+                "accepted",
+            )
+            for block in blocks
+        ),
+    )
+    service, _, session, _, _, _, _ = task_service_fixture(tmp_path, (document,))
+    sources = service._snapshot_sources(service.get(session.session_id), "vault-1")
+    scope_filter = RetrievalMetadata(
+        "英语", "七年级上册", 1, None, "resolved", "explicit-scope"
+    )
+
+    items = service._scoped_completeness_coverage_items(
+        "vault-1", scope_filter, sources, heading_scope_paths=(("Unit 1",),)
+    )
+
+    assert [item.excerpt for item in items] == ["unit one evidence"]
+
+
 def test_task_snapshot_is_invalidated_when_context_changes(tmp_path) -> None:
     class Vaults:
         def get(self, vault_id):
@@ -1146,6 +1163,59 @@ def test_execute_prepared_task_persists_bounded_local_evidence_and_timings(tmp_p
     assert restarted.retrieval_results[0].evidences[0].excerpt == evidence.excerpt
 
 
+def test_run_task_sends_only_outbound_allowed_evidence_to_the_selected_model(tmp_path) -> None:
+    (tmp_path / "notes").mkdir()
+    allowed = IndexedDocument(
+        "allowed", "vault-1", "notes/visible.md", "a" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Visible", "visible evidence for the answer"),), "now",
+    )
+    blocked = IndexedDocument(
+        "blocked", "vault-1", "notes/private.md", "b" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Private", "secret evidence that must stay local"),), "now",
+    )
+    service, repository, session, _, providers, policies, _ = task_service_fixture(
+        tmp_path, (allowed, blocked)
+    )
+    policies.preview = lambda _vault_id, _source_path, derived_path, stage: PolicyEvaluation(
+        stage != "outbound" or derived_path != "notes/private.md", stage, (), (), "fixture"
+    )
+
+    result = service.run_task(
+        session.session_id,
+        "请根据资料回答。",
+        vault_id="vault-1",
+        scope_kind="directory",
+        scope_path="notes",
+        provider_id="provider-1",
+        model_id="chat-1",
+        intent="source-lookup",
+    )
+    detail = repository.get_detail(session.session_id)
+
+    assert result.status == "completed"
+    assert result.generation_duration_ms >= 0
+    assert len(providers.generated_prompts) == 1
+    prompt = providers.generated_prompts[0]
+    assert "visible evidence for the answer" in prompt
+    assert "secret evidence that must stay local" not in prompt
+    assert "notes/visible.md" not in prompt
+    assert "[证据" not in prompt
+    assert "不要在回答中提及知识库、检索、证据、引用、文件、位置或编号" in prompt
+    assert detail.session.scope_kind == "directory"
+    assert detail.session.scope_path == "notes"
+    assert len(detail.messages) == 1
+    assert len(detail.task_snapshots) == 1
+    assert len(detail.retrieval_results) == 1
+    assert [item.content_origin for item in detail.generation_results] == ["model-judgement"]
+    assert [item.content for item in detail.generation_results] == ["整理后的可直接使用内容。"]
+    assert [item.relative_path for item in detail.citations] == ["notes/visible.md"]
+    assert detail.citations[0].result_id == detail.generation_results[0].result_id
+    assert all(
+        term not in result.summary
+        for term in ("知识库", "检索", "证据", "引用", "文件", "位置", "编号")
+    )
+
+
 def test_source_lookup_limits_lexical_hits_to_snapshot_scope_and_policy(tmp_path) -> None:
     allowed = IndexedDocument(
         "allowed", "vault-1", "notes/visible.md", "a" * 64, "native", (), (), (),
@@ -1253,7 +1323,7 @@ def test_source_lookup_fails_closed_when_lexical_retrieval_is_disabled(tmp_path)
     result = service.execute_task(session.session_id, snapshot.task_id)
 
     assert result.status == "no-evidence"
-    assert result.recovery_action == "启用本机词法检索后重新准备任务。"
+    assert result.recovery_action == "启用内容查找后重新发送。"
 
 
 def test_hybrid_source_lookup_uses_an_independent_semantic_channel_without_prompt(tmp_path) -> None:
@@ -1290,7 +1360,57 @@ def test_hybrid_source_lookup_uses_an_independent_semantic_channel_without_promp
     assert len(indexes.lexical_queries) == 1
     assert len(indexes.heading_queries) == 1
     assert len(indexes.vector_queries) == 1
-    assert policies.authorizations == {}
+
+
+def test_semantic_source_lookup_uses_only_the_vector_channel(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1",
+        "vault-1",
+        "notes/unit.md",
+        "a" * 64,
+        "native",
+        (),
+        (),
+        (),
+        (
+            IndexBlock(1, "heading: Context", "context before the concept"),
+            IndexBlock(2, "heading: Target", "semantic target evidence"),
+            IndexBlock(3, "heading: Follow-up", "context after the concept"),
+        ),
+        "now",
+    )
+    service, _, session, _, providers, _, indexes = task_service_fixture(tmp_path, (document,))
+    service.set_retrieval_mode("semantic")
+    indexes.semantic_status = "partial"
+    indexes.vector_results = [BlockHit(document.document_id, document.relative_path, document.blocks[1], 1.0)]
+    snapshot = service.create_task(session.session_id, "改写后的概念问题", intent="source-lookup")
+
+    result = service.execute_task(session.session_id, snapshot.task_id)
+
+    assert result.status == "completed"
+    assert result.evidences[0].matched_channels == ("semantic",)
+    assert providers.embedding_queries == ["改写后的概念问题"]
+    assert indexes.lexical_queries == []
+    assert indexes.heading_queries == []
+    assert len(indexes.vector_queries) == 1
+
+
+def test_semantic_source_lookup_fails_closed_without_a_semantic_index(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1", "vault-1", "notes/unit.md", "a" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Unit", "semantic evidence"),), "now",
+    )
+    service, _, session, _, providers, _, indexes = task_service_fixture(tmp_path, (document,))
+    service.set_retrieval_mode("semantic")
+    snapshot = service.create_task(session.session_id, "寻找相似概念", intent="source-lookup")
+
+    result = service.execute_task(session.session_id, snapshot.task_id)
+
+    assert result.status == "index-unavailable"
+    assert "仅语义" in result.summary
+    assert providers.embedding_queries == []
+    assert indexes.lexical_queries == []
+    assert indexes.vector_queries == []
 
 
 class _FixtureReranker:
@@ -1334,7 +1454,7 @@ class _PreflightFailureReranker:
         raise RerankerExecutionError("Rerank preflight failed.", network_request_count=0)
 
 
-def test_authorized_rerank_reorders_rrf_before_neighborhood_expansion_and_persists_audit(
+def test_default_rerank_reorders_rrf_before_neighborhood_expansion_and_persists_audit(
     tmp_path,
 ) -> None:
     blocks = tuple(
@@ -1359,36 +1479,19 @@ def test_authorized_rerank_reorders_rrf_before_neighborhood_expansion_and_persis
         "now",
     )
     reranker = _FixtureReranker()
-    service, repository, session, _, _, policies, _ = task_service_fixture(
+    service, repository, session, _, _, _, _ = task_service_fixture(
         tmp_path,
         (document,),
         hybrid_retrieval_enabled=True,
         reranker=reranker,
         rerank_retrieval_enabled=True,
     )
-    policies.outbound_mode = "ask-each-task"
     snapshot = service.create_task(session.session_id, "What is in Unit 1?", intent="source-lookup")
 
-    preview, authorization = service.prepare_rerank_authorization(session.session_id, snapshot.task_id)
-
-    assert preview.is_authorizable is True
-    assert preview.candidate_count == 5
-    assert preview.model_id == "rerank-1"
-    assert preview.content_categories == ("query", "block-text")
-    assert authorization is not None and authorization.status == "pending"
-    approved = policies.confirm_outbound_authorization(
-        "vault-1", authorization.authorization_id, approved=True
-    )
-
-    result = service.execute_task(
-        session.session_id,
-        snapshot.task_id,
-        rerank_authorization_id=approved.authorization_id,
-    )
+    result = service.execute_task(session.session_id, snapshot.task_id)
     restarted = SqliteSessionRepository(repository.database_path).get_detail(session.session_id)
 
     assert result.rerank_status == "completed"
-    assert result.rerank_authorization_id == approved.authorization_id
     assert result.rerank_network_request_count == 1
     assert result.rerank_duration_ms >= 0
     assert [evidence.excerpt for evidence in result.evidences] == [
@@ -1413,7 +1516,7 @@ def test_authorized_rerank_reorders_rrf_before_neighborhood_expansion_and_persis
     assert restarted.retrieval_results[0].rerank_network_request_count == 1
 
 
-def test_rerank_excludes_never_send_cloud_candidates_but_can_authorize_remaining_candidates(
+def test_rerank_excludes_never_send_cloud_candidates_and_sends_remaining_candidates(
     tmp_path,
 ) -> None:
     visible = IndexedDocument(
@@ -1448,29 +1551,50 @@ def test_rerank_excludes_never_send_cloud_candidates_but_can_authorize_remaining
         reranker=reranker,
         rerank_retrieval_enabled=True,
     )
-    policies.outbound_mode = "ask-each-task"
     policies.preview = lambda _vault_id, _source_path, derived_path, stage: PolicyEvaluation(
         stage != "outbound" or derived_path != "notes/private.md", stage, (), (), "fixture"
     )
     snapshot = service.create_task(session.session_id, "visible candidate", intent="source-lookup")
 
-    preview, authorization = service.prepare_rerank_authorization(session.session_id, snapshot.task_id)
-
-    assert preview.is_authorizable is True
-    assert (preview.candidate_count, preview.blocked_candidate_count) == (1, 1)
-    assert authorization is not None
-    approved = policies.confirm_outbound_authorization(
-        "vault-1", authorization.authorization_id, approved=True
-    )
-    result = service.execute_task(
-        session.session_id,
-        snapshot.task_id,
-        rerank_authorization_id=approved.authorization_id,
-    )
+    result = service.execute_task(session.session_id, snapshot.task_id)
 
     assert result.rerank_status == "completed"
     assert len(reranker.calls) == 1
     assert [candidate.text for candidate in reranker.calls[0][1]] == ["visible candidate"]
+
+
+def _multi_unit_vocabulary_document() -> IndexedDocument:
+    return IndexedDocument(
+        "textbook",
+        "vault-1",
+        "notes/textbook.md",
+        "a" * 64,
+        "native",
+        (),
+        (),
+        (),
+        (
+            IndexBlock(
+                1,
+                "heading: Unit 1; 重点词汇与短语",
+                "unit one vocabulary evidence",
+                heading_path=("Unit 1 You and Me", "重点词汇与短语"),
+            ),
+            IndexBlock(
+                2,
+                "heading: Unit 7; 重点词汇与短语",
+                "unit seven vocabulary evidence",
+                heading_path=("Unit 7 Happy Birthday!", "重点词汇与短语"),
+            ),
+            IndexBlock(
+                3,
+                "heading: Unit 10; 重点词汇与短语",
+                "unit ten vocabulary evidence",
+                heading_path=("Unit 10 On the Move", "重点词汇与短语"),
+            ),
+        ),
+        "now",
+    )
 
 
 @pytest.mark.parametrize(
@@ -1500,15 +1624,8 @@ def test_rerank_path_hygiene_never_sends_absolute_path_projections(tmp_path, uns
     )
     snapshot = service.create_task(session.session_id, "find the item", intent="source-lookup")
 
-    preview, authorization = service.prepare_rerank_authorization(session.session_id, snapshot.task_id)
-    result = service.execute_task(
-        session.session_id,
-        snapshot.task_id,
-        rerank_authorization_id="authorization-not-issued",
-    )
+    result = service.execute_task(session.session_id, snapshot.task_id)
 
-    assert preview.is_authorizable is False
-    assert authorization is None
     assert result.rerank_status == "blocked"
     assert reranker.calls == []
 
@@ -1541,14 +1658,13 @@ def test_rerank_path_hygiene_checks_query_heading_and_tags(tmp_path, unsafe_fiel
     query = unsafe_value if unsafe_field == "query" else "find the item"
     snapshot = service.create_task(session.session_id, query, intent="source-lookup")
 
-    preview, authorization = service.prepare_rerank_authorization(session.session_id, snapshot.task_id)
+    result = service.execute_task(session.session_id, snapshot.task_id)
 
-    assert preview.is_authorizable is False
-    assert authorization is None
+    assert result.rerank_status == "blocked"
     assert reranker.calls == []
 
 
-def test_unconfirmed_rerank_authorization_keeps_local_rrf_without_a_provider_call(tmp_path) -> None:
+def test_default_rerank_sends_a_safe_candidate(tmp_path) -> None:
     document = IndexedDocument(
         "native-1",
         "vault-1",
@@ -1562,27 +1678,20 @@ def test_unconfirmed_rerank_authorization_keeps_local_rrf_without_a_provider_cal
         "now",
     )
     reranker = _FixtureReranker()
-    service, _, session, _, _, policies, _ = task_service_fixture(
+    service, _, session, _, _, _, _ = task_service_fixture(
         tmp_path,
         (document,),
         hybrid_retrieval_enabled=True,
         reranker=reranker,
         rerank_retrieval_enabled=True,
     )
-    policies.outbound_mode = "ask-each-task"
     snapshot = service.create_task(session.session_id, "local candidate", intent="source-lookup")
-    _preview, authorization = service.prepare_rerank_authorization(session.session_id, snapshot.task_id)
+    result = service.execute_task(session.session_id, snapshot.task_id)
 
-    result = service.execute_task(
-        session.session_id,
-        snapshot.task_id,
-        rerank_authorization_id=authorization.authorization_id,
-    )
-
-    assert result.rerank_status == "authorization-invalid"
-    assert result.rerank_network_request_count == 0
+    assert result.rerank_status == "completed"
+    assert result.rerank_network_request_count == 1
     assert [evidence.excerpt for evidence in result.evidences] == ["local candidate"]
-    assert reranker.calls == []
+    assert len(reranker.calls) == 1
 
 
 def test_rerank_preflight_failure_records_no_network_request(tmp_path) -> None:
@@ -1599,32 +1708,22 @@ def test_rerank_preflight_failure_records_no_network_request(tmp_path) -> None:
         "now",
     )
     reranker = _PreflightFailureReranker()
-    service, _, session, _, _, policies, _ = task_service_fixture(
+    service, _, session, _, _, _, _ = task_service_fixture(
         tmp_path,
         (document,),
         hybrid_retrieval_enabled=True,
         reranker=reranker,
         rerank_retrieval_enabled=True,
     )
-    policies.outbound_mode = "ask-each-task"
     snapshot = service.create_task(session.session_id, "local candidate", intent="source-lookup")
-    _preview, authorization = service.prepare_rerank_authorization(session.session_id, snapshot.task_id)
-    approved = policies.confirm_outbound_authorization(
-        "vault-1", authorization.authorization_id, approved=True
-    )
-
-    result = service.execute_task(
-        session.session_id,
-        snapshot.task_id,
-        rerank_authorization_id=approved.authorization_id,
-    )
+    result = service.execute_task(session.session_id, snapshot.task_id)
 
     assert result.rerank_status == "failed"
     assert result.rerank_network_request_count == 0
     assert reranker.calls == 1
 
 
-def test_changed_rerank_provider_revision_keeps_local_rrf_without_a_provider_call(tmp_path) -> None:
+def test_rerank_uses_the_current_provider_revision_at_execution_time(tmp_path) -> None:
     document = IndexedDocument(
         "native-1",
         "vault-1",
@@ -1638,31 +1737,22 @@ def test_changed_rerank_provider_revision_keeps_local_rrf_without_a_provider_cal
         "now",
     )
     reranker = _FixtureReranker()
-    service, _, session, _, providers, policies, _ = task_service_fixture(
+    service, _, session, _, providers, _, _ = task_service_fixture(
         tmp_path,
         (document,),
         hybrid_retrieval_enabled=True,
         reranker=reranker,
         rerank_retrieval_enabled=True,
     )
-    policies.outbound_mode = "ask-each-task"
     snapshot = service.create_task(session.session_id, "local candidate", intent="source-lookup")
-    _preview, authorization = service.prepare_rerank_authorization(session.session_id, snapshot.task_id)
-    approved = policies.confirm_outbound_authorization(
-        "vault-1", authorization.authorization_id, approved=True
-    )
     providers.provider = replace(providers.provider, updated_at="provider-revision-changed")
 
-    result = service.execute_task(
-        session.session_id,
-        snapshot.task_id,
-        rerank_authorization_id=approved.authorization_id,
-    )
+    result = service.execute_task(session.session_id, snapshot.task_id)
 
-    assert result.rerank_status == "authorization-invalid"
-    assert result.rerank_network_request_count == 0
+    assert result.rerank_status == "completed"
+    assert result.rerank_network_request_count == 1
     assert [evidence.excerpt for evidence in result.evidences] == ["local candidate"]
-    assert reranker.calls == []
+    assert reranker.calls[0][2].provider_configuration_revision == "provider-revision-changed"
 
 
 def test_concurrent_rerank_execution_sends_only_one_provider_request(tmp_path) -> None:
@@ -1679,19 +1769,14 @@ def test_concurrent_rerank_execution_sends_only_one_provider_request(tmp_path) -
         "now",
     )
     reranker = _BlockingFixtureReranker()
-    service, _, session, _, _, policies, _ = task_service_fixture(
+    service, _, session, _, _, _, _ = task_service_fixture(
         tmp_path,
         (document,),
         hybrid_retrieval_enabled=True,
         reranker=reranker,
         rerank_retrieval_enabled=True,
     )
-    policies.outbound_mode = "ask-each-task"
     snapshot = service.create_task(session.session_id, "local candidate", intent="source-lookup")
-    _preview, authorization = service.prepare_rerank_authorization(session.session_id, snapshot.task_id)
-    approved = policies.confirm_outbound_authorization(
-        "vault-1", authorization.authorization_id, approved=True
-    )
     fused, _unit_cards, _semantic_sent, _semantic_unavailable = service._hybrid_fused_candidates(
         snapshot.vault_id,
         "local candidate",
@@ -1703,24 +1788,22 @@ def test_concurrent_rerank_execution_sends_only_one_provider_request(tmp_path) -
     first = Thread(
         target=lambda: first_result.setdefault(
             "value",
-            service._apply_authorized_rerank(
+            service._apply_rerank(
                 snapshot,
                 "local candidate",
                 fused,
                 {document.document_id: document},
-                approved.authorization_id,
             ),
         )
     )
     first.start()
     assert reranker.started.wait(2)
 
-    second = service._apply_authorized_rerank(
+    second = service._apply_rerank(
         snapshot,
         "local candidate",
         fused,
         {document.document_id: document},
-        approved.authorization_id,
     )
     reranker.release.set()
     first.join(2)
@@ -1744,39 +1827,26 @@ def test_concurrent_rerank_task_execution_cannot_overwrite_external_audit(tmp_pa
         "now",
     )
     reranker = _BlockingFixtureReranker()
-    service, repository, session, _, _, policies, _ = task_service_fixture(
+    service, repository, session, _, _, _, _ = task_service_fixture(
         tmp_path,
         (document,),
         hybrid_retrieval_enabled=True,
         reranker=reranker,
         rerank_retrieval_enabled=True,
     )
-    policies.outbound_mode = "ask-each-task"
     snapshot = service.create_task(session.session_id, "local candidate", intent="source-lookup")
-    _preview, authorization = service.prepare_rerank_authorization(session.session_id, snapshot.task_id)
-    approved = policies.confirm_outbound_authorization(
-        "vault-1", authorization.authorization_id, approved=True
-    )
     first_result: dict[str, object] = {}
     first = Thread(
         target=lambda: first_result.setdefault(
             "value",
-            service.execute_task(
-                session.session_id,
-                snapshot.task_id,
-                rerank_authorization_id=approved.authorization_id,
-            ),
+            service.execute_task(session.session_id, snapshot.task_id),
         )
     )
     first.start()
     assert reranker.started.wait(2)
 
     with pytest.raises(SessionValidationError, match="正在执行候选重排"):
-        service.execute_task(
-            session.session_id,
-            snapshot.task_id,
-            rerank_authorization_id=approved.authorization_id,
-        )
+        service.execute_task(session.session_id, snapshot.task_id)
 
     reranker.release.set()
     first.join(2)
@@ -1924,6 +1994,37 @@ def test_follow_up_retrieval_includes_bounded_prior_user_context(tmp_path) -> No
     assert "前序语境中的唯一标识" in captured[0]
 
 
+def test_explicit_heading_scope_does_not_inherit_a_previous_unit_query(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1",
+        "vault-1",
+        "notes/units.md",
+        "a" * 64,
+        "native",
+        (),
+        (),
+        (),
+        (
+            IndexBlock(1, "heading: Unit 1", "unit one evidence", heading_path=("Unit 1",)),
+            IndexBlock(2, "heading: Unit 2", "unit two evidence", heading_path=("Unit 2",)),
+        ),
+        "now",
+    )
+    service, _, session, _, _, _, indexes = task_service_fixture(
+        tmp_path, (document,), hybrid_retrieval_enabled=True
+    )
+    service.send_user_message(session.session_id, "第二单元重点短语")
+    snapshot = service.create_task(
+        session.session_id, "第一单元重点短语", intent="source-lookup"
+    )
+
+    service.execute_task(session.session_id, snapshot.task_id)
+
+    assert indexes.lexical_queries[-1].text == "第一单元重点短语"
+    assert "unit1" in indexes.heading_queries[-1].prefixes
+    assert "unit2" not in indexes.heading_queries[-1].prefixes
+
+
 def test_context_summary_preserves_constraints_scope_citations_and_open_question(tmp_path) -> None:
     document = IndexedDocument(
         "native-1", "vault-1", "notes/unit.md", "a" * 64, "native", (), (), (),
@@ -2029,7 +2130,7 @@ def test_execute_task_distinguishes_content_excluded_from_a_healthy_no_evidence_
     assert snapshot.source_count == 0
     assert result.status == "excluded"
     assert "排除" in result.summary
-    assert result.recovery_action == "检查排除规则后重新准备任务。"
+    assert result.recovery_action == "检查排除规则后重新发送。"
 
 
 def test_execute_task_keeps_completed_evidence_but_invalidates_it_when_sources_change(tmp_path) -> None:
@@ -2066,7 +2167,11 @@ def test_execute_task_reports_no_evidence_when_only_nonblocking_rules_exist(tmp_
 
     assert snapshot.source_count == 0
     assert result.status == "no-evidence"
-    assert result.recovery_action == "修改问题或范围后重新准备任务。"
+    assert result.recovery_action == "修改问题或范围后重新发送。"
+    assert all(
+        term not in result.summary
+        for term in ("知识库", "检索", "证据", "引用", "文件", "位置", "编号")
+    )
 
 
 def test_concurrent_task_execution_returns_the_existing_result(tmp_path) -> None:
@@ -2119,6 +2224,10 @@ def test_completeness_execution_persists_every_snapshot_block_and_confirmed_gaps
     assert [item.disposition for item in snapshot.coverage_items] == ["excluded", "planned", "planned"]
     assert result.status == "completed-with-confirmed-gaps"
     assert result.processed_ordinals == (2, 3)
+    assert all(
+        term not in result.summary
+        for term in ("知识库", "检索", "证据", "引用", "文件", "位置", "编号")
+    )
     assert restarted.completeness_results[0] == result
     assert restarted.task_snapshots[0].coverage_items[0].reason
     indexes.current = [
@@ -2285,7 +2394,7 @@ def test_knowledge_organization_conclusions_require_frozen_evidence_references()
     result = SessionKnowledgeOrganizationResult(
         "result-1", "session-1", "task-1", "snapshot-1", "completed", "已生成 1 段。",
         None, (), 1, "2026-07-23T00:00:00+00:00", (),
-        structure_kind="outline", completed_ordinals=(1,), authorization_id="authorization-1",
+        structure_kind="outline", completed_ordinals=(1,),
     )
 
     assert conclusion.evidence_ordinals == (1, 2)
@@ -2390,34 +2499,34 @@ def test_knowledge_organization_execution_uses_only_persisted_plan_evidence(tmp_
     assert result.status == "completed"
     assert result.outcomes[0].status == "completed"
     assert result.outcomes[0].conclusions[0].evidence_ordinals == (1,)
-    assert providers.generated_prompts[0].count("word evidence") == 1
+    assert result.outcomes[0].conclusions[0].content == "整理后的可直接使用内容。"
+    prompt = providers.generated_prompts[0]
+    assert prompt.count("word evidence") == 1
+    assert "notes/unit/vocabulary.md" not in prompt
+    assert "[证据" not in prompt
+    assert "不要在输出中提及知识库、检索、证据、引用、文件、位置或编号" in prompt
+    assert all(
+        term not in result.summary
+        for term in ("知识库", "检索", "证据", "引用", "文件", "位置", "编号")
+    )
     assert repository.get_detail(session.session_id).task_snapshots[0].status == "completed"
 
 
-def test_knowledge_organization_waits_for_task_authorization_before_generating(tmp_path) -> None:
+def test_knowledge_organization_generates_in_one_execution(tmp_path) -> None:
     document = IndexedDocument(
         "native-1", "vault-1", "notes/unit/vocabulary.md", "a" * 64, "native", (), (), (),
         (IndexBlock(1, "heading: Vocabulary", "word evidence"),), "now",
     )
-    service, repository, session, _, providers, policies, _ = task_service_fixture(tmp_path, (document,))
-    policies.outbound_mode = "ask-each-task"
+    service, repository, session, _, providers, _, _ = task_service_fixture(tmp_path, (document,))
     snapshot = service.create_task(
         session.session_id, "整理英语知识点", intent="knowledge-organization"
     )
 
-    waiting = service.execute_task(session.session_id, snapshot.task_id)
-
-    assert waiting.status == "waiting-authorization"
-    assert waiting.authorization_id == "authorization-1"
-    assert providers.generated_prompts == []
-    assert repository.get_detail(session.session_id).task_snapshots[0].status == "waiting-authorization"
-
-    completed = service.confirm_knowledge_organization_authorization(
-        session.session_id, snapshot.task_id, waiting.authorization_id, approved=True
-    )
+    completed = service.execute_task(session.session_id, snapshot.task_id)
 
     assert completed.status == "completed"
     assert len(providers.generated_prompts) == 1
+    assert repository.get_detail(session.session_id).task_snapshots[0].status == "completed"
 
 
 def test_knowledge_organization_direct_execution_invalidates_changed_policy_without_reading_documents(tmp_path) -> None:
@@ -2576,6 +2685,10 @@ def test_knowledge_organization_records_a_failed_section_without_completing_unkn
         (1, "completed"), (2, "failed")
     ]
     assert result.outcomes[1].evidence_count == 0
+    assert all(
+        term not in result.summary
+        for term in ("知识库", "检索", "证据", "引用", "文件", "位置", "编号")
+    )
     assert repository.get_detail(session.session_id).task_snapshots[0].status == "failed"
 
 
@@ -2706,36 +2819,699 @@ def test_knowledge_organization_invalidates_when_frozen_index_blocks_change(tmp_
     assert repository.get_detail(session.session_id).task_snapshots[0].status == "invalidated"
 
 
-def test_deep_creation_waits_for_authorization_then_generates_model_judgement(tmp_path) -> None:
+def test_deep_creation_generates_model_judgement_in_one_execution(tmp_path) -> None:
     document = IndexedDocument(
         "native-1", "vault-1", "notes/unit/vocabulary.md", "a" * 64, "native", (), (), (),
         (IndexBlock(1, "heading: Vocabulary", "word evidence"),), "now",
     )
-    service, repository, session, _, providers, policies, _ = task_service_fixture(tmp_path, (document,))
-
-    policies.outbound_mode = "ask-each-task"
+    service, repository, session, _, providers, _, _ = task_service_fixture(tmp_path, (document,))
     snapshot = service.create_task(
         session.session_id, "根据资料写一段学习笔记", intent="deep-creation"
     )
 
-    waiting = service.execute_task(session.session_id, snapshot.task_id)
-
-    assert waiting.status == "waiting-authorization"
-    assert providers.generated_prompts == []
-
-    completed = service.confirm_deep_creation_authorization(
-        session.session_id, snapshot.task_id, waiting.authorization_id, approved=True
-    )
+    completed = service.execute_task(session.session_id, snapshot.task_id)
     restarted = SqliteSessionRepository(repository.database_path).get_detail(session.session_id)
 
     assert completed.status == "completed"
     assert completed.completed_ordinals == (1,)
     assert completed.outcomes[0].local_evidence_count == 1
-    assert completed.outcomes[0].model_judgement.startswith("模型判断：")
-    assert "word evidence" in providers.generated_prompts[0]
-    assert "互联网证据" not in providers.generated_prompts[0]
+    assert completed.outcomes[0].content == "整理后的可直接使用内容。"
+    assert completed.outcomes[0].model_judgement == "已完成本段内容生成。"
+    prompt = providers.generated_prompts[0]
+    assert "word evidence" in prompt
+    assert "notes/unit/vocabulary.md" not in prompt
+    assert "[知识库证据" not in prompt
+    assert "不要在输出中提及知识库、检索、证据、引用、文件、位置或编号" in prompt
+    assert all(
+        term not in completed.summary
+        for term in ("知识库", "检索", "证据", "引用", "文件", "位置", "编号")
+    )
     assert restarted.task_snapshots[0].deep_creation_sections == snapshot.deep_creation_sections
     assert restarted.deep_creation_results[0] == completed
+
+
+def test_deep_creation_keeps_a_neutral_recovery_summary_when_generation_fails(tmp_path) -> None:
+    document = IndexedDocument(
+        "native-1", "vault-1", "notes/unit/vocabulary.md", "a" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Vocabulary", "word evidence"),), "now",
+    )
+    service, _, session, _, providers, _, _ = task_service_fixture(tmp_path, (document,))
+    providers.generate_chat = lambda *_args: (_ for _ in ()).throw(ValueError("fixture failure"))
+    snapshot = service.create_task(
+        session.session_id, "根据资料写一段学习笔记", intent="deep-creation"
+    )
+
+    result = service.execute_task(session.session_id, snapshot.task_id)
+
+    assert result.status == "recoverable"
+    assert result.outcomes[0].reason == "fixture failure"
+    assert result.recovery_action == "修复 Provider 或失败段后重新准备任务。"
+    assert all(
+        term not in result.summary
+        for term in ("知识库", "检索", "证据", "引用", "文件", "位置", "编号")
+    )
+
+
+@pytest.mark.parametrize(
+    ("intent", "section_attribute"),
+    (("knowledge-organization", "organization_sections"), ("deep-creation", "deep_creation_sections")),
+)
+def test_title_range_excludes_other_heading_hierarchies_without_metadata(
+    tmp_path, intent, section_attribute
+) -> None:
+    service, _, session, _, providers, _, _ = task_service_fixture(
+        tmp_path, (_multi_unit_vocabulary_document(),)
+    )
+
+    snapshot = service.create_task(
+        session.session_id, "将第一单元单词短语发给我", intent=intent
+    )
+    sections = getattr(snapshot, section_attribute)
+    evidence_attribute = "local_evidence" if intent == "deep-creation" else "evidence"
+    frozen_evidence = tuple(item for section in sections for item in getattr(section, evidence_attribute))
+
+    assert [item.excerpt for item in frozen_evidence] == ["unit one vocabulary evidence"]
+    if intent == "deep-creation":
+        result = service.execute_task(session.session_id, snapshot.task_id)
+        assert result.status == "completed"
+        assert "unit one vocabulary evidence" in providers.generated_prompts[0]
+        assert "unit seven vocabulary evidence" not in providers.generated_prompts[0]
+        assert "unit ten vocabulary evidence" not in providers.generated_prompts[0]
+
+
+def test_auto_vocabulary_topic_uses_only_its_title_hierarchy(tmp_path) -> None:
+    service, _, session, _, _, _, _ = task_service_fixture(
+        tmp_path, (_multi_unit_vocabulary_document(),)
+    )
+
+    snapshot = service.create_task(session.session_id, "第一单元重点词汇与短语")
+    evidence = tuple(item for section in snapshot.organization_sections for item in section.evidence)
+
+    assert snapshot.intent == "knowledge-organization"
+    assert [item.excerpt for item in evidence] == ["unit one vocabulary evidence"]
+
+
+def test_title_scopes_use_structured_blocks_when_default_reads_are_legacy(tmp_path) -> None:
+    structured_document = _multi_unit_vocabulary_document()
+    legacy_document = replace(
+        structured_document,
+        blocks=tuple(
+            IndexBlock(block.sequence, block.location, block.text)
+            for block in structured_document.blocks
+        ),
+    )
+    service, _, session, _, _, _, indexes = task_service_fixture(
+        tmp_path, (structured_document,)
+    )
+    indexes.current_documents = lambda _vault_id: [legacy_document]
+    indexes.current_heading_scope_documents = lambda _vault_id: [structured_document]
+
+    exact = service.preview_task(session.session_id, "第一单元重点词汇与短语")
+    completeness = service.preview_task(session.session_id, "列出第一单元全部内容")
+    exact_evidence = tuple(
+        item for section in exact.organization_sections for item in section.evidence
+    )
+
+    assert [item.excerpt for item in exact_evidence] == ["unit one vocabulary evidence"]
+    assert [item.excerpt for item in completeness.coverage_items] == [
+        "unit one vocabulary evidence"
+    ]
+
+
+def test_completeness_uses_title_scope_when_metadata_scope_is_incomplete(tmp_path) -> None:
+    service, _, session, _, _, _, _ = task_service_fixture(
+        tmp_path, (_multi_unit_vocabulary_document(),)
+    )
+
+    snapshot = service.create_task(session.session_id, "列出第一单元全部内容")
+
+    assert snapshot.intent == "completeness"
+    assert [item.excerpt for item in snapshot.coverage_items] == [
+        "unit one vocabulary evidence"
+    ]
+
+
+def test_completeness_without_a_title_scope_still_enumerates_the_selected_vault(tmp_path) -> None:
+    service, _, session, _, _, _, _ = task_service_fixture(
+        tmp_path, (_multi_unit_vocabulary_document(),)
+    )
+
+    snapshot = service.create_task(session.session_id, "列出当前 vault 全部资料")
+
+    assert snapshot.intent == "completeness"
+    assert [item.excerpt for item in snapshot.coverage_items] == [
+        "unit one vocabulary evidence",
+        "unit seven vocabulary evidence",
+        "unit ten vocabulary evidence",
+    ]
+
+
+def test_completeness_whole_vault_query_does_not_treat_vault_heading_as_a_scope(tmp_path) -> None:
+    document = IndexedDocument(
+        "vault-sections",
+        "vault-1",
+        "notes/sections.md",
+        "a" * 64,
+        "native",
+        (),
+        (),
+        (),
+        (
+            IndexBlock(1, "heading: Vault", "vault heading evidence", heading_path=("Vault",)),
+            IndexBlock(2, "heading: Other", "other heading evidence", heading_path=("Other",)),
+        ),
+        "now",
+    )
+    service, _, session, _, _, _, indexes = task_service_fixture(tmp_path, (document,))
+    indexes.current_heading_scope_documents = lambda _vault_id: (_ for _ in ()).throw(
+        AssertionError("whole-vault enumeration must not inspect title structure")
+    )
+
+    snapshot = service.create_task(session.session_id, "列出当前 vault 全部资料")
+
+    assert [item.excerpt for item in snapshot.coverage_items] == [
+        "vault heading evidence",
+        "other heading evidence",
+    ]
+
+
+@pytest.mark.parametrize(
+    "content",
+    (
+        "all notes",
+        "list all notes in the current vault",
+        "show all contents in the vault",
+        "列出 vault 中的全部资料",
+        "请帮我列出当前 vault 的全部资料",
+        "Could you please list all notes in the current vault?",
+        "please help me show all content in this vault",
+    ),
+)
+def test_whole_vault_query_does_not_treat_content_nouns_as_a_scope(tmp_path, content) -> None:
+    document = IndexedDocument(
+        "note-sections",
+        "vault-1",
+        "notes/sections.md",
+        "a" * 64,
+        "native",
+        (),
+        (),
+        (),
+        (
+            IndexBlock(1, "heading: Notes", "notes evidence", heading_path=("Notes",)),
+            IndexBlock(2, "heading: Other", "other evidence", heading_path=("Other",)),
+        ),
+        "now",
+    )
+    service, _, session, _, _, _, _ = task_service_fixture(tmp_path, (document,))
+
+    snapshot = service.create_task(session.session_id, content, intent="completeness")
+
+    assert [item.excerpt for item in snapshot.coverage_items] == [
+        "notes evidence",
+        "other evidence",
+    ]
+
+
+def test_completeness_keeps_an_explicit_generic_heading_scope(tmp_path) -> None:
+    documents = (
+        IndexedDocument(
+            "project-a",
+            "vault-1",
+            "notes/projects.md",
+            "a" * 64,
+            "native",
+            (),
+            (),
+            (),
+            (IndexBlock(1, "heading: Project A", "project a evidence", heading_path=("Project A",)),),
+            "now",
+        ),
+        IndexedDocument(
+            "project-b",
+            "vault-1",
+            "notes/projects.md",
+            "b" * 64,
+            "native",
+            (),
+            (),
+            (),
+            (IndexBlock(1, "heading: Project B", "project b evidence", heading_path=("Project B",)),),
+            "now",
+        ),
+    )
+    service, _, session, _, _, _, _ = task_service_fixture(tmp_path, documents)
+
+    snapshot = service.create_task(session.session_id, "列出 Project A 的全部资料")
+
+    assert [item.excerpt for item in snapshot.coverage_items] == ["project a evidence"]
+
+
+@pytest.mark.parametrize("intent", ("completeness", "knowledge-organization"))
+def test_generic_heading_scope_intersects_parent_and_shared_child(tmp_path, intent) -> None:
+    document = IndexedDocument(
+        "projects",
+        "vault-1",
+        "notes/projects.md",
+        "a" * 64,
+        "native",
+        (),
+        (),
+        (),
+        (
+            IndexBlock(
+                1,
+                "heading: Project A; Overview",
+                "project a overview",
+                heading_path=("Project A", "Overview"),
+            ),
+            IndexBlock(
+                2,
+                "heading: Project B; Overview",
+                "project b overview",
+                heading_path=("Project B", "Overview"),
+            ),
+        ),
+        "now",
+    )
+    service, _, session, _, _, _, _ = task_service_fixture(tmp_path, (document,))
+
+    snapshot = service.create_task(
+        session.session_id,
+        "列出 Project A Overview 的全部内容",
+        intent=intent,
+    )
+
+    excerpts = (
+        [item.excerpt for item in snapshot.coverage_items]
+        if intent == "completeness"
+        else [
+            item.excerpt
+            for section in snapshot.organization_sections
+            for item in section.evidence
+        ]
+    )
+    assert excerpts == ["project a overview"]
+
+
+def test_generic_heading_scope_requires_parent_and_child_on_the_same_path(tmp_path) -> None:
+    document = IndexedDocument(
+        "projects",
+        "vault-1",
+        "notes/projects.md",
+        "a" * 64,
+        "native",
+        (),
+        (),
+        (),
+        (
+            IndexBlock(
+                1,
+                "heading: Project A; Overview",
+                "project a overview",
+                heading_path=("Project A", "Overview"),
+            ),
+            IndexBlock(
+                2,
+                "heading: Project B; Details",
+                "project b details",
+                heading_path=("Project B", "Details"),
+            ),
+        ),
+        "now",
+    )
+    service, _, session, _, providers, _, _ = task_service_fixture(tmp_path, (document,))
+
+    preview = service.preview_task(session.session_id, "列出 Project A Details 的全部内容")
+
+    assert preview.is_ready is False
+    assert preview.blocking_reason == "当前资料范围未找到匹配的标题内容。"
+    assert providers.generated_prompts == []
+
+
+@pytest.mark.parametrize(
+    "content",
+    ("organize Topic A Details", "organize Project A Details"),
+)
+def test_untemplated_heading_scope_still_requires_one_matching_path(
+    tmp_path, content
+) -> None:
+    document = IndexedDocument(
+        "projects",
+        "vault-1",
+        "notes/projects.md",
+        "a" * 64,
+        "native",
+        (),
+        (),
+        (),
+        (
+            IndexBlock(
+                1,
+                "heading: Topic A; Project A; Overview",
+                "first branch",
+                heading_path=("Topic A", "Project A", "Overview"),
+            ),
+            IndexBlock(
+                2,
+                "heading: Topic B; Project B; Details",
+                "second branch",
+                heading_path=("Topic B", "Project B", "Details"),
+            ),
+        ),
+        "now",
+    )
+    service, _, session, _, providers, _, _ = task_service_fixture(tmp_path, (document,))
+
+    preview = service.preview_task(
+        session.session_id, content, intent="knowledge-organization"
+    )
+
+    assert preview.is_ready is False
+    assert preview.blocking_reason == "当前资料范围未找到匹配的标题内容。"
+    assert providers.generated_prompts == []
+
+
+def test_exact_heading_text_outweighs_a_shared_structural_alias(tmp_path) -> None:
+    document = IndexedDocument(
+        "project-variants",
+        "vault-1",
+        "notes/projects.md",
+        "a" * 64,
+        "native",
+        (),
+        (),
+        (),
+        (
+            IndexBlock(
+                1,
+                "heading: Project A Alpha",
+                "project alpha evidence",
+                heading_path=("Project A Alpha",),
+            ),
+            IndexBlock(
+                2,
+                "heading: Project A Beta",
+                "project beta evidence",
+                heading_path=("Project A Beta",),
+            ),
+        ),
+        "now",
+    )
+    service, _, session, _, _, _, _ = task_service_fixture(tmp_path, (document,))
+
+    snapshot = service.create_task(
+        session.session_id,
+        "organize Project A Alpha materials",
+        intent="knowledge-organization",
+    )
+    evidence = tuple(
+        item for section in snapshot.organization_sections for item in section.evidence
+    )
+
+    assert [item.excerpt for item in evidence] == ["project alpha evidence"]
+
+
+def test_generic_structural_alias_selects_chapter_heading_without_unit_logic(tmp_path) -> None:
+    document = IndexedDocument(
+        "chapters",
+        "vault-1",
+        "notes/book.md",
+        "a" * 64,
+        "native",
+        (),
+        (),
+        (),
+        (
+            IndexBlock(1, "heading: Chapter 2", "chapter two", heading_path=("Chapter 2",)),
+            IndexBlock(2, "heading: Chapter 3", "chapter three", heading_path=("Chapter 3",)),
+        ),
+        "now",
+    )
+    service, _, session, _, _, _, _ = task_service_fixture(tmp_path, (document,))
+
+    snapshot = service.create_task(session.session_id, "列出第二章全部内容")
+
+    assert [item.excerpt for item in snapshot.coverage_items] == ["chapter two"]
+
+
+def test_missing_generic_structural_heading_fails_closed(tmp_path) -> None:
+    document = IndexedDocument(
+        "projects",
+        "vault-1",
+        "notes/projects.md",
+        "a" * 64,
+        "native",
+        (),
+        (),
+        (),
+        (IndexBlock(1, "heading: Project A", "project a", heading_path=("Project A",)),),
+        "now",
+    )
+    service, _, session, _, providers, _, _ = task_service_fixture(tmp_path, (document,))
+
+    preview = service.preview_task(session.session_id, "列出 Project Z 的全部内容")
+
+    assert preview.is_ready is False
+    assert preview.blocking_reason == "当前资料范围未找到匹配的标题内容。"
+    with pytest.raises(SessionValidationError, match="当前资料范围未找到匹配的标题内容"):
+        service.create_task(session.session_id, "列出 Project Z 的全部内容")
+    assert providers.generated_prompts == []
+
+
+@pytest.mark.parametrize(
+    "content",
+    (
+        "列出 Topic Z 全部内容",
+        "列出 Topic Z 内容",
+        "列出专题乙内容",
+        "list all content in Topic Z",
+        "list Topic Z content",
+        "show contents from Topic Z",
+    ),
+)
+def test_missing_arbitrary_explicit_heading_fails_closed(tmp_path, content) -> None:
+    document = IndexedDocument(
+        "topics",
+        "vault-1",
+        "notes/topics.md",
+        "a" * 64,
+        "native",
+        (),
+        (),
+        (),
+        (IndexBlock(1, "heading: Topic A", "topic a", heading_path=("Topic A",)),),
+        "now",
+    )
+    service, _, session, _, providers, _, _ = task_service_fixture(tmp_path, (document,))
+
+    preview = service.preview_task(session.session_id, content, intent="completeness")
+
+    assert preview.is_ready is False
+    assert preview.blocking_reason == "当前资料范围未找到匹配的标题内容。"
+    with pytest.raises(SessionValidationError, match="当前资料范围未找到匹配的标题内容"):
+        service.create_task(session.session_id, content, intent="completeness")
+    assert providers.generated_prompts == []
+
+
+@pytest.mark.parametrize(
+    "content",
+    (
+        "organize Topic Z key points",
+        "summarize the key points of Topic Z",
+        "整理 Topic Z 的重点",
+        "整理专题乙的重点",
+        "归纳 Topic Z 要点",
+    ),
+)
+def test_untemplated_missing_heading_scope_fails_closed(tmp_path, content) -> None:
+    document = IndexedDocument(
+        "topics",
+        "vault-1",
+        "notes/topics.md",
+        "a" * 64,
+        "native",
+        (),
+        (),
+        (),
+        (IndexBlock(1, "heading: Topic A", "topic a", heading_path=("Topic A",)),),
+        "now",
+    )
+    service, _, session, _, providers, _, _ = task_service_fixture(tmp_path, (document,))
+
+    preview = service.preview_task(
+        session.session_id, content, intent="knowledge-organization"
+    )
+
+    assert preview.is_ready is False
+    assert preview.blocking_reason == "当前资料范围未找到匹配的标题内容。"
+    assert providers.generated_prompts == []
+
+
+def test_missing_explicit_heading_cannot_match_a_query_noise_heading(tmp_path) -> None:
+    document = IndexedDocument(
+        "projects",
+        "vault-1",
+        "notes/projects.md",
+        "a" * 64,
+        "native",
+        (),
+        (),
+        (),
+        (
+            IndexBlock(1, "heading: Project A", "project a", heading_path=("Project A",)),
+            IndexBlock(2, "heading: 内容", "content noise", heading_path=("内容",)),
+        ),
+        "now",
+    )
+    service, _, session, _, providers, _, _ = task_service_fixture(tmp_path, (document,))
+
+    preview = service.preview_task(session.session_id, "列出 Project Z 的全部内容")
+
+    assert preview.is_ready is False
+    assert preview.blocking_reason == "当前资料范围未找到匹配的标题内容。"
+    assert providers.generated_prompts == []
+
+
+def test_two_character_heading_text_resolves_as_an_exact_scope(tmp_path) -> None:
+    document = IndexedDocument(
+        "topics",
+        "vault-1",
+        "notes/topics.md",
+        "a" * 64,
+        "native",
+        (),
+        (),
+        (),
+        (
+            IndexBlock(1, "heading: 词汇", "vocabulary evidence", heading_path=("词汇",)),
+            IndexBlock(2, "heading: 语法", "grammar evidence", heading_path=("语法",)),
+        ),
+        "now",
+    )
+    service, _, session, _, _, _, _ = task_service_fixture(tmp_path, (document,))
+
+    snapshot = service.create_task(session.session_id, "列出词汇的全部内容")
+
+    assert [item.excerpt for item in snapshot.coverage_items] == ["vocabulary evidence"]
+
+
+def test_completeness_missing_title_scope_blocks_task_creation(tmp_path) -> None:
+    unit_seven = IndexedDocument(
+        "unit-seven", "vault-1", "notes/unit-seven.md", "a" * 64, "native", (), (), (),
+        (
+            IndexBlock(
+                1,
+                "heading: Unit 7; Vocabulary",
+                "unit seven vocabulary evidence",
+                heading_path=("Unit 7 Happy Birthday!", "Vocabulary"),
+            ),
+        ),
+        "now",
+    )
+    service, _, session, _, providers, _, _ = task_service_fixture(tmp_path, (unit_seven,))
+
+    preview = service.preview_task(session.session_id, "列出第九单元全部内容")
+
+    assert preview.intent == "completeness"
+    assert preview.is_ready is False
+    assert preview.blocking_reason == "当前资料范围未找到匹配的标题内容。"
+    with pytest.raises(SessionValidationError, match="当前资料范围未找到匹配的标题内容"):
+        service.create_task(session.session_id, "列出第九单元全部内容")
+    assert providers.generated_prompts == []
+
+
+def test_missing_structural_parent_cannot_fall_back_to_a_shared_child(tmp_path) -> None:
+    service, _, session, _, providers, _, _ = task_service_fixture(
+        tmp_path, (_multi_unit_vocabulary_document(),)
+    )
+
+    preview = service.preview_task(
+        session.session_id, "列出第九单元重点词汇与短语全部内容"
+    )
+
+    assert preview.is_ready is False
+    assert preview.blocking_reason == "当前资料范围未找到匹配的标题内容。"
+    assert providers.generated_prompts == []
+
+
+def test_title_range_matches_generic_heading_text_without_specialized_metadata(tmp_path) -> None:
+    project_a = IndexedDocument(
+        "project-a", "vault-1", "notes/projects.md", "a" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Project A", "project a evidence", heading_path=("Project A",)),),
+        "now",
+    )
+    project_b = IndexedDocument(
+        "project-b", "vault-1", "notes/projects.md", "b" * 64, "native", (), (), (),
+        (IndexBlock(1, "heading: Project B", "project b evidence", heading_path=("Project B",)),),
+        "now",
+    )
+    service, _, session, _, _, _, _ = task_service_fixture(tmp_path, (project_a, project_b))
+
+    snapshot = service.create_task(
+        session.session_id, "整理 Project A 的资料", intent="knowledge-organization"
+    )
+
+    assert [item.excerpt for item in snapshot.organization_sections[0].evidence] == [
+        "project a evidence"
+    ]
+
+
+def test_knowledge_organization_without_a_title_scope_uses_legacy_compatible_documents(
+    tmp_path,
+) -> None:
+    document = IndexedDocument(
+        "legacy-like",
+        "vault-1",
+        "notes/general.md",
+        "a" * 64,
+        "native",
+        (),
+        (),
+        (),
+        (IndexBlock(1, "line:1", "general legacy evidence"),),
+        "now",
+    )
+    service, _, session, _, _, _, indexes = task_service_fixture(tmp_path, (document,))
+    indexes.current_heading_scope_documents = lambda _vault_id: (_ for _ in ()).throw(
+        AssertionError("unscoped organization must use legacy-compatible documents")
+    )
+
+    snapshot = service.create_task(
+        session.session_id, "整理资料", intent="knowledge-organization"
+    )
+
+    assert [item.excerpt for item in snapshot.organization_sections[0].evidence] == [
+        "general legacy evidence"
+    ]
+
+
+def test_title_range_without_a_matching_heading_blocks_provider_execution(tmp_path) -> None:
+    unit_seven = IndexedDocument(
+        "unit-seven", "vault-1", "notes/textbook.md", "a" * 64, "native", (), (), (),
+        (
+            IndexBlock(
+                1,
+                "heading: Unit 7; Vocabulary",
+                "unit seven vocabulary evidence",
+                heading_path=("Unit 7 Happy Birthday!", "Vocabulary"),
+            ),
+        ),
+        "now",
+    )
+    service, _, session, _, providers, _, _ = task_service_fixture(tmp_path, (unit_seven,))
+
+    preview = service.preview_task(
+        session.session_id, "将第一单元单词短语发给我", intent="deep-creation"
+    )
+
+    assert preview.is_ready is False
+    assert preview.blocking_reason == "当前资料范围未找到匹配的标题内容。"
+    with pytest.raises(SessionValidationError, match="当前资料范围未找到匹配的标题内容"):
+        service.create_task(
+            session.session_id, "将第一单元单词短语发给我", intent="deep-creation"
+        )
+    assert providers.generated_prompts == []
 
 
 def test_deep_creation_streams_chunks_while_persisting_its_completed_section(tmp_path) -> None:
@@ -2755,9 +3531,9 @@ def test_deep_creation_streams_chunks_while_persisting_its_completed_section(tmp
         on_stream_chunk=lambda ordinal, chunk: chunks.append((ordinal, chunk)),
     )
 
-    assert chunks == [(1, "基于已冻结"), (1, "证据的结构化结论。")]
+    assert chunks == [(1, "整理后的"), (1, "可直接使用内容。")]
     assert result.status == "completed"
-    assert result.outcomes[0].content == "基于已冻结证据的结构化结论。"
+    assert result.outcomes[0].content == "整理后的可直接使用内容。"
     assert repository.get_detail(session.session_id).deep_creation_results[0] == result
 
 
@@ -2776,10 +3552,10 @@ def test_deep_creation_detail_keeps_an_active_stream_execution_in_progress(tmp_p
     def block_stream(provider_id, model_id, prompt):
         assert (provider_id, model_id) == ("provider-1", "chat-1")
         providers.generated_prompts.append(prompt)
-        yield "基于已冻结"
+        yield "整理后的"
         started.set()
         assert proceed.wait(2)
-        yield "证据的结构化结论。"
+        yield "可直接使用内容。"
 
     providers.stream_chat = block_stream
     execution: dict[str, object] = {}

@@ -1,12 +1,10 @@
 from dataclasses import dataclass
-from hashlib import sha256
-import json
 import re
 
 
 RULE_KINDS = frozenset({"completely-ignore", "do-not-index", "never-send-cloud"})
 PROCESSING_STAGES = frozenset({"import", "index", "retrieval", "outbound"})
-OUTBOUND_MODES = frozenset({"ask-each-task", "always-allow"})
+OUTBOUND_MODES = frozenset({"always-allow"})
 
 
 @dataclass(frozen=True)
@@ -36,30 +34,6 @@ class PolicyEvaluation:
     reason: str
 
 
-@dataclass(frozen=True)
-class OutboundAuthorization:
-    authorization_id: str
-    vault_id: str
-    policy_revision: int
-    provider_id: str | None
-    model_id: str | None
-    operation: str
-    task_id: str
-    snapshot_digest: str
-    scope_summary: str
-    actual_scope_summary: str | None
-    actual_scope_digest: str | None
-    status: str
-    created_at: str
-    updated_at: str
-
-
-@dataclass(frozen=True)
-class OutboundScope:
-    source_path: str
-    derived_path: str | None
-
-
 def normalize_vault_relative_path(candidate: str) -> str:
     normalized_candidate = candidate.strip().replace("\\", "/")
     if (
@@ -72,45 +46,6 @@ def normalize_vault_relative_path(candidate: str) -> str:
     if not parts or any(part == ".." for part in parts):
         raise ValueError("Policy paths must be non-empty vault-relative paths.")
     return "/".join(parts).casefold()
-
-
-def normalize_outbound_scope(source_path: str, derived_path: str | None) -> OutboundScope:
-    return OutboundScope(
-        source_path=normalize_vault_relative_path(source_path),
-        derived_path=(
-            normalize_vault_relative_path(derived_path)
-            if derived_path is not None
-            else None
-        ),
-    )
-
-
-def outbound_context_digest(
-    *,
-    provider_id: str | None,
-    model_id: str | None,
-    operation: str,
-    task_id: str,
-    scopes: tuple[OutboundScope, ...],
-) -> str:
-    canonical_context = {
-        "model_id": model_id,
-        "operation": operation,
-        "provider_id": provider_id,
-        "scopes": [
-            {"derived_path": scope.derived_path, "source_path": scope.source_path}
-            for scope in scopes
-        ],
-        "task_id": task_id,
-    }
-    encoded = json.dumps(
-        canonical_context, ensure_ascii=True, separators=(",", ":"), sort_keys=True
-    ).encode("utf-8")
-    return sha256(encoded).hexdigest()
-
-
-def bounded_scope_summary(scopes: tuple[OutboundScope, ...]) -> str:
-    return f"{len(scopes)} scoped item(s)"
 
 
 def _rule_matches_path(rule_path: str, candidate_path: str) -> bool:

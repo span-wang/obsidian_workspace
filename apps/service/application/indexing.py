@@ -116,7 +116,11 @@ class IndexingService:
                 sorted(
                     path
                     for path, candidate in discovered.items()
-                    if self._needs_index(vault, candidate, current.get(path))
+                    if (
+                        path.rsplit("/", 1)[-1] == "index.md"
+                        and _is_platform_derived_index_note(path, candidate.read_text(encoding="utf-8"))
+                    )
+                    or self._needs_index(vault, candidate, current.get(path))
                 )
             )
             missing_hashes = {current[path].content_sha256 for path in missing}
@@ -168,8 +172,12 @@ class IndexingService:
                 if path is None:
                     invalidations.append((vault.vault_id, relative_path, "file-deleted"))
                     continue
+                markdown = path.read_text(encoding="utf-8")
+                if _is_platform_derived_index_note(relative_path, markdown):
+                    invalidations.append((vault.vault_id, relative_path, "generated-derived-index"))
+                    continue
                 document = self._document_from_markdown(
-                    vault.vault_id, relative_path, path.read_text(encoding="utf-8"), path,
+                    vault.vault_id, relative_path, markdown, path,
                     pending_association=False,
                     committed_projection=projection,
                 )
@@ -293,6 +301,11 @@ class IndexingService:
             self.repository.invalidate_current_path(vault.vault_id, relative_path, "file-deleted")
             return
         markdown = path.read_text(encoding="utf-8")
+        if _is_platform_derived_index_note(relative_path, markdown):
+            self.repository.invalidate_current_path(
+                vault.vault_id, relative_path, "generated-derived-index"
+            )
+            return
         document = self._document_from_markdown(
             vault.vault_id,
             relative_path,
@@ -522,6 +535,13 @@ def _platform_provenance(markdown: str) -> tuple[dict[str, object] | None, str |
     values["source_locators"] = locators
     validation = validate_platform_provenance(values)
     return (values, None) if validation.verifiable else (None, "unverifiable-provenance")
+
+
+def _is_platform_derived_index_note(relative_path: str, markdown: str) -> bool:
+    if relative_path.rsplit("/", 1)[-1] != "index.md":
+        return False
+    provenance, _reason = _platform_provenance(markdown)
+    return provenance is not None
 
 
 def _yaml_pair(value: str) -> tuple[str, object]:

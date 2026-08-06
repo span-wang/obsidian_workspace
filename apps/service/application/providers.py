@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
+from ipaddress import ip_address
 from threading import Event, Lock, RLock
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -19,7 +20,6 @@ from domain.providers import (
     ResolvedProviderModel,
 )
 from ports.credential_store import CredentialStore
-from ports.provider_authorization_invalidator import ProviderAuthorizationInvalidator
 from ports.provider_client import ProviderClient, ProviderClientError
 from ports.provider_repository import ProviderRepository
 from ports.provider_unit_card_invalidator import ProviderUnitCardInvalidator
@@ -44,31 +44,39 @@ class ProviderService:
         repository: ProviderRepository,
         credentials: CredentialStore,
         client: ProviderClient,
-        authorization_invalidator: ProviderAuthorizationInvalidator,
         unit_card_invalidator: ProviderUnitCardInvalidator | None = None,
     ) -> None:
         self.repository = repository
         self.credentials = credentials
         self.client = client
-        self.authorization_invalidator = authorization_invalidator
         self.unit_card_invalidator = unit_card_invalidator
         self._locks_guard = Lock()
         self._provider_locks: dict[str, RLock] = {}
 
-    def create(self, name: str, endpoint: str, secret: str) -> Provider:
+    def create(self, name: str, endpoint: str, secret: str | None = None) -> Provider:
         normalized_name = self._validate_name(name)
         normalized_endpoint = self._normalize_endpoint(endpoint)
-        self._validate_secret(secret)
+        if secret is not None and not isinstance(secret, str):
+            raise ProviderValidationError("Provider credential is invalid.")
+        secret = secret.strip() if secret is not None else None
+        if not secret:
+            secret = None
+        if secret is not None:
+            self._validate_secret(secret)
+        elif not self._is_loopback_endpoint(normalized_endpoint):
+            raise ProviderValidationError("Provider credential is required for non-local endpoints.")
         timestamp = utc_now()
         provider_id = str(uuid4())
         reference = f"ObsidianPersonalKnowledgePlatform/{provider_id}"
-        self.credentials.save(reference, secret)
-        provider = Provider(provider_id, normalized_name, normalized_endpoint, reference, True,
+        if secret is not None:
+            self.credentials.save(reference, secret)
+        provider = Provider(provider_id, normalized_name, normalized_endpoint, reference, secret is not None,
                             ProviderProbeResults.not_run(), (), None, timestamp, timestamp)
         try:
             self.repository.save(provider)
         except Exception:
-            self.credentials.delete(reference)
+            if secret is not None:
+                self.credentials.delete(reference)
             raise
         self._invalidate(provider_id, timestamp)
         return provider
@@ -136,8 +144,8 @@ class ProviderService:
             self.repository.save(invalidated)
             self._invalidate(provider_id, timestamp)
             try:
-                secret = self.credentials.read(provider.credential_reference)
-            except Exception:
+                secret = self._credential_for(provider)
+            except ProviderUnavailableError:
                 unavailable = replace(invalidated, credential_configured=False,
                                       verification=self._failed_verification("Credential is unavailable."),
                                       last_tested_at=timestamp)
@@ -160,7 +168,7 @@ class ProviderService:
                         verified_at=timestamp)
                 for model_id, model in existing_models.items() if model_id not in discovered_models
             )
-            tested = replace(invalidated, credential_configured=True, verification=verification,
+            tested = replace(invalidated, verification=verification,
                              models=models + disappeared_models, last_tested_at=timestamp)
             self.repository.save(tested)
             self._invalidate(provider_id, timestamp)
@@ -199,19 +207,19 @@ class ProviderService:
             ), updated_at=timestamp)
             self.repository.save(invalidated)
             self._invalidate(provider_id, timestamp)
-            if model.model_type == "rerank" and urlparse(provider.endpoint).scheme != "https":
+            if model.model_type == "rerank" and not self._is_secure_endpoint(provider.endpoint):
                 tested_model = replace(
                     invalidated_model,
                     verification=ProbeResult.failed(
-                        "Rerank model verification requires an HTTPS Provider endpoint."
+                        "Rerank model verification requires an HTTPS or loopback Provider endpoint."
                     ),
                     verified_at=timestamp,
                 )
                 updated = invalidated
             else:
                 try:
-                    secret = self.credentials.read(provider.credential_reference)
-                except Exception:
+                    secret = self._credential_for(provider)
+                except ProviderUnavailableError:
                     tested_model = replace(
                         invalidated_model,
                         verification=ProbeResult.failed("Credential is unavailable."),
@@ -219,7 +227,7 @@ class ProviderService:
                     )
                     updated = replace(invalidated, credential_configured=False)
                 else:
-                    if model.model_type == "chat":
+                    if model.model_type in {"chat", "markdown"}:
                         verification = self._probe(
                             lambda: self.client.probe_streaming_generation(
                                 invalidated.endpoint, secret, model_id, cancel_event
@@ -264,7 +272,7 @@ class ProviderService:
                 raise ProviderValidationError("The selected Provider model is not verified for this model type.")
             if not provider.verification.is_verified:
                 raise ProviderValidationError("The selected Provider has not passed discovery and health checks.")
-            if not provider.credential_configured or not self._credential_is_available(provider):
+            if not self._credential_is_available(provider):
                 raise ProviderValidationError("The selected Provider credential is unavailable.")
             previous = self.repository.get_default(model_type)
             selection = ModelSelection(model_type, provider_id, model_id, utc_now())
@@ -298,9 +306,9 @@ class ProviderService:
             provider = self.repository.get(provider_id)
         except KeyError as error:
             raise ProviderUnavailableError(f"The selected {model_type} Provider is unavailable. Choose another model.") from error
-        if require_https and urlparse(provider.endpoint).scheme != "https":
-            raise ProviderUnavailableError("The selected Provider must use an HTTPS endpoint.")
-        if not provider.credential_configured or not self._credential_is_available(provider):
+        if require_https and not self._is_secure_endpoint(provider.endpoint):
+            raise ProviderUnavailableError("The selected Provider must use an HTTPS or loopback endpoint.")
+        if not self._credential_is_available(provider):
             raise ProviderUnavailableError("The selected Provider credential is unavailable. Reconfigure it.")
         if not provider.verification.is_verified:
             raise ProviderUnavailableError("The selected Provider has not passed discovery and health checks.")
@@ -332,12 +340,9 @@ class ProviderService:
                 and resolved.provider.updated_at != expected_provider_updated_at
             ):
                 raise ProviderUnavailableError(
-                    "The chat Provider configuration changed. Request a new authorization."
+                    "The chat Provider configuration changed. Retry the request."
                 )
-            try:
-                secret = self.credentials.read(resolved.provider.credential_reference)
-            except Exception as error:
-                raise ProviderUnavailableError("The selected Provider credential is unavailable.") from error
+            secret = self._credential_for(resolved.provider)
             try:
                 return self.client.generate_chat(
                     resolved.provider.endpoint, secret, resolved.model.model_id, normalized_prompt
@@ -348,6 +353,49 @@ class ProviderService:
                 ) from error
             except Exception as error:
                 raise ProviderUnavailableError("The selected Provider could not generate this section.") from error
+
+    def generate_markdown(
+        self,
+        provider_id: str,
+        model_id: str,
+        prompt: str,
+        *,
+        max_output_tokens: int,
+        expected_provider_updated_at: str | None = None,
+    ) -> str:
+        normalized_prompt = prompt.strip()
+        if not normalized_prompt or len(normalized_prompt) > 200_000:
+            raise ProviderUnavailableError("The Markdown structuring request is invalid.")
+        if type(max_output_tokens) is not int or not 1 <= max_output_tokens <= 4_096:
+            raise ProviderUnavailableError("The Markdown structuring output token limit is invalid.")
+        if expected_provider_updated_at is not None and not expected_provider_updated_at:
+            raise ProviderUnavailableError("The Markdown Provider configuration revision is invalid.")
+        with self._provider_lock(provider_id):
+            resolved = self.resolve_specific_model("markdown", provider_id, model_id, require_https=True)
+            if (
+                expected_provider_updated_at is not None
+                and resolved.provider.updated_at != expected_provider_updated_at
+            ):
+                raise ProviderUnavailableError(
+                    "The Markdown Provider configuration changed. Retry the request."
+                )
+            secret = self._credential_for(resolved.provider)
+            try:
+                return self.client.generate_chat_with_usage(
+                    resolved.provider.endpoint,
+                    secret,
+                    resolved.model.model_id,
+                    normalized_prompt,
+                    max_output_tokens,
+                ).content
+            except ProviderClientError as error:
+                raise ProviderUnavailableError(
+                    f"The selected Markdown Provider could not structure this section: {error}"
+                ) from error
+            except Exception as error:
+                raise ProviderUnavailableError(
+                    "The selected Markdown Provider could not structure this section."
+                ) from error
 
     def generate_chat_with_usage(
         self,
@@ -374,12 +422,9 @@ class ProviderService:
                 and resolved.provider.updated_at != expected_provider_updated_at
             ):
                 raise ProviderUnavailableError(
-                    "The chat Provider configuration changed. Request a new authorization."
+                    "The chat Provider configuration changed. Retry the request."
                 )
-            try:
-                secret = self.credentials.read(resolved.provider.credential_reference)
-            except Exception as error:
-                raise ProviderUnavailableError("The selected Provider credential is unavailable.") from error
+            secret = self._credential_for(resolved.provider)
             try:
                 return self.client.generate_chat_with_usage(
                     resolved.provider.endpoint,
@@ -401,10 +446,7 @@ class ProviderService:
             raise ProviderUnavailableError("The generation request is invalid.")
         with self._provider_lock(provider_id):
             resolved = self.resolve_specific_model("chat", provider_id, model_id)
-            try:
-                secret = self.credentials.read(resolved.provider.credential_reference)
-            except Exception as error:
-                raise ProviderUnavailableError("The selected Provider credential is unavailable.") from error
+            secret = self._credential_for(resolved.provider)
             try:
                 yield from self.client.stream_chat(
                     resolved.provider.endpoint, secret, resolved.model.model_id, normalized_prompt
@@ -430,14 +472,11 @@ class ProviderService:
             resolved = self.resolve_specific_model("embedding", provider_id, model_id)
             if resolved.provider.updated_at != expected_provider_updated_at:
                 raise ProviderUnavailableError(
-                    "The embedding Provider configuration changed. Request a new authorization."
+                    "The embedding Provider configuration changed. Retry the request."
                 )
-            if urlparse(resolved.provider.endpoint).scheme != "https":
-                raise ProviderUnavailableError("Embedding requests require an HTTPS Provider endpoint.")
-            try:
-                secret = self.credentials.read(resolved.provider.credential_reference)
-            except Exception as error:
-                raise ProviderUnavailableError("The selected Provider credential is unavailable.") from error
+            if not self._is_secure_endpoint(resolved.provider.endpoint):
+                raise ProviderUnavailableError("Embedding requests require an HTTPS or loopback Provider endpoint.")
+            secret = self._credential_for(resolved.provider)
             try:
                 return self.client.create_embeddings(
                     resolved.provider.endpoint, secret, resolved.model.model_id, inputs
@@ -472,12 +511,9 @@ class ProviderService:
             )
             if resolved.provider.updated_at != expected_provider_updated_at:
                 raise ProviderUnavailableError(
-                    "The rerank Provider configuration changed. Request a new authorization."
+                    "The rerank Provider configuration changed. Retry the request."
                 )
-            try:
-                secret = self.credentials.read(resolved.provider.credential_reference)
-            except Exception as error:
-                raise ProviderUnavailableError("The selected Provider credential is unavailable.") from error
+            secret = self._credential_for(resolved.provider)
             try:
                 return self.client.rerank(
                     resolved.provider.endpoint,
@@ -508,10 +544,10 @@ class ProviderService:
             resolved = self.resolve_specific_model("embedding", provider_id, model_id)
             if resolved.provider.updated_at != expected_provider_updated_at:
                 raise ProviderUnavailableError(
-                    "The embedding Provider configuration changed. Request a new authorization."
+                    "The embedding Provider configuration changed. Retry the request."
                 )
-            if urlparse(resolved.provider.endpoint).scheme != "https":
-                raise ProviderUnavailableError("Embedding requests require an HTTPS Provider endpoint.")
+            if not self._is_secure_endpoint(resolved.provider.endpoint):
+                raise ProviderUnavailableError("Embedding requests require an HTTPS or loopback Provider endpoint.")
             return EmbeddingProfileLocator(
                 provider_id=resolved.provider.provider_id,
                 endpoint=resolved.provider.endpoint,
@@ -543,7 +579,7 @@ class ProviderService:
     @staticmethod
     def _validate_model_type(model_type: str) -> None:
         if model_type not in MODEL_TYPES:
-            raise ProviderValidationError("Model type must be chat, embedding, or rerank.")
+            raise ProviderValidationError("Model type must be chat, embedding, rerank, or markdown.")
 
     @staticmethod
     def _find_model(provider: Provider, model_id: str) -> ProviderModel:
@@ -559,11 +595,40 @@ class ProviderService:
         return replace(existing, is_discovered=True, verification=ProbeResult.not_run(), verified_at=None)
 
     def _credential_is_available(self, provider: Provider) -> bool:
+        if not provider.credential_configured:
+            return self._is_loopback_endpoint(provider.endpoint)
         try:
             self.credentials.read(provider.credential_reference)
         except Exception:
             return False
         return True
+
+    def _credential_for(self, provider: Provider) -> str:
+        if not provider.credential_configured:
+            if self._is_loopback_endpoint(provider.endpoint):
+                return ""
+            raise ProviderUnavailableError("The selected Provider credential is unavailable.")
+        try:
+            return self.credentials.read(provider.credential_reference)
+        except Exception as error:
+            raise ProviderUnavailableError("The selected Provider credential is unavailable.") from error
+
+    @staticmethod
+    def _is_loopback_endpoint(endpoint: str) -> bool:
+        hostname = urlparse(endpoint).hostname
+        if hostname is None:
+            return False
+        normalized_hostname = hostname.lower().rstrip(".")
+        if normalized_hostname == "localhost" or normalized_hostname.endswith(".localhost"):
+            return True
+        try:
+            return ip_address(normalized_hostname).is_loopback
+        except ValueError:
+            return False
+
+    @classmethod
+    def _is_secure_endpoint(cls, endpoint: str) -> bool:
+        return urlparse(endpoint).scheme == "https" or cls._is_loopback_endpoint(endpoint)
 
     def _probe_discovery(self, provider: Provider, secret: str, cancel_event: Event | None) -> tuple[tuple[str, ...], ProbeResult]:
         try:
@@ -585,7 +650,6 @@ class ProviderService:
         return ProviderProbeResults(failed, failed)
 
     def _invalidate(self, provider_id: str, timestamp: str) -> None:
-        self.authorization_invalidator.invalidate_provider_authorizations(provider_id, timestamp)
         if self.unit_card_invalidator is not None:
             self.unit_card_invalidator.invalidate_unit_cards_for_provider_change(provider_id, timestamp)
 

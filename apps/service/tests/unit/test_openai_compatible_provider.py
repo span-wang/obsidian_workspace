@@ -11,8 +11,15 @@ import pytest
 from adapters.openai_compatible_provider import OpenAiCompatibleProviderClient, ProviderClientError
 
 
+FINAL_RESPONSE_ONLY_INSTRUCTION = (
+    "Return only the requested final content. Do not include reasoning, thinking, analysis, "
+    "chain-of-thought, or scratch work."
+)
+
+
 class FixtureProviderHandler(BaseHTTPRequestHandler):
     calls: list[tuple[str, str, dict[str, object] | None]] = []
+    expected_authorization: str | None = "Bearer test-secret"
     stream_event = {"choices": [{"delta": {"content": "结构化结论"}}]}
     stream_events: list[dict[str, object]] = []
     embedding_data = [{"embedding": [0.1]}]
@@ -58,7 +65,7 @@ class FixtureProviderHandler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def _record(self, body: dict[str, object] | None) -> None:
-        assert self.headers["Authorization"] == "Bearer test-secret"
+        assert self.headers.get("Authorization") == self.expected_authorization
         self.calls.append((self.command, self.path, body))
 
     def _json_response(self, body: dict[str, object]) -> None:
@@ -99,6 +106,7 @@ class CaptureHandler(BaseHTTPRequestHandler):
 
 def with_fixture_provider(callback) -> None:
     FixtureProviderHandler.calls = []
+    FixtureProviderHandler.expected_authorization = "Bearer test-secret"
     FixtureProviderHandler.stream_event = {"choices": [{"delta": {"content": "结构化结论"}}]}
     FixtureProviderHandler.stream_events = []
     FixtureProviderHandler.embedding_data = [{"embedding": [0.1]}]
@@ -132,6 +140,14 @@ def test_openai_compatible_adapter_probes_each_required_capability_separately() 
     ]
 
 
+def test_openai_compatible_adapter_omits_authorization_for_local_models_without_a_key() -> None:
+    def verify(client, endpoint) -> None:
+        FixtureProviderHandler.expected_authorization = None
+        assert client.discover_models(endpoint, "") == ("model-alpha",)
+
+    with_fixture_provider(verify)
+
+
 def test_empty_stream_or_embedding_response_does_not_verify_capability() -> None:
     def verify(client, endpoint) -> None:
         FixtureProviderHandler.stream_event = {"choices": []}
@@ -161,6 +177,21 @@ def test_create_embeddings_orders_indexed_vectors_and_sends_one_bounded_batch() 
         "/v1/embeddings",
         {"model": "model-alpha", "input": ["first", "second"]},
     )
+
+
+def test_create_embeddings_accepts_a_response_larger_than_one_megabyte() -> None:
+    def verify(client, endpoint) -> None:
+        vector = [0.1] * 210_000
+        assert len(json.dumps({"data": [{"index": 0, "embedding": vector}]}).encode()) > 1_000_000
+        FixtureProviderHandler.embedding_data = [{"index": 0, "embedding": vector}]
+
+        vectors = client.create_embeddings(endpoint, "test-secret", "model-alpha", ("first",))
+
+        assert len(vectors) == 1
+        assert len(vectors[0]) == len(vector)
+        assert vectors[0][0] == vectors[0][-1] == 0.1
+
+    with_fixture_provider(verify)
 
 
 @pytest.mark.parametrize(
@@ -277,7 +308,10 @@ def test_openai_compatible_adapter_collects_streaming_chat_content() -> None:
         "/v1/chat/completions",
         {
             "model": "model-alpha",
-            "messages": [{"role": "user", "content": "仅使用此段证据。"}],
+            "messages": [
+                {"role": "system", "content": FINAL_RESPONSE_ONLY_INSTRUCTION},
+                {"role": "user", "content": "仅使用此段证据。"},
+            ],
             "stream": True,
         },
     )
@@ -295,10 +329,23 @@ def test_openai_compatible_adapter_streams_chat_content_chunks() -> None:
         "/v1/chat/completions",
         {
             "model": "model-alpha",
-            "messages": [{"role": "user", "content": "开始流式。"}],
+            "messages": [
+                {"role": "system", "content": FINAL_RESPONSE_ONLY_INSTRUCTION},
+                {"role": "user", "content": "开始流式。"},
+            ],
             "stream": True,
         },
     )
+
+
+def test_openai_compatible_adapter_accepts_a_stream_larger_than_one_megabyte() -> None:
+    def verify(client, endpoint) -> None:
+        content = "a" * 1_100_000
+        FixtureProviderHandler.stream_event = {"choices": [{"delta": {"content": content}}]}
+
+        assert "".join(client.stream_chat(endpoint, "test-secret", "model-alpha", "stream")) == content
+
+    with_fixture_provider(verify)
 
 
 def test_openai_compatible_adapter_accepts_a_final_message_content_chunk() -> None:
@@ -309,6 +356,18 @@ def test_openai_compatible_adapter_accepts_a_final_message_content_chunk() -> No
         assert client.generate_chat(endpoint, "test-secret", "model-alpha", "respond") == "final response"
 
     with_fixture_provider(verify)
+
+
+def test_deepseek_chat_requests_disable_thinking() -> None:
+    payload = OpenAiCompatibleProviderClient._chat_payload(
+        "https://api.deepseek.com/v1", "deepseek-v4-pro", "只返回 JSON。"
+    )
+
+    assert payload["thinking"] == {"type": "disabled"}
+    assert payload["messages"] == [
+        {"role": "system", "content": FINAL_RESPONSE_ONLY_INSTRUCTION},
+        {"role": "user", "content": "只返回 JSON。"},
+    ]
 
 
 def test_measured_chat_generation_uses_the_streaming_contract_and_keeps_only_usage_counts() -> None:
@@ -338,7 +397,10 @@ def test_measured_chat_generation_uses_the_streaming_contract_and_keeps_only_usa
         "/v1/chat/completions",
         {
             "model": "model-alpha",
-            "messages": [{"role": "user", "content": "仅排序候选。"}],
+            "messages": [
+                {"role": "system", "content": FINAL_RESPONSE_ONLY_INSTRUCTION},
+                {"role": "user", "content": "仅排序候选。"},
+            ],
             "stream": True,
             "stream_options": {"include_usage": True},
             "max_tokens": 128,

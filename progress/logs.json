@@ -1,6 +1,235 @@
 {
   "logs": [
     {
+      "date": "2026-08-05",
+      "taskId": "RET-18-01",
+      "action": "完成自动化导入提交与私有建议隔离",
+      "result": "导入任务现从扫描自动串行执行解析、OCR/转换、Markdown 结构化、Vault 提交、索引和 Embedding；提交前不再创建或等待审核快照，失败保留 restart-* 或 retry-commit 可恢复状态并复用原子写入、索引和向量回滚。分类建议、元数据与标签、候选链接分别作为任务私有只读观察产出，不写回 Markdown、不移动文件、不改变索引或检索排序。服务端移除审核/提交/解析/转换手工路由，前端任务详情只保留状态、建议、提交记录、取消和自动重试。",
+      "verification": [
+        "uv run --directory apps/service pytest tests/unit -q（634 passed，2 skipped）",
+        "uv run --directory apps/service ruff check application/ingest.py api/main.py tests/unit/test_import_service.py tests/unit/test_review_commit_service.py tests/unit/test_review_commit_api.py tests/unit/test_import_api.py tests/unit/test_document_conversion_v2.py tests/integration/test_loopback_server.py（All checks passed）",
+        "npm --prefix apps/web run test（29 passed）",
+        "npm --prefix apps/web run lint && npm --prefix apps/web run build（通过）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6401'; npm run integration（13 passed，2 skipped）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6402'; npm run browser-test（23 passed）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过）"
+      ],
+      "files": [
+        "apps/service/application/ingest.py",
+        "apps/service/api/main.py",
+        "apps/service/tests/unit/test_import_service.py",
+        "apps/service/tests/unit/test_review_commit_service.py",
+        "apps/service/tests/unit/test_review_commit_api.py",
+        "apps/service/tests/unit/test_import_api.py",
+        "apps/service/tests/unit/test_document_conversion_v2.py",
+        "apps/service/tests/integration/test_loopback_server.py",
+        "apps/web/src/app.js",
+        "browser-tests/loopback.spec.mjs",
+        "progress/tasks/retrieval.json",
+        "progress/risks.json",
+        "progress/logs.json"
+      ],
+      "next": "如需将三类建议自动采纳为可见知识图谱、文件移动或 Markdown 修改，另立带质量门槛、回滚和用户可见变更的任务。"
+    },
+    {
+      "date": "2026-08-05",
+      "taskId": "RET-18-01",
+      "action": "开始自动化导入提交与私有建议隔离",
+      "result": "用户明确确认移除导入审核步骤和审核 API/UI。任务将自动完成解析、Markdown 结构化、Vault 提交、索引与 Embedding；元数据与标签、候选链接和分类建议仅保留为互相隔离的任务私有产出，不参与提交。保留既有路径验证、事务回滚、向量化门禁和可恢复失败语义。",
+      "verification": [],
+      "files": [
+        "progress/config.json",
+        "progress/tasks/retrieval.json",
+        "progress/risks.json",
+        "progress/logs.json"
+      ],
+      "next": "改造导入状态机、移除审核 API/UI，并以自动提交与失败回滚回归验证。"
+    },
+    {
+      "date": "2026-07-28",
+      "taskId": "RET-14-01",
+      "action": "完成全模式问答输出与应用证据分层",
+      "result": "source-lookup、知识整理、深度创作和完整性检查现在都在主对话区呈现可直接使用的正文、结论或可恢复状态；会话头部也不再显示 vault、范围或 Model 元数据。已筛选内容仅作为生成时的内部材料；citation 与 coverage 关联仍保留，并统一在右侧“应用证据”中按结果显示。正文旁的角标可定位到对应证据卡且不参与复制。范围过滤、never-send-cloud、检索排序、任务编排、SQLite/API 合同、Provider 配置与出网策略均未改变；未新增风险或技术债。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_sessions.py tests/unit/test_sessions_api.py（137 passed）",
+        "uv run --directory apps/service ruff check application/sessions.py tests/unit/test_sessions.py tests/unit/test_sessions_api.py（All checks passed）",
+        "npm --prefix apps/web run test（27 passed）",
+        "npm --prefix apps/web run lint（通过）",
+        "npm --prefix apps/web run build（通过）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6341'; npm run browser-test（22 passed）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过；仅 Windows 行尾提示）"
+      ],
+      "files": [
+        "apps/service/application/sessions.py",
+        "apps/service/tests/unit/test_sessions.py",
+        "apps/service/tests/unit/test_sessions_api.py",
+        "apps/web/src/app.js",
+        "apps/web/src/style.css",
+        "apps/web/tests/app.test.js",
+        "browser-tests/loopback.spec.mjs",
+        "progress/tasks/retrieval.json",
+        "progress/logs.json"
+      ],
+      "next": "如需将角标定位到 PDF/DOCX 的具体区域，待原文查看器提供稳定用户级锚点后另立任务。"
+    },
+    {
+      "date": "2026-07-28",
+      "taskId": "RET-14-01",
+      "action": "开始全模式问答输出与应用证据分层",
+      "result": "用户确认所有会话模式均采用直接可用的内容输出。检索、整理、创作和完整性检查的证据将保留为既有可核验数据，并统一移至右侧“应用证据”；内容旁的角标仅用于定位证据，复制操作不包含角标。未改变检索、标题范围、SQLite、Provider 或外发边界。",
+      "verification": [],
+      "files": [
+        "apps/service/application/sessions.py",
+        "apps/service/tests/unit/test_sessions.py",
+        "apps/web/src/app.js",
+        "apps/web/src/style.css",
+        "apps/web/tests/app.test.js",
+        "browser-tests/loopback.spec.mjs",
+        "progress/"
+      ],
+      "next": "先以提示词与渲染回归固定正文、角标和右侧证据分层，再运行服务、前端和浏览器验证。"
+    },
+    {
+      "date": "2026-07-27",
+      "taskId": "RET-12-02",
+      "action": "移除 Provider 响应大小硬上限",
+      "result": "按用户明确决定，OpenAI-compatible Provider 客户端不再对普通 JSON 或流式响应累计字节数施加硬上限。读取仍以固定小块进行，并保留请求超时、取消、重定向拒绝、JSON 格式和 Embedding 向量校验。新增超过 1 MB 的 Embedding 响应与流式事件回归，验证不会再因累计字节数被拒绝。未新增技术债或出网行为。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_openai_compatible_provider.py（36 passed）",
+        "uv run --directory apps/service ruff check adapters/openai_compatible_provider.py tests/unit/test_openai_compatible_provider.py（All checks passed）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过）"
+      ],
+      "files": [
+        "apps/service/adapters/openai_compatible_provider.py",
+        "apps/service/tests/unit/test_openai_compatible_provider.py",
+        "progress/"
+      ],
+      "next": "如 Provider 无界输出造成实际内存问题，另立任务以协议级分页、流式消费或 Provider 合同解决，而不恢复任意字节上限。"
+    },
+    {
+      "date": "2026-07-27",
+      "taskId": "RET-12-01",
+      "action": "完成默认出网、会话单次发送与导入向量化门禁",
+      "result": "已删除 Embedding、元数据、单元卡片、会话生成和 rerank 的逐任务出网授权、确认与执行前授权核验；已验证的 HTTPS Provider 默认允许执行。旧 SQLite outbound_authorizations 历史表和行保留，但新库不再创建且运行时不读取或写入。never-send-cloud、do-not-index、completely-ignore、HTTPS、Provider/model、内容哈希、向量维度和响应校验继续失败关闭。会话工作台仅保留一次发送，浏览器用例已删除准备任务、固定快照和旧执行流程。导入提交会自动向量化；Embedding 服务缺失或 Provider 失败时恢复本次提交的全部已写入文件与索引、记录 failed/rolled-back journal，并保留 retry-commit 状态。未新增技术债。",
+      "verification": [
+        "受影响服务定向回归：Embedding/metadata/unit-card/vault API 21 passed；会话、政策、Provider、rerank 与 vault API 169 passed；提交门禁回归 13 passed。",
+        "npm run unit（前端 24 passed；服务端 572 passed，3 skipped）",
+        "npm run lint（All checks passed）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6262'; npm run integration（11 passed，2 skipped；默认 6240 被既有本机实例占用，未停止该实例）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6262'; npm run browser-test（22 passed）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过）"
+      ],
+      "files": [
+        "apps/service/application/ingest.py",
+        "apps/service/application/embedding_batches.py",
+        "apps/service/application/metadata_batches.py",
+        "apps/service/application/unit_card_batches.py",
+        "apps/service/application/sessions.py",
+        "apps/service/adapters/sqlite_vault_repository.py",
+        "apps/service/adapters/sqlite_session_repository.py",
+        "apps/service/api/main.py",
+        "apps/web/src/app.js",
+        "browser-tests/loopback.spec.mjs",
+        "docs/retrieval-redesign.md",
+        "progress/"
+      ],
+      "next": "如需重新引入交互式出网开关，须另立产品决策和任务，不复用已移除的授权快照。"
+    },
+    {
+      "date": "2026-07-27",
+      "taskId": "RET-11-01",
+      "action": "完成短原子块聚合与派生目录索引排除",
+      "result": "同一标题上下文内连续的 short paragraph atomic projection 现按既有 300 至 500 字目标和 800 字硬上限聚合，合并块保留全部 source locator、起始 graph block identity、阅读顺序和最小置信度。带有效 platform_provenance 的派生 index.md 目录笔记不再进入普通索引、提交期索引或重建；历史 current 目录索引会在 reconcile/rebuild 时失效。当前 vault 已通过运行中服务重建，从 4 个索引文档 / 776 块降至 2 个正文文档 / 49 个唯一块，未修改原始 Markdown，未新增出网行为或技术债。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_index_chunking.py tests/unit/test_index_service.py tests/unit/test_index_graph_projection_rebuild.py -q（30 passed）",
+        "uv run --directory apps/service ruff check domain/retrieval_chunking.py application/indexing.py tests/unit/test_index_chunking.py tests/unit/test_index_service.py（All checks passed）",
+        "npm run unit（通过；前端 26 passed，服务端 591 项收集完成）",
+        "本机服务重启后 POST /api/vaults/<current>/index/rebuild 返回 healthy；current_count=2、semantic_eligible_block_count=49。",
+        "SQLite 只读聚合：49 块、49 个 block_content_sha256、0 个 current derived index.md、平均 340.7 字符。",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过）"
+      ],
+      "files": [
+        "apps/service/domain/retrieval_chunking.py",
+        "apps/service/application/indexing.py",
+        "apps/service/tests/unit/test_index_chunking.py",
+        "apps/service/tests/unit/test_index_service.py",
+        "progress/config.json",
+        "progress/tasks/retrieval.json",
+        "progress/risks.json",
+        "progress/logs.json"
+      ],
+      "next": "如需保留派生目录笔记中的用户自写正文，应先为目录笔记增加显式 provenance role，再调整排除规则。"
+    },
+    {
+      "date": "2026-07-27",
+      "taskId": "RET-12-01",
+      "action": "落地会话单次发送、检索与模型生成",
+      "result": "会话工作台移除了保存语境、准备任务和固定快照的用户操作；用户在同一表单选择 vault、资料范围和已验证 chat Model 后输入问题，页面直接调用 POST /api/sessions/{session_id}/run。服务在同一调用中保存本次选择、建立内部可追溯记录、检索并把仅 outbound policy 允许的证据提交给所选 Model。never-send-cloud 命中的证据仍保留本地检索边界，绝不会写入模型提示词。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_sessions.py tests/unit/test_sessions_api.py -q（94 passed）",
+        "uv run --directory apps/service ruff check application/sessions.py api/main.py tests/unit/test_sessions.py tests/unit/test_sessions_api.py（All checks passed）",
+        "npm --prefix apps/web run test && npm --prefix apps/web run lint && npm --prefix apps/web run build（通过；24 个前端单测）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6262'; npx playwright test --config browser-tests/playwright.config.mjs --grep 'submits the selected session context' --reporter=line（1 passed）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "本任务文件范围 git diff --check（通过）；全工作区检查仍被既有 apps/service/domain/retrieval_rerank.py 的 EOF 空白行阻断。"
+      ],
+      "files": [
+        "apps/service/application/sessions.py",
+        "apps/service/api/main.py",
+        "apps/service/tests/unit/test_sessions.py",
+        "apps/service/tests/unit/test_sessions_api.py",
+        "apps/web/src/app.js",
+        "apps/web/tests/app.test.js",
+        "browser-tests/loopback.spec.mjs",
+        "progress/"
+      ],
+      "next": "RET-12-01 仍需同步其余已删除授权路径、提交前自动向量化门禁及完整 browser suite 的旧流程断言，任务保持进行中。"
+    },
+    {
+      "date": "2026-07-27",
+      "taskId": "RET-12-01",
+      "action": "确认默认出网与提交前自动向量化边界",
+      "result": "用户明确要求删除项目中的所有逐次出网授权，默认允许出网；导入解析产物须在提交完成前自动向当前已验证的 Embedding Provider 向量化。保留 never-send-cloud、do-not-index、completely-ignore、HTTPS、Provider/model 与响应校验；旧授权历史不做破坏性删除。",
+      "verification": [
+        "用户在当前任务明确确认出网隐私边界和提交门禁语义。"
+      ],
+      "files": [
+        "progress/config.json",
+        "progress/tasks/retrieval.json",
+        "progress/risks.json",
+        "progress/logs.json"
+      ],
+      "next": "实施 RET-12-01：移除授权合同与调用链，并建立默认出网的提交前向量化门禁。"
+    },
+    {
+      "date": "2026-07-27",
+      "taskId": "RET-10-01",
+      "action": "完成用户界面来源信息收敛",
+      "result": "生产 React 工作台现以文件、标题、页码、原始资料、摘录和匹配方式展示证据；会话、完整性、知识整理、深度创作、导入审核、版本候选、元数据审核、候选链接与投影重建不再直接显示 Source ID、内容哈希、来源摘要哈希或 graph/chunk 内部定位。未知定位失败关闭，内部字段继续保留给前端数据与后端合同中的去重、核验和授权。导出文件名也不再包含会话 ID。桌面与移动视口均确认信息层级可读；未新增风险或技术债。",
+      "verification": [
+        "npm --prefix apps/web run test（26 passed）",
+        "npm --prefix apps/web run lint（通过）",
+        "npm --prefix apps/web run build（通过）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6257'; npm run browser-test（29 passed）",
+        "桌面 1280px 与移动 390px 视觉检查（通过）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过；仅 Windows 行尾提示）"
+      ],
+      "files": [
+        "apps/web/src/app.js",
+        "apps/web/src/style.css",
+        "apps/web/tests/app.test.js",
+        "browser-tests/loopback.spec.mjs",
+        "progress/"
+      ],
+      "next": "待原文查看器具备稳定的用户级页面或段落锚点后，另立任务将友好页码升级为可点击的原文区域跳转。"
+    },
+    {
       "date": "2026-07-27",
       "taskId": "RET-09-01",
       "action": "完成独立原生 Rerank 模型的受限真实 Provider 测量",
@@ -842,6 +1071,382 @@
         "progress/"
       ],
       "next": "实施 RET-06-04：以独立 vector、lexical 与 heading 候选集校准 RRF，并在不改变 D-002 授权边界的前提下接入点查路径。"
+    },
+    {
+      "date": "2026-07-27",
+      "taskId": "RET-05-05",
+      "action": "开始通用标题层级范围过滤",
+      "result": "用户已确认不以学科、册次、单元等专用元数据约束通用知识库。执行边界改为使用现有 IndexBlock.heading_path：用户明确的标题范围仅可冻结对应标题及其子标题块；无匹配范围必须在 Provider 调用前失败关闭，不能退回 vault 全量证据。未新增出网行为或技术债。",
+      "verification": [],
+      "files": [
+        "apps/service/domain/retrieval_hybrid.py",
+        "apps/service/application/sessions.py",
+        "apps/service/tests/unit/test_retrieval_hybrid.py",
+        "apps/service/tests/unit/test_sessions.py",
+        "progress/"
+      ],
+      "next": "先写 Unit 1/Unit 7 串证据回归，再以最小会话范围过滤实现使其通过。"
+    },
+    {
+      "date": "2026-07-27",
+      "taskId": "RET-05-05",
+      "action": "完成通用标题层级范围过滤",
+      "result": "知识整理和深度创作现根据当前 vault/目录中允许来源的 IndexBlock.heading_path 冻结标题范围；标题命中时仅包含该标题及其子标题块。中文“第一单元”会以标题别名匹配 Unit 1，且以数字边界排除 Unit 7、Unit 10 等相邻编号；用户请求中出现的任意现有标题（如 Project A）同样可作为范围，无需学科、册次、单元或资料类型元数据。旧索引块只在已有 location 以 heading: 开头时作为只读兼容回退。明确标题范围无命中会在调用 Provider 前返回可恢复状态，不退回全范围证据。未新增出网行为或技术债。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_retrieval_hybrid.py tests/unit/test_sessions.py -q（90 passed）",
+        "uv run --directory apps/service ruff check domain/retrieval_hybrid.py application/sessions.py tests/unit/test_retrieval_hybrid.py tests/unit/test_sessions.py（All checks passed）",
+        "npm run unit（通过；前端 24 项、服务 unit 582 项收集）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过）"
+      ],
+      "files": [
+        "apps/service/domain/retrieval_hybrid.py",
+        "apps/service/application/sessions.py",
+        "apps/service/tests/unit/test_retrieval_hybrid.py",
+        "apps/service/tests/unit/test_sessions.py",
+        "progress/"
+      ],
+      "next": "如需让用户在多个同名标题中交互选择范围，另立标题范围预览与选择任务。"
+    },
+    {
+      "date": "2026-07-28",
+      "taskId": "RET-13-01",
+      "action": "开始修正自动意图与显式标题范围扩大",
+      "result": "用户确认先解决最根本的查询理解与范围合同冲突。已定位第一单元重点词汇与短语被判为 completeness，同时元数据范围为 incomplete-scope，应用层随后退回全 vault 覆盖，导致 Unit 1 的 10 块与 Unit 7 的 39 块共同冻结。本步先增加失败回归，再修正意图和完整列举标题范围；不修改索引、Provider 或原始资料。",
+      "verification": [],
+      "files": [
+        "apps/service/domain/retrieval_query.py",
+        "apps/service/application/sessions.py",
+        "apps/service/tests/unit/test_retrieval_query.py",
+        "apps/service/tests/unit/test_sessions.py",
+        "progress/"
+      ],
+      "next": "添加精确输入、Unit 1/Unit 7 和无匹配标题的失败回归，确认现状后实施最小修复。"
+    },
+    {
+      "date": "2026-07-28",
+      "taskId": "RET-13-01",
+      "action": "完成自动意图与显式标题范围闭合",
+      "result": "根因由三层叠加：单元号被误判为 completeness；未解析元数据使完整列举退回全 vault；生产 legacy 块读取又丢失了已经持久化的 heading_path。现已让单元号本身不再触发完整列举，窄词汇主题且非具体问句进入知识整理；完整列举和知识整理对显式标题使用经校验的结构化块，并以 Unit 1 等父级结构前缀作为硬边界，避免 Unit 7 的同名子标题重新命中。显式范围零命中在任务持久化和 Provider 调用前失败关闭，整库请求保持全量语义。默认 legacy 配置下真实 vault 精确输入与完整列举均仅命中 Unit 1 的 10 块且无 Unit 7，Unit 9 为 0 块并阻断，整库仍为 49 块。未调用 Provider，未修改原始 vault、SQLite schema 或既有 6240 进程。",
+      "verification": [
+        "受影响服务定向回归（133 passed）；Ruff（All checks passed）",
+        "npm run unit（前端 24 passed；服务端 587 passed，3 skipped）",
+        "npm run lint（All checks passed）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6265'; npm run integration（11 passed，2 skipped）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6265'; npm run browser-test（22 passed）",
+        "默认 legacy 读取配置、独立 127.0.0.1:6265 真实 vault 预览（Unit 1 精确输入 10 块；完整列举 10 块；Unit 7 均未命中；Unit 9 阻断；整库 49 块）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过；仅 Windows 行尾提示）"
+      ],
+      "files": [
+        "apps/service/domain/retrieval_query.py",
+        "apps/service/application/sessions.py",
+        "apps/service/ports/index_repository.py",
+        "apps/service/adapters/sqlite_index_repository.py",
+        "apps/service/tests/unit/test_retrieval_query.py",
+        "apps/service/tests/unit/test_sessions.py",
+        "apps/service/tests/unit/test_sessions_api.py",
+        "apps/service/tests/unit/test_sqlite_index_rich_blocks.py",
+        "progress/"
+      ],
+      "next": "点查如需在单个多单元文档内把标题范围下推到 BM25、向量和标题 adapter 查询，另立 port 合同任务。"
+    },
+    {
+      "date": "2026-07-28",
+      "taskId": "RET-13-01",
+      "action": "完成通用标题路径检索闭合",
+      "result": "按用户确认将原先围绕 Unit 的修正升级为通用标题层级机制。范围规划直接解析当前允许来源的 IndexBlock.heading_path，请求中的父标题、子标题和多个结构引用必须在同一条实际路径共同成立；完整标题文本优先于章、节、课、部分、模块、项目、卷、阶段、单元等结构别名，任一显式范围未解析或无匹配都在任务持久化及 Provider 调用前失败关闭，不再回退兄弟标题或整个 vault。自动意图改用重点、核心、要点、关键、概念与方法等通用整理主题，不依赖词汇教材特例；all notes、当前 vault 等普通整库表达继续保持全范围语义。legacy/rich 标题视图按块兼容，未修改 SQLite schema、索引块、原始 vault、Provider、Embedding、rerank 或出网规则，未新增技术债。",
+      "verification": [
+        "通用标题范围五文件定向回归（174 passed）；Ruff（All checks passed）",
+        "回归矩阵覆盖 Project A/Project B 共享子标题、跨路径 Project A + Details、缺失结构父级 + 共享子标题、Chapter/Module 中英文别名、两字中文标题、纯中文自然缺失标题、命令噪声标题、all notes 与中英文整库表达",
+        "npm run unit（前端 24 passed；服务端 628 passed，3 skipped）",
+        "npm run lint（All checks passed）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6273'; npm run integration（11 passed，2 skipped；未停止既有 6240 实例）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6274'; npm run browser-test（22 passed）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过；仅 Windows 行尾提示）"
+      ],
+      "files": [
+        "apps/service/domain/retrieval_hybrid.py",
+        "apps/service/domain/retrieval_query.py",
+        "apps/service/application/sessions.py",
+        "apps/service/ports/index_repository.py",
+        "apps/service/adapters/sqlite_index_repository.py",
+        "apps/service/tests/unit/test_retrieval_hybrid.py",
+        "apps/service/tests/unit/test_retrieval_query.py",
+        "apps/service/tests/unit/test_sessions.py",
+        "apps/service/tests/unit/test_sessions_api.py",
+        "apps/service/tests/unit/test_sqlite_index_rich_blocks.py",
+        "progress/"
+      ],
+      "next": "通用标题范围闭合已完成；如需将同一合同扩展到 source-lookup 的 BM25、向量和标题 adapter 查询，另立 port 合同任务。"
+    },
+    {
+      "date": "2026-08-04",
+      "taskId": "RET-15-01",
+      "action": "完成会话消息稳定渲染与问答定位导航",
+      "result": "会话详情刷新不再用空白加载态替换已显示消息或应用证据。首次打开有内容的会话会定位到最新轮次；用户向上阅读后，后续刷新仅保留当前位置，不会回到首条消息。对话区右侧新增按用户提问及其后续输出分组的紧凑定位条，悬停可查看问题摘要，点击可平滑定位并显示当前轮次。未修改会话 API、SQLite schema、Provider、检索、证据关联或任务执行语义；无新增技术债。",
+      "verification": [
+        "npm --prefix apps/web run test（28 passed）",
+        "npm --prefix apps/web run lint（通过）",
+        "npm --prefix apps/web run build（通过）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6377'; npm run browser-test（22 passed）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过；仅 Windows 行尾提示）"
+      ],
+      "files": [
+        "apps/web/src/app.js",
+        "apps/web/src/style.css",
+        "apps/web/tests/app.test.js",
+        "browser-tests/loopback.spec.mjs",
+        "progress/"
+      ],
+      "next": "如会话规模需要窗口化加载或跨设备恢复阅读位置，另立性能与持久化任务。"
+    },
+    {
+      "date": "2026-08-04",
+      "taskId": "RET-16-01",
+      "action": "开始非服务机资料上传与私有暂存",
+      "result": "用户已明确确认，允许非服务机浏览器的文件经公网传输到服务端并暂存。实施仅增加受当前同源会话保护的浏览器上传入口，随后复用现有导入选择、扫描、审核、提交、向量化与索引链路；Vault 授权和写入时机不变。",
+      "verification": [],
+      "files": [
+        "apps/service/api/main.py",
+        "apps/service/application/import_selections.py",
+        "apps/service/application/ingest.py",
+        "apps/service/adapters/local_import_upload_store.py",
+        "apps/service/ports/import_upload_store.py",
+        "apps/web/src/app.js",
+        "progress/"
+      ],
+      "next": "补充上传暂存和任务清理回归，再实现最小 API 与前端交互。"
+    },
+    {
+      "date": "2026-08-04",
+      "taskId": "RET-16-01",
+      "action": "完成非服务机资料上传与私有暂存",
+      "result": "资料页现可由任意已建立同源会话的浏览器选择一个或多个本机文件，并以 multipart 上传到服务数据目录下的随机私有批次目录。上传完成后仅产生既有 ImportSelection，后续扫描、审核、提交、自动向量化和索引链路不变；任务审核提交前不会写入 Vault。服务机 Windows 文件和文件夹选择器仍保留。单文件超过 512 MiB、非法文件名和无效批次会失败返回；未消费选择过期、创建任务失败或最后一个引用文件的任务删除后均会清理暂存，不暴露绝对路径。未新增技术债。",
+      "verification": [
+        "服务上传/选择/API 定向回归（16 passed）与 Ruff（All checks passed）",
+        "前端 lint、28 项单测和构建通过",
+        "完整 unit（前端 28 passed；服务端 639 项收集，3 skipped）",
+        "真实 loopback multipart 集成回归（12 passed，2 skipped）",
+        "浏览器资料页文件选择与任务创建回归（22 passed）"
+      ],
+      "files": [
+        "apps/service/adapters/local_import_upload_store.py",
+        "apps/service/ports/import_upload_store.py",
+        "apps/service/application/import_selections.py",
+        "apps/service/application/ingest.py",
+        "apps/service/api/main.py",
+        "apps/service/pyproject.toml",
+        "apps/service/uv.lock",
+        "apps/service/tests/unit/test_import_uploads.py",
+        "apps/service/tests/unit/test_import_selections.py",
+        "apps/service/tests/unit/test_import_api.py",
+        "apps/service/tests/integration/test_loopback_server.py",
+        "apps/web/src/app.js",
+        "apps/web/tests/app.test.js",
+        "browser-tests/loopback.spec.mjs",
+        "progress/"
+      ],
+      "next": "如需使公开 Tunnel 具备独立身份认证、上传配额、断点续传或浏览器文件夹递归上传，应先创建专门的访问控制与传输任务。"
+    },
+    {
+      "date": "2026-08-04",
+      "taskId": "RET-16-01",
+      "action": "扩展远程多文件与文件夹上传",
+      "result": "用户明确要求文件夹和多文件上传。浏览器多文件上传已存在，本步新增可保留相对路径的浏览器文件夹选择，并以现有 directory 导入合同进入递归扫描；不改变 Vault 写入与审核语义。",
+      "verification": [],
+      "files": [
+        "apps/service/adapters/local_import_upload_store.py",
+        "apps/service/ports/import_upload_store.py",
+        "apps/service/api/main.py",
+        "apps/web/src/app.js",
+        "apps/service/tests/",
+        "browser-tests/",
+        "progress/"
+      ],
+      "next": "为目录层级暂存、API directory 选择、真实递归扫描和浏览器文件夹控件补失败回归后完成实现。"
+    },
+    {
+      "date": "2026-08-04",
+      "taskId": "RET-16-01",
+      "action": "完成非服务机单、多文件和文件夹上传",
+      "result": "非服务机浏览器现在可选择单个文件、多个文件或一个文件夹并经同源 multipart 上传。普通文件继续按文件选择进入既有导入链路；文件夹的 webkitRelativePath 会逐段规范化并在随机私有暂存区保留层级，作为一个 directory 选择复用既有递归扫描。上传在审核提交前不会写入 Vault，服务机 Windows 文件和文件夹选择器以及 Vault 授权、managed_root、sources/notes、审核、提交、向量化和索引语义均未改变。删除任务或过期未消费选择会清理对应文件或文件夹暂存，API 不返回客户端或服务端绝对路径。未新增技术债；公开 Tunnel 的独立身份认证、配额与可恢复上传继续由 RET-R015 跟踪。",
+      "verification": [
+        "服务上传/选择/API 定向回归（22 passed）与完整 lint（通过）",
+        "前端 lint、29 项单测和构建通过",
+        "真实 loopback multipart 集成回归（13 passed，2 skipped）",
+        "浏览器多文件和文件夹选择、相对路径 multipart 与任务创建回归（23 passed）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过；仅 Windows 行尾提示）"
+      ],
+      "files": [
+        "apps/service/adapters/local_import_upload_store.py",
+        "apps/service/ports/import_upload_store.py",
+        "apps/service/application/import_selections.py",
+        "apps/service/application/ingest.py",
+        "apps/service/api/main.py",
+        "apps/service/pyproject.toml",
+        "apps/service/uv.lock",
+        "apps/service/tests/unit/test_import_uploads.py",
+        "apps/service/tests/unit/test_import_selections.py",
+        "apps/service/tests/unit/test_import_api.py",
+        "apps/service/tests/integration/test_loopback_server.py",
+        "apps/web/src/app.js",
+        "apps/web/tests/app.test.js",
+        "browser-tests/loopback.spec.mjs",
+        "progress/"
+      ],
+      "next": "如需为公开 Tunnel 增加独立身份认证、上传配额、断点续传或可恢复上传，另立访问控制与传输任务。"
+    },
+    {
+      "date": "2026-08-05",
+      "taskId": "RET-17-01",
+      "action": "开始 PDF/DOCX Markdown Provider 结构化扩展",
+      "result": "用户明确要求 PDF 与 DOCX 解析后的原格式 Markdown 也必须提交给 Markdown Provider 做结构化，并要求移除重复页眉、页脚等噪音。用户同时明确确认该解析正文可按现有 Provider 出网边界发送。实施会保留 DocumentGraph、原始文件、图块 ID、页码/OOXML locator 和人工审核语义；Provider 仅返回经严格核验的结构分类，整块可回链的 noise 才从私有候选排除。",
+      "verification": [],
+      "files": [
+        "apps/service/application/ingest.py",
+        "apps/service/application/markdown_structuring.py",
+        "apps/service/domain/derived_notes.py",
+        "apps/service/tests/unit/",
+        "progress/"
+      ],
+      "next": "先补 PDF/DOCX Provider 输入、长文上下文、页眉页脚 noise、图块溯源和失败恢复回归，再做最小应用层接线。"
+    },
+    {
+      "date": "2026-08-05",
+      "taskId": "RET-17-01",
+      "action": "完成 Markdown Provider 结构化导入、PDF/DOCX 投影与上下文分块",
+      "result": "Provider 配置现有独立的 markdown 模型类型、验证、默认选择和可回滚 SQLite 升级。原生 .md 与已选 PDF/DOCX DocumentGraph 的格式保留 Markdown 投影都会先按 vault outbound policy 拦截 never-send-cloud 或 completely-ignore，再把结构安全的源单位发送给该模型，而不是把本地规则结果作为任务结构；后续长文分块携带当前有效的标题层级，不重复正文，并同时限制 24,000 字符与 64 个源单位以保证分类 JSON 可完整返回。提示词要求模型将每个重复且不承载正文的页眉、页脚、页码等分页伪影标为 noise；PDF/DOCX 仅在该 noise 可完整回链单个 DocumentGraph 块时从私有候选排除，原始文件、图块 ID、定位和审核语义不变。模型响应仍须逐单位、顺序一致地覆盖所有源单位；兼容但校验 chunk_id 回显，拒绝任何其他顶层字段。策略、Provider、配置 revision 或响应核验失败会使导入任务保持 restart-derivation 可恢复状态。默认出网边界不变；RET-R016 继续跟踪模型语义分类质量，未新增技术债。",
+      "verification": [
+        "PDF/DOCX Provider 结构化、长文上下文、噪音排除、图块溯源与 chunk_id 回显定向回归（66 passed，1 skipped）",
+        "受影响服务文件 Ruff（All checks passed）",
+        "npm run lint（通过）",
+        "npm run unit（前端 29 passed；服务端 664 passed，3 skipped）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6394'; npm run integration（13 passed，2 skipped）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6395'; npm run browser-test（23 passed）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过；仅 Windows 行尾提示）"
+      ],
+      "files": [
+        "apps/service/domain/markdown_structuring.py",
+        "apps/service/application/markdown_structuring.py",
+        "apps/service/application/ingest.py",
+        "apps/service/domain/derived_notes.py",
+        "apps/service/tests/unit/test_markdown_structuring.py",
+        "apps/service/tests/unit/test_import_service.py",
+        "apps/service/tests/unit/test_document_conversion_v2.py",
+        "progress/"
+      ],
+      "next": "如需让 vault 重建消费 Provider 结构块，先设计 durable projection 合同；同时以已审阅的脱敏长 Markdown 样本衡量 RET-R016 的模型分类质量。"
+    },
+    {
+      "date": "2026-08-05",
+      "taskId": "RET-17-01",
+      "action": "修正为 Markdown Provider 直出最终 Markdown并完成真实任务验证",
+      "result": "按用户确认移除 JSON blocks 协议：Provider 现在直接返回最终 Markdown，服务按结构安全分块发送并拼接，不再根据 JSON 做本地结构化。真实任务 c6fb7415-f03c-43cc-8c0f-319fc023631b 重启后进入 waiting-for-review；解析图含 182 个图块，Provider Markdown 9978 字符，10 个重复分页噪音图块保留 graph ID，私有候选命中 noise 的行数为 0。Provider 的 Markdown 重排不再误判为协议失败，唯一图块仍保留原始图块溯源与审核语义。",
+      "verification": [
+        "定向 Markdown/PDF/DOCX Provider 直出、长文上下文、JSON 拒绝、噪音排除与图块溯源回归（71 passed，1 skipped）",
+        "npm run lint（通过）",
+        "npm run unit（前端 29 passed；服务端 669 passed，3 skipped）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6396'; npm run integration（13 passed，2 skipped）",
+        "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6397'; npm run browser-test（23 passed）",
+        "git diff --check（通过；仅 Windows 行尾提示）"
+      ],
+      "files": [
+        "apps/service/application/markdown_structuring.py",
+        "apps/service/domain/markdown_structuring.py",
+        "apps/service/domain/derived_notes.py",
+        "apps/service/application/ingest.py",
+        "apps/service/tests/unit/test_markdown_structuring.py",
+        "apps/service/tests/unit/test_import_service.py",
+        "apps/service/tests/unit/test_document_conversion_v2.py",
+        "progress/"
+      ],
+      "next": "继续以已审阅、不可逆脱敏 Markdown 样本评估 Provider 的正文保留和噪音识别质量；如需让 vault 重建消费 Provider Markdown，另立 durable projection 任务。"
+    },
+    {
+      "date": "2026-08-05",
+      "taskId": "RET-17-01",
+      "action": "优化 Markdown Provider 清洗与标题层级提示词",
+      "result": "按用户确认将提示词扩展为删除重复页眉、页脚、运行标题、页码、广告和 OCR 噪音，并要求 Provider 根据标题语义、编号、相邻内容和继承标题上下文重建 Markdown 标题层级；正文措辞、顺序和结构保持不变，歧义内容保留。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_markdown_structuring.py（14 passed）",
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_markdown_structuring.py tests/unit/test_import_service.py tests/unit/test_providers.py tests/unit/test_sqlite_provider_repository_rerank.py（45 passed）",
+        "uv run --directory apps/service ruff check application/markdown_structuring.py tests/unit/test_markdown_structuring.py（All checks passed）",
+        "git diff --check（通过）"
+      ],
+      "files": [
+        "apps/service/application/markdown_structuring.py",
+        "apps/service/tests/unit/test_markdown_structuring.py",
+        "progress/"
+      ],
+      "next": "继续以已审阅、不可逆脱敏 Markdown 样本评估噪音识别和标题层级质量；如需让 vault 重建消费 Provider Markdown，另立 durable projection 任务。"
+    },
+    {
+      "date": "2026-08-05",
+      "taskId": "RET-19-01",
+      "action": "开始 PDF 原生优先与按页 MinerU 回退",
+      "result": "用户确认 PDF 按页优先使用原生解析，原生文字为空或质量不通过时回退 MinerU；本步将以数字/英文 token 完整性校验保护 GB15577、15 min、1，并保留图片、公式和两种解析 artifact。",
+      "verification": [],
+      "files": [
+        "apps/service/workers/converters/launcher.py",
+        "apps/service/workers/document_parser.py",
+        "apps/service/tests/unit/test_document_conversion_v2.py",
+        "apps/service/tests/unit/test_document_parser.py",
+        "progress/"
+      ],
+      "next": "先补失败测试，再实现页面级 native/MinerU 合并并用当前 PDF 样例验证。"
+    },
+    {
+      "date": "2026-08-05",
+      "taskId": "RET-19-01",
+      "action": "完成 PDF 原生优先与按页 MinerU 回退",
+      "result": "PDF 现先按页读取原生文字层并比较数字/英文 token 计数；原生文字为空、读取失败或完整性失败时，保留默认 pipeline 产物并按相邻页范围调用已批准的本机 MinerU VLM。混合图保留原始 PDF、pipeline/VLM artifact、图片 asset、公式和页面级 fallback 标记；空白分隔页不会被伪造成正文。已将本机 profile 绑定 VLM 缓存目录和 hash，保持离线运行。",
+      "verification": [
+        "PDF converter/parser/provisioning 定向回归（61 passed）",
+        "受影响文件 Ruff（All checks passed）",
+        "服务端完整 unit（641 passed，2 skipped）",
+        "真实 23 页 PDF smoke（158 s）：selected=native-pdf+mineru；18 页原生覆盖；2、4、6、22、23 页 VLM 回退；第 12 页保留 GB15577、15 min、1；VLM artifact 14 个",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过）"
+      ],
+      "files": [
+        "apps/service/workers/converters/launcher.py",
+        "apps/service/workers/converters/profiles.py",
+        "apps/service/workers/converters/provisioning.py",
+        "apps/service/tests/unit/test_document_conversion_v2.py",
+        "progress/"
+      ],
+      "next": "以更多已审阅、脱敏的扫描 PDF 衡量 VLM 非空页的文字、公式和表格质量，再决定是否调整页级质量阈值或默认 backend。"
+    },
+    {
+      "date": "2026-08-05",
+      "taskId": "RET-06-05",
+      "action": "完成前端检索模式切换",
+      "result": "会话工作台新增仅关键词、仅语义和关键词与语义混合三种即时模式。模式通过本机会话保护 API 切换；仅关键词只调用词法通道，仅语义只调用向量通道并在语义索引或 Embedding Provider 不可用时失败关闭，混合模式保留词法、向量和标题 RRF 并在语义不可用时显示本地降级。",
+      "verification": [
+        "服务端检索模式、API 和运行时定向回归通过（141 passed）",
+        "前端单测 30 passed；lint/build 通过",
+        "OBSIDIAN_PLATFORM_TEST_PORT=6403 integration（13 passed，2 skipped）",
+        "OBSIDIAN_PLATFORM_TEST_PORT=6405 browser-test（23 passed）",
+        "git diff --check（通过；仅 Windows 行尾转换提示）"
+      ],
+      "files": [
+        "apps/service/domain/retrieval_hybrid.py",
+        "apps/service/application/sessions.py",
+        "apps/service/api/main.py",
+        "apps/service/tests/unit/test_sessions.py",
+        "apps/service/tests/unit/test_sessions_api.py",
+        "apps/web/src/app.js",
+        "apps/web/src/style.css",
+        "apps/web/tests/app.test.js",
+        "browser-tests/loopback.spec.mjs",
+        "progress/"
+      ],
+      "next": "如需跨服务重启保存模式或缓存重复查询的 Embedding，另立运行时配置和查询向量缓存任务。"
     }
   ]
 }

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from domain.policies import OutboundScope, normalize_vault_relative_path
+from domain.policies import normalize_vault_relative_path
 
 
 UNIT_CARD_CONTENT_CATEGORIES = (
@@ -58,8 +58,8 @@ class UnitCardBlockedDocument:
 
 
 @dataclass(frozen=True)
-class UnitCardAuthorizationPreview:
-    """Content-free facts for the paired chat and embedding authorizations."""
+class UnitCardBatchPreview:
+    """Content-free facts for the paired chat and embedding batch."""
 
     vault_id: str
     scope: UnitCardBatchScope
@@ -80,7 +80,7 @@ class UnitCardAuthorizationPreview:
     blocked_block_count: int
     blocked_documents: tuple[UnitCardBlockedDocument, ...]
     content_categories: tuple[str, ...]
-    scopes: tuple[OutboundScope, ...]
+    relative_paths: tuple[str, ...]
 
     def __post_init__(self) -> None:
         identifiers = (
@@ -96,9 +96,9 @@ class UnitCardAuthorizationPreview:
             self.task_id,
         )
         if any(not isinstance(value, str) or not value.strip() for value in identifiers):
-            raise ValueError("Unit card authorization preview identity is invalid.")
+            raise ValueError("Unit card batch preview identity is invalid.")
         if type(self.policy_revision) is not int or self.policy_revision < 1:
-            raise ValueError("Unit card authorization preview policy revision is invalid.")
+            raise ValueError("Unit card batch preview policy revision is invalid.")
         counts = (
             self.file_count,
             self.block_count,
@@ -107,22 +107,20 @@ class UnitCardAuthorizationPreview:
             self.blocked_block_count,
         )
         if any(type(value) is not int or value < 0 for value in counts):
-            raise ValueError("Unit card authorization preview counts are invalid.")
-        if self.file_count != len(self.scopes) or self.blocked_file_count < len(self.blocked_documents):
-            raise ValueError("Unit card authorization preview scope counts are invalid.")
+            raise ValueError("Unit card batch preview counts are invalid.")
+        if self.file_count != len(self.relative_paths) or self.blocked_file_count < len(self.blocked_documents):
+            raise ValueError("Unit card batch preview path counts are invalid.")
         if self.content_categories != UNIT_CARD_CONTENT_CATEGORIES:
-            raise ValueError("Unit card authorization content categories are invalid.")
+            raise ValueError("Unit card batch content categories are invalid.")
 
     @property
-    def is_authorizable(self) -> bool:
+    def is_executable(self) -> bool:
         return self.file_count > 0 and self.block_count > 0 and self.card_count > 0
 
 
 @dataclass(frozen=True)
 class UnitCardExecutionReport:
     vault_id: str
-    chat_authorization_id: str
-    embedding_authorization_id: str
     status: str
     file_count: int
     block_count: int
@@ -133,8 +131,6 @@ class UnitCardExecutionReport:
     def __post_init__(self) -> None:
         if (
             not self.vault_id
-            or not self.chat_authorization_id
-            or not self.embedding_authorization_id
             or self.status not in {"completed", "failed"}
         ):
             raise ValueError("Unit card execution report identity is invalid.")

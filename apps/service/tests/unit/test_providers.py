@@ -58,49 +58,52 @@ class FakeCredentials:
 class FakeClient:
     def __init__(self) -> None:
         self.calls = []
+        self.secrets = []
         self.stream_started: threading.Event | None = None
         self.release_stream: threading.Event | None = None
+        self.chat_response = '{"results":[]}'
 
     def discover_models(self, endpoint, secret, cancel_event=None):
+        self.secrets.append(secret)
         self.calls.append("discover")
-        return ("chat-model", "embedding-model", "rerank-model")
+        return ("chat-model", "embedding-model", "rerank-model", "markdown-model")
 
     def health_check(self, endpoint, secret, cancel_event=None) -> None:
+        self.secrets.append(secret)
         self.calls.append("health")
 
     def probe_streaming_generation(self, endpoint, secret, model_id, cancel_event=None) -> None:
+        self.secrets.append(secret)
         self.calls.append(("chat", model_id))
         if self.stream_started and self.release_stream:
             self.stream_started.set()
             self.release_stream.wait(timeout=2)
 
     def probe_embedding(self, endpoint, secret, model_id, cancel_event=None) -> None:
+        self.secrets.append(secret)
         self.calls.append(("embedding", model_id))
 
     def probe_rerank(self, endpoint, secret, model_id, cancel_event=None) -> None:
+        self.secrets.append(secret)
         self.calls.append(("rerank-probe", model_id))
 
+
     def create_embeddings(self, endpoint, secret, model_id, inputs, cancel_event=None):
+        self.secrets.append(secret)
         self.calls.append(("create-embeddings", model_id, inputs))
         return tuple((float(index), 1.0) for index, _value in enumerate(inputs, start=1))
 
     def rerank(self, endpoint, secret, model_id, query, documents, cancel_event=None):
+        self.secrets.append(secret)
         self.calls.append(("rerank", model_id, query, documents))
         return tuple(1.0 / (index + 1) for index in range(len(documents)))
 
     def generate_chat_with_usage(
         self, endpoint, secret, model_id, prompt, max_output_tokens, cancel_event=None
     ):
+        self.secrets.append(secret)
         self.calls.append(("generate-chat-with-usage", model_id, max_output_tokens))
-        return ChatGeneration("{\"results\":[]}", ChatUsage(10, 5, 15))
-
-
-class FakeInvalidator:
-    def __init__(self) -> None:
-        self.calls = []
-
-    def invalidate_provider_authorizations(self, provider_id, updated_at) -> None:
-        self.calls.append(provider_id)
+        return ChatGeneration(self.chat_response, ChatUsage(10, 5, 15))
 
 
 class FakeUnitCardInvalidator:
@@ -117,7 +120,6 @@ def make_service(*, repository=None, client=None, unit_card_invalidator=None):
         repository=repository or FakeRepository(),
         credentials=credentials,
         client=client or FakeClient(),
-        authorization_invalidator=FakeInvalidator(),
         unit_card_invalidator=unit_card_invalidator,
     )
     return service, service.repository, credentials
@@ -138,9 +140,43 @@ def test_provider_test_only_discovers_and_checks_health() -> None:
     assert {model.model_id for model in provider.models} == {
         "chat-model",
         "embedding-model",
+        "markdown-model",
         "rerank-model",
     }
     assert all(model.model_type is None for model in provider.models)
+
+
+def test_loopback_provider_without_a_key_can_be_verified_and_used() -> None:
+    client = FakeClient()
+    service, _, credentials = make_service(client=client)
+
+    provider = service.create("Local", "http://127.0.0.1:11434/v1")
+    assert provider.credential_configured is False
+    assert credentials.values == {}
+
+    discovered = service.test(provider.provider_id)
+    service.configure_model(discovered.provider_id, "chat-model", "chat")
+    verified = service.test_model(discovered.provider_id, "chat-model")
+    service.set_default("chat", verified.provider_id, "chat-model")
+    response = service.generate_chat_with_usage(
+        verified.provider_id,
+        "chat-model",
+        "Hello",
+        max_output_tokens=32,
+        expected_provider_updated_at=verified.updated_at,
+    )
+
+    assert response.content == '{"results":[]}'
+    assert service.resolve_model("chat").provider.provider_id == provider.provider_id
+    assert client.secrets == ["", "", "", ""]
+    assert credentials.reads == []
+
+
+def test_provider_without_a_key_must_use_a_loopback_endpoint() -> None:
+    service, _, _ = make_service()
+
+    with pytest.raises(ProviderValidationError, match="non-local"):
+        service.create("Cloud", "https://provider.example/v1")
 
 
 def test_models_are_verified_by_type_and_defaults_are_independent() -> None:
@@ -166,6 +202,26 @@ def test_models_are_verified_by_type_and_defaults_are_independent() -> None:
     assert service.resolve_model("chat").model.model_id == "chat-model"
     assert service.resolve_model("embedding").model.model_id == "embedding-model"
     assert service.resolve_model("rerank").model.model_id == "rerank-model"
+
+
+def test_markdown_model_is_verified_and_generation_is_locked_to_its_default() -> None:
+    client = FakeClient()
+    client.chat_response = '{"blocks":[]}'
+    service, _, _ = make_service(client=client)
+    provider = discovered_provider(service)
+
+    service.configure_model(provider.provider_id, "markdown-model", "markdown")
+    verified = service.test_model(provider.provider_id, "markdown-model")
+    service.set_default("markdown", verified.provider_id, "markdown-model")
+
+    assert service.generate_markdown(
+        verified.provider_id,
+        "markdown-model",
+        "structure this",
+        max_output_tokens=128,
+        expected_provider_updated_at=verified.updated_at,
+    ) == '{"blocks":[]}'
+    assert ("chat", "markdown-model") in client.calls
 
 
 def test_refresh_invalidates_previously_verified_models() -> None:
@@ -238,12 +294,16 @@ def test_sqlite_persists_typed_models_and_dual_defaults_without_secret(tmp_path)
     service, _, _ = make_service(repository=repository)
     provider = discovered_provider(service)
     service.configure_model(provider.provider_id, "chat-model", "chat")
+    service.configure_model(provider.provider_id, "markdown-model", "markdown")
     service.test_model(provider.provider_id, "chat-model")
+    service.test_model(provider.provider_id, "markdown-model")
     service.set_default("chat", provider.provider_id, "chat-model")
+    service.set_default("markdown", provider.provider_id, "markdown-model")
 
     reopened = SqliteProviderRepository(tmp_path / "providers.sqlite3")
     assert reopened.get(provider.provider_id).models[0].model_type in {"chat", None}
     assert reopened.get_default("chat").model_id == "chat-model"
+    assert reopened.get_default("markdown").model_id == "markdown-model"
     assert b"secret" not in (tmp_path / "providers.sqlite3").read_bytes()
 
 
@@ -317,7 +377,7 @@ def test_measured_generation_rejects_a_stale_revision_before_provider_egress() -
 def test_measured_generation_rejects_http_before_reading_a_provider_credential() -> None:
     client = FakeClient()
     service, _, credentials = make_service(client=client)
-    provider = service.test(service.create("Cloud", "http://127.0.0.1/v1", "secret").provider_id)
+    provider = service.test(service.create("Cloud", "http://provider.example/v1", "secret").provider_id)
     service.configure_model(provider.provider_id, "chat-model", "chat")
     verified = service.test_model(provider.provider_id, "chat-model")
     credentials.reads.clear()
@@ -381,7 +441,7 @@ def test_batch_embeddings_reject_stale_configuration_revisions_before_provider_e
 def test_batch_embeddings_refuse_http_even_for_an_otherwise_verified_model() -> None:
     client = FakeClient()
     service, _, _ = make_service(client=client)
-    provider = service.test(service.create("Cloud", "http://127.0.0.1/v1", "secret").provider_id)
+    provider = service.test(service.create("Cloud", "http://provider.example/v1", "secret").provider_id)
     service.configure_model(provider.provider_id, "embedding-model", "embedding")
     verified = service.test_model(provider.provider_id, "embedding-model")
 
@@ -445,7 +505,7 @@ def test_rerank_rejects_http_before_reading_a_provider_credential_or_egress() ->
     provider = discovered_provider(service)
     service.configure_model(provider.provider_id, "rerank-model", "rerank")
     verified = service.test_model(provider.provider_id, "rerank-model")
-    repository.save(replace(verified, endpoint="http://127.0.0.1/v1"))
+    repository.save(replace(verified, endpoint="http://provider.example/v1"))
     credentials.reads.clear()
 
     with pytest.raises(ProviderUnavailableError, match="HTTPS"):
@@ -464,7 +524,7 @@ def test_rerank_rejects_http_before_reading_a_provider_credential_or_egress() ->
 def test_rerank_model_test_rejects_http_before_reading_a_provider_credential() -> None:
     client = FakeClient()
     service, _, credentials = make_service(client=client)
-    provider = service.test(service.create("Cloud", "http://127.0.0.1/v1", "secret").provider_id)
+    provider = service.test(service.create("Cloud", "http://provider.example/v1", "secret").provider_id)
     service.configure_model(provider.provider_id, "rerank-model", "rerank")
     credentials.reads.clear()
 

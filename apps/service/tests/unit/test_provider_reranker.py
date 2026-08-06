@@ -93,7 +93,7 @@ def test_provider_reranker_requires_https_before_sending_documents() -> None:
     assert error.value.network_request_count == 0
 
 
-def test_provider_reranker_rejects_a_changed_authorized_provider_revision_before_sending() -> None:
+def test_provider_reranker_rejects_a_changed_provider_revision_before_sending() -> None:
     providers = _Providers()
     providers.resolved = ResolvedProviderModel(
         replace(providers.resolved.provider, updated_at="revision-2"),

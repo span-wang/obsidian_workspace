@@ -16,6 +16,7 @@ from domain.evidence import (
     StructuredContentUnit,
     document_locator_from_dict,
 )
+from domain.markdown_structuring import MarkdownStructureBlock
 
 
 PROVENANCE_SCHEMA_VERSION = 1
@@ -339,6 +340,9 @@ class DerivedMarkdownProposal:
     graph_block_ids: tuple[str, ...] = ()
     graph_block_locators: tuple[tuple[EvidenceLocator, ...], ...] = ()
     asset_manifest: tuple[dict[str, object], ...] = ()
+    structured_blocks: tuple[MarkdownStructureBlock, ...] = ()
+    noise_graph_block_ids: tuple[str, ...] = ()
+    provider_markdown: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -367,6 +371,9 @@ class DerivedMarkdownProposal:
                 for locators in self.graph_block_locators
             ],
             "asset_manifest": list(self.asset_manifest),
+            "structured_blocks": [block.to_dict() for block in self.structured_blocks],
+            "noise_graph_block_ids": list(self.noise_graph_block_ids),
+            "provider_markdown": self.provider_markdown,
         }
 
     @classmethod
@@ -405,6 +412,16 @@ class DerivedMarkdownProposal:
                 for locators in list(value.get("graph_block_locators", []))
             ),
             asset_manifest=tuple(dict(asset) for asset in list(value.get("asset_manifest", []))),
+            structured_blocks=tuple(
+                MarkdownStructureBlock.from_dict(dict(block))
+                for block in list(value.get("structured_blocks", []))
+            ),
+            noise_graph_block_ids=tuple(
+                str(block_id) for block_id in list(value.get("noise_graph_block_ids", []))
+            ),
+            provider_markdown=(
+                str(value["provider_markdown"]) if value.get("provider_markdown") is not None else None
+            ),
         )
 
 
@@ -416,8 +433,16 @@ class NativeMarkdownProposal:
     content_sha256: str
     markdown: str
     heading_locations: tuple[str, ...]
+    structured_blocks: tuple[MarkdownStructureBlock, ...] = ()
     revision: int = 1
     kind: str = "native"
+
+    def __post_init__(self) -> None:
+        previous_offset = 0
+        for block in self.structured_blocks:
+            if block.end_offset > len(self.markdown) or block.start_offset < previous_offset:
+                raise ValueError("Native Markdown structure blocks must be ordered source slices.")
+            previous_offset = block.end_offset
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -428,6 +453,7 @@ class NativeMarkdownProposal:
             "content_sha256": self.content_sha256,
             "markdown": self.markdown,
             "heading_locations": list(self.heading_locations),
+            "structured_blocks": [block.to_dict() for block in self.structured_blocks],
             "revision": self.revision,
         }
 
@@ -535,6 +561,78 @@ def derive_graph_markdown_proposal(
     )
 
 
+def structure_graph_markdown_proposal(
+    proposal: DerivedMarkdownProposal,
+    *,
+    graph: DocumentGraph,
+    provider_markdown: str,
+) -> DerivedMarkdownProposal:
+    """Apply direct Provider Markdown while preserving graph-backed source identity."""
+
+    if (
+        proposal.graph_id != graph.graph_id
+        or proposal.graph_revision != graph.graph_revision
+        or proposal.graph_selected_attempt_id != graph.selected_attempt_id
+        or proposal.source_sha256 != graph.source_sha256
+    ):
+        raise ValueError("Provider structure graph identity does not match the derived proposal.")
+    rendered = render_document_graph(graph)
+    unit_texts, noise_graph_block_ids = _align_provider_markdown_to_graph(
+        graph, provider_markdown
+    )
+    if len(unit_texts) != len(proposal.units):
+        raise ValueError("Provider Markdown cannot be aligned with the selected conversion graph.")
+    updated = replace(
+        proposal,
+        units=tuple(replace(unit, text=text) for unit, text in zip(proposal.units, unit_texts)),
+        structured_blocks=(),
+        noise_graph_block_ids=noise_graph_block_ids,
+        provider_markdown=provider_markdown.strip(),
+    )
+    return _with_graph_provenance(
+        updated,
+        graph=graph,
+        graph_block_locators=proposal.graph_block_locators,
+        asset_manifest=proposal.asset_manifest,
+        rendered=rendered,
+    )
+
+
+def _align_provider_markdown_to_graph(
+    graph: DocumentGraph, provider_markdown: str
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Map preserved Markdown back to graph blocks; only repeated omissions are pagination noise."""
+
+    normalized = provider_markdown.strip()
+    if not normalized:
+        raise ValueError("Markdown Provider returned empty Markdown.")
+    assets = {asset.asset_id: asset for asset in graph.assets}
+    source_blocks = tuple(_render_document_block(block, assets) for block in graph.blocks)
+    repeated = {
+        block_text.strip()
+        for block_text in source_blocks
+        if block_text.strip() and sum(candidate.strip() == block_text.strip() for candidate in source_blocks) > 1
+    }
+    cursor = 0
+    aligned: list[str] = []
+    noise_ids: list[str] = []
+    for graph_block, source_text in zip(graph.blocks, source_blocks):
+        position = normalized.find(source_text, cursor)
+        if position >= cursor:
+            aligned.append(source_text)
+            cursor = position + len(source_text)
+            continue
+        if source_text.strip() in repeated:
+            aligned.append("")
+            noise_ids.append(graph_block.block_id)
+            continue
+        # A Provider may normalize whitespace or repair Markdown syntax. Keep the
+        # original graph unit for audit and candidate provenance in that case; the
+        # final Provider Markdown is stored separately for the generated note.
+        aligned.append(source_text)
+    return tuple(aligned), tuple(noise_ids)
+
+
 def _proposal_unit_kind(block: DocumentBlock) -> str:
     if block.kind == "heading":
         level = int(block.payload.to_dict()["level"])
@@ -585,6 +683,14 @@ def _with_graph_provenance(
                 ),
             )
         )
+    if proposal.provider_markdown:
+        provider_bodies = _split_provider_markdown_for_notes(
+            proposal.provider_markdown, proposal.groups, proposal.units
+        )
+        notes = [
+            replace(note, markdown=_replace_note_body(note.markdown, body))
+            for note, body in zip(notes, provider_bodies)
+        ]
     index_locators = locators_for(tuple(range(len(proposal.units))))
     index_provenance = _provenance(
         vault_id=proposal.vault_id,
@@ -606,7 +712,7 @@ def _with_graph_provenance(
             f"来源：[[{proposal.source_relative_path}|原始资料]]\n"
         ),
     )
-    if "\n\n".join(unit.text for unit in proposal.units) != rendered.markdown:
+    if proposal.provider_markdown is None and "\n\n".join(unit.text for unit in proposal.units) != rendered.markdown:
         raise ValueError("Typed graph rendering drifted before proposal persistence.")
     return replace(
         proposal,
@@ -711,16 +817,25 @@ def relocate_native_proposal(
 
 
 def native_markdown_proposal(
-    *, item_id: int, vault_id: str, relative_path: str, content_sha256: str, markdown: str
+    *,
+    item_id: int,
+    vault_id: str,
+    relative_path: str,
+    content_sha256: str,
+    markdown: str,
+    structured_blocks: tuple[MarkdownStructureBlock, ...] = (),
 ) -> NativeMarkdownProposal:
     content_sha256 = content_sha256.lower()
     if not _SHA256_PATTERN.fullmatch(content_sha256):
         raise ValueError("Native Markdown SHA-256 must be a lowercase 64-hex string.")
-    headings = tuple(
-        f"line:{line_number}"
-        for line_number, line in enumerate(markdown.splitlines(), start=1)
-        if line.lstrip().startswith("#")
-    )
+    if structured_blocks:
+        headings = tuple(f"line:{block.start_line}" for block in structured_blocks if block.kind == "heading")
+    else:
+        headings = tuple(
+            f"line:{line_number}"
+            for line_number, line in enumerate(markdown.splitlines(), start=1)
+            if line.lstrip().startswith("#")
+        )
     return NativeMarkdownProposal(
         item_id=item_id,
         vault_id=vault_id,
@@ -728,12 +843,14 @@ def native_markdown_proposal(
         content_sha256=content_sha256,
         markdown=markdown,
         heading_locations=headings,
+        structured_blocks=tuple(structured_blocks),
     )
 
 
 def private_index_candidates(proposal: NoteProposal) -> tuple[PrivateIndexCandidate, ...]:
     if isinstance(proposal, DerivedMarkdownProposal):
         candidates: list[PrivateIndexCandidate] = []
+        noise_graph_block_ids = set(proposal.noise_graph_block_ids)
         for note in proposal.notes:
             if not note.provenance_verifiable:
                 continue
@@ -749,6 +866,8 @@ def private_index_candidates(proposal: NoteProposal) -> tuple[PrivateIndexCandid
                     if unit_index < len(proposal.graph_block_ids)
                     else None
                 )
+                if block_id in noise_graph_block_ids:
+                    continue
                 candidates.append(
                     PrivateIndexCandidate(
                         item_id=proposal.item_id,
@@ -758,6 +877,25 @@ def private_index_candidates(proposal: NoteProposal) -> tuple[PrivateIndexCandid
                         text=unit.text,
                         source_locators=graph_locators or (unit.locator,),
                         block_location=f"graph:{block_id}" if block_id else f"unit:{unit_index}",
+                    )
+                )
+        return tuple(candidates)
+
+    if proposal.structured_blocks:
+        candidates = []
+        for block_sequence, block in enumerate(proposal.structured_blocks, start=1):
+            if block.kind == "noise":
+                continue
+            text = proposal.markdown[block.start_offset:block.end_offset].strip()
+            if text:
+                candidates.append(
+                    PrivateIndexCandidate(
+                        item_id=proposal.item_id,
+                        proposal_kind=proposal.kind,
+                        note_relative_path=proposal.relative_path,
+                        block_sequence=block_sequence,
+                        text=text,
+                        block_location=f"line:{block.start_line}",
                     )
                 )
         return tuple(candidates)
@@ -793,6 +931,10 @@ def proposal_from_dict(value: dict[str, object]) -> NoteProposal:
             content_sha256=str(value["content_sha256"]),
             markdown=str(value["markdown"]),
             heading_locations=tuple(str(location) for location in list(value["heading_locations"])),
+            structured_blocks=tuple(
+                MarkdownStructureBlock.from_dict(dict(block))
+                for block in list(value.get("structured_blocks", []))
+            ),
             revision=int(value.get("revision", 1)),
         )
     return DerivedMarkdownProposal.from_dict(value)
@@ -961,7 +1103,7 @@ def _render_proposal(
                 provenance=provenance,
                 markdown=markdown,
             )
-    )
+        )
     index_path = f"{notes_root}/index.md"
     empty_index_notice = "\n- 尚无可生成的内容单元" if not notes else ""
     index_locators = _unique_locators(unit.locator for unit in units) or fallback_locators
@@ -986,7 +1128,7 @@ def _render_proposal(
             f"# {source_label}\n\n来源：[[{source_relative_path}|原始资料]]{empty_index_notice}\n"
         ),
     )
-    return DerivedMarkdownProposal(
+    proposal = DerivedMarkdownProposal(
         item_id=item_id,
         vault_id=vault_id,
         source_id=source_id,
@@ -1000,6 +1142,43 @@ def _render_proposal(
         risks=risks,
         revision=revision,
     )
+    return proposal
+
+
+def _split_provider_markdown_for_notes(
+    markdown: str,
+    groups: tuple[tuple[int, ...], ...],
+    units: tuple[StructuredContentUnit, ...],
+) -> tuple[str, ...]:
+    if len(groups) <= 1:
+        return (markdown.strip(),)
+    total = max(sum(len(units[index].text) for group in groups for index in group), 1)
+    bodies: list[str] = []
+    start = 0
+    for group in groups[:-1]:
+        weight = sum(len(units[index].text) for index in group)
+        target = start + round(len(markdown) * weight / total)
+        boundaries = [match.start() + 2 for match in re.finditer(r"\n\s*\n", markdown)]
+        boundary = min(
+            (candidate for candidate in boundaries if candidate > start),
+            key=lambda candidate: abs(candidate - target),
+            default=target,
+        )
+        bodies.append(markdown[start:boundary].strip())
+        start = boundary
+    bodies.append(markdown[start:].strip())
+    return tuple(bodies)
+
+
+def _replace_note_body(markdown: str, body: str) -> str:
+    marker = "\n\n来源："
+    source_start = markdown.find(marker)
+    if source_start < 0:
+        return markdown
+    source_end = markdown.find("\n\n", source_start + len(marker))
+    if source_end < 0:
+        return markdown
+    return markdown[: source_end + 2] + body + "\n"
 
 
 def _legacy_same_source_navigation_links(
@@ -1189,7 +1368,9 @@ def _valid_locator_dict(value: dict[str, object]) -> bool:
             return False
         return True
     page, docx_location, region = value.get("page"), value.get("docx_location"), value.get("region")
-    if (page is None) == (docx_location is None):
+    if page is None and docx_location is None and region is None:
+        return False
+    if page is not None and docx_location is not None:
         return False
     if page is not None and (type(page) is not int or page < 1):
         return False

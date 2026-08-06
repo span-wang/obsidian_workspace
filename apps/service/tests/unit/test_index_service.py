@@ -9,6 +9,7 @@ from application.indexing import IndexingService
 from application.policies import PolicyService
 from application.vaults import VaultService
 from domain.indexing import IndexBlock, IndexedDocument, IndexJob
+from domain.review_commits import CommitFile, CommitUnit
 from domain.tasks import utc_now
 
 
@@ -63,6 +64,89 @@ def test_reconcile_keeps_derived_and_native_evidence_identities_distinct(tmp_pat
     assert documents["native.md"].source_id is None
     assert documents["native.md"].source_sha256 is None
     assert documents["native.md"].heading_locations == ("line:1",)
+
+
+def test_reconcile_excludes_platform_derived_index_notes_and_invalidates_historical_copy(
+    tmp_path: Path,
+) -> None:
+    service, repository, vault = _service(tmp_path)
+    source_hash = sha256(b"source").hexdigest()
+    source = vault.path / "platform" / "sources" / "book.pdf"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"source")
+    note = vault.path / "platform" / "notes" / "source-1" / "01-note.md"
+    directory = note.with_name("index.md")
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text(_derived_markdown(vault.vault_id, source_hash), encoding="utf-8")
+    directory.write_text(_derived_markdown(vault.vault_id, source_hash), encoding="utf-8")
+    historical = service._document_from_markdown(
+        vault.vault_id,
+        "platform/notes/source-1/index.md",
+        directory.read_text(encoding="utf-8"),
+        directory,
+        pending_association=False,
+    )
+    repository.save_document(historical)
+
+    health = service.reconcile(vault.vault_id)
+    current_paths = [document.relative_path for document in repository.current_documents(vault.vault_id)]
+    historical_index = next(
+        document
+        for document in repository.documents(vault.vault_id)
+        if document.relative_path == "platform/notes/source-1/index.md"
+    )
+
+    assert health.status == "healthy"
+    assert current_paths == ["platform/notes/source-1/01-note.md"]
+    assert historical_index.is_current is False
+    assert service.rebuild(vault.vault_id).status == "healthy"
+    assert [document.relative_path for document in repository.current_documents(vault.vault_id)] == [
+        "platform/notes/source-1/01-note.md"
+    ]
+
+
+def test_committed_unit_does_not_index_a_platform_derived_index_note(tmp_path: Path) -> None:
+    service, repository, vault = _service(tmp_path)
+    source_hash = sha256(b"source").hexdigest()
+    source = vault.path / "platform" / "sources" / "book.pdf"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"source")
+    note = vault.path / "platform" / "notes" / "source-1" / "01-note.md"
+    directory = note.with_name("index.md")
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note_markdown = _derived_markdown(vault.vault_id, source_hash)
+    directory_markdown = _derived_markdown(vault.vault_id, source_hash)
+    note.write_text(note_markdown, encoding="utf-8")
+    directory.write_text(directory_markdown, encoding="utf-8")
+    unit = CommitUnit(
+        "unit-1",
+        1,
+        "Book",
+        "source",
+        (
+            CommitFile(
+                "platform/notes/source-1/01-note.md",
+                "markdown",
+                note_markdown,
+                sha256(note_markdown.encode("utf-8")).hexdigest(),
+                None,
+            ),
+            CommitFile(
+                "platform/notes/source-1/index.md",
+                "markdown",
+                directory_markdown,
+                sha256(directory_markdown.encode("utf-8")).hexdigest(),
+                None,
+            ),
+        ),
+    )
+
+    health = service.index_committed_unit(vault, unit)
+
+    assert health.status == "healthy"
+    assert [document.relative_path for document in repository.current_documents(vault.vault_id)] == [
+        "platform/notes/source-1/01-note.md"
+    ]
 
 
 def test_backfill_current_blocks_does_not_rescan_or_replace_documents(tmp_path: Path, monkeypatch) -> None:

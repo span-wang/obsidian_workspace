@@ -10,13 +10,12 @@ from application.providers import ProviderService, ProviderUnavailableError
 from application.vaults import VaultService
 from domain.metadata_extraction import (
     METADATA_CONTENT_CATEGORIES,
-    MetadataAuthorizationPreview,
+    MetadataBatchPreview,
     MetadataBatchScope,
     MetadataBlockedDocument,
     MetadataInput,
     metadata_input_text,
 )
-from domain.policies import OutboundAuthorization, OutboundScope
 from ports.index_repository import IndexRepository
 
 
@@ -25,25 +24,24 @@ METADATA_TASK_ID_PREFIX = "metadata-index"
 _BLOCKED_DOCUMENT_SAMPLE_LIMIT = 10
 
 
-class MetadataAuthorizationValidationError(ValueError):
-    """Raised when a metadata batch cannot safely be previewed or authorized."""
+class MetadataBatchValidationError(ValueError):
+    """Raised when a metadata batch cannot safely be executed."""
 
 
 @dataclass(frozen=True)
 class CheckedMetadataBatch:
-    """Authorization-approved in-memory inputs; callers must not serialize this value."""
+    """Eligible in-memory inputs; callers must not serialize this value."""
 
-    preview: MetadataAuthorizationPreview
-    authorization: OutboundAuthorization
+    preview: MetadataBatchPreview
     inputs: tuple[MetadataInput, ...]
 
     def __post_init__(self) -> None:
         if len(self.inputs) != self.preview.block_count:
-            raise ValueError("Metadata authorization inputs must match the approved block count.")
+            raise ValueError("Metadata batch inputs must match the selected block count.")
 
 
-class MetadataAuthorizationService:
-    """Build and recheck a content-free authorization snapshot for metadata extraction."""
+class MetadataBatchService:
+    """Collect and recheck the current content-free metadata extraction batch."""
 
     def __init__(
         self,
@@ -57,56 +55,28 @@ class MetadataAuthorizationService:
         self.provider_service = provider_service
         self.index_repository = index_repository
 
-    def preview(
-        self, vault_id: str, scope: MetadataBatchScope
-    ) -> MetadataAuthorizationPreview:
-        return self._collect(vault_id, scope)[0]
-
-    def request(
-        self, vault_id: str, scope: MetadataBatchScope
-    ) -> tuple[MetadataAuthorizationPreview, OutboundAuthorization]:
-        preview = self.preview(vault_id, scope)
-        self._require_authorizable(preview)
-        authorization = self.policy_service.request_outbound_authorization(
-            vault_id,
-            provider_id=preview.provider_id,
-            model_id=preview.model_id,
-            operation=METADATA_OPERATION,
-            task_id=preview.task_id,
-            scopes=list(preview.scopes),
-        )
-        return preview, authorization
-
-    def check(
-        self, vault_id: str, authorization_id: str, scope: MetadataBatchScope
-    ) -> OutboundAuthorization:
-        preview, _inputs = self._collect(vault_id, scope)
-        return self._check_preview(vault_id, authorization_id, preview)
-
-    def checked_batch(
-        self, vault_id: str, authorization_id: str, scope: MetadataBatchScope
-    ) -> CheckedMetadataBatch:
+    def default_batch(self, vault_id: str, scope: MetadataBatchScope) -> CheckedMetadataBatch:
         preview, inputs = self._collect(vault_id, scope)
-        authorization = self._check_preview(vault_id, authorization_id, preview)
-        return CheckedMetadataBatch(preview, authorization, inputs)
+        self._require_executable(preview)
+        return CheckedMetadataBatch(preview, inputs)
 
     def _collect(
         self, vault_id: str, scope: MetadataBatchScope
-    ) -> tuple[MetadataAuthorizationPreview, tuple[MetadataInput, ...]]:
+    ) -> tuple[MetadataBatchPreview, tuple[MetadataInput, ...]]:
         self.vault_service.get(vault_id)
         try:
             resolved_model = self.provider_service.resolve_model("chat")
         except ProviderUnavailableError as error:
-            raise MetadataAuthorizationValidationError(
+            raise MetadataBatchValidationError(
                 "Choose a verified chat Provider model before extracting metadata."
             ) from error
         if urlparse(resolved_model.provider.endpoint).scheme != "https":
-            raise MetadataAuthorizationValidationError(
+            raise MetadataBatchValidationError(
                 "Metadata extraction requests require an HTTPS Provider endpoint."
             )
 
         policy = self.policy_service.get(vault_id)
-        scopes: list[OutboundScope] = []
+        relative_paths: list[str] = []
         frozen_documents: list[dict[str, object]] = []
         blocked_documents: list[MetadataBlockedDocument] = []
         inputs: list[MetadataInput] = []
@@ -142,7 +112,7 @@ class MetadataAuthorizationService:
                 )
                 for block in document.blocks
             )
-            scopes.append(OutboundScope(source_path, document.relative_path))
+            relative_paths.append(document.relative_path)
             frozen_documents.append(
                 {
                     "blocks": [
@@ -157,7 +127,7 @@ class MetadataAuthorizationService:
             inputs.extend(document_inputs)
             block_count += len(document_inputs)
 
-        preview = MetadataAuthorizationPreview(
+        preview = MetadataBatchPreview(
             vault_id=vault_id,
             scope=scope,
             provider_id=resolved_model.provider.provider_id,
@@ -168,36 +138,20 @@ class MetadataAuthorizationService:
                 scope, resolved_model.provider.updated_at, frozen_documents
             ),
             policy_revision=policy.policy_revision,
-            file_count=len(scopes),
+            file_count=len(relative_paths),
             block_count=block_count,
             blocked_file_count=blocked_file_count,
             blocked_block_count=blocked_block_count,
             blocked_documents=tuple(blocked_documents),
             content_categories=METADATA_CONTENT_CATEGORIES,
-            scopes=tuple(scopes),
+            relative_paths=tuple(relative_paths),
         )
         return preview, tuple(inputs)
 
-    def _check_preview(
-        self,
-        vault_id: str,
-        authorization_id: str,
-        preview: MetadataAuthorizationPreview,
-    ) -> OutboundAuthorization:
-        return self.policy_service.check_outbound_authorization(
-            vault_id,
-            authorization_id,
-            provider_id=preview.provider_id,
-            model_id=preview.model_id,
-            operation=METADATA_OPERATION,
-            task_id=preview.task_id,
-            scopes=list(preview.scopes),
-        )
-
     @staticmethod
-    def _require_authorizable(preview: MetadataAuthorizationPreview) -> None:
-        if not preview.is_authorizable:
-            raise MetadataAuthorizationValidationError(
+    def _require_executable(preview: MetadataBatchPreview) -> None:
+        if not preview.is_executable:
+            raise MetadataBatchValidationError(
                 "The selected metadata scope has no eligible indexed blocks."
             )
 

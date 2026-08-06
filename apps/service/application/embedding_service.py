@@ -2,13 +2,12 @@ from __future__ import annotations
 
 from math import isfinite
 
-from application.embedding_authorizations import (
+from application.embedding_batches import (
     CheckedEmbeddingBatch,
-    EmbeddingAuthorizationService,
+    EmbeddingBatchService,
 )
-from application.policies import OutboundAuthorizationDenied
 from application.providers import ProviderService, ProviderUnavailableError
-from domain.embedding_authorization import EmbeddingBatchScope
+from domain.embedding_batches import EmbeddingBatchScope
 from domain.embeddings import (
     EmbeddingBlockVector,
     EmbeddingCacheConsistencyError,
@@ -22,28 +21,26 @@ from ports.index_repository import IndexRepository
 
 
 class EmbeddingExecutionError(RuntimeError):
-    """Raised when an approved embedding batch cannot safely continue."""
+    """Raised when an embedding batch cannot safely continue."""
 
 
 class EmbeddingService:
-    """Runs authorized embedding batches while keeping text inside the application layer."""
+    """Runs eligible embedding batches while keeping text inside the application layer."""
 
     MAX_PROVIDER_BATCH_SIZE = 64
 
     def __init__(
         self,
-        authorization_service: EmbeddingAuthorizationService,
+        batch_service: EmbeddingBatchService,
         provider_service: ProviderService,
         index_repository: IndexRepository,
     ) -> None:
-        self.authorization_service = authorization_service
+        self.batch_service = batch_service
         self.provider_service = provider_service
         self.index_repository = index_repository
 
-    def execute(
-        self, vault_id: str, authorization_id: str, scope: EmbeddingBatchScope
-    ) -> EmbeddingExecutionReport:
-        initial = self._checked_batch(vault_id, authorization_id, scope)
+    def execute(self, vault_id: str, scope: EmbeddingBatchScope) -> EmbeddingExecutionReport:
+        initial = self._checked_batch(vault_id, scope)
         try:
             locator = self.provider_service.embedding_profile_locator(
                 initial.preview.provider_id,
@@ -66,7 +63,7 @@ class EmbeddingService:
         network_batch_count = 0
         created_cache_entry_count = 0
         for input_hashes in _batches(missing_hashes, self.MAX_PROVIDER_BATCH_SIZE):
-            current = self._checked_batch(vault_id, authorization_id, scope)
+            current = self._checked_batch(vault_id, scope)
             self._require_same_batch(initial, current)
             provider_inputs = tuple(input_groups[input_hash][0].text for input_hash in input_hashes)
             try:
@@ -97,7 +94,7 @@ class EmbeddingService:
             network_batch_count += 1
             created_cache_entry_count += len(entries)
 
-        current = self._checked_batch(vault_id, authorization_id, scope)
+        current = self._checked_batch(vault_id, scope)
         self._require_same_batch(initial, current)
         if set(entries_by_hash) != set(input_groups):
             raise EmbeddingExecutionError("Embedding cache does not cover the approved block inputs.")
@@ -122,7 +119,6 @@ class EmbeddingService:
         provider_block_count = initial.preview.block_count - cache_hit_block_count
         return EmbeddingExecutionReport(
             vault_id=vault_id,
-            authorization_id=authorization_id,
             file_count=initial.preview.file_count,
             block_count=initial.preview.block_count,
             cache_hit_block_count=cache_hit_block_count,
@@ -131,13 +127,9 @@ class EmbeddingService:
             network_batch_count=network_batch_count,
         )
 
-    def _checked_batch(
-        self, vault_id: str, authorization_id: str, scope: EmbeddingBatchScope
-    ) -> CheckedEmbeddingBatch:
+    def _checked_batch(self, vault_id: str, scope: EmbeddingBatchScope) -> CheckedEmbeddingBatch:
         try:
-            return self.authorization_service.checked_batch(vault_id, authorization_id, scope)
-        except OutboundAuthorizationDenied:
-            raise
+            return self.batch_service.default_batch(vault_id, scope)
         except ValueError as error:
             raise EmbeddingExecutionError(str(error)) from error
 
@@ -161,7 +153,7 @@ class EmbeddingService:
     def _require_same_batch(initial: CheckedEmbeddingBatch, current: CheckedEmbeddingBatch) -> None:
         if initial.preview != current.preview or initial.inputs != current.inputs:
             raise EmbeddingExecutionError(
-                "Embedding authorization inputs changed. Request a new authorization."
+                "Embedding inputs changed during execution. Retry the batch."
             )
 
 

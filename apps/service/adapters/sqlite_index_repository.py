@@ -1329,11 +1329,11 @@ class SqliteIndexRepository:
                 ).fetchone()
                 if row is None:
                     raise EmbeddingVectorConsistencyError(
-                        "Embedding block is no longer current and eligible. Request a new authorization."
+                        "Embedding block is no longer current and eligible. Retry the batch."
                     )
                 if row["block_content_sha256"] != binding.content_sha256:
                     raise EmbeddingVectorConsistencyError(
-                        "Embedding block content changed. Request a new authorization."
+                        "Embedding block content changed. Retry the batch."
                     )
                 try:
                     expected_input_sha256 = embedding_input_sha256(
@@ -1347,7 +1347,7 @@ class SqliteIndexRepository:
                     raise EmbeddingVectorConsistencyError("Embedding block input is invalid.") from error
                 if binding.input_sha256 != expected_input_sha256:
                     raise EmbeddingVectorConsistencyError(
-                        "Embedding block input changed. Request a new authorization."
+                        "Embedding block input changed. Retry the batch."
                     )
                 normalized_vector = self._normalized_float32_vector(
                     binding.vector, binding.profile.dimension
@@ -1824,6 +1824,44 @@ class SqliteIndexRepository:
                 for row in rows
             ]
 
+    def current_heading_scope_documents(self, vault_id: str) -> list[IndexedDocument]:
+        """Read current blocks whose persisted heading structure can be trusted."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM index_documents
+                WHERE vault_id = ? AND is_current = 1
+                ORDER BY indexed_at, document_id
+                """,
+                (vault_id,),
+            ).fetchall()
+            invalid_blocks = {
+                (issue.document_id, issue.sequence)
+                for issue in self._current_block_report(connection, vault_id, 0, 0).issues
+            }
+            documents: list[IndexedDocument] = []
+            for row in rows:
+                block_rows = self._block_rows(connection, row["document_id"])
+                blocks = tuple(
+                    block
+                    for block_row in block_rows
+                    if (
+                        block := self._heading_compatible_block_from_row(
+                            block_row,
+                            rich_allowed=(
+                                block_row["document_id"], block_row["sequence"]
+                            )
+                            not in invalid_blocks,
+                        )
+                    )
+                    is not None
+                )
+                if not blocks:
+                    continue
+                documents.append(self._document_from_blocks(connection, row, blocks))
+            return documents
+
     def current_embedding_documents(self, vault_id: str) -> list[IndexedDocument]:
         """Read rich current blocks for outbound embedding regardless of the legacy read flag."""
 
@@ -2259,6 +2297,19 @@ class SqliteIndexRepository:
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             return None
+
+    @classmethod
+    def _heading_compatible_block_from_row(
+        cls, row: sqlite3.Row, *, rich_allowed: bool
+    ) -> IndexBlock | None:
+        legacy_block = cls._legacy_block_from_row(row)
+        rich_block = cls._rich_block_from_row(row) if rich_allowed else None
+        if rich_block is not None and rich_block.heading_path:
+            return rich_block
+        if legacy_block is None or not legacy_block.location.startswith("heading:"):
+            return None
+        heading = legacy_block.location.removeprefix("heading:").split(";", maxsplit=1)[0]
+        return legacy_block if heading.strip() else None
 
     @classmethod
     def _block_ref_from_row(cls, row: sqlite3.Row) -> IndexBlockRef:
@@ -3082,23 +3133,7 @@ class SqliteIndexRepository:
         *,
         rich_block_reads_enabled: bool,
     ) -> IndexedDocument:
-        block_rows = connection.execute(
-            """
-            SELECT sequence, location, text, block_content_sha256, block_kind, heading_path_json, heading_level,
-                   source_locators_json, graph_block_id, reading_order, confidence, retrieval_text,
-                   contextual_prefix, token_estimate
-            FROM index_blocks WHERE document_id = ? ORDER BY sequence
-            """,
-            (row["document_id"],),
-        ).fetchall()
-        metadata_rows = connection.execute(
-            """
-            SELECT sequence, subject, grade_volume, unit_no, material_type, meta_origin,
-                   meta_confidence, meta_status
-            FROM index_block_meta WHERE document_id = ? ORDER BY sequence
-            """,
-            (row["document_id"],),
-        ).fetchall()
+        block_rows = cls._block_rows(connection, row["document_id"])
         blocks: list[IndexBlock] = []
         for block_row in block_rows:
             block = (
@@ -3110,6 +3145,36 @@ class SqliteIndexRepository:
                 mode = "Rich" if rich_block_reads_enabled else "Legacy"
                 raise ValueError(f"{mode} index block is invalid.")
             blocks.append(block)
+        return cls._document_from_blocks(connection, row, tuple(blocks))
+
+    @staticmethod
+    def _block_rows(connection: sqlite3.Connection, document_id: str) -> list[sqlite3.Row]:
+        return connection.execute(
+            """
+            SELECT document_id, sequence, location, text, block_content_sha256, block_kind,
+                   heading_path_json, heading_level, source_locators_json, graph_block_id,
+                   reading_order, confidence, retrieval_text, contextual_prefix, token_estimate
+            FROM index_blocks WHERE document_id = ? ORDER BY sequence
+            """,
+            (document_id,),
+        ).fetchall()
+
+    @classmethod
+    def _document_from_blocks(
+        cls,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        blocks: tuple[IndexBlock, ...],
+    ) -> IndexedDocument:
+        metadata_rows = connection.execute(
+            """
+            SELECT sequence, subject, grade_volume, unit_no, material_type, meta_origin,
+                   meta_confidence, meta_status
+            FROM index_block_meta WHERE document_id = ? ORDER BY sequence
+            """,
+            (row["document_id"],),
+        ).fetchall()
+        block_sequences = {block.sequence for block in blocks}
         return IndexedDocument(
             document_id=row["document_id"],
             vault_id=row["vault_id"],
@@ -3119,7 +3184,7 @@ class SqliteIndexRepository:
             heading_locations=tuple(json.loads(row["heading_locations_json"])),
             links=tuple(json.loads(row["links_json"])),
             tags=tuple(json.loads(row["tags_json"])),
-            blocks=tuple(blocks),
+            blocks=blocks,
             indexed_at=row["indexed_at"],
             source_id=row["source_id"],
             source_sha256=row["source_sha256"],
@@ -3133,5 +3198,9 @@ class SqliteIndexRepository:
             source_observed_mtime_ns=row["source_observed_mtime_ns"],
             source_observed_size=row["source_observed_size"],
             policy_revision=row["policy_revision"],
-            block_metadata=tuple(cls._metadata_from_row(metadata_row) for metadata_row in metadata_rows),
+            block_metadata=tuple(
+                cls._metadata_from_row(metadata_row)
+                for metadata_row in metadata_rows
+                if metadata_row["sequence"] in block_sequences
+            ),
         )

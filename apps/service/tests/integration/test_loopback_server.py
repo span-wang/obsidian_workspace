@@ -47,6 +47,47 @@ def request_json(
         return error.code, json.loads(error.read())
 
 
+def request_multipart(
+    browser, path: str, *, files: list[tuple[str, bytes]], fields: dict[str, str] | None = None
+) -> tuple[int, dict[str, object]]:
+    boundary = "import-upload-boundary"
+    parts = []
+    for name, value in (fields or {}).items():
+        parts.extend(
+            (
+                f"--{boundary}\r\n".encode(),
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode(),
+                value.encode(),
+                b"\r\n",
+            )
+        )
+    for filename, content in files:
+        parts.extend(
+            (
+                f"--{boundary}\r\n".encode(),
+                (
+                    "Content-Disposition: form-data; name=\"files\"; "
+                    f"filename=\"{filename}\"\r\n"
+                ).encode(),
+                b"Content-Type: application/octet-stream\r\n\r\n",
+                content,
+                b"\r\n",
+            )
+        )
+    parts.append(f"--{boundary}--\r\n".encode())
+    request = Request(
+        f"{BASE_URL}{path}",
+        data=b"".join(parts),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    try:
+        with browser.open(request, timeout=0.5) as response:
+            return response.status, json.loads(response.read())
+    except HTTPError as error:
+        return error.code, json.loads(error.read())
+
+
 def select_vault_directory(browser) -> str:
     status, payload = request_json(browser, "/api/vaults/select-directory", method="POST")
 
@@ -247,6 +288,11 @@ def test_provider_endpoints_keep_the_local_session_boundary_and_typed_default_st
             "status": "unconfigured",
             "reason": "No rerank Provider model is selected.",
         },
+        "markdown": {
+            "default": None,
+            "status": "unconfigured",
+            "reason": "No markdown Provider model is selected.",
+        },
     }
 
 
@@ -347,7 +393,7 @@ def test_vault_validation_uses_the_standard_error_contract(local_browser, tmp_pa
     assert payload["retryable"] is True
 
 
-def test_vault_policy_persists_default_mode_and_blocks_stale_outbound_authorization(
+def test_vault_policy_defaults_to_allow_and_keeps_never_send_cloud_blocked(
     local_browser,
     tmp_path: Path,
 ) -> None:
@@ -362,77 +408,38 @@ def test_vault_policy_persists_default_mode_and_blocks_stale_outbound_authorizat
     vault_id = created["vault"]["vault_id"]
 
     policy_status, policy = request_json(local_browser, f"/api/vaults/{vault_id}/policy")
-    pending_status, pending = request_json(
-        local_browser,
-        f"/api/vaults/{vault_id}/outbound-authorizations",
-        method="POST",
-        payload={
-            "operation": "web-search",
-            "task_id": "task-1",
-            "scopes": [{"source_path": "public/brief.md"}],
-        },
-    )
-    authorization_id = pending["authorization"]["authorization_id"]
-    confirmed_status, confirmed = request_json(
-        local_browser,
-        f"/api/vaults/{vault_id}/outbound-authorizations/{authorization_id}/confirm",
-        method="POST",
-        payload={"approved": True},
-    )
-    checked_status, checked = request_json(
-        local_browser,
-        f"/api/vaults/{vault_id}/outbound-authorizations/{authorization_id}/check",
-        method="POST",
-        payload={
-            "operation": "web-search",
-            "task_id": "task-1",
-            "scopes": [{"source_path": "public/brief.md"}],
-        },
-    )
-    mismatched_status, mismatched = request_json(
-        local_browser,
-        f"/api/vaults/{vault_id}/outbound-authorizations/{authorization_id}/check",
-        method="POST",
-        payload={
-            "operation": "web-search",
-            "task_id": "task-1",
-            "scopes": [{"source_path": "private/secret.md"}],
-        },
-    )
     rule_status, _ = request_json(
         local_browser,
         f"/api/vaults/{vault_id}/policy/rules",
         method="POST",
         payload={"kind": "never-send-cloud", "relative_path": "public"},
     )
-    stale_status, stale = request_json(
+    blocked_status, blocked = request_json(
         local_browser,
-        f"/api/vaults/{vault_id}/outbound-authorizations/{authorization_id}/check",
+        f"/api/vaults/{vault_id}/policy/preview",
         method="POST",
         payload={
-            "operation": "web-search",
-            "task_id": "task-1",
-            "scopes": [{"source_path": "public/brief.md"}],
+            "source_path": "public/brief.md",
+            "derived_path": None,
+            "stage": "outbound",
         },
+    )
+    removed_endpoint_status, _ = request_json(
+        local_browser,
+        f"/api/vaults/{vault_id}/outbound-authorizations",
+        method="POST",
+        payload={},
     )
 
     assert policy_status == 200
     assert policy["policy"]["outbound_mode"] == "always-allow"
-    assert pending_status == 200
-    assert pending["authorization"]["status"] == "approved"
-    assert confirmed_status == 403
-    assert confirmed["code"] == "outbound_authorization_denied"
-    assert "scope_paths" not in pending["authorization"]
-    assert checked_status == 200
-    assert checked["authorization"]["actual_scope_summary"] == "1 scoped item(s)"
-    assert mismatched_status == 403
-    assert mismatched["code"] == "outbound_authorization_denied"
     assert rule_status == 200
-    assert stale_status == 403
-    assert stale["code"] == "outbound_authorization_denied"
+    assert blocked_status == 200
+    assert blocked["preview"]["allowed"] is False
+    assert removed_endpoint_status == 405
 
 
-def test_manual_import_scan_persists_progress_without_writing_the_vault(
+def test_automatic_import_recovers_without_writing_the_vault_when_conversion_is_unavailable(
     local_browser,
     tmp_path: Path,
 ) -> None:
@@ -460,31 +467,18 @@ def test_manual_import_scan_persists_progress_without_writing_the_vault(
     detail_status, detail = 0, {}
     while time.monotonic() < deadline:
         detail_status, detail = request_json(local_browser, f"/api/import-tasks/{task_id}")
-        if detail["task"]["phase"] == "waiting-for-review":
+        if detail["task"]["lifecycle"] != "running":
             break
         time.sleep(0.1)
 
     assert created_status == 200
     assert detail_status == 200
-    assert detail["task"]["lifecycle"] == "waiting-for-review"
-    assert detail["task"]["counts"] == {
-        "discovered": 1,
-        "supported": 1,
-        "skipped": 0,
-        "unsupported": 0,
-        "failed": 0,
-        "new": 1,
-        "duplicate": 0,
-        "possible_version": 0,
-        "identity_failed": 0,
-        "parsed": 0,
-        "parse_failed": 0,
-        "ocr_completed": 0,
-        "ocr_failed": 0,
-        "confirmed_gaps": 0,
-        "required_check": 1,
-        "derived_notes": 0,
-    }
+    assert detail["task"]["lifecycle"] == "recoverable"
+    assert detail["task"]["phase"] == "failed"
+    assert detail["task"]["recovery_actions"] == ["restart-conversion", "restart-derivation"]
+    assert "complete document graph" in detail["task"]["failure_reason"]
+    assert detail["task"]["counts"]["discovered"] == 1
+    assert detail["task"]["counts"]["supported"] == 1
     assert detail["classification_suggestions"] == []
     assert detail["items"][0]["label"] == "selected-import.pdf"
     assert detail["items"][0]["document_kind"] == "pdf"
@@ -508,9 +502,106 @@ def test_manual_import_scan_persists_progress_without_writing_the_vault(
             "conversion-started",
             "conversion-item-rejected",
             "conversion-profile-rejected",
-            "review-snapshot-created",
+            "automatic-pipeline-blocked",
+            "item-discovered",
         }
-        assert event_name == f"event: {event_payload['event_type']}\n"
+        assert event_name in {
+            f"event: {event_payload['event_type']}\n",
+            "event: task-update\n",
+        }
+
+
+def test_browser_upload_stages_client_file_before_the_existing_import_flow(
+    local_browser,
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "selected-vault"
+    vault_path.mkdir()
+    client_file = tmp_path / "client-upload.pdf"
+    write_electronic_pdf(client_file)
+    _, created = request_json(
+        local_browser,
+        "/api/vaults",
+        method="POST",
+        payload={"selection_id": select_vault_directory(local_browser), "managed_root": "platform"},
+    )
+    vault_id = created["vault"]["vault_id"]
+
+    upload_status, upload = request_multipart(
+        local_browser,
+        "/api/import-selections/uploads",
+        files=[("remote-upload.pdf", client_file.read_bytes())],
+    )
+    created_status, created_task = request_json(
+        local_browser,
+        "/api/import-tasks",
+        method="POST",
+        payload={"vault_id": vault_id, "selection_id": upload["selection_id"]},
+    )
+    task_id = created_task["task"]["task_id"]
+    deadline = time.monotonic() + 10
+    detail_status, detail = 0, {}
+    while time.monotonic() < deadline:
+        detail_status, detail = request_json(local_browser, f"/api/import-tasks/{task_id}")
+        if detail["task"]["lifecycle"] != "running":
+            break
+        time.sleep(0.1)
+
+    assert upload_status == 200
+    assert upload["label"] == "remote-upload.pdf"
+    assert "path" not in upload
+    assert created_status == 200
+    assert detail_status == 200
+    assert detail["items"][0]["label"] == "remote-upload.pdf"
+    assert str(client_file) not in json.dumps(detail)
+    assert not (vault_path / "platform" / "sources" / "remote-upload.pdf").exists()
+
+
+def test_browser_folder_upload_stages_nested_client_files_before_the_existing_import_flow(
+    local_browser,
+    tmp_path: Path,
+) -> None:
+    vault_path = tmp_path / "selected-vault"
+    vault_path.mkdir()
+    client_file = tmp_path / "client-upload.pdf"
+    write_electronic_pdf(client_file)
+    _, created = request_json(
+        local_browser,
+        "/api/vaults",
+        method="POST",
+        payload={"selection_id": select_vault_directory(local_browser), "managed_root": "platform"},
+    )
+    vault_id = created["vault"]["vault_id"]
+
+    upload_status, upload = request_multipart(
+        local_browser,
+        "/api/import-selections/uploads",
+        files=[("materials/chapter-1/remote-upload.pdf", client_file.read_bytes())],
+        fields={"kind": "directory"},
+    )
+    created_status, created_task = request_json(
+        local_browser,
+        "/api/import-tasks",
+        method="POST",
+        payload={"vault_id": vault_id, "selection_id": upload["selection_id"]},
+    )
+    task_id = created_task["task"]["task_id"]
+    deadline = time.monotonic() + 10
+    detail_status, detail = 0, {}
+    while time.monotonic() < deadline:
+        detail_status, detail = request_json(local_browser, f"/api/import-tasks/{task_id}")
+        if detail["task"]["lifecycle"] != "running":
+            break
+        time.sleep(0.1)
+
+    assert upload_status == 200
+    assert upload["label"] == "materials"
+    assert "path" not in upload
+    assert created_status == 200
+    assert detail_status == 200
+    assert detail["items"][0]["label"] == "remote-upload.pdf"
+    assert str(client_file) not in json.dumps(detail)
+    assert not (vault_path / "platform" / "sources" / "remote-upload.pdf").exists()
 
 
 def test_second_start_reuses_the_verified_running_instance(

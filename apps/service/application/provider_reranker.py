@@ -25,7 +25,7 @@ class RerankerResponseError(RerankerExecutionError):
 
 
 class ProviderReranker:
-    """Native rerank adapter; callers remain responsible for outbound authorization."""
+    """Native rerank adapter with verified HTTPS Provider checks."""
 
     def __init__(self, provider_service: ProviderService) -> None:
         self.provider_service = provider_service
@@ -56,7 +56,7 @@ class ProviderReranker:
             ) from error
         if resolved.provider.updated_at != target.provider_configuration_revision:
             raise RerankerUnavailableError(
-                "The selected Provider configuration changed. Request a new authorization.",
+                "The selected Provider configuration changed. Retry the request.",
                 network_request_count=0,
             )
         if urlparse(resolved.provider.endpoint).scheme != "https":

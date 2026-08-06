@@ -6,7 +6,7 @@ import pytest
 
 from adapters.filesystem_vault_adapter import LocalVaultFilesystem
 from adapters.sqlite_vault_repository import SqliteVaultRepository
-from application.metadata_authorizations import MetadataAuthorizationService
+from application.metadata_batches import MetadataBatchService
 from application.metadata_service import MetadataExtractionError, MetadataExtractionService
 from application.policies import PolicyService
 from application.vaults import VaultService
@@ -100,12 +100,12 @@ def _service(tmp_path: Path, response: str):
     policy_service = PolicyService(vault_service, repository)
     index_repository = FakeIndexRepository([_document(vault.vault_id, "Subject verb agreement")])
     provider_service = FakeProviderService(response)
-    authorization_service = MetadataAuthorizationService(
+    batch_service = MetadataBatchService(
         vault_service, policy_service, provider_service, index_repository
     )
     return (
-        MetadataExtractionService(authorization_service, provider_service, index_repository),
-        authorization_service,
+        MetadataExtractionService(batch_service, provider_service, index_repository),
+        batch_service,
         vault.vault_id,
         index_repository,
         provider_service,
@@ -113,7 +113,7 @@ def _service(tmp_path: Path, response: str):
 
 
 def test_metadata_service_writes_new_concepts_as_required_review_candidates(tmp_path: Path) -> None:
-    service, authorization_service, vault_id, repository, provider = _service(
+    service, _batch_service, vault_id, repository, provider = _service(
         tmp_path,
         json.dumps(
             {
@@ -128,9 +128,7 @@ def test_metadata_service_writes_new_concepts_as_required_review_candidates(tmp_
             }
         ),
     )
-    _preview, authorization = authorization_service.request(vault_id, MetadataBatchScope("vault"))
-
-    report = service.execute(vault_id, authorization.authorization_id, MetadataBatchScope("vault"))
+    report = service.execute(vault_id, MetadataBatchScope("vault"))
 
     assert report.status == "completed"
     assert report.candidate_count == 1
@@ -143,12 +141,11 @@ def test_metadata_service_writes_new_concepts_as_required_review_candidates(tmp_
 
 
 def test_metadata_service_rejects_invalid_provider_output_without_persisting_candidates(tmp_path: Path) -> None:
-    service, authorization_service, vault_id, repository, _provider = _service(
+    service, _batch_service, vault_id, repository, _provider = _service(
         tmp_path, json.dumps({"items": []})
     )
-    _preview, authorization = authorization_service.request(vault_id, MetadataBatchScope("vault"))
 
     with pytest.raises(MetadataExtractionError, match="does not cover"):
-        service.execute(vault_id, authorization.authorization_id, MetadataBatchScope("vault"))
+        service.execute(vault_id, MetadataBatchScope("vault"))
 
     assert repository.candidates == []
