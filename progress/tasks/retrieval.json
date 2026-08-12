@@ -1,6 +1,6 @@
 {
   "initiativeId": "RET",
-  "updatedOn": "2026-08-05",
+  "updatedOn": "2026-08-12",
   "tasks": [
     {
       "id": "RET-00-01",
@@ -1617,7 +1617,7 @@
       "verification": [
         "npm --prefix apps/web run test（26 passed）",
         "npm --prefix apps/web run lint（通过）",
-        "npm --prefix apps/web run build（通过）",
+        "npm --prefix apps/web run build（通过；包含窄屏任务多选行对齐复核）",
         "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6257'; npm run browser-test（29 passed）",
         "桌面 1280px 与移动 390px 视觉检查（通过；证据层级显示文件、标题、页码、原始资料、摘录和匹配方式，未显示 Source ID、哈希或 graph/chunk 定位）",
         "npm run progress:build && npm run progress:check（通过）",
@@ -2149,6 +2149,68 @@
       ]
     },
     {
+      "id": "RET-18-02",
+      "phaseId": "RET-18",
+      "order": 2,
+      "title": "导入任务展示与已提交文件删除",
+      "priority": "P1",
+      "status": "已完成",
+      "dependsOn": [
+        "RET-18-01"
+      ],
+      "executionBoundary": {
+        "inScope": [
+          "导入任务页只显示当前选中的 vault 的任务，默认每页 10 条，允许切换页大小并可翻页，避免任务数量导致页面无限延长。",
+          "删除任务成功后直接更新前端任务状态，不重新请求整页任务列表。",
+          "删除已完成任务时，按该任务的提交日志回退 Vault 内的 Markdown、源文件和资料附件：任务新建的文件删除，任务覆盖的文件恢复提交前备份。",
+          "删除前校验每个 Vault 文件仍等于任务提交时的哈希；任一文件已被后续编辑、删除或替换时失败关闭，保留任务和文件。",
+          "回退 Vault 文件后物理清理该任务提交 Markdown 的索引文档、FTS、向量、元数据候选和无引用 graph projection；任务和来源身份均无其他引用时清理来源哈希与解析证据。",
+          "回退 Vault 文件后同步索引状态，并补充服务、前端和浏览器回归。"
+        ],
+        "outOfScope": [
+          "不删除上传时浏览器或服务机选择的原始本地文件；只清理由既有上传生命周期负责的暂存副本。",
+          "不删除其他任务提交或当前索引仍引用的 Vault 文件、来源身份、解析证据、Embedding 缓存或 graph projection，不修改 Vault 授权、managed_root、Provider、Embedding、检索排序或公开 API 合同。",
+          "不为历史缺少提交日志的任务猜测或扫描 Vault 文件删除。"
+        ],
+        "followup": [
+          "如需按服务端数据库分页或按更多条件筛选任务，另立列表查询性能任务。",
+          "如需支持已被用户修改的任务文件选择性删除或冲突解决，另立带逐文件确认的恢复任务。",
+          "如需清理无法从任务关联到来源的历史 Embedding 缓存，另立有迁移与共享引用审计的存储治理任务。"
+        ],
+        "verification": [
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_import_tasks.py tests/unit/test_source_identities.py tests/unit/test_sqlite_index_graph_projection.py tests/unit/test_filesystem_vault_committer.py",
+          "uv run --directory apps/service ruff check application/ingest.py application/indexing.py adapters/sqlite_index_repository.py adapters/sqlite_source_repository.py adapters/sqlite_task_repository.py ports/index_repository.py ports/source_repository.py tests/unit/test_import_tasks.py tests/unit/test_source_identities.py tests/unit/test_sqlite_index_graph_projection.py tests/unit/test_filesystem_vault_committer.py",
+          "npm --prefix apps/web run test",
+          "npm --prefix apps/web run lint",
+          "npm --prefix apps/web run build",
+          "npm run integration",
+          "npm run browser-test",
+          "npm run progress:build && npm run progress:check",
+          "git diff --check"
+        ]
+      },
+      "deliverables": [
+        "按当前 vault 过滤且带可调页大小的导入任务列表",
+        "无整页刷新抖动的任务删除交互",
+        "按提交日志安全回退 Vault 内 Markdown、源文件和附件的删除生命周期"
+      ],
+      "acceptance": "任务页只展示当前 vault 的任务，默认每页最多 10 条且可调整页大小、翻页；删除任务不会重新加载列表或造成页面抖动。删除已完成任务会仅回退该任务提交到 Vault 的 Markdown、源文件和资料附件，并同步索引；任何目标文件不再匹配提交哈希时，删除失败且不改动 Vault 或任务记录；上传时的本地原件不删除。",
+    "verification": [
+      "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_import_tasks.py tests/unit/test_filesystem_vault_committer.py（19 passed，2 skipped）",
+      "uv run --directory apps/service ruff check application/ingest.py adapters/filesystem_vault_committer.py ports/vault_committer.py tests/unit/test_import_tasks.py tests/unit/test_filesystem_vault_committer.py（All checks passed）",
+      "uv run --directory apps/service pytest -p no:cacheprovider tests/unit（646 passed，2 skipped）",
+      "npm --prefix apps/web run test（31 passed）",
+      "npm --prefix apps/web run lint 与 build（通过）",
+      "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6417'; npm run integration（13 passed，2 skipped）",
+      "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6415'; npm run browser-test（23 passed）",
+      "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_import_tasks.py tests/unit/test_source_identities.py tests/unit/test_sqlite_index_graph_projection.py tests/unit/test_sqlite_index_vectors.py tests/unit/test_index_service.py tests/unit/test_filesystem_vault_committer.py tests/unit/test_import_api.py（65 passed，2 skipped）",
+      "uv run --directory apps/service ruff check application/ingest.py application/indexing.py adapters/sqlite_index_repository.py adapters/sqlite_source_repository.py adapters/sqlite_task_repository.py ports/index_repository.py ports/source_repository.py tests/unit/test_import_tasks.py tests/unit/test_source_identities.py tests/unit/test_sqlite_index_graph_projection.py tests/unit/test_sqlite_index_vectors.py tests/unit/test_filesystem_vault_committer.py tests/unit/test_import_api.py（All checks passed）",
+      "$env:OBSIDIAN_PLATFORM_TEST_PORT = '6428'; npm run integration（12 passed，2 skipped，1 failed：test_automatic_import_recovers_without_writing_the_vault_when_conversion_is_unavailable 期望 restart-derivation；当前在线解析恢复逻辑未返回该动作，与本任务删除链路无交集）",
+      "npm run progress:build && npm run progress:check（通过）",
+      "git diff --check（通过；仅 Windows 行尾提示）"
+    ]
+    },
+    {
       "id": "RET-19-01",
       "phaseId": "RET-19",
       "order": 1,
@@ -2195,6 +2257,542 @@
         "当前 23 页 PDF smoke（158 s）：selected=native-pdf+mineru；18 个原生文字页覆盖；第 2、4、6、22、23 页回退 VLM；第 12 页保留 GB15577、15 min、1；本机 VLM artifact 14 个。",
         "npm run progress:build && npm run progress:check（通过）",
         "git diff --check（通过）"
+      ]
+    },
+    {
+      "id": "RET-20-01",
+      "phaseId": "RET-20",
+      "order": 1,
+      "title": "Markdown Provider 层级与去重质量约束",
+      "priority": "P0",
+      "status": "已完成",
+      "dependsOn": [
+        "RET-17-01"
+      ],
+      "executionBoundary": {
+        "inScope": [
+          "为每个 Markdown Provider 分块提供仅供判断、不得直接输出的文档级原始标题纲要，并保留既有分块的继承标题上下文。",
+          "明确提示词的语义内容恰好一次、标题保留与重复分页噪音区分、文档标题与章节层级、同级一致、父子连续及跨块不重打上级标题规则。",
+          "在合并后的 Provider Markdown 上拒绝可机械确认的标题深度跳级或重复文档标题，并对整文结果有限重试；仍不合格时保持既有可恢复失败语义。",
+          "增加脱敏定向回归，覆盖全局纲要、跨块继承、重复标题、深度跳级和提示词质量契约。"
+        ],
+        "outOfScope": [
+          "不改变 Provider、模型选择、SQLite schema、出网 policy、原始 Markdown、DocumentGraph、Vault 提交或索引重建。",
+          "不以本地规则猜测语义标题、改写 Provider Markdown，或为语义重复建立不可解释的自动删除机制。",
+          "不以本任务评估具体 Provider 的语义准确率或处理历史已提交的 Vault Markdown。"
+        ],
+        "followup": [
+          "如需量化不同 Provider 的实际标题判断、正文保真和重复率，使用已审阅脱敏语料另立 golden evaluation 任务。",
+          "如需修复已经提交的 Markdown，另立可预览、可回滚的重处理任务。"
+        ],
+        "verification": [
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_markdown_structuring.py tests/unit/test_import_service.py",
+          "uv run --directory apps/service ruff check domain/markdown_structuring.py application/markdown_structuring.py tests/unit/test_markdown_structuring.py",
+          "npm run progress:build && npm run progress:check",
+          "git diff --check"
+        ]
+      },
+      "deliverables": [
+        "文档级标题纲要与跨块结构化上下文",
+        "无歧义的 Markdown Provider 层级、保真和去重提示词",
+        "最终 Markdown 标题结构校验、有限重试与定向回归"
+      ],
+      "acceptance": "每个 Provider 分块都有其完整原始 Markdown 标题纲要和当前继承标题上下文，纲要不会被直接重复输出。提示词明确要求语义内容按源顺序保留一次、只删除可确认的分页噪音、保留标题文字、同级统一且父子不跳级；来源没有明确文档标题时不得臆造。合并结果拒绝标题深度跳级及重复文档标题，并有限重试；失败时不写入不完整提案，保持可恢复。定向回归、Ruff、进度检查和差异检查均通过。",
+      "verification": []
+    },
+    {
+      "id": "RET-21-01",
+      "phaseId": "RET-21",
+      "order": 1,
+      "title": "多 Vault 工作台全景与二级上下文交互",
+      "priority": "P1",
+      "status": "已完成",
+      "dependsOn": [
+        "RET-10-01",
+        "RET-14-01",
+        "RET-18-02"
+      ],
+      "executionBoundary": {
+        "inScope": [
+          "新增仅返回 Vault 摘要、索引健康、任务计数、会话活动和最近事件的工作台聚合读取合同。",
+          "以全 Vault 可扫描矩阵替换单一当前 Vault 首屏，并提供异常、运行中和待处理状态的可点击二级筛选。",
+          "实现选中 Vault 的右侧二级详情抽屉，覆盖概况、索引、资料、图谱、会话和策略标签页。",
+          "统一按钮、图标按钮、选择器、输入框、分段控件、状态标记和响应式布局的视觉与交互状态。",
+          "在导入任务资料项中以‘解析器’标签显示已持久化的 conversion_engine；自动导入详情和兼容审核详情保持一致，未选择引擎时不显示。",
+          "覆盖空态、加载态、失败态、不可用 Vault、键盘操作、桌面与移动视口。"
+        ],
+        "outOfScope": [
+          "不返回或跨 Vault 混合展示正文、绝对路径、Provider 凭据、来源哈希或证据片段。",
+          "不改变现有 Vault 隔离、索引、任务、会话、图谱关系、出网策略或破坏性操作语义。",
+          "不重写现有会话内容渲染、导入状态机、Provider 配置或 SQLite schema。",
+          "不在任务总表聚合多个资料项的解析器，也不为标签新增 API 字段或数据库迁移。",
+          "不以视觉层聚合数据替代 application/ports/adapters 分层，也不在 API 直接写 SQL。"
+        ],
+        "followup": [
+          "若需跨 Vault 内容搜索或图谱合并，另立数据边界和检索合同任务。",
+          "若需工作台历史趋势、事件持久化或推送刷新，另立时间序列与实时更新任务。"
+        ],
+        "verification": [
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_workbench_overview.py tests/unit/test_vault_api.py",
+          "uv run --directory apps/service ruff check application/workbench_overview.py api/main.py tests/unit/test_workbench_overview.py",
+          "npm --prefix apps/web run test",
+          "npm --prefix apps/web run lint",
+          "npm --prefix apps/web run build",
+          "npm run browser-test",
+          "npm run progress:build && npm run progress:check",
+          "git diff --check"
+        ]
+      },
+      "deliverables": [
+        "跨 Vault 工作台摘要聚合合同与受保护 API",
+        "全 Vault 全景首页、优先处理队列和最近动态时间线",
+        "Vault 二级详情抽屉与共享控件设计系统",
+        "服务、前端和浏览器回归证据"
+      ],
+      "acceptance": "工作台首屏可查看所有已授权 Vault 的可用性、索引健康、任务与活动摘要；点击任一状态可在不丢失全局上下文的二级抽屉中定位对应详情和操作；导入任务资料项在已选择解析引擎时显示‘解析器’标签，兼容审核详情与自动导入详情一致，未选择引擎时保持空缺；摘要不泄露正文或跨 Vault 关系；桌面和移动端的按钮、选择器、输入容器及键盘交互具备一致的加载、禁用、错误和焦点状态。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_document_conversion_v2.py tests/unit/test_import_service.py tests/unit/test_import_tasks.py tests/unit/test_import_api.py（61 passed）",
+        "uv run --directory apps/service ruff check application/ingest.py domain/derived_notes.py workers/converters/launcher.py tests/unit/test_import_service.py tests/unit/test_document_conversion_v2.py（All checks passed）",
+        "npm --prefix apps/web run test（33 passed）、lint 与 build（通过）",
+        "本机任务 03/09 均完成；详情接口 62/63 ms 返回且 index=null；两项 Word 提案 provider_markdown=null；运行/排队计数均为 0。"
+      ]
+    },
+    {
+      "id": "RET-22-01",
+      "phaseId": "RET-22",
+      "order": 1,
+      "title": "以 PaddleOCR-VL 1.6 替换 PDF 解析",
+      "priority": "P0",
+      "status": "已完成",
+      "dependsOn": [
+        "RET-19-01"
+      ],
+      "executionBoundary": {
+        "inScope": [
+          "将 PDF V2 主转换器从 native-pdf+MinerU 混合路径替换为经 profile 校验的本机 PaddleOCR-VL 1.6 pipeline。",
+          "保留 PaddleOCR-VL 的 executable、配置和模型目录哈希及 release approval 门禁合同；仅在本机 runtime 与模型获批准后启用。",
+          "将 PaddleOCR-VL 1.6 的页面结构、文本、表格、公式、图片和 bbox 输出映射到现有 DocumentGraph 与私有 artifact 合同。",
+          "安装经批准的本机 GPU PaddlePaddle 3.2.2、PaddleOCR-VL 1.6 与布局模型，完成 profile 哈希验证与脱敏 PDF application smoke。",
+          "补充命令构造、真实保存 JSON 适配、无效输出、profile 缺失和图片/公式/数字保真回归。"
+        ],
+        "outOfScope": [
+          "不安装或回退到 CPU PaddlePaddle；仅使用经批准的本机 GPU runtime。",
+          "不下载或运行未由本机 profile 验证的 PaddlePaddle/VL 模型，不启用远程 VLM 或 API。",
+          "不改变 DOCX、Markdown、Vault、索引 schema、Markdown Provider、出网 policy 或公开 API。",
+          "不删除 pypdf 的旧任务读取和 PDF 预检兼容路径，不对历史已生成 Markdown 做破坏性重处理。"
+        ],
+        "followup": [
+          "如需字符级 bbox、复杂阅读顺序或模型质量调参，另立 PDF 解析质量任务。",
+          "如需消除 GPU runtime 报告的 CUDNN 9.9 与系统 9.5 版本警告，另立运行时兼容性任务并以多份脱敏 PDF 回归。"
+        ],
+        "verification": [
+          "GPU runtime 自检：paddlepaddle-gpu 3.2.2、cuda=True、device=gpu:0、CPU paddlepaddle distribution absent。",
+          "uv run --directory apps/service --locked --no-sync pytest -p no:cacheprovider tests/unit/test_document_conversion_v2.py tests/unit/test_converter_provisioning.py tests/unit/test_document_parser.py（67 passed）",
+          "uv run --directory apps/service --locked --no-sync ruff check workers/converters/launcher.py workers/converters/profiles.py workers/converters/provisioning.py tests/unit/test_document_conversion_v2.py tests/unit/test_converter_provisioning.py tests/unit/test_document_parser.py（All checks passed）",
+          "PaddleOCR-VL 1.6 脱敏 PDF application smoke：engine=paddleocr-vl-1.6、quality=accepted、18 blocks、page 1 bbox、5 artifact drafts；临时 input.pdf 未进入 artifact。",
+          "npm run progress:build && npm run progress:check",
+          "git diff --check"
+        ]
+      },
+      "deliverables": [
+        "PaddleOCR-VL 1.6 PDF converter profile and command adapter",
+        "PaddleOCR-VL output to DocumentGraph mapping",
+        "PaddleOCR-VL profile, output and fidelity regression tests"
+      ],
+      "acceptance": "PDF V2 不再调用 MinerU 或 native-pdf+MinerU 混合解析；仅当已批准的本机 PaddleOCR-VL 1.6 profile、配置和模型完整可核验时运行。有效输出能保留文本、页码/bbox、表格、公式、图片及 artifact 溯源；profile 缺失、输出格式无效或转换失败时失败关闭且任务可恢复。",
+      "verification": [
+        "GPU runtime 自检：paddlepaddle-gpu 3.2.2、cuda=True、device=gpu:0、CPU paddlepaddle distribution absent。",
+        "PaddleOCR-VL 1.6 真实保存页面 JSON fixture 与无扩展名 snapshot 的私有 input.pdf staging 回归。",
+        "uv run --directory apps/service --locked --no-sync pytest -p no:cacheprovider tests/unit/test_document_conversion_v2.py tests/unit/test_converter_provisioning.py tests/unit/test_document_parser.py（67 passed）",
+        "uv run --directory apps/service --locked --no-sync ruff check workers/converters/launcher.py workers/converters/profiles.py workers/converters/provisioning.py tests/unit/test_document_conversion_v2.py tests/unit/test_converter_provisioning.py tests/unit/test_document_parser.py（All checks passed）",
+        "PaddleOCR-VL 1.6 脱敏 PDF application smoke：engine=paddleocr-vl-1.6、quality=accepted、18 blocks、page 1 bbox、5 artifact drafts；临时 input.pdf 未进入 artifact。",
+        "完整服务端 unit 在 180 秒上限内未完成且未输出失败断言；未记为通过。"
+      ]
+    },
+    {
+      "id": "RET-23-01",
+      "phaseId": "RET-23",
+      "order": 1,
+      "title": "Markdown Provider 大 token 结构安全分块",
+      "priority": "P0",
+      "status": "已完成",
+      "dependsOn": [
+        "RET-20-01"
+      ],
+      "executionBoundary": {
+        "inScope": [
+          "以本地、保守的 Markdown token 估算替换默认的字符数与 24 个源单位上限；默认最小、目标和最大请求正文预算分别为 10k、16k、20k token。",
+          "保持标题、列表、表格、引用和代码围栏的既有原子边界及后续块的继承标题上下文；整篇不足最小预算、最终尾块不足最小预算或受不可拆结构限制形成的小块仍发送，且不重复正文。",
+          "在 Provider 设置中增加可持久化的 Markdown 结构化分块最小、目标和最大 token 预算；后端对其范围与顺序失败关闭，并让新配置即时用于后续导入。",
+          "当单个不可拆结构本身超过配置的最大预算时，保留原文并跳过该结构的 Provider 请求，避免超预算出网或静默截断。",
+          "仅提高 Markdown Provider 路径的输出 token 预算，并同步响应大小校验，避免与较大的输入正文不匹配而截断；普通聊天生成预算保持不变。",
+          "覆盖中文、英文、混合 Markdown、单位数量、尾块、超长散文与超长不可拆结构的定向回归。"
+        ],
+        "outOfScope": [
+          "不变更 Provider 模型选择、凭据、出网 policy、提示词语义、原始 Markdown、DocumentGraph、Vault 提交或索引。",
+          "不为各 Provider 或模型新增 context window 配置、远程 tokenizer 或自动降级到小批次；不支持大输出的 Provider 继续返回既有可恢复错误。",
+          "不拆开列表、表格、引用或代码围栏来强行满足 20k 上限。"
+        ],
+        "followup": [
+          "如需根据具体模型 context window 动态协商预算，另立 Provider capability 合同任务。",
+          "如需量化分块规模对真实 Provider 质量、延迟和费用的影响，以已审阅脱敏长文另立 golden evaluation 任务。"
+        ],
+        "verification": [
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_markdown_structuring.py tests/unit/test_providers.py tests/unit/test_openai_compatible_provider.py tests/unit/test_sqlite_provider_repository_rerank.py tests/unit/test_vault_api.py",
+          "uv run --directory apps/service ruff check domain/markdown_structuring.py application/markdown_structuring.py application/providers.py adapters/openai_compatible_provider.py adapters/sqlite_provider_repository.py ports/provider_repository.py api/main.py tests/unit/test_markdown_structuring.py tests/unit/test_providers.py tests/unit/test_openai_compatible_provider.py tests/unit/test_sqlite_provider_repository_rerank.py tests/unit/test_vault_api.py",
+          "npm --prefix apps/web run test && npm --prefix apps/web run lint && npm --prefix apps/web run build",
+          "npm run progress:build && npm run progress:check",
+          "git diff --check"
+        ]
+      },
+      "deliverables": [
+        "默认 10k/16k/20k 且可在 Provider 设置调整的结构安全 Markdown Provider token 分块",
+        "可回滚的 Markdown Provider 分块预算 SQLite 设置与受保护 API",
+        "不受普通聊天预算影响的 Markdown 输出 token 预算",
+        "长文、尾块和不可拆结构的预算与保真回归"
+      ],
+      "acceptance": "设置页可查看和保存 Markdown 结构化请求正文的最小、目标和最大 token 预算，默认 10k/16k/20k；无效顺序或越界值不会持久化。可安全聚合的长 Markdown 正文以约目标值、最多最大值的请求发送，不会再因默认字符数或 24 单位上限产生大量小请求。整篇不足最小值、最终尾块不足最小值或结构边界迫使的小块仍发送；标题、列表、表格、引用、代码围栏、源顺序和继承标题上下文保持不变。单个超过上限的不可拆结构不出网也不截断。Markdown Provider 的输出预算足以返回同量级正文，普通聊天生成预算不变。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_markdown_structuring.py tests/unit/test_providers.py tests/unit/test_openai_compatible_provider.py tests/unit/test_sqlite_provider_repository_rerank.py tests/unit/test_vault_api.py -q（108 passed）",
+        "uv run --directory apps/service ruff check domain/markdown_structuring.py application/markdown_structuring.py application/providers.py adapters/openai_compatible_provider.py adapters/sqlite_provider_repository.py ports/provider_repository.py api/main.py tests/unit/test_markdown_structuring.py tests/unit/test_providers.py tests/unit/test_openai_compatible_provider.py tests/unit/test_sqlite_provider_repository_rerank.py tests/unit/test_vault_api.py（All checks passed）",
+        "npm --prefix apps/web run test（33 passed）、lint 与 build（通过）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过；仅 Windows 行尾提示）"
+      ]
+    },
+    {
+      "id": "RET-24-01",
+      "phaseId": "RET-24",
+      "order": 1,
+      "title": "导入任务排队与 Word 本地提案修复",
+      "priority": "P0",
+      "status": "已完成",
+      "dependsOn": [
+        "RET-18-01",
+        "RET-23-01"
+      ],
+      "executionBoundary": {
+        "inScope": [
+          "批量选择产生的导入任务以单消费者队列推进：仅队首任务运行，终态后才启动下一项。",
+          "DOCX 和 PDF 的已验证 DocumentGraph 只在本地生成派生 Markdown 提案，不调用 Markdown Provider。",
+          "任务详情和转换图读取不持有导入状态全局写入锁，避免长任务阻塞详情页面。",
+          "补充队列顺序、DOCX/PDF 零 Markdown Provider 调用和详情读取的定向回归。"
+        ],
+        "outOfScope": [
+          "不改变原生 Markdown 的 Markdown Provider 结构化行为、Provider 凭据、模型选择或 token 预算。",
+          "不修改 SQLite schema、Vault 文件、已提交资料、索引或 Embedding 合同。",
+          "不为队列新增并发配置、跨进程调度、后台服务或公开 API。"
+        ],
+        "followup": [
+          "如需可配置并发、暂停/重排队列或跨服务持久化调度，另立导入调度合同任务。",
+          "如需重新结构化历史 Word/PDF 的已提交 Markdown，另立可预览、可回滚的重处理任务。"
+        ],
+        "verification": [
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_import_service.py tests/unit/test_import_tasks.py tests/unit/test_import_api.py",
+          "uv run --directory apps/service ruff check application/ingest.py tests/unit/test_import_service.py",
+          "npm --prefix apps/web run test && npm --prefix apps/web run lint && npm --prefix apps/web run build",
+          "npm run progress:build && npm run progress:check",
+          "git diff --check"
+        ]
+      },
+      "deliverables": [
+        "单消费者导入任务队列",
+        "Word/PDF 本地派生提案边界",
+        "不会被导入写锁阻塞的任务详情读取"
+      ],
+      "acceptance": "同一批量选择中只有一个任务处于运行态，其他任务显示排队；当前任务进入完成、失败或取消终态后下一项自动推进。DOCX/PDF 的 DocumentGraph 不会调用 Markdown Provider，原生 Markdown 行为保持不变。慢写入不会阻塞任务详情读取。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_document_conversion_v2.py tests/unit/test_import_service.py tests/unit/test_import_tasks.py tests/unit/test_import_api.py（61 passed）",
+        "uv run --directory apps/service ruff check application/ingest.py domain/derived_notes.py workers/converters/launcher.py tests/unit/test_import_service.py tests/unit/test_document_conversion_v2.py（All checks passed）",
+        "npm --prefix apps/web run test（33 passed）、lint 与 build（通过）",
+        "本机任务 03/09 均完成；详情接口 62/63 ms 返回且 index=null；两项 Word 提案 provider_markdown=null；运行/排队计数均为 0。"
+      ]
+    },
+    {
+      "id": "RET-24-02",
+      "phaseId": "RET-24",
+      "order": 2,
+      "title": "导入任务源解析与结构化结果对照",
+      "priority": "P1",
+      "status": "已完成",
+      "dependsOn": [
+        "RET-24-01"
+      ],
+      "executionBoundary": {
+        "inScope": [
+          "在受本机会话保护的导入任务详情中，仅为已选 DocumentGraph 或兼容 ParseEvidence 返回按阅读顺序的可显示解析正文、块类型和用户可理解的位置。",
+          "将同一资料项的源解析内容与现有只读结构化 Markdown 结果并列显示，供人工比较。",
+          "覆盖 API 不返回私有 raw extraction、绝对路径、哈希、转换工件或内部 block ID，以及前端内容、空态和资料项归属。"
+        ],
+        "outOfScope": [
+          "不改变 PDF/DOCX 本地解析、Markdown Provider、出网 policy、Vault 提交、索引、Embedding 或 SQLite schema。",
+          "不提供原始文件、图片、bbox、转换 artifact、解析器内部 JSON、绝对路径或跨 Vault 内容浏览。",
+          "不改变原生 Markdown 的 Provider 结构化行为或为任务详情增加编辑、审核、确认操作。"
+        ],
+        "followup": [
+          "如需逐页原始文件预览或图像区域高亮，另立受控媒体读取、授权与缓存任务。",
+          "如需自动评估源解析与结构化 Markdown 的差异，另立脱敏语料和质量指标任务。"
+        ],
+        "verification": [
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_import_api.py",
+          "uv run --directory apps/service ruff check api/main.py tests/unit/test_import_api.py",
+          "npm --prefix apps/web run test && npm --prefix apps/web run lint && npm --prefix apps/web run build",
+          "npm run progress:build && npm run progress:check",
+          "git diff --check"
+        ]
+      },
+      "deliverables": [
+        "最小化的源解析内容任务详情 API 合同",
+        "按资料项并列的源解析与结构化 Markdown 只读对照面板",
+        "服务与前端回归证据"
+      ],
+      "acceptance": "已解析的 PDF/DOCX 任务详情可按资料项查看源解析正文及其用户可理解的位置，并与同一资料项的结构化 Markdown 结果直接对照；未解析资料保持清晰空态；响应不包含原始解析工件、绝对路径、哈希或内部块身份。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_import_api.py tests/unit/test_import_service.py（17 passed）",
+        "uv run --directory apps/service ruff check application/ingest.py api/main.py tests/unit/test_import_api.py（All checks passed）",
+        "npm --prefix apps/web run test（34 passed）、lint 与 build（通过）",
+        "OBSIDIAN_PLATFORM_TEST_PORT=6424 npm run browser-test（23 passed）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过）"
+      ]
+    },
+    {
+      "id": "RET-25-01",
+      "phaseId": "RET-25",
+      "order": 1,
+      "title": "iOS 设计语言统一前端 UI 重构",
+      "priority": "P0",
+      "status": "进行中",
+      "dependsOn": [
+        "RET-21-01",
+        "RET-24-02"
+      ],
+      "executionBoundary": {
+      "inScope": [
+        "按根目录 DESIGN.md 建立语义化 CSS tokens、共享控件样式和 Lucide 图标使用规则，并统一工作台、资料、会话、任务和设置五个生产入口。",
+        "保留桌面导航与会话三栏，完成 390px 移动端的逐层导航、底部 Sheet 和完整可操作路径。",
+        "删除营销式标题、英文眉题和重复解释，保留用户完成操作所需的状态、风险、错误与恢复动作。",
+        "让刷新、切换、Drawer、Sheet、按钮和异步状态使用可减少动态的连续动效，保留旧内容和阅读位置，避免闪白和布局跳动。",
+        "补充前端单测与关键 Playwright 浏览器回归，覆盖桌面、紧凑桌面、移动端、键盘、减少动态和主要点击路径。",
+        "会话首次进入直接定位到最新消息，不播放从首条到末条的下滚动画；问答定位导航仍保留用户触发的平滑滚动。"
+        ],
+        "outOfScope": [
+          "不修改 FastAPI API、领域合同、SQLite schema、检索排序、Provider、出网策略或业务判定。",
+          "不新增深色模式、用户主题设置、远程字体、远程图片、状态库或 UI 框架。",
+          "不改变 retrieval-chunking lab 的诊断职责，除非另有明确任务边界。",
+          "不删除或回退当前工作区已有的服务端、前端和进度未提交改动。"
+        ],
+        "followup": [
+          "如需深色模式，另立以独立色彩 token、对比度复核和持久化偏好为范围的主题任务。",
+          "如需更复杂的手势、共享元素导航或跨页动画，先以性能测量和 reduced-motion 评审建立独立动效任务。"
+        ],
+      "verification": [
+        "npm --prefix apps/web run test",
+        "npm --prefix apps/web run lint",
+        "npm --prefix apps/web run build",
+        "以独立端口运行 npm run browser-test",
+        "浏览器断言会话首次定位使用 scroll-behavior: auto，问答定位仍可用",
+        "Playwright CLI 检查 1440x900、1024x768、390x844 和 prefers-reduced-motion 的主要流程与截图",
+          "npm run progress:build && npm run progress:check",
+          "git diff --check"
+        ]
+      },
+      "deliverables": [
+        "DESIGN.md 驱动的共享前端设计 tokens、控件和动效规则",
+        "统一的工作台、资料、会话、任务和设置生产界面",
+        "桌面、紧凑桌面和移动端可操作的视觉与交互回归证据"
+      ],
+      "acceptance": "五个生产入口均遵循 DESIGN.md 的 iOS 设计语言、中文简洁文案、状态连续和无障碍标准；桌面三栏与移动端逐层路径完整可操作；刷新不闪白或丢失阅读位置；关键单测、构建、浏览器和视觉检查通过。",
+      "verification": []
+    },
+    {
+      "id": "RET-26-01",
+      "phaseId": "RET-26",
+      "order": 1,
+      "title": "解析产物可读命名与同名保护",
+      "priority": "P1",
+      "status": "已完成",
+      "dependsOn": [
+        "RET-24-01"
+      ],
+      "executionBoundary": {
+        "inScope": [
+          "将新导入原件保留为导入文件名，派生笔记目录使用文件主名，章节笔记使用解析标题，目录页使用‘文件名 - 目录.md’。",
+          "移除新生成 Vault 路径中的 source ID、内容哈希和顺序前缀；内部来源 ID、哈希和前言溯源保持不变。",
+          "同名但内容不同的原件只使用常规‘（2）’后缀区分，避免覆盖已有 Vault 文件。",
+          "保持新的目录页及遗留 index.md 均不进入正文索引，并补充导入、标签和索引回归。"
+        ],
+        "outOfScope": [
+          "不重命名或迁移已提交的历史 Vault 文件。",
+          "不修改原生 Markdown、Provider、出网策略、SQLite schema、检索排序或公开 API。",
+          "不改变解析正文、章节划分、前言溯源或任务删除的回滚语义。"
+        ],
+        "followup": [
+          "如需对历史导入按新规则重命名，需另立可预览、可回滚的 Vault 迁移任务。",
+          "如需支持用户自定义命名模板或批量重命名，需另立冲突确认与撤销语义任务。"
+        ],
+        "verification": [
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_derived_notes.py tests/unit/test_import_service.py tests/unit/test_metadata_tags.py tests/unit/test_index_service.py",
+          "uv run --directory apps/service ruff check domain/derived_notes.py application/ingest.py application/indexing.py tests/unit/test_derived_notes.py tests/unit/test_import_service.py tests/unit/test_metadata_tags.py tests/unit/test_index_service.py",
+          "npm run progress:build && npm run progress:check",
+          "git diff --check"
+        ]
+      },
+      "deliverables": [
+        "以导入文件名和解析标题生成的可读 Vault 路径",
+        "同名原件的常规后缀保护",
+        "目录页索引排除的兼容回归"
+      ],
+      "acceptance": "新导入的原件、目录页和派生笔记路径不含 source ID、哈希或章节序号，且可直接从导入文件名和解析标题理解；同名不同内容不会覆盖已有资料；新目录页及旧 index.md 都不进入正文索引；内部来源身份、溯源和删除回滚保持有效。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_derived_notes.py tests/unit/test_import_service.py tests/unit/test_metadata_tags.py tests/unit/test_index_service.py（59 passed）",
+        "uv run --directory apps/service ruff check domain/derived_notes.py application/ingest.py application/indexing.py tests/unit/test_derived_notes.py tests/unit/test_import_service.py tests/unit/test_metadata_tags.py tests/unit/test_index_service.py（All checks passed）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过；仅既有 Windows 行尾提示）",
+        "完整服务端 unit 在 184 秒上限内未完成且未输出失败断言；未记为通过。"
+      ]
+    },
+    {
+      "id": "RET-27-01",
+      "phaseId": "RET-27",
+      "order": 1,
+      "title": "任务级在线 OCR Provider 与显式授权",
+      "priority": "P0",
+      "status": "进行中",
+      "dependsOn": [
+        "RET-24-01",
+        "RET-25-01"
+      ],
+      "executionBoundary": {
+        "inScope": [
+          "定义 PaddleOCR 官方 API 与 MinerU 官方 API 的在线文档解析 Provider 合同，接入受控凭据、连接测试、提交、轮询和结果归一化。",
+          "将在线解析选择冻结到导入任务，并在 Vault outbound policy、Provider 验证与凭据可用性通过后才上传 PDF 原件与文件名。",
+          "在创建导入任务界面增加默认关闭的在线解析 Switch 和已验证 Provider 选择；任务详情仅展示安全的 Provider 与状态摘要。",
+          "持久化远端作业身份以支持重启后继续轮询；覆盖失败、取消、策略拒绝及不静默回退。"
+        ],
+        "outOfScope": [
+          "不将 DOCX、原生 Markdown、其他文件类型、Vault 全量内容或已提交历史资料发送到在线 Provider。",
+          "不暴露 Provider token、绝对路径、远端 job ID、签名 URL、原始 HTTP 响应或完整 Provider 日志。",
+          "不把在线 Provider 失败自动改为本地或另一在线 Provider；不承诺取消已在云端提交的作业。",
+          "不修改公开网络入口、Cloudflare Tunnel、安全会话边界或检索排序。"
+        ],
+        "followup": [
+          "需要在线 Provider 的费用预算、配额告警或用量结算时，另立费用与配额治理任务。",
+          "需要其他云端 OCR Provider、图片/演示文稿/表格支持或远端作业取消时，另立兼容性与隐私审查任务。"
+        ],
+        "verification": [
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_online_document_parser.py tests/unit/test_import_service.py tests/unit/test_import_api.py",
+          "uv run --directory apps/service ruff check domain application adapters api tests/unit",
+          "npm --prefix apps/web run test && npm --prefix apps/web run lint && npm --prefix apps/web run build",
+          "以独立端口运行 npm run browser-test",
+          "Playwright CLI 检查 1440x900、1024x768、390x844 的在线解析开关、Provider 选择与错误恢复",
+          "npm run progress:build && npm run progress:check",
+          "git diff --check"
+        ]
+      },
+      "deliverables": [
+        "PaddleOCR-VL 1.6 与 MinerU 官方在线解析 Provider",
+        "任务级显式在线解析选择、出网门禁和可恢复轮询",
+        "设置页 Provider 配置与导入任务在线解析开关",
+        "服务、前端与浏览器回归证据"
+      ],
+      "acceptance": "用户只有在创建 PDF 导入任务时显式打开在线解析且选择已验证 Provider 后，原件与文件名才会发送到 PaddleOCR 官方 API 或 MinerU；其他格式始终本地解析。默认和策略拒绝时零上传。任务可显示安全状态、可在服务重启后继续轮询，Provider 失败不会静默回退；两个 Provider 的连接测试、服务测试、前端测试和关键浏览器流程通过。",
+      "verification": []
+    },
+    {
+      "id": "RET-28-01",
+      "phaseId": "RET-28",
+      "order": 1,
+      "title": "双语标题来源链接核验修复",
+      "priority": "P0",
+      "status": "已完成",
+      "dependsOn": [
+        "RET-26-01"
+      ],
+      "executionBoundary": {
+        "inScope": [
+          "复现派生笔记的中英文两行一级标题位于来源链接之前时被错误标记 source-link-broken 的问题。",
+          "仅修复来源链接顶部核验，使来源链接可位于同一顶部一级标题区间内的双语标题之后。",
+          "使既有 source-link-broken 索引文档在下一次 reconcile 时重新核验并恢复。",
+          "运行索引服务定向回归、Ruff 和进度一致性检查。"
+        ],
+        "outOfScope": [
+          "不修改来源哈希、来源路径、provenance 合同、SQLite schema、索引重建或检索排序。",
+          "不放宽来源链接为正文任意位置的链接，也不改写已有 Vault 笔记。",
+          "不处理其他 stale 原因或清理既有历史索引记录。"
+        ],
+        "followup": [
+          "如发现现有索引需要重新核验或重建，按现有索引重建流程另行执行。"
+        ],
+        "verification": [
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_index_service.py",
+          "uv run --directory apps/service ruff check application/indexing.py tests/unit/test_index_service.py",
+          "npm run progress:build && npm run progress:check",
+          "git diff --check"
+        ]
+      },
+      "deliverables": [
+        "双语标题来源链接的回归测试",
+        "受限于顶部一级标题区间的来源链接核验修复"
+      ],
+      "acceptance": "来源文件与哈希未变化且来源链接位于中英文两行一级标题之后时，派生笔记保持 verifiable，不产生 source-link-broken；既有同原因 stale 文档在下一次 reconcile 自动恢复；来源链接缺失或仅出现在后续正文时仍不可核验。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_index_service.py -q（19 passed；修复前新增双语标题回归单独失败并复现 source-link-broken）",
+        "uv run --directory apps/service ruff check application/indexing.py tests/unit/test_index_service.py（All checks passed）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过）"
+      ]
+    },
+    {
+      "id": "RET-29-01",
+      "phaseId": "RET-29",
+      "order": 1,
+      "title": "当前页导入任务多选删除",
+      "priority": "P1",
+      "status": "已完成",
+      "dependsOn": [
+        "RET-18-02",
+        "RET-25-01"
+      ],
+      "executionBoundary": {
+        "inScope": [
+          "在当前 Vault 的导入任务当前分页中提供逐项复选、全选当前可删除任务和删除所选命令。",
+          "删除确认明确显示所选任务数量，并按既有单任务删除请求逐项执行，复用现有 Vault 文件哈希校验、回退和索引清理语义。",
+          "已成功删除的任务立即从当前列表移除；失败项保留选中状态并展示可恢复错误。",
+          "补充前端单元测试和关键浏览器删除流程验证。"
+        ],
+        "outOfScope": [
+          "不新增批量删除 API、领域合同、SQLite schema 或服务端删除语义。",
+          "不允许选择运行中的任务，不改变单任务删除入口、Vault 文件回退范围、哈希保护或原始上传文件保留规则。",
+          "不改变任务筛选、服务端分页、Provider、出网策略、检索排序或其他页面。"
+        ],
+        "followup": [
+          "如需跨页选择、服务端批量删除事务或撤销删除，另立包含并发、失败原子性和恢复语义的任务。"
+        ],
+        "verification": [
+          "npm --prefix apps/web run test",
+          "npm --prefix apps/web run lint",
+          "npm --prefix apps/web run build",
+          "以独立端口运行 npm run browser-test",
+          "Playwright CLI 检查 1440x900、1024x768、390x844 的当前页多选、全选、确认、成功移除和失败保留路径",
+          "npm run progress:build && npm run progress:check",
+          "git diff --check"
+        ]
+      },
+      "deliverables": [
+        "当前页导入任务的可访问复选与全选控件",
+        "明确范围的批量删除确认与逐项安全删除反馈",
+        "前端与浏览器回归证据"
+      ],
+      "acceptance": "当前 Vault 的任务列表可单选或全选当前页中所有非运行任务；确认后只通过既有单任务删除路径逐项处理。成功项即时从列表移除，失败项保持选中并显示原因；分页、切换 Vault 或改变页大小不会把选择范围扩展到当前页以外。",
+      "verification": [
+        "npm --prefix apps/web run test（38 passed）",
+        "npm --prefix apps/web run lint（通过）",
+        "npm --prefix apps/web run build（通过）",
+        "OBSIDIAN_PLATFORM_TEST_PORT=6431 npm run browser-test：新增当前页多选、运行中任务排除、部分失败保留用例通过；完整 24 项中 16 项通过，另有 8 项在既有工作台、设置和会话 UI 场景失败，未归因于本任务。",
+        "单独重跑新增浏览器用例时隔离服务未在 10 秒健康检查窗口内启动；此前完整套件中该用例已通过，因此不记为功能失败。",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过；仅既有 Windows 行尾提示）"
       ]
     }
   ]

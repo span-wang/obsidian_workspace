@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from adapters.sqlite_provider_repository import SqliteProviderRepository
+from domain.markdown_structuring import MarkdownProviderChunkBudget
 from domain.providers import ModelSelection, ProbeResult, Provider, ProviderModel, ProviderProbeResults
 
 
@@ -268,6 +269,37 @@ def test_rerank_database_upgrades_to_markdown_defaults_and_is_idempotent(tmp_pat
             """SELECT COUNT(*) FROM provider_schema_migrations
                 WHERE migration_id = 'ret-17-01-provider-markdown-model-type-v1'"""
         ).fetchone()[0] == 1
+
+
+def test_markdown_chunk_budget_defaults_and_persists_across_restarts(tmp_path: Path) -> None:
+    database_path = tmp_path / "providers.sqlite3"
+    repository = SqliteProviderRepository(database_path)
+
+    assert repository.get_markdown_structure_budget() == MarkdownProviderChunkBudget()
+    repository.save_markdown_structure_budget(MarkdownProviderChunkBudget(12_000, 16_000, 19_000))
+
+    assert SqliteProviderRepository(database_path).get_markdown_structure_budget() == MarkdownProviderChunkBudget(
+        12_000, 16_000, 19_000
+    )
+
+
+def test_failed_markdown_chunk_budget_migration_rolls_back_and_can_be_retried(tmp_path: Path) -> None:
+    database_path = tmp_path / "providers.sqlite3"
+    _create_rerank_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE markdown_structure_budgets (placeholder TEXT)")
+
+    with pytest.raises(sqlite3.OperationalError, match="already exists"):
+        SqliteProviderRepository(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            """SELECT COUNT(*) FROM provider_schema_migrations
+            WHERE migration_id = 'ret-23-01-provider-markdown-chunk-budget-v1'"""
+        ).fetchone()[0] == 0
+        connection.execute("DROP TABLE markdown_structure_budgets")
+
+    assert SqliteProviderRepository(database_path).get_markdown_structure_budget() == MarkdownProviderChunkBudget()
 
 
 def test_failed_markdown_migration_rolls_back_and_can_be_retried(tmp_path: Path) -> None:

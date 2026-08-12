@@ -6,6 +6,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from domain.sources import VersionSuggestion
+from domain.online_document_parser import OnlineParseJob, OnlineParseSelection
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,8 @@ class ImportTask:
     created_at: str
     updated_at: str
     ignored_paths: tuple[Path, ...] = ()
+    online_parse_selection: OnlineParseSelection | None = None
+    online_parse_job: OnlineParseJob | None = None
 
 
 @dataclass(frozen=True)
@@ -110,6 +113,8 @@ def new_import_task(
     source_paths: tuple[Path, ...],
     scope_label: str,
     parent_task_id: str | None = None,
+    online_parse_selection: OnlineParseSelection | None = None,
+    online_parse_job: OnlineParseJob | None = None,
 ) -> ImportTask:
     timestamp = utc_now()
     return ImportTask(
@@ -122,9 +127,11 @@ def new_import_task(
         phase="queued",
         current_item_label=None,
         counts=ImportTaskCounts(),
-        recovery_actions=("cancel",),
+        recovery_actions=(),
         failure_reason=None,
         parent_task_id=parent_task_id,
         created_at=timestamp,
         updated_at=timestamp,
+        online_parse_selection=online_parse_selection,
+        online_parse_job=online_parse_job,
     )

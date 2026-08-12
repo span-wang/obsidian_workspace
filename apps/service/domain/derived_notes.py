@@ -174,6 +174,11 @@ def _render_list(payload: dict[str, object]) -> str:
         raise ValueError("List payload items must be structured.")
     if nesting is None:
         levels = [0] * len(items)
+    elif type(nesting) is int and nesting >= 0 and len(items) == 1:
+        # Older DOCX graphs stored the nesting depth directly for a single list
+        # item. Keep those immutable graphs renderable while new graphs use the
+        # list form below.
+        levels = [nesting]
     elif isinstance(nesting, list) and len(nesting) == len(items) and all(
         type(level) is int and level >= 0 for level in nesting
     ):
@@ -195,6 +200,8 @@ def _render_list(payload: dict[str, object]) -> str:
 def _render_list_item(value: object) -> str:
     if isinstance(value, dict) and "inline_runs" in value:
         return _render_inline_runs(value["inline_runs"])
+    if isinstance(value, dict) and isinstance(value.get("text"), str):
+        return _escape_markdown_text(value["text"])
     return _escape_markdown_text(str(value))
 
 
@@ -478,10 +485,9 @@ def derive_markdown_proposal(
     if not _SHA256_PATTERN.fullmatch(source_sha256):
         raise ValueError("Source SHA-256 must be a lowercase 64-hex string.")
     managed_root = _normalize_relative_path(managed_root)
-    source_suffix = source_suffix.lower() if source_suffix.startswith(".") else f".{source_suffix.lower()}"
-    source_relative_path = (
-        f"{managed_root}/sources/{source_id}-{source_sha256[:16]}{source_suffix}"
-    )
+    source_filename = _source_filename(source_label, source_suffix)
+    source_title = _source_title(source_filename)
+    source_relative_path = f"{managed_root}/sources/{source_filename}"
     units = evidence.units
     groups = _default_groups(units)
     fallback_locators = _unique_locators(issue.locator for issue in evidence.issues)
@@ -492,8 +498,8 @@ def derive_markdown_proposal(
         processing_task_id=processing_task_id,
         source_sha256=source_sha256,
         source_relative_path=source_relative_path,
-        notes_root=f"{managed_root}/notes/{source_id}",
-        source_label=source_label,
+        notes_root=f"{managed_root}/notes/{source_title}",
+        source_label=source_title,
         units=units,
         groups=groups,
         risks=risks,
@@ -535,9 +541,10 @@ def derive_graph_markdown_proposal(
             )
         )
         block_locators.append(locators)
-    source_suffix = source_suffix.lower() if source_suffix.startswith(".") else f".{source_suffix.lower()}"
     managed_root = _normalize_relative_path(managed_root)
-    source_relative_path = f"{managed_root}/sources/{source_id}-{source_sha256[:16]}{source_suffix}"
+    source_filename = _source_filename(source_label, source_suffix)
+    source_title = _source_title(source_filename)
+    source_relative_path = f"{managed_root}/sources/{source_filename}"
     graph_risks = tuple(issue.message for issue in graph.issues if issue.state != "accepted")
     proposal = _render_proposal(
         item_id=item_id,
@@ -546,8 +553,8 @@ def derive_graph_markdown_proposal(
         processing_task_id=processing_task_id,
         source_sha256=source_sha256,
         source_relative_path=source_relative_path,
-        notes_root=f"{managed_root}/notes/{source_id}",
-        source_label=source_label,
+        notes_root=f"{managed_root}/notes/{source_title}",
+        source_label=source_title,
         units=tuple(units),
         groups=_default_groups(tuple(units)),
         risks=tuple(dict.fromkeys((*risks, *graph_risks))),
@@ -785,7 +792,8 @@ def relocate_derived_proposal(
     category_parts = target_parts[notes_index + 1 :]
     managed_root = PurePosixPath(*managed_root_parts)
     source_path = managed_root / "sources" / PurePosixPath(*category_parts) / filename
-    notes_root = PurePosixPath(target_folder) / proposal.source_id
+    source_title = _source_title(filename)
+    notes_root = PurePosixPath(target_folder) / source_title
     return _render_proposal(
         item_id=proposal.item_id,
         vault_id=proposal.vault_id,
@@ -794,7 +802,7 @@ def relocate_derived_proposal(
         source_sha256=proposal.source_sha256,
         source_relative_path=source_path.as_posix(),
         notes_root=notes_root.as_posix(),
-        source_label=proposal.index_note.title,
+        source_label=source_title,
         units=proposal.units,
         groups=proposal.groups,
         risks=proposal.risks,
@@ -1071,10 +1079,12 @@ def _render_proposal(
     fallback_locators: tuple[EvidenceLocator, ...] = (),
     revision: int = 1,
 ) -> DerivedMarkdownProposal:
-    note_specs = [
-        (group, _group_title(units, group, source_label), f"{index:02d}-{_slug(_group_title(units, group, source_label))}")
-        for index, group in enumerate(groups, start=1)
-    ]
+    index_filename = f"{_filename_stem(source_label, '资料')} - 目录"
+    used_filenames = {index_filename.casefold()}
+    note_specs = []
+    for group in groups:
+        title = _group_title(units, group, source_label)
+        note_specs.append((group, title, _unique_filename(title, used_filenames)))
     notes: list[ProposedMarkdownNote] = []
     for sequence, (group, title, filename) in enumerate(note_specs, start=1):
         relative_path = f"{notes_root}/{filename}.md"
@@ -1104,7 +1114,7 @@ def _render_proposal(
                 markdown=markdown,
             )
         )
-    index_path = f"{notes_root}/index.md"
+    index_path = f"{notes_root}/{index_filename}.md"
     empty_index_notice = "\n- 尚无可生成的内容单元" if not notes else ""
     index_locators = _unique_locators(unit.locator for unit in units) or fallback_locators
     index_provenance = _provenance(
@@ -1304,9 +1314,35 @@ def _group_characters(
     return sum(len(units[index].text) for index in group)
 
 
-def _slug(value: str) -> str:
-    normalized = re.sub(r"[^a-z0-9]+", "-", value.casefold()).strip("-")
-    return normalized or "section"
+def _source_filename(source_label: str, source_suffix: str) -> str:
+    if "/" in source_label or "\\" in source_label:
+        raise ValueError("Source label must be a single filename.")
+    label = source_label.strip()
+    if label in {"", ".", ".."}:
+        raise ValueError("Source label must be a non-empty filename.")
+    suffix = source_suffix if source_suffix.startswith(".") else f".{source_suffix}"
+    return label if PurePosixPath(label).suffix else f"{label}{suffix}"
+
+
+def _source_title(filename: str) -> str:
+    return _filename_stem(PurePosixPath(filename).stem, "资料")
+
+
+def _unique_filename(title: str, used_filenames: set[str]) -> str:
+    base = _filename_stem(title, "内容")
+    filename = base
+    suffix = 2
+    while filename.casefold() in used_filenames:
+        filename = f"{base} ({suffix})"
+        suffix += 1
+    used_filenames.add(filename.casefold())
+    return filename
+
+
+def _filename_stem(value: str, fallback: str) -> str:
+    normalized = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "-", value)
+    normalized = re.sub(r"\s+", " ", normalized).strip(" .")
+    return normalized or fallback
 
 
 def _is_safe_boundary(units: tuple[StructuredContentUnit, ...], left_index: int, right_index: int) -> bool:

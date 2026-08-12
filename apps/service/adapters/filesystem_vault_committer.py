@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 
 from domain.review_commits import CommitBackup
@@ -54,22 +55,48 @@ class LocalVaultCommitter:
             )
         )
 
+    def capture_current_backups(
+        self,
+        vault_path: Path,
+        relative_paths: tuple[str, ...],
+        managed_root_relative_path: str | None = None,
+    ) -> tuple[CommitBackup, ...]:
+        vault_path = vault_path.resolve(strict=True)
+        writes = tuple(VaultWrite(relative_path, b"", None) for relative_path in relative_paths)
+        return tuple(
+            CommitBackup.from_bytes(write.relative_path, target.read_bytes() if target.exists() else None)
+            for target, write in self._validate_writes(
+                vault_path, writes, managed_root_relative_path, allow_existing=True
+            )
+        )
+
+    def validate_restore(
+        self,
+        vault_path: Path,
+        backups: tuple[CommitBackup, ...],
+        expected_current_sha256: Mapping[str, str],
+        managed_root_relative_path: str | None = None,
+    ) -> None:
+        vault_path = vault_path.resolve(strict=True)
+        planned = self._restore_plan(
+            vault_path, backups, managed_root_relative_path, create_parents=False
+        )
+        self._validate_expected_current(planned, expected_current_sha256)
+
     def restore(
         self,
         vault_path: Path,
         backups: tuple[CommitBackup, ...],
         managed_root_relative_path: str | None = None,
+        *,
+        expected_current_sha256: Mapping[str, str] | None = None,
     ) -> None:
         if not backups:
             return
         vault_path = vault_path.resolve(strict=True)
-        writes = tuple(
-            VaultWrite(backup.relative_path, backup.content() or b"", None)
-            for backup in backups
-        )
-        planned = self._validate_writes(
-            vault_path, writes, managed_root_relative_path, allow_existing=True
-        )
+        planned = self._restore_plan(vault_path, backups, managed_root_relative_path)
+        if expected_current_sha256 is not None:
+            self._validate_expected_current(planned, expected_current_sha256)
         content_by_path = {backup.relative_path: backup.content() for backup in backups}
         previous: dict[Path, bytes | None] = {}
         staged: list[tuple[Path, Path]] = []
@@ -96,6 +123,41 @@ class LocalVaultCommitter:
                 if temporary.exists():
                     temporary.unlink()
 
+    def _restore_plan(
+        self,
+        vault_path: Path,
+        backups: tuple[CommitBackup, ...],
+        managed_root_relative_path: str | None,
+        *,
+        create_parents: bool = True,
+    ) -> tuple[tuple[Path, VaultWrite], ...]:
+        writes = tuple(
+            VaultWrite(backup.relative_path, backup.content() or b"", None)
+            for backup in backups
+        )
+        return self._validate_writes(
+            vault_path,
+            writes,
+            managed_root_relative_path,
+            allow_existing=True,
+            create_parents=create_parents,
+        )
+
+    @staticmethod
+    def _validate_expected_current(
+        planned: tuple[tuple[Path, VaultWrite], ...],
+        expected_current_sha256: Mapping[str, str],
+    ) -> None:
+        planned_paths = {write.relative_path for _, write in planned}
+        if planned_paths != set(expected_current_sha256):
+            raise VaultCommitError("Vault rollback hashes do not match the committed file set.")
+        for target, write in planned:
+            if not target.exists():
+                raise VaultCommitError("A committed vault file is missing and cannot be deleted safely.")
+            actual = hashlib.sha256(target.read_bytes()).hexdigest()
+            if actual != expected_current_sha256[write.relative_path]:
+                raise VaultCommitError("A committed vault file changed after the task was completed.")
+
     def _validate_writes(
         self,
         vault_path: Path,
@@ -103,6 +165,7 @@ class LocalVaultCommitter:
         managed_root_relative_path: str | None,
         *,
         allow_existing: bool = False,
+        create_parents: bool = True,
     ) -> tuple[tuple[Path, VaultWrite], ...]:
         root_parts = self._relative_parts(managed_root_relative_path) if managed_root_relative_path else ()
         managed_root = vault_path.joinpath(*root_parts) if root_parts else vault_path
@@ -124,8 +187,15 @@ class LocalVaultCommitter:
                 and vault_path not in resolved_existing_parent.parents
             ):
                 raise VaultCommitError("Commit paths must stay inside the vault.")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            resolved_parent = target.parent.resolve(strict=True)
+            if create_parents:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                resolved_parent = target.parent.resolve(strict=True)
+            else:
+                resolved_parent = (
+                    target.parent.resolve(strict=True)
+                    if target.parent.exists()
+                    else resolved_existing_parent
+                )
             if resolved_parent != vault_path and vault_path not in resolved_parent.parents:
                 raise VaultCommitError("Commit paths must stay inside the vault.")
             if root_parts:

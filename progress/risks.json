@@ -1,5 +1,5 @@
 {
-  "updatedOn": "2026-08-05",
+  "updatedOn": "2026-08-12",
   "risks": [
     {
       "id": "RET-R001",
@@ -140,8 +140,10 @@
       "id": "RET-R016",
       "severity": "中",
       "status": "开放",
-      "mitigation": "RET-17-01 在发送原生和 PDF/DOCX 转换 Markdown 前复用 vault outbound policy，命中 never-send-cloud 或 completely-ignore 时不调用 Provider；Provider 直接返回最终 Markdown，服务拒绝 JSON、空响应和不保留任何源内容的响应，并按结构安全分块拼接。标题、列表、表格、引用和代码围栏不跨 Provider 分块，后续块携带继承标题上下文。仅重复出现且不承载正文的页眉、页脚、页码、广告等分页伪影可由 Provider 移除；Provider 依据语义和上下文保留标题文字并优化标题层级，不凭空创建标题。PDF/DOCX 只有能回链的重复图块才从私有候选排除，原始文件、图块 ID、定位和审核语义仍保留。模型发生正常 Markdown 重排时保留原图块用于审核与候选溯源，最终 Provider Markdown 用于生成提案；Provider 或响应核验失败会保持任务可恢复，不写入不完整提案。真实 PDF 任务已验证 182 个图块、10 个 noise 图块和 0 个 noise 候选行；语义质量仍需后续脱敏样本评估，因此风险保持开放。",
-      "ownerTaskId": "RET-17-01"
+      "title": "Markdown Provider 结构化误删、重复与层级失真",
+      "impact": "长文分块时模型可能重复输出标题或正文、误删语义内容，或产生跳级和混杂的标题层级，导致最终 Markdown 不准确且难以导航。",
+      "mitigation": "RET-17-01 已将原生和 PDF/DOCX 转换 Markdown 纳入 outbound policy、结构安全分块和可恢复失败链路。RET-20-01 正在为每个分块补充完整原始标题纲要与继承上下文，收紧语义内容恰好一次、标题保留、分页噪音删除、同级一致和父子连续的提示词规则，并拒绝可机械确认的跳级及重复文档标题后有限重试。该约束不能单独证明模型的语义判断；仍需以已审阅脱敏语料评估正文保真、标题判定和重复率。",
+      "ownerTaskId": "RET-20-01"
     },
     {
       "id": "RET-R017",
@@ -160,6 +162,96 @@
       "impact": "MinerU pipeline 可能丢失行内数字和标准号；整份文档回退又会牺牲原生文字层，导致 GB15577、15 min、1 等证据缺失或重复。",
       "mitigation": "RET-19-01 已按页优先使用 pypdf 原生文字层，并以数字/英文 token 完整性校验决定页面级 MinerU VLM 回退；混合 DocumentGraph 保留原始 PDF、pipeline/VLM artifact、图片和公式溯源。真实 23 页样例中 18 个文字页走原生，第 2、4、6、22、23 页走 VLM；第 12 页的 GB15577、15 min、1 均保留。该样例的 2、6、22、23 页是实际空白分隔页，VLM artifact 保留但没有伪造正文。仍需以更多脱敏的扫描 PDF 样本评估 VLM 的非空页 OCR 质量。",
       "ownerTaskId": "RET-19-01"
+    },
+    {
+      "id": "RET-R019",
+      "severity": "高",
+      "status": "已关闭",
+      "title": "删除任务误删提交后的 Vault 文件修改",
+      "impact": "任务提交的 Markdown、源文件或资料附件若在之后被用户修改，直接按路径删除会丢失后续内容。",
+      "mitigation": "RET-18-02 已实现全链路删除：仅回退最新 committed journal 中该任务拥有的 Vault 文件，并先以提交内容 SHA-256 精确比对；任一不匹配、缺失或不可读时整次删除失败关闭，不删除任务记录或任何 Vault 文件。回退后物理清理该任务的索引文档、FTS、向量、Embedding 缓存、元数据候选、索引任务路径、无引用 graph projection，以及无其他任务引用的来源身份和解析证据；共享状态保留。",
+      "ownerTaskId": "RET-18-02"
+    },
+    {
+      "id": "RET-R020",
+      "severity": "中",
+      "status": "开放",
+      "title": "工作台聚合摘要与 Vault 实际状态不同步",
+      "impact": "跨 Vault 摘要若在索引、任务或会话状态变化后过期，用户可能基于错误的健康度或待处理数量执行操作。",
+      "mitigation": "RET-21-01 只聚合已有可核验摘要，不缓存正文；首次加载、手动刷新和关键操作后重新读取，并在摘要带 updated_at 与明确的部分失败状态。实时推送、历史趋势和持久化事件另立任务。",
+      "ownerTaskId": "RET-21-01"
+    },
+    {
+      "id": "RET-R021",
+      "severity": "高",
+      "status": "开放",
+      "title": "PaddleOCR-VL 1.6 本机运行时或模型 profile 不完整",
+      "impact": "PDF 解析在未安装 PaddlePaddle 推理运行时、VL 1.6 模型或哈希批准记录时无法执行；若绕过 profile，可能发生隐式下载、版本漂移或远程调用。",
+      "mitigation": "RET-22-01 已将 PDF V2 主路径固定为 PaddleOCR-VL 1.6 的 native backend，并以 manifest 的 executable、配置和模型哈希及 release approval 门禁启动。子进程禁用模型源连通性检查、继承代理和 Hugging Face/Transformers 在线模式；缺失、无 bbox、无关联图片 artifact 或输出不完整时失败关闭。2026-08-07 已按用户批准安装并验证 GPU-only runtime：paddlepaddle-gpu 3.2.2、cuda=True、device=gpu:0，CPU paddlepaddle distribution absent；本机 profile 的 PaddleOCR-VL 1.6、PP-DocLayoutV3、字体、配置和 approval 哈希均加载通过。真实脱敏 PDF application smoke 选中 paddleocr-vl-1.6，quality=accepted，得到 18 个带 page 1 bbox 的 blocks 与 5 个 artifact drafts，且没有隐式下载。runtime 提示编译时 CUDNN 9.9 与系统 9.5 不匹配，当前 smoke 成功但仍须用更多脱敏 PDF 监测稳定性，因此风险保持开放。",
+      "ownerTaskId": "RET-22-01"
+    },
+    {
+      "id": "RET-R022",
+      "severity": "中",
+      "status": "开放",
+      "title": "Markdown Provider 的模型窗口或输出上限小于大分块预算",
+      "impact": "Provider 可能拒绝约 16k 至 20k token 的正文或无法返回完整 Markdown，导致导入任务不能完成结构化。",
+      "mitigation": "RET-23-01 已以保守本地估算和可持久化的最小/目标/最大设置将可发送正文限制在配置上限内，默认上限为 20k token，并将 Markdown 专用输出预算提高到可覆盖同量级正文；定向回归覆盖默认值、更新重启、旧库迁移失败重试、小文档和尾块。Provider 拒绝请求或响应未通过保真校验时维持既有可恢复失败，不写入部分提案。具体模型窗口协商与真实 Provider 容量验证不在本步实现，因此风险保持开放。",
+      "ownerTaskId": "RET-23-01"
+    },
+    {
+      "id": "RET-R023",
+      "severity": "高",
+      "status": "已关闭",
+      "title": "批量导入并行状态与 Word Provider 边界失控",
+      "impact": "一轮多文件上传若将全部任务立刻标为运行中，会占满本地执行资源；若 DocumentGraph 被错误交给 Markdown Provider，则会扩大正文出网范围并使任务详情被长操作阻塞。",
+      "mitigation": "RET-24-01 已将批量选择拆为单文件任务并由单消费者 FIFO 队列推进；恢复、重新派生和重试提交都先入队，重试提交以后台任务启动，不阻塞操作请求。DOCX/PDF 的 DocumentGraph 只在本地渲染派生提案，provider_markdown 保持 null；原生 Markdown 保留 Provider 结构化。任务详情不再持有导入状态写锁或同步读取索引。61 项服务定向回归及前端测试/lint/build 通过；现场恢复的两项 Word 任务均完成，详情在 62/63 ms 返回。",
+      "ownerTaskId": "RET-24-01"
+    },
+    {
+      "id": "RET-R024",
+      "severity": "中",
+      "status": "已关闭",
+      "title": "任务详情正文展示扩大本地浏览器可见范围",
+      "impact": "将解析正文返回到任务详情可能意外泄漏绝对路径、哈希、转换工件或解析器内部原始输出，也可能把尚未选择的资料项内容混入当前任务。",
+      "mitigation": "RET-24-02 仅从当前任务已选 DocumentGraph 的 retrieval_projection 或兼容 ParseEvidence.units 构造显示合同，按 item_id 归属并过滤为块类型、用户可理解定位和文本；不返回 raw extraction、artifact、bbox、哈希、内部 block ID 或绝对路径。接口继续要求本机会话；服务定向回归、前端单测/lint/build 和独立端口浏览器回归均通过，并断言敏感字段缺失。",
+      "ownerTaskId": "RET-24-02"
+    },
+    {
+      "id": "RET-R025",
+      "severity": "中",
+      "status": "开放",
+      "title": "全局 UI 重构降低高频操作可发现性或引入动效性能回归",
+      "impact": "重排导航、收敛说明和迁移移动端层级可能让用户找不到既有操作；不受约束的动画或组件重挂载也可能造成闪白、滚动位置丢失、掉帧或无障碍退化。",
+      "mitigation": "RET-25-01 保留五个入口和全部现有业务能力，只重构呈现层；主要操作保持文字标签，工具图标带 aria-label 和 Tooltip；刷新保留旧内容与位置；动画限定 transform/opacity 并支持 prefers-reduced-motion。2026-08-11 会话首次进入已改为直接定位最新消息，不继承默认平滑下滚，问答定位保留用户触发的平滑滚动。以桌面、紧凑桌面、390px、键盘和关键点击流程的 Playwright 回归及截图复核作为验收闸门。",
+      "ownerTaskId": "RET-25-01"
+    },
+    {
+      "id": "RET-R026",
+      "severity": "中",
+      "status": "已关闭",
+      "title": "可读导入文件名发生同名覆盖或目录页重复索引",
+      "impact": "移除内部 ID 与哈希后，同名不同内容可能覆盖既有原件或笔记；目录页若被当作正文索引，会形成重复检索结果。",
+      "mitigation": "RET-26-01 已在派生前检查 managed sources 目录：同内容复用已有名称，不同内容使用常规‘（2）’后缀。目录页改为‘文件名 - 目录.md’，索引层同时识别该格式与遗留 index.md。自动导入、同名、中文命名、标签和索引定向回归共 59 项通过。",
+      "ownerTaskId": "RET-26-01"
+    },
+    {
+      "id": "RET-R027",
+      "severity": "高",
+      "status": "开放",
+      "title": "在线解析外发扩大原件与文件名暴露范围",
+      "impact": "在线 OCR 需要将任务原件和文件名上传至 PaddleOCR 官方云 API 或 MinerU；若没有逐任务选择、策略门禁或稳定的失败语义，可能在用户未知或配置变化后扩大外发范围。",
+      "mitigation": "RET-27-01 以创建任务时默认关闭的显式 Switch 冻结 Provider、模型和策略版本；提交前重验 Vault outbound policy、已验证 Provider 和凭据，不满足即零上传。仅 PDF 在用户选择后外发；不保存 token、绝对路径、签名 URL、远端 job ID 或原始响应到 UI；失败不静默回退，取消仅停止本机等待。用户已于 2026-08-11 明确确认该任务级外发范围，并明确限制为 PDF。",
+      "ownerTaskId": "RET-27-01"
+    },
+    {
+      "id": "RET-R028",
+      "severity": "高",
+      "status": "已关闭",
+      "title": "双语标题误判来源链接失效",
+      "impact": "来源文件与哈希均未变化的派生笔记会因一级标题后的英文副标题而被标记 source-link-broken，导致 CME 索引错误 stale 并从检索范围排除。",
+      "mitigation": "RET-28-01 已将来源链接核验改为允许一级标题后的单行副标题，再接受精确来源链接；既有 source-link-broken 文档会在下一次 reconcile 自动重新核验。回归覆盖中文标题、英文副标题、有效来源链接、恢复路径，并确认正文内容之后的链接仍会被拒绝。",
+      "ownerTaskId": "RET-28-01"
     }
   ]
 }

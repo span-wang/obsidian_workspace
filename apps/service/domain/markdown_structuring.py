@@ -11,6 +11,7 @@ _LIST = re.compile(r"^[ \t]*(?:[-+*]|\d+[.)])[ \t]+")
 _QUOTE = re.compile(r"^[ \t]*>[ \t]?")
 _TABLE_SEPARATOR = re.compile(r"^[ \t]*\|?(?:[ \t]*:?-{3,}:?[ \t]*\|)+[ \t]*$")
 _SENTENCE = re.compile(r"(?<=[.!?。！？])(?:[ \t]+|(?=\n))")
+_TOKEN_PIECE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]|[A-Za-z0-9_]+|[^\s]")
 
 MARKDOWN_BLOCK_KINDS = frozenset(
     {
@@ -26,13 +27,32 @@ MARKDOWN_BLOCK_KINDS = frozenset(
         "noise",
     }
 )
-MAX_MARKDOWN_PROVIDER_CHARS = 24_000
+# This remains an explicit compatibility override for tests and callers that
+# need a smaller local chunk. It is intentionally not the default budget.
 MAX_MARKDOWN_PROVIDER_UNITS = 24
+MIN_MARKDOWN_PROVIDER_TOKENS = 10_000
+TARGET_MARKDOWN_PROVIDER_TOKENS = 16_000
+MAX_MARKDOWN_PROVIDER_TOKENS = 20_000
+MAX_MARKDOWN_PROVIDER_OUTPUT_TOKENS = 24_576
 _JSON_FENCE = re.compile(r"\A```(?:json)?[ \t]*\r?\n(?P<payload>[\s\S]*?)\r?\n?```\Z", re.IGNORECASE)
 
 
 class MarkdownStructureError(ValueError):
     """Raised when a Markdown structure response cannot be verified against its input."""
+
+
+@dataclass(frozen=True)
+class MarkdownProviderChunkBudget:
+    minimum_tokens: int = MIN_MARKDOWN_PROVIDER_TOKENS
+    target_tokens: int = TARGET_MARKDOWN_PROVIDER_TOKENS
+    maximum_tokens: int = MAX_MARKDOWN_PROVIDER_TOKENS
+
+    def __post_init__(self) -> None:
+        if any(
+            type(value) is not int
+            for value in (self.minimum_tokens, self.target_tokens, self.maximum_tokens)
+        ) or not 1 <= self.minimum_tokens <= self.target_tokens <= self.maximum_tokens <= MAX_MARKDOWN_PROVIDER_TOKENS:
+            raise MarkdownStructureError("Markdown Provider token budget is invalid.")
 
 
 @dataclass(frozen=True)
@@ -60,10 +80,11 @@ class MarkdownStructureChunk:
     chunk_id: str
     units: tuple[MarkdownSourceUnit, ...]
     heading_context: tuple[MarkdownHeadingContext, ...] = ()
+    source_text: str = ""
 
     @property
     def text(self) -> str:
-        return "".join(unit.text for unit in self.units)
+        return self.source_text or "".join(unit.text for unit in self.units)
 
 
 @dataclass(frozen=True)
@@ -132,14 +153,21 @@ class MarkdownStructureBlock:
 def split_markdown_for_provider(
     markdown: str,
     *,
-    max_chunk_characters: int = MAX_MARKDOWN_PROVIDER_CHARS,
-    max_chunk_units: int = MAX_MARKDOWN_PROVIDER_UNITS,
+    max_chunk_characters: int | None = None,
+    max_chunk_units: int | None = None,
+    min_chunk_tokens: int = MIN_MARKDOWN_PROVIDER_TOKENS,
+    target_chunk_tokens: int = TARGET_MARKDOWN_PROVIDER_TOKENS,
+    max_chunk_tokens: int = MAX_MARKDOWN_PROVIDER_TOKENS,
 ) -> tuple[MarkdownStructureChunk, ...]:
     if (
         not isinstance(markdown, str)
-        or max_chunk_characters < 1
-        or type(max_chunk_units) is not int
-        or max_chunk_units < 1
+        or (max_chunk_characters is not None and (
+            type(max_chunk_characters) is not int or max_chunk_characters < 1
+        ))
+        or (max_chunk_units is not None and (type(max_chunk_units) is not int or max_chunk_units < 1))
+        or any(type(value) is not int for value in (min_chunk_tokens, target_chunk_tokens, max_chunk_tokens))
+        or not 1 <= min_chunk_tokens <= target_chunk_tokens <= max_chunk_tokens
+        or max_chunk_tokens > MAX_MARKDOWN_PROVIDER_TOKENS
     ):
         raise MarkdownStructureError("Markdown chunk input is invalid.")
     lines = markdown.splitlines(keepends=True)
@@ -184,36 +212,86 @@ def split_markdown_for_provider(
                     break
                 index += 1
         added = _split_source_unit(
-            markdown, lines, line_offsets, start, index, unit_number, max_chunk_characters
+            markdown,
+            lines,
+            line_offsets,
+            start,
+            index,
+            unit_number,
+            max_chunk_characters,
+            max_chunk_tokens,
         )
         units.extend(added)
         unit_number += len(added)
     if not units:
         return ()
-    chunks: list[MarkdownStructureChunk] = []
-    current: list[MarkdownSourceUnit] = []
-    active_headings: list[MarkdownHeadingContext] = []
-    chunk_heading_context: tuple[MarkdownHeadingContext, ...] = ()
-    current_size = 0
-    chunk_number = 1
-    for unit in units:
-        unit_size = len(unit.text)
-        if current and (
-            current_size + unit_size > max_chunk_characters or len(current) >= max_chunk_units
-        ):
-            chunks.append(
-                MarkdownStructureChunk(f"chunk-{chunk_number}", tuple(current), chunk_heading_context)
+    unit_tokens = [estimate_markdown_provider_tokens(unit.text) for unit in units]
+    minimum_chunks = max(1, (sum(unit_tokens) + max_chunk_tokens - 1) // max_chunk_tokens)
+    if max_chunk_characters is not None:
+        minimum_chunks = max(
+            minimum_chunks,
+            (sum(len(unit.text) for unit in units) + max_chunk_characters - 1) // max_chunk_characters,
+        )
+    if max_chunk_units is not None:
+        minimum_chunks = max(minimum_chunks, (len(units) + max_chunk_units - 1) // max_chunk_units)
+    maximum_chunks = max(minimum_chunks, max(1, sum(unit_tokens) // min_chunk_tokens))
+    preferred_chunks = max(
+        1,
+        (sum(unit_tokens) + target_chunk_tokens // 2) // target_chunk_tokens,
+    )
+    target_chunk_count = min(max(preferred_chunks, minimum_chunks), maximum_chunks)
+    unit_groups: list[list[MarkdownSourceUnit]] = []
+    unit_index = 0
+    remaining_tokens = sum(unit_tokens)
+    remaining_chunks = target_chunk_count
+    while unit_index < len(units):
+        target_tokens = (remaining_tokens + remaining_chunks - 1) // remaining_chunks
+        current: list[MarkdownSourceUnit] = []
+        current_tokens = 0
+        current_characters = 0
+        while unit_index < len(units):
+            unit = units[unit_index]
+            token_count = unit_tokens[unit_index]
+            proposed_tokens = current_tokens + token_count
+            proposed_characters = current_characters + len(unit.text)
+            exceeds_hard_limit = (
+                proposed_tokens > max_chunk_tokens
+                or (
+                    max_chunk_characters is not None
+                    and proposed_characters > max_chunk_characters
+                )
+                or (max_chunk_units is not None and len(current) >= max_chunk_units)
             )
-            chunk_number += 1
-            current = []
-            current_size = 0
-        if not current:
-            chunk_heading_context = tuple(active_headings)
-        current.append(unit)
-        current_size += unit_size
-        _apply_heading_context(active_headings, unit)
-    if current:
-        chunks.append(MarkdownStructureChunk(f"chunk-{chunk_number}", tuple(current), chunk_heading_context))
+            can_balance_at_target = (
+                current
+                and current_tokens >= min_chunk_tokens
+                and proposed_tokens > target_tokens
+                and remaining_tokens - current_tokens
+                <= (remaining_chunks - 1) * max_chunk_tokens
+            )
+            if current and (exceeds_hard_limit or can_balance_at_target):
+                break
+            current.append(unit)
+            current_tokens = proposed_tokens
+            current_characters = proposed_characters
+            unit_index += 1
+        unit_groups.append(current)
+        remaining_tokens -= current_tokens
+        remaining_chunks = max(1, remaining_chunks - 1)
+
+    chunks: list[MarkdownStructureChunk] = []
+    active_headings: list[MarkdownHeadingContext] = []
+    for chunk_number, group in enumerate(unit_groups, start=1):
+        chunks.append(
+            MarkdownStructureChunk(
+                f"chunk-{chunk_number}",
+                tuple(group),
+                tuple(active_headings),
+                _chunk_source_text(markdown, group),
+            )
+        )
+        for unit in group:
+            _apply_heading_context(active_headings, unit)
     return tuple(chunks)
 
 
@@ -265,7 +343,7 @@ def validate_markdown_provider_response(
     normalized = response.strip()
     if not normalized:
         return ""
-    if len(normalized) > MAX_MARKDOWN_PROVIDER_CHARS:
+    if estimate_markdown_provider_tokens(normalized) > MAX_MARKDOWN_PROVIDER_OUTPUT_TOKENS:
         raise MarkdownStructureError("Markdown Provider response exceeds the chunk size limit.")
     try:
         payload = json.loads(normalized)
@@ -335,24 +413,25 @@ def _split_source_unit(
     start: int,
     end: int,
     unit_number: int,
-    max_chunk_characters: int,
+    max_chunk_characters: int | None,
+    max_chunk_tokens: int,
 ) -> tuple[MarkdownSourceUnit, ...]:
     start_offset = line_offsets[start]
     end_offset = line_offsets[end]
     text = markdown[start_offset:end_offset]
-    if len(text) <= max_chunk_characters or _is_atomic_structure(lines, start):
+    if _fits_chunk_budget(text, max_chunk_characters, max_chunk_tokens) or _is_atomic_structure(lines, start):
         return (_source_unit(f"unit-{unit_number}", text, start_offset, end_offset, start + 1, end),)
     pieces: list[MarkdownSourceUnit] = []
     cursor = 0
     piece_number = 1
     while cursor < len(text):
-        limit = min(cursor + max_chunk_characters, len(text))
+        limit = _source_unit_limit(text, cursor, max_chunk_characters, max_chunk_tokens)
         if limit < len(text):
             candidates = [match.end() for match in _SENTENCE.finditer(text, cursor, limit)]
             if candidates:
                 limit = max(candidates)
         if limit <= cursor:
-            limit = min(cursor + max_chunk_characters, len(text))
+            limit = min(cursor + 1, len(text))
         absolute_start = start_offset + cursor
         absolute_end = start_offset + limit
         pieces.append(
@@ -370,10 +449,59 @@ def _split_source_unit(
     return tuple(pieces)
 
 
+def estimate_markdown_provider_tokens(markdown: str) -> int:
+    """Return a conservative local token budget for Markdown request sizing."""
+
+    if not isinstance(markdown, str):
+        raise MarkdownStructureError("Markdown token estimate input is invalid.")
+    estimate = 0
+    for match in _TOKEN_PIECE.finditer(markdown):
+        piece = match.group(0)
+        if len(piece) == 1 and "\u3400" <= piece <= "\ufaff":
+            estimate += 1
+        elif piece[0].isascii() and (piece[0].isalnum() or piece[0] == "_"):
+            estimate += max(1, (len(piece) + 2) // 3)
+        else:
+            estimate += 1
+    return estimate
+
+
+def _fits_chunk_budget(text: str, max_chunk_characters: int | None, max_chunk_tokens: int) -> bool:
+    return (
+        (max_chunk_characters is None or len(text) <= max_chunk_characters)
+        and estimate_markdown_provider_tokens(text) <= max_chunk_tokens
+    )
+
+
+def _source_unit_limit(
+    text: str, cursor: int, max_chunk_characters: int | None, max_chunk_tokens: int
+) -> int:
+    maximum = len(text)
+    if max_chunk_characters is not None:
+        maximum = min(maximum, cursor + max_chunk_characters)
+    if estimate_markdown_provider_tokens(text[cursor:maximum]) <= max_chunk_tokens:
+        return maximum
+    lower = cursor + 1
+    upper = maximum
+    while lower < upper:
+        middle = (lower + upper + 1) // 2
+        if estimate_markdown_provider_tokens(text[cursor:middle]) <= max_chunk_tokens:
+            lower = middle
+        else:
+            upper = middle - 1
+    return lower
+
+
 def _source_unit(
     unit_id: str, text: str, start_offset: int, end_offset: int, start_line: int, end_line: int
 ) -> MarkdownSourceUnit:
     return MarkdownSourceUnit(unit_id, text, start_offset, end_offset, start_line, end_line)
+
+
+def _chunk_source_text(markdown: str, units: list[MarkdownSourceUnit]) -> str:
+    if not units:
+        return ""
+    return markdown[units[0].start_offset : units[-1].end_offset]
 
 
 def _line_for_offset(line_offsets: list[int], offset: int) -> int:
@@ -397,16 +525,22 @@ def _is_atomic_structure(lines: list[str], index: int) -> bool:
     )
 
 
+def _heading_from_line(line: str) -> MarkdownHeadingContext | None:
+    match = _HEADING.match(line)
+    if match is None:
+        return None
+    text = re.sub(r"[ \t]+#+[ \t]*$", "", line[match.end() :]).strip()
+    if not text:
+        return None
+    return MarkdownHeadingContext(len(match.group("marker")), text)
+
+
 def _apply_heading_context(
     active_headings: list[MarkdownHeadingContext], unit: MarkdownSourceUnit
 ) -> None:
     first_line = unit.text.splitlines()[0] if unit.text else ""
-    match = _HEADING.match(first_line)
-    if match is None:
+    heading = _heading_from_line(first_line)
+    if heading is None:
         return
-    text = re.sub(r"[ \t]+#+[ \t]*$", "", first_line[match.end():]).strip()
-    if not text:
-        return
-    heading = MarkdownHeadingContext(len(match.group("marker")), text)
     del active_headings[heading.level - 1:]
     active_headings.append(heading)

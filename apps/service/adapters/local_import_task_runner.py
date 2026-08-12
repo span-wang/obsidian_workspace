@@ -102,6 +102,26 @@ class LocalImportTaskRunner:
             inputs_by_item = {int(item["item_id"]): item for item in converter_items}
 
             def conversion_event(event_task_id: str, event: dict[str, object]) -> None:
+                if event["type"] == "online-parse-submitted":
+                    job = dict(event.get("job", {}))
+                    remote_job_id = str(job.get("remote_job_id", ""))
+                    persisted = False
+                    try:
+                        if not remote_job_id or on_event(event_task_id, event) is not True:
+                            raise RuntimeError("The service did not confirm online parse job persistence.")
+                        persisted = True
+                    except Exception:
+                        on_event(
+                            event_task_id,
+                            {
+                                "type": "conversion-failed-item",
+                                "item_id": next(iter(inputs_by_item)),
+                                "reason": "在线解析作业状态无法保存。",
+                            },
+                        )
+                    finally:
+                        confirmations.put({"remote_job_id": remote_job_id, "persisted": persisted})
+                    return
                 if event["type"] == "conversion-attempted":
                     candidate = dict(event.get("candidate", {}))
                     attempt_id = str(dict(candidate.get("attempt", {})).get("attempt_id", ""))
@@ -180,6 +200,17 @@ class LocalImportTaskRunner:
             "input_snapshot_hash": snapshot.source_sha256,
             "input_snapshot_path": str(snapshot.absolute_path),
             "preflight_inventory": {"document_kind": item.document_kind, **preflight.inventory},
+            "input_filename": item.label,
+            "online_parse_selection": (
+                task.online_parse_selection.to_dict()
+                if task.online_parse_selection is not None and item.document_kind == "pdf"
+                else None
+            ),
+            "online_parse_job": (
+                task.online_parse_job.to_dict()
+                if task.online_parse_job is not None and item.document_kind == "pdf"
+                else None
+            ),
         }
 
     def _prepare_conversion_event(

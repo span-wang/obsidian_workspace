@@ -19,6 +19,7 @@ from domain.evidence import (
     ParseIssue,
 )
 from domain.metadata_tags import MetadataTagProposal, TagChangePreview, TagDefinition
+from domain.online_document_parser import OnlineParseJob, OnlineParseSelection
 from domain.review_commits import CommitJournal, ReviewDecision, ReviewSnapshot
 from domain.sources import VersionSuggestion
 from domain.tasks import (
@@ -33,6 +34,8 @@ from domain.tasks import (
 
 _LEGACY_CANDIDATE_LINK_ISOLATION_MIGRATION = "legacy-candidate-link-isolation-2026-07-22"
 _DOCUMENT_CONVERSION_V2_MIGRATION = "document-conversion-v2-2026-07-22"
+_ONLINE_PARSE_SELECTION_MIGRATION = "online-parse-selection-2026-08-11"
+_ONLINE_PARSE_JOB_MIGRATION = "online-parse-job-2026-08-11"
 
 
 class SqliteImportTaskRepository:
@@ -78,6 +81,8 @@ class SqliteImportTaskRepository:
                     recovery_actions_json TEXT NOT NULL,
                     failure_reason TEXT,
                     parent_task_id TEXT,
+                    online_parse_selection_json TEXT,
+                    online_parse_job_json TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
@@ -144,6 +149,8 @@ class SqliteImportTaskRepository:
             self._ensure_column(connection, "import_tasks", "ocr_failed_count INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(connection, "import_tasks", "confirmed_gap_count INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(connection, "import_tasks", "derived_note_count INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "import_tasks", "online_parse_selection_json TEXT")
+            self._ensure_column(connection, "import_tasks", "online_parse_job_json TEXT")
             self._ensure_column(
                 connection, "import_task_items", "parse_status TEXT NOT NULL DEFAULT 'not-applicable'"
             )
@@ -409,6 +416,14 @@ class SqliteImportTaskRepository:
                 """
             )
             self._initialize_document_conversion_v2(connection)
+            connection.execute(
+                "INSERT OR IGNORE INTO import_repository_migrations(migration_id, applied_at) VALUES (?, ?)",
+                (_ONLINE_PARSE_SELECTION_MIGRATION, utc_now()),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO import_repository_migrations(migration_id, applied_at) VALUES (?, ?)",
+                (_ONLINE_PARSE_JOB_MIGRATION, utc_now()),
+            )
             self._isolate_legacy_candidate_links(connection)
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS vault_tag_definitions_latest "
@@ -599,6 +614,14 @@ class SqliteImportTaskRepository:
                     "SELECT item_id FROM import_task_items WHERE task_id = ?", (task_id,)
                 )
             ]
+            source_pairs = [
+                (task.vault_id, row["source_id"], row["content_sha256"])
+                for row in connection.execute(
+                    "SELECT source_id, content_sha256 FROM import_task_items "
+                    "WHERE task_id = ? AND source_id IS NOT NULL AND content_sha256 IS NOT NULL",
+                    (task_id,),
+                )
+            ]
             if item_ids:
                 item_placeholders = ", ".join("?" for _ in item_ids)
                 item_parameters = tuple(item_ids)
@@ -627,14 +650,7 @@ class SqliteImportTaskRepository:
             connection.execute("DELETE FROM import_private_index_candidates WHERE task_id = ?", (task_id,))
             connection.execute("DELETE FROM import_note_proposals WHERE task_id = ?", (task_id,))
             connection.execute("DELETE FROM import_classification_suggestions WHERE task_id = ?", (task_id,))
-            if task.lifecycle in {"complete", "completed-with-confirmed-gaps"}:
-                connection.execute(
-                    "DELETE FROM import_metadata_tag_proposals "
-                    "WHERE task_id = ? AND decision IS NOT 'accepted'",
-                    (task_id,),
-                )
-            else:
-                connection.execute("DELETE FROM import_metadata_tag_proposals WHERE task_id = ?", (task_id,))
+            connection.execute("DELETE FROM import_metadata_tag_proposals WHERE task_id = ?", (task_id,))
             connection.execute("DELETE FROM import_candidate_link_proposals WHERE task_id = ?", (task_id,))
             connection.execute("DELETE FROM import_review_decisions WHERE task_id = ?", (task_id,))
             connection.execute("DELETE FROM import_review_snapshots WHERE task_id = ?", (task_id,))
@@ -642,6 +658,21 @@ class SqliteImportTaskRepository:
             connection.execute("DELETE FROM import_task_events WHERE task_id = ?", (task_id,))
             connection.execute("DELETE FROM import_task_items WHERE task_id = ?", (task_id,))
             connection.execute("DELETE FROM import_tasks WHERE task_id = ?", (task_id,))
+            for vault_id, source_id, content_sha256 in source_pairs:
+                connection.execute(
+                    """
+                    DELETE FROM import_parse_evidence
+                    WHERE vault_id = ? AND source_id = ? AND content_sha256 = ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM import_task_items AS items
+                          JOIN import_tasks AS tasks ON tasks.task_id = items.task_id
+                          WHERE tasks.vault_id = import_parse_evidence.vault_id
+                            AND items.source_id = import_parse_evidence.source_id
+                            AND items.content_sha256 = import_parse_evidence.content_sha256
+                      )
+                    """,
+                    (vault_id, source_id, content_sha256),
+                )
 
     def append_item(self, task_id: str, item: ImportTaskItem) -> ImportTask:
         with self._connect() as connection:
@@ -1406,6 +1437,18 @@ class SqliteImportTaskRepository:
                 raise KeyError(item_id)
             timestamp = utc_now()
             self._insert_note_proposal(connection, row, item_id, proposal, timestamp)
+            # Legacy builds recorded Markdown-specific failures as parse failures. A
+            # successful proposal supersedes only those sentinel values.
+            connection.execute(
+                """
+                UPDATE import_task_items
+                SET parse_status = 'not-applicable', parse_confidence = NULL, parse_issue_count = 0,
+                    parse_locator_summary = NULL, parse_issue_summary = NULL, parse_evidence_id = NULL
+                WHERE item_id = ? AND parse_status = 'parse-failed'
+                  AND parse_locator_summary IN ('provider', 'outbound-policy')
+                """,
+                (item_id,),
+            )
             task = self._task_from_connection(connection, row["task_id"])
             updated = replace(
                 task,
@@ -2357,8 +2400,9 @@ class SqliteImportTaskRepository:
                 failed_count, new_count, duplicate_count, possible_version_count, identity_failed_count,
                 parsed_count, parse_failed_count, required_check_count, ocr_completed_count,
                 ocr_failed_count, confirmed_gap_count, derived_note_count,
-                recovery_actions_json, failure_reason, parent_task_id, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                recovery_actions_json, failure_reason, parent_task_id, online_parse_selection_json,
+                online_parse_job_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(task_id) DO UPDATE SET
                 vault_id = excluded.vault_id,
                 vault_label = excluded.vault_label,
@@ -2386,6 +2430,8 @@ class SqliteImportTaskRepository:
                 recovery_actions_json = excluded.recovery_actions_json,
                 failure_reason = excluded.failure_reason,
                 parent_task_id = excluded.parent_task_id,
+                online_parse_selection_json = excluded.online_parse_selection_json,
+                online_parse_job_json = excluded.online_parse_job_json,
                 updated_at = excluded.updated_at
             """,
             (
@@ -2416,6 +2462,10 @@ class SqliteImportTaskRepository:
                 json.dumps(task.recovery_actions),
                 task.failure_reason,
                 task.parent_task_id,
+                json.dumps(task.online_parse_selection.to_dict())
+                if task.online_parse_selection is not None
+                else None,
+                json.dumps(task.online_parse_job.to_dict()) if task.online_parse_job is not None else None,
                 task.created_at,
                 task.updated_at,
             ),
@@ -2642,6 +2692,16 @@ class SqliteImportTaskRepository:
             parent_task_id=row["parent_task_id"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            online_parse_selection=(
+                OnlineParseSelection.from_dict(json.loads(row["online_parse_selection_json"]))
+                if row["online_parse_selection_json"]
+                else None
+            ),
+            online_parse_job=(
+                OnlineParseJob.from_dict(json.loads(row["online_parse_job_json"]))
+                if row["online_parse_job_json"]
+                else None
+            ),
         )
 
     @staticmethod

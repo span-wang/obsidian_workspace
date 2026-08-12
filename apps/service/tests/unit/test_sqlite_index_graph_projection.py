@@ -15,7 +15,7 @@ from domain.graph_projection import (
     GraphProjectionKey,
     GraphProjectionListItem,
 )
-from domain.indexing import IndexBlock, IndexedDocument
+from domain.indexing import IndexBlock, IndexedDocument, IndexJob
 
 
 def _projection() -> DurableGraphProjection:
@@ -410,3 +410,102 @@ def test_graph_projection_failure_rolls_back_the_committed_document_batch(tmp_pa
 
     assert repository.current_documents("vault-1") == []
     assert repository.get_graph_projection(GraphProjectionKey("vault-1", "graph-1", 1)) is None
+
+
+def test_purge_paths_removes_documents_fts_and_unreferenced_projection(tmp_path) -> None:
+    repository = SqliteIndexRepository(tmp_path / "indexes.sqlite3")
+    document = _document()
+    projection = _projection()
+
+    repository.save_committed_unit((document,), (), projection)
+
+    assert repository.purge_paths(
+        "vault-1", (document.relative_path,), (projection.source_id,)
+    ) == (projection.source_id,)
+    assert repository.documents("vault-1") == []
+    assert repository.get_graph_projection(projection.key) is None
+    with sqlite3.connect(repository.database_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM index_blocks").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM index_block_fts_map").fetchone()[0] == 0
+
+
+def test_purge_paths_removes_deleted_paths_from_index_jobs(tmp_path) -> None:
+    repository = SqliteIndexRepository(tmp_path / "indexes.sqlite3")
+    document = _document()
+    timestamp = "2026-08-12T00:00:00Z"
+    repository.save_document(document)
+    repository.enqueue(
+        IndexJob(
+            job_id="deleted-only",
+            vault_id="vault-1",
+            relative_paths=(document.relative_path,),
+            reason="reconcile",
+            status="failed",
+            created_at=timestamp,
+            updated_at=timestamp,
+            failure_reason="interrupted",
+        )
+    )
+    repository.enqueue(
+        IndexJob(
+            job_id="mixed",
+            vault_id="vault-1",
+            relative_paths=(document.relative_path, "platform/notes/retained.md"),
+            reason="reconcile",
+            status="pending",
+            created_at=timestamp,
+            updated_at=timestamp,
+        )
+    )
+    repository.enqueue(
+        IndexJob(
+            job_id="unrelated",
+            vault_id="vault-1",
+            relative_paths=("platform/notes/unrelated.md",),
+            reason="reconcile",
+            status="complete",
+            created_at=timestamp,
+            updated_at=timestamp,
+        )
+    )
+
+    repository.purge_paths("vault-1", (document.relative_path,), ())
+
+    with sqlite3.connect(repository.database_path) as connection:
+        rows = connection.execute(
+            "SELECT job_id, relative_paths_json FROM index_jobs ORDER BY job_id"
+        ).fetchall()
+    assert rows == [
+        ("mixed", '["platform/notes/retained.md"]'),
+        ("unrelated", '["platform/notes/unrelated.md"]'),
+    ]
+
+
+def test_purge_paths_retains_shared_source_projection_and_document(tmp_path) -> None:
+    repository = SqliteIndexRepository(tmp_path / "indexes.sqlite3")
+    projection = _projection()
+    first = _document()
+    second = IndexedDocument(
+        document_id="document-2",
+        vault_id="vault-1",
+        relative_path="platform/notes/source-1/other.md",
+        content_sha256=sha256(b"# Other\n").hexdigest(),
+        document_kind="derived",
+        heading_locations=("line:1",),
+        links=(),
+        tags=(),
+        blocks=(IndexBlock(1, "line:1", "# Other"),),
+        indexed_at="2026-08-12T00:00:00Z",
+        source_id=projection.source_id,
+        source_sha256=projection.source_sha256,
+        source_path=projection.source_path,
+    )
+    repository.save_committed_unit((first, second), (), projection)
+
+    assert repository.purge_paths(
+        "vault-1", (first.relative_path,), (projection.source_id,)
+    ) == ()
+    assert [document.document_id for document in repository.current_documents("vault-1")] == [
+        second.document_id
+    ]
+    assert repository.get_graph_projection(projection.key) == projection

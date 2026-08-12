@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
 from hashlib import sha256
 
 import pytest
@@ -377,6 +378,66 @@ def test_rich_reads_fail_closed_on_a_current_block_consistency_issue(tmp_path) -
         IndexBlock(1, "line:1", "Legacy note."),
     )
     assert legacy_repository.health("vault-1").status == "healthy"
+
+
+def test_health_loads_graph_projections_once_for_all_current_blocks(tmp_path, monkeypatch) -> None:
+    database_path = tmp_path / "indexes.sqlite3"
+    repository = SqliteIndexRepository(database_path, rich_block_reads_enabled=True)
+    repository.save_graph_projection(
+        DurableGraphProjection(
+            vault_id="vault-1",
+            graph_id="graph-1",
+            graph_revision=1,
+            selected_attempt_id="attempt-1",
+            source_id="source-1",
+            source_sha256="a" * 64,
+            source_path="platform/sources/source-1.pdf",
+            blocks=(
+                GraphProjectionBlock(
+                    block_id="block-1",
+                    kind="paragraph",
+                    reading_order=0,
+                    locators=(PdfRegionLocator(page=1, bounds=(0.0, 0.0, 1.0, 1.0)),),
+                    confidence=0.9,
+                    retrieval_projection="Durable projection text.",
+                ),
+            ),
+        )
+    )
+    graph_document = replace(
+        _document(
+            IndexBlock(
+                1,
+                "graph:graph-1:1:block-1",
+                "Durable projection text.",
+                source_locators=(PdfRegionLocator(page=1, bounds=(0.0, 0.0, 1.0, 1.0)),),
+                graph_block_id="block-1",
+                reading_order=0,
+                confidence=0.9,
+                retrieval_text="Durable projection text.",
+            )
+        ),
+        document_kind="derived",
+        source_id="source-1",
+        source_sha256="a" * 64,
+        source_path="platform/sources/source-1.pdf",
+    )
+    repository.save_document(graph_document)
+
+    statements: list[str] = []
+    original_connect = sqlite3.connect
+
+    def traced_connect(*args, **kwargs):
+        connection = original_connect(*args, **kwargs)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", traced_connect)
+
+    assert repository.health("vault-1").status == "healthy"
+    projection_queries = [statement for statement in statements if "FROM graph_projections" in statement]
+
+    assert len(projection_queries) == 1
 
 
 def test_rich_block_migration_upgrades_legacy_rows_idempotently(tmp_path) -> None:

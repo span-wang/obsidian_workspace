@@ -5,12 +5,22 @@ import sqlite3
 
 import pytest
 
+from adapters.filesystem_vault_committer import LocalVaultCommitter
+from adapters.filesystem_vault_adapter import LocalVaultFilesystem
+from adapters.sqlite_index_repository import SqliteIndexRepository
+from adapters.sqlite_source_repository import SqliteSourceRepository
 from adapters.sqlite_task_repository import SqliteImportTaskRepository
+from adapters.sqlite_vault_repository import SqliteVaultRepository
 from application.ingest import ImportTaskError, ImportTaskService
+from application.indexing import IndexingService
+from application.vaults import VaultService
 from domain.classification import ClassificationSuggestion
-from domain.evidence import EvidenceLocator, ParseEvidence, ParseIssue, StructuredContentUnit
+from domain.evidence import EvidenceLocator, ParseEvidence, ParseIssue, PdfRegionLocator, StructuredContentUnit
+from domain.graph_projection import DurableGraphProjection, GraphProjectionBlock
+from domain.indexing import IndexBlock, IndexedDocument
 from domain.metadata_tags import MetadataTagProposal, TagSuggestion
 from domain.review_commits import CommitFile, CommitJournal, CommitUnit, build_review_snapshot
+from ports.vault_committer import VaultWrite
 from domain.sources import VersionSuggestion
 from domain.tasks import ImportTask, ImportTaskCounts, ImportTaskItem, new_import_task
 from workers.converters.artifact_store import PrivateArtifactStore
@@ -28,6 +38,121 @@ class DeleteTaskRepository:
 
     def delete(self, task_id: str) -> None:
         self.deleted_task_id = task_id
+
+    def list_commit_journals(self, task_id: str) -> list[CommitJournal]:
+        return []
+
+    def list_items(self, task_id: str) -> list[ImportTaskItem]:
+        return []
+
+
+class RecordingIndexService:
+    def __init__(self) -> None:
+        self.reconciled_vault_ids: list[str] = []
+
+    def reconcile(self, vault_id: str) -> None:
+        self.reconciled_vault_ids.append(vault_id)
+
+
+def _service_with_committed_vault_files(tmp_path: Path, *, persistent_indexes: bool = False):
+    vault_path = tmp_path / "vault"
+    vault_path.mkdir()
+    local_source = tmp_path / "uploaded.pdf"
+    local_source.write_bytes(b"local upload remains")
+    vault_service = VaultService(
+        SqliteVaultRepository(tmp_path / "vaults.sqlite3"), LocalVaultFilesystem()
+    )
+    vault = vault_service.authorize(vault_path, "platform")
+    repository = SqliteImportTaskRepository(tmp_path / "tasks.sqlite3")
+    task = replace(
+        new_import_task(
+            vault_id=vault.vault_id,
+            vault_label="Vault",
+            source_paths=(local_source,),
+            scope_label="uploaded.pdf",
+        ),
+        lifecycle="complete",
+        phase="complete",
+    )
+    repository.create(task, "created")
+    existing_markdown = vault.path / "platform" / "notes" / "existing.md"
+    existing_markdown.write_text("before task", encoding="utf-8")
+    files = (
+        CommitFile(
+            relative_path="platform/sources/source.pdf",
+            kind="source",
+            content=None,
+            content_sha256=sha256(b"vault source").hexdigest(),
+            expected_existing_sha256=None,
+        ),
+        CommitFile(
+            relative_path="platform/notes/existing.md",
+            kind="markdown",
+            content="# task note\n",
+            content_sha256=sha256(b"# task note\n").hexdigest(),
+            expected_existing_sha256=sha256(b"before task").hexdigest(),
+        ),
+        CommitFile.asset(
+            relative_path="platform/assets/attachment.bin",
+            content=b"vault attachment",
+        ),
+    )
+    writes = tuple(
+        VaultWrite(
+            relative_path=file.relative_path,
+            content=(
+                b"vault source"
+                if file.kind == "source"
+                else file.binary_content()
+                if file.kind == "asset"
+                else (file.content or "").encode("utf-8")
+            ),
+            expected_existing_sha256=file.expected_existing_sha256,
+            content_sha256=file.content_sha256,
+        )
+        for file in files
+    )
+    committer = LocalVaultCommitter()
+    backups = committer.capture_backups(vault.path, writes, "platform")
+    committer.commit(vault.path, writes, "platform")
+    unit = CommitUnit(
+        unit_id="unit-1",
+        source_item_id=1,
+        source_label="uploaded.pdf",
+        kind="source",
+        files=files,
+    )
+    repository.record_commit_journal(
+        CommitJournal(
+            task_id=task.task_id,
+            vault_id=vault.vault_id,
+            unit_id=unit.unit_id,
+            snapshot_digest="a" * 64,
+            unit=unit,
+            status="committed",
+            created_at="2026-08-06T00:00:00+00:00",
+            backups=backups,
+        ),
+        "commit-unit-committed",
+    )
+    index = (
+        IndexingService(
+            vault_service,
+            SqliteIndexRepository(tmp_path / "indexes.sqlite3", rich_block_reads_enabled=True),
+            LocalVaultFilesystem(),
+        )
+        if persistent_indexes
+        else RecordingIndexService()
+    )
+    service = ImportTaskService(
+        vault_service,
+        repository,
+        object(),
+        vault_committer=committer,
+        index_service=index,
+        source_repository=SqliteSourceRepository(tmp_path / "tasks.sqlite3") if persistent_indexes else None,
+    )
+    return service, vault, task, local_source, index
 
 
 def test_import_task_persists_scope_counts_and_recovers_interrupted_scans(tmp_path: Path) -> None:
@@ -570,6 +695,143 @@ def test_import_task_service_rejects_running_task_deletion() -> None:
     assert running_repository.deleted_task_id is None
 
 
+def test_delete_task_reverts_all_committed_vault_files_but_keeps_local_upload(
+    tmp_path: Path,
+) -> None:
+    service, vault, task, local_source, index = _service_with_committed_vault_files(tmp_path)
+
+    service.delete(task.task_id)
+
+    assert not (vault.path / "platform" / "sources" / "source.pdf").exists()
+    assert not (vault.path / "platform" / "assets" / "attachment.bin").exists()
+    assert (
+        vault.path / "platform" / "notes" / "existing.md"
+    ).read_text(encoding="utf-8") == "before task"
+    assert local_source.exists()
+    assert index.reconciled_vault_ids == [vault.vault_id]
+    with pytest.raises(KeyError):
+        service.get(task.task_id)
+
+
+def test_delete_task_refuses_a_vault_file_changed_after_commit(tmp_path: Path) -> None:
+    service, vault, task, _local_source, index = _service_with_committed_vault_files(tmp_path)
+    changed = vault.path / "platform" / "assets" / "attachment.bin"
+    changed.write_bytes(b"edited after commit")
+
+    with pytest.raises(ImportTaskError, match="changed after"):
+        service.delete(task.task_id)
+
+    assert changed.read_bytes() == b"edited after commit"
+    assert (vault.path / "platform" / "sources" / "source.pdf").exists()
+    assert (vault.path / "platform" / "notes" / "existing.md").read_text(encoding="utf-8") == "# task note\n"
+    assert index.reconciled_vault_ids == []
+    assert service.get(task.task_id).task_id == task.task_id
+
+
+def test_delete_task_purges_committed_index_projection_identity_and_parse_evidence(tmp_path: Path) -> None:
+    service, vault, task, _local_source, index = _service_with_committed_vault_files(
+        tmp_path, persistent_indexes=True
+    )
+    assert isinstance(index, IndexingService)
+    source_sha256 = sha256(b"vault source").hexdigest()
+    source_repository = SqliteSourceRepository(tmp_path / "tasks.sqlite3")
+    source_id = source_repository.resolve(
+        vault_id=vault.vault_id,
+        content_sha256=source_sha256,
+        label="source.pdf",
+        task_id=task.task_id,
+    ).source_id
+    source_path = "platform/sources/source.pdf"
+    note_path = "platform/notes/existing.md"
+    projection = DurableGraphProjection(
+        vault_id=vault.vault_id,
+        graph_id="graph-1",
+        graph_revision=1,
+        selected_attempt_id="attempt-1",
+        source_id=source_id,
+        source_sha256=source_sha256,
+        source_path=source_path,
+        blocks=(
+            GraphProjectionBlock(
+                block_id="block-1",
+                kind="paragraph",
+                reading_order=0,
+                locators=(PdfRegionLocator(1, (0.0, 0.0, 1.0, 1.0)),),
+                confidence=0.9,
+                retrieval_projection="Committed content.",
+            ),
+        ),
+    )
+    index.repository.save_committed_unit(
+        (
+            IndexedDocument(
+                document_id="document-1",
+                vault_id=vault.vault_id,
+                relative_path=note_path,
+                content_sha256=sha256(b"# task note\n").hexdigest(),
+                document_kind="derived",
+                heading_locations=("line:1",),
+                links=(),
+                tags=(),
+                blocks=(IndexBlock(1, "line:1", "# task note"),),
+                indexed_at="2026-08-12T00:00:00Z",
+                source_id=source_id,
+                source_sha256=source_sha256,
+                source_path=source_path,
+            ),
+        ),
+        (),
+        projection,
+    )
+    repository = service.repository
+    repository.append_item(
+        task.task_id,
+        ImportTaskItem(
+            item_id=0,
+            task_id=task.task_id,
+            source_path=tmp_path / "uploaded.pdf",
+            label="source.pdf",
+            category="supported",
+            document_kind="pdf",
+            reason=None,
+            content_sha256=source_sha256,
+            source_id=source_id,
+            identity_status="new",
+        ),
+    )
+    item = repository.list_items(task.task_id)[0]
+    repository.record_parse_evidence(
+        item.item_id,
+        ParseEvidence(
+            document_kind="pdf",
+            raw_extraction={},
+            units=(StructuredContentUnit("text", "Committed content.", EvidenceLocator(page=1)),),
+            confidence=1.0,
+            issues=(),
+        ),
+    )
+
+    service.delete(task.task_id)
+
+    with sqlite3.connect(tmp_path / "indexes.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM index_documents WHERE source_id = ?", (source_id,)
+        ).fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM graph_projections").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM graph_projection_blocks").fetchone()[0] == 0
+        assert connection.execute(
+            """
+            SELECT COUNT(*) FROM index_block_fts_map AS mappings
+            JOIN index_documents AS documents ON documents.document_id = mappings.document_id
+            WHERE documents.source_id = ?
+            """,
+            (source_id,),
+        ).fetchone()[0] == 0
+    with sqlite3.connect(tmp_path / "tasks.sqlite3") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM source_identities").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM import_parse_evidence").fetchone()[0] == 0
+
+
 def test_delete_import_task_removes_its_private_artifact_namespace(tmp_path: Path) -> None:
     task = new_import_task(
         vault_id="vault-1", vault_label="Vault", source_paths=(tmp_path / "book.pdf",), scope_label="book.pdf"
@@ -590,7 +852,7 @@ def test_delete_import_task_removes_its_private_artifact_namespace(tmp_path: Pat
     assert repository.deleted_task_id == task.task_id
 
 
-def test_delete_completed_task_keeps_accepted_tag_reference_for_vault_governance(tmp_path: Path) -> None:
+def test_delete_completed_task_removes_accepted_tag_proposal_but_keeps_vault_tag(tmp_path: Path) -> None:
     repository = SqliteImportTaskRepository(tmp_path / "tasks.sqlite3")
     task = replace(
         new_import_task(
@@ -638,7 +900,4 @@ def test_delete_completed_task_keeps_accepted_tag_reference_for_vault_governance
 
     repository.delete(task.task_id)
 
-    assert repository.list_metadata_tag_proposals_for_vault("vault-1") == [proposal]
-    updated = replace(proposal, revision=2)
-    repository.record_vault_metadata_tag_proposal(updated)
-    assert repository.list_metadata_tag_proposals_for_vault("vault-1") == [updated]
+    assert repository.list_metadata_tag_proposals_for_vault("vault-1") == []

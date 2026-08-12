@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from hashlib import sha256
+import json
 from pathlib import Path
 import queue
 import sqlite3
@@ -51,11 +52,8 @@ from workers.converters.quality_gate import StructuralQualityGate
 from workers.converters.artifact_store import PrivateArtifactStore
 from workers.converters.launcher import (
     ProvisionedConversionLauncher,
-    _coalesced_page_ranges,
-    _hybrid_pdf_graph,
-    _mineru_blocks,
-    _native_fidelity_tokens,
-    _native_page_quality,
+    _paddleocr_vl_blocks,
+    _stage_paddleocr_vl_input,
 )
 from workers.converters.runner import (
     ConversionArtifactDraft,
@@ -67,10 +65,14 @@ from workers.converters.runner import (
     run_conversion_worker,
 )
 from adapters.filesystem_vault_adapter import LocalVaultFilesystem
+from adapters.filesystem_vault_committer import LocalVaultCommitter
+from adapters.sqlite_index_repository import SqliteIndexRepository
 from adapters.sqlite_task_repository import SqliteImportTaskRepository
 from adapters.sqlite_vault_repository import SqliteVaultRepository
 from application.ingest import ImportTaskService
+from application.indexing import IndexingService
 from application.vaults import VaultService
+from domain.online_document_parser import OnlineParseSelection
 from domain.tasks import ImportTaskItem, new_import_task
 from workers.markdown_deriver import derive_items
 
@@ -158,157 +160,125 @@ def _accepted_quality_decision(attempt: ConversionAttempt) -> dict[str, object]:
     }
 
 
-def _hybrid_artifact(artifact_id: str, digest: str, producer: str) -> ArtifactRef:
+def _paddleocr_vl_artifact(artifact_id: str, digest: str, producer: str, *, role: str = "converter-json") -> ArtifactRef:
     return ArtifactRef(
         artifact_id=artifact_id,
-        attempt_id="attempt-hybrid",
+        attempt_id="attempt-paddleocr-vl",
         sha256=digest,
-        media_type="application/pdf",
-        role="converter-output",
+        media_type="image/png" if role == "image" else "application/json",
+        role=role,
         private_relative_path=f"pending/{artifact_id}",
         producer_object_id=producer,
     )
 
 
-def _hybrid_block(
-    page: int, text: str, artifact: ArtifactRef, *, kind: str = "paragraph"
-) -> DocumentBlock:
-    payload = (
-        {"display_mode": True, "state": "resolved", "latex": text}
-        if kind == "formula"
-        else {"inline_runs": [{"kind": "text", "text": text}]}
+def test_paddleocr_vl_maps_structured_page_blocks_and_verified_image_artifacts() -> None:
+    raw = _paddleocr_vl_artifact("paddle-page", "c" * 64, "paddleocr-vl/book_res.json")
+    image = _paddleocr_vl_artifact(
+        "paddle-image", "d" * 64, "paddleocr-vl/images/figure.png", role="image"
     )
-    return DocumentBlock(
-        block_id=DocumentBlock.deterministic_id("attempt-hybrid", artifact.producer_object_id or "mineru", f"page:{page}:{text}"),
-        kind=kind,
-        reading_order=0,
-        locators=(PdfRegionLocator(page, (10.0, 20.0, 100.0, 120.0)),),
-        confidence=0.9,
-        payload=BlockPayload.from_dict(kind, payload),
-        evidence_refs=(EvidenceRef(artifact.artifact_id, artifact.sha256, producer_object_id=artifact.producer_object_id),),
-        retrieval_projection=text,
-    )
-
-
-def test_pdf_hybrid_prefers_native_tokens_and_falls_back_only_for_empty_pages() -> None:
-    native_artifact = _hybrid_artifact("native", "c" * 64, "native-source.pdf")
-    mineru_artifact = _hybrid_artifact("mineru", "d" * 64, "mineru/content.json")
-    native_text = "GB15577 每15 min记录1个瞬时值"
-    native = ParseEvidence(
-        "pdf",
-        {"pages": [{"page": 1, "text": native_text}, {"page": 2, "text": ""}]},
-        (StructuredContentUnit("paragraph", native_text, EvidenceLocator(page=1)),),
-        0.95,
-        (),
-    )
-    fallback_block = _hybrid_block(2, "扫描页 2 的 42", mineru_artifact)
-    request = ConversionRequest(
-        task_id="task-hybrid",
-        item_id=1,
-        document_kind="pdf",
-        source_sha256=_HASH,
-        input_snapshot_hash=_HASH,
-        input_snapshot_path="private/source.pdf",
-        preflight_inventory={"document_kind": "pdf", "page_count": 2},
+    assets: list[DocumentAsset] = []
+    blocks, issues = _paddleocr_vl_blocks(
+        {
+            "res": {
+                "page_index": 0,
+                "parsing_res_list": [
+                    {"block_label": "doc_title", "block_content": "# 标准", "block_bbox": [1, 2, 30, 12], "block_id": 1, "block_order": 1},
+                    {"block_label": "text", "block_content": "GB15577 每 15 min 记录 1 个瞬时值", "block_bbox": [1, 13, 30, 24], "block_id": 2, "block_order": 2},
+                    {"block_label": "table", "block_content": "<table><tr><th>术语</th><th>值</th></tr><tr><td>频率</td><td>15 min</td></tr></table>", "block_bbox": [1, 25, 30, 46], "block_id": 3, "block_order": 3},
+                    {"block_label": "display_formula", "block_content": "$$x^2 + 1$$", "block_bbox": [1, 47, 30, 58], "block_id": 4, "block_order": 4},
+                    {"block_label": "image", "block_content": "<img src=\"images/figure.png\" alt=\"图示\" />", "block_bbox": [1, 59, 30, 70], "block_id": 5, "block_order": 5},
+                    {"block_label": "header", "block_content": "重复页眉", "block_bbox": [1, 71, 30, 80], "block_id": 6, "block_order": None}
+                ]
+            }
+        },
+        "attempt-paddleocr-vl",
+        raw,
+        {"paddleocr-vl/images/figure.png": image},
+        assets,
     )
 
-    graph = _hybrid_pdf_graph(
-        native,
-        [fallback_block],
-        [],
-        request,
-        "attempt-hybrid",
-        native_artifact,
-        [],
+    assert [block.kind for block in blocks] == ["heading", "paragraph", "table", "formula", "image"]
+    assert [block.retrieval_projection for block in blocks[:2]] == ["标准", "GB15577 每 15 min 记录 1 个瞬时值"]
+    assert blocks[2].payload.to_dict()["cells"][1][1] == "15 min"
+    assert blocks[3].payload.to_dict()["latex"] == "x^2 + 1"
+    assert blocks[4].locators[0].page == 1
+    assert len(assets) == 1
+    assert assets[0].artifact_ref == image
+    assert [(issue.code, issue.state) for issue in issues] == [
+        ("paddleocr-vl-page-furniture-omitted", "accepted")
+    ]
+
+
+def test_paddleocr_vl_maps_saved_page_result_without_a_res_wrapper() -> None:
+    raw = _paddleocr_vl_artifact("paddle-page", "c" * 64, "paddleocr-vl/book_0_res.json")
+    fixture_path = Path(__file__).parents[1] / "fixtures" / "paddleocr-vl-1.6-page-result.json"
+
+    blocks, issues = _paddleocr_vl_blocks(
+        json.loads(fixture_path.read_text(encoding="utf-8")),
+        "attempt-paddleocr-vl",
+        raw,
     )
 
-    assert [block.retrieval_projection for block in graph.blocks] == [native_text, "扫描页 2 的 42"]
-    assert graph.blocks[0].evidence_refs[0].artifact_id == "native"
-    assert graph.blocks[1].evidence_refs[0].artifact_id == "mineru"
-    assert any(issue.code == "native-page-fallback" for issue in graph.issues)
-    assert "gb" in set(_native_fidelity_tokens(native_text))
-    assert _native_page_quality(native_text, list(native.units))[0]
-
-def test_pdf_hybrid_retains_mineru_formula_on_a_native_text_page() -> None:
-    native_artifact = _hybrid_artifact("native", "c" * 64, "native-source.pdf")
-    mineru_artifact = _hybrid_artifact("mineru", "d" * 64, "mineru/content.json")
-    native = ParseEvidence(
-        "pdf",
-        {"pages": [{"page": 1, "text": "Formula 15 min"}]},
-        (StructuredContentUnit("paragraph", "Formula 15 min", EvidenceLocator(page=1)),),
-        0.95,
-        (),
+    assert [block.kind for block in blocks] == ["paragraph", "table"]
+    assert blocks[0].retrieval_projection == "本机 PDF 解析"
+    assert blocks[0].locators[0] == PdfRegionLocator(
+        1, (18.0, 21.0, 118.0, 41.0), segment_id="paddleocr-vl:0"
     )
-    formula = _hybrid_block(1, "x^2 + 1", mineru_artifact, kind="formula")
-    request = ConversionRequest("task-hybrid", 1, "pdf", _HASH, _HASH, "private/source.pdf", {})
-
-    graph = _hybrid_pdf_graph(native, [formula], [], request, "attempt-hybrid", native_artifact, [])
-
-    assert [block.kind for block in graph.blocks] == ["paragraph", "formula"]
-    assert graph.blocks[1].retrieval_projection == "x^2 + 1"
+    assert blocks[1].payload.to_dict()["cells"] == [["术语", "值"], ["频率", "15 min"]]
+    assert [(issue.code, issue.state) for issue in issues] == [
+        ("paddleocr-vl-empty-text", "accepted")
+    ]
 
 
-def test_pdf_hybrid_falls_back_when_native_numeric_token_fidelity_fails() -> None:
-    native_artifact = _hybrid_artifact("native", "c" * 64, "native-source.pdf")
-    mineru_artifact = _hybrid_artifact("mineru", "d" * 64, "mineru/content.json")
-    native = ParseEvidence(
-        "pdf",
-        {"pages": [{"page": 1, "text": "GB15577 每15 min记录1个瞬时值"}]},
-        (StructuredContentUnit("paragraph", "GB 15 min", EvidenceLocator(page=1)),),
-        0.95,
-        (),
+def test_paddleocr_vl_stages_an_extension_named_private_input(tmp_path: Path) -> None:
+    staged_input = _stage_paddleocr_vl_input(b"%PDF-1.7", tmp_path)
+
+    assert staged_input == tmp_path / "input.pdf"
+    assert staged_input.read_bytes() == b"%PDF-1.7"
+
+
+def test_paddleocr_vl_rejects_blocks_without_a_concrete_bbox() -> None:
+    raw = _paddleocr_vl_artifact("paddle-page", "c" * 64, "paddleocr-vl/book_res.json")
+    blocks, issues = _paddleocr_vl_blocks(
+        {"res": {"page_index": 0, "parsing_res_list": [{"block_label": "text", "block_content": "evidence", "block_bbox": [1, 2]}]}},
+        "attempt-paddleocr-vl",
+        raw,
     )
-    mineru = _hybrid_block(1, "GB 15577 每 15 min 记录 1 个瞬时值", mineru_artifact)
-    request = ConversionRequest("task-hybrid", 1, "pdf", _HASH, _HASH, "private/source.pdf", {})
 
-    graph = _hybrid_pdf_graph(native, [mineru], [], request, "attempt-hybrid", native_artifact, [])
-
-    assert [block.retrieval_projection for block in graph.blocks] == [mineru.retrieval_projection]
-    assert graph.blocks[0].evidence_refs[0].artifact_id == "mineru"
-    assert any(issue.code == "native-page-fallback" for issue in graph.issues)
+    assert not blocks
+    assert [issue.code for issue in issues] == ["paddleocr-vl-location-missing"]
 
 
-def test_pdf_hybrid_coalesces_vlm_fallback_ranges_and_preserves_page_offsets() -> None:
-    assert _coalesced_page_ranges((2, 4, 6, 22, 23)) == ((1, 5), (21, 22))
-
+def test_paddleocr_vl_command_is_pinned_to_pipeline_v1_6_and_local_native_backend() -> None:
     profile = ConverterProfile(
-        profile_id="mineru-test",
-        engine="mineru",
-        engine_version="3.4.4",
+        profile_id="paddleocr-vl-test",
+        engine="paddleocr-vl",
+        engine_version="3.7.0",
         executable_sha256=_HASH,
         config_hash=_CONFIG_HASH,
         model_hashes=("c" * 64,),
         resource_limits={"wall_clock_seconds": 60},
         release_approved=True,
         network_denied=True,
-        executable_path="C:/converter/mineru.exe",
-        backends=("pipeline", "vlm-engine"),
+        executable_path="C:/converter/paddleocr.exe",
+        config_path="C:/converter/paddleocr-vl-1.6.yaml",
+        backends=("native",),
     )
-    request = ConversionRequest("task-hybrid", 1, "pdf", _HASH, _HASH, "private/source.pdf", {})
+    request = ConversionRequest("task-paddleocr-vl", 1, "pdf", _HASH, _HASH, "private/source.pdf", {})
 
     command = ProvisionedConversionLauncher._command(
-        "mineru",
+        "paddleocr-vl",
         profile,
         request,
         Path("C:/private-attempt"),
-        backend="vlm-engine",
-        output_root=Path("C:/private-attempt/mineru-vlm-2-6"),
-        start_page=1,
-        end_page=5,
     )
 
-    assert command[command.index("-b") + 1] == "vlm-engine"
-    assert command[command.index("-s") + 1] == "1"
-    assert command[command.index("-e") + 1] == "5"
-
-    blocks, issues = _mineru_blocks(
-        [[{"type": "paragraph", "content": "VLM fallback", "bbox": [1, 1, 10, 10]}]],
-        "attempt-hybrid",
-        _hybrid_artifact("vlm", "e" * 64, "mineru-vlm-22-23/content.json"),
-        page_offset=21,
-    )
-    assert not issues
-    assert getattr(blocks[0].locators[0], "page") == 22
+    assert command[1] == "doc_parser"
+    assert command[command.index("--pipeline_version") + 1] == "v1.6"
+    assert command[command.index("--vl_rec_backend") + 1] == "native"
+    assert command[command.index("--device") + 1] == "gpu:0"
+    assert command[command.index("--paddlex_config") + 1] == profile.config_path
 
 
 class _ServiceDerivationWorker:
@@ -416,6 +386,20 @@ def test_typed_renderer_escapes_markdown_and_preserves_nested_lists_and_table_sp
     assert "- top\n    - child" in markdown
     assert '<th>Header</th>' in markdown
     assert '<td colspan="2">spans two</td>' in markdown
+
+
+def test_typed_renderer_keeps_legacy_docx_single_item_list_graphs_renderable() -> None:
+    legacy_list = replace(
+        _block(),
+        block_id="legacy-docx-list",
+        kind="list",
+        payload=BlockPayload.from_dict(
+            "list",
+            {"ordered": True, "items": [{"text": "legacy item"}], "nesting": 0},
+        ),
+    )
+
+    assert render_document_graph(_graph(legacy_list)).markdown == "1. legacy item"
 
 
 def test_quality_gate_selects_one_complete_fallback_graph_without_merging() -> None:
@@ -722,27 +706,24 @@ def test_deriver_consumes_only_selected_v2_graph_and_refuses_unresolved_content(
     assert blocked_events[1]["type"] == "derivation-failed-item"
 
 
-def test_selected_conversion_graph_persists_a_rendered_proposal_and_automatically_reaches_commit(
+def test_selected_conversion_graph_stays_local_and_automatically_reaches_commit(
     tmp_path: Path,
 ) -> None:
     class Policy:
         def __init__(self) -> None:
-            self.source_paths: list[str] = []
+            self.called = False
 
         def preview(self, vault_id, source_path, derived_path, stage):
-            assert vault_id
-            assert derived_path is None
-            assert stage == "outbound"
-            self.source_paths.append(source_path)
-            return type("Evaluation", (), {"allowed": True})()
+            self.called = True
+            raise AssertionError("DocumentGraph proposal generation must not request outbound policy.")
 
     class Structurer:
         def __init__(self) -> None:
-            self.markdown = ""
+            self.called = False
 
         def structure(self, markdown: str) -> str:
-            self.markdown = markdown
-            return markdown
+            self.called = True
+            raise AssertionError("DocumentGraph proposal generation must not call the Markdown Provider.")
 
     source = tmp_path / "book.pdf"
     source.write_bytes(b"selected conversion source")
@@ -823,14 +804,147 @@ def test_selected_conversion_graph_persists_a_rendered_proposal_and_automaticall
     assert proposal.graph_revision == graph.graph_revision
     assert "# Converted heading" in proposal.notes[0].markdown
     assert proposal.graph_block_locators[0][0].document_locator == graph.blocks[0].locators[0].to_dict()
-    assert structurer.markdown == "# Converted heading\n\nConverted body"
-    assert proposal.provider_markdown == "# Converted heading\n\nConverted body"
+    assert not structurer.called
+    assert not policy.called
+    assert proposal.provider_markdown is None
     assert proposal.structured_blocks == ()
-    assert policy.source_paths == [f"platform/sources/source-v2-{source_hash[:16]}.pdf"]
     assert completed.lifecycle == "recoverable"
     assert completed.phase == "failed"
     assert completed.recovery_actions == ("retry-commit",)
     assert completed.failure_reason == "Vault commit service is unavailable."
+
+
+def test_selected_online_graph_is_structured_before_projection_indexing_and_embedding(
+    tmp_path: Path,
+) -> None:
+    class Structurer:
+        def __init__(self) -> None:
+            self.inputs: list[str] = []
+
+        def structure(self, markdown: str) -> str:
+            self.inputs.append(markdown)
+            return "\n\n".join(
+                section for section in markdown.split("\n\n") if section != "Repeated header"
+            )
+
+    class Embeddings:
+        def __init__(self, index_repository) -> None:
+            self.index_repository = index_repository
+            self.calls: list[tuple[str, str]] = []
+            self.inputs: list[str] = []
+
+        def execute(self, vault_id: str, scope) -> None:
+            self.calls.append((vault_id, scope.kind))
+            self.inputs = [
+                block.retrieval_text
+                for document in self.index_repository.current_embedding_documents(vault_id)
+                for block in document.blocks
+            ]
+
+    source = tmp_path / "book.pdf"
+    source.write_bytes(b"online conversion source")
+    source_hash = sha256(source.read_bytes()).hexdigest()
+    vault_path = tmp_path / "vault"
+    vault_path.mkdir()
+    filesystem = LocalVaultFilesystem()
+    vault_service = VaultService(SqliteVaultRepository(tmp_path / "vaults.sqlite3"), filesystem)
+    vault = vault_service.authorize(vault_path, "platform")
+    repository = SqliteImportTaskRepository(tmp_path / "tasks.sqlite3")
+    index_repository = SqliteIndexRepository(tmp_path / "indexes.sqlite3", rich_block_reads_enabled=True)
+    index_service = IndexingService(vault_service, index_repository, filesystem)
+    artifact_store = PrivateArtifactStore(tmp_path / "private")
+    task = new_import_task(
+        vault_id=vault.vault_id,
+        vault_label="Vault",
+        source_paths=(source,),
+        scope_label=source.name,
+        online_parse_selection=OnlineParseSelection(
+            provider_id="paddleocr-official",
+            provider_kind="paddleocr-official",
+            provider_name="PaddleOCR-VL 1.6",
+            endpoint=None,
+            model="PaddleOCR-VL-1.6",
+            credential_reference="online-credential",
+            policy_revision=1,
+            policy_path=source.name,
+        ),
+    )
+    repository.create(task, "created")
+    repository.append_item(
+        task.task_id,
+        ImportTaskItem(
+            item_id=0,
+            task_id=task.task_id,
+            source_path=source,
+            label=source.name,
+            category="supported",
+            document_kind="pdf",
+            reason=None,
+            source_id="source-online",
+            content_sha256=source_hash,
+            identity_status="new",
+        ),
+    )
+    item = repository.list_items(task.task_id)[0]
+    artifact_store.snapshot_input(
+        task_id=task.task_id,
+        item_id=item.item_id,
+        source=source,
+        expected_sha256=source_hash,
+    )
+    graph = replace(
+        _graph(
+            replace(_block("heading", text="Lesson"), block_id="heading"),
+            replace(_block(text="Repeated header"), block_id="header-first"),
+            replace(_block(text="Main body"), block_id="body"),
+            replace(_block(text="Repeated header"), block_id="header-second"),
+        ),
+        graph_id="graph-online",
+        source_sha256=source_hash,
+        input_snapshot_hash=source_hash,
+    )
+    attempt = replace(
+        _attempt(graph),
+        task_id=task.task_id,
+        item_id=item.item_id,
+        input_snapshot_hash=source_hash,
+    )
+    structurer = Structurer()
+    embeddings = Embeddings(index_repository)
+    service = ImportTaskService(
+        vault_service,
+        repository,
+        _ServiceDerivationWorker(),
+        vault_committer=LocalVaultCommitter(),
+        index_service=index_service,
+        embedding_service=embeddings,
+        markdown_structuring_service=structurer,
+        artifact_store=artifact_store,
+    )
+    repository.save(replace(task, lifecycle="running", phase="converting"), "conversion-started")
+
+    service._handle_worker_event(
+        task.task_id,
+        {
+            "type": "conversion-item",
+            "item_id": item.item_id,
+            "content_sha256": source_hash,
+            "evidence": ConversionEvidence("pdf", graph, attempt).to_dict(),
+            "quality_gate_decision": _accepted_quality_decision(attempt),
+        },
+    )
+    service._handle_worker_event(task.task_id, {"type": "conversion-completed"})
+
+    proposal = repository.get_note_proposal(item.item_id)
+    assert proposal is not None
+    assert structurer.inputs == [render_document_graph(graph).markdown]
+    assert proposal.provider_markdown == "# Lesson\n\nMain body"
+    assert proposal.noise_graph_block_ids == ("header-first", "header-second")
+    assert task.task_id == service.get(task.task_id).task_id
+    assert service.get(task.task_id).lifecycle == "complete"
+    assert all("Repeated header" not in value for value in embeddings.inputs)
+    assert embeddings.inputs
+    assert embeddings.calls == [(vault.vault_id, "vault")]
 
 
 def test_selected_graph_assets_and_source_snapshot_are_staged_in_one_commit_unit(tmp_path: Path) -> None:
@@ -1130,6 +1244,7 @@ def test_runner_gates_and_promotes_only_a_verified_snapshot_matched_graph(tmp_pa
     store = PrivateArtifactStore(tmp_path / "private")
     runner = LocalImportTaskRunner(artifact_store=store)
     request = runner._conversion_input(task, item)
+    assert request["input_filename"] == source.name
     temporary = store.create_attempt_directory("attempt-managed")
     raw = temporary / "graph.json"
     raw_content = b'{"graph":"trusted"}'

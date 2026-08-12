@@ -7,6 +7,7 @@ from pathlib import PurePosixPath
 from typing import Protocol
 
 from domain.evidence import ConversionAttempt, ConversionEvidence, DocumentGraph
+from domain.online_document_parser import OnlineParseJob, OnlineParseSelection
 from workers.converters.quality_gate import StructuralQualityGate
 
 
@@ -21,6 +22,9 @@ class ConversionRequest:
     input_snapshot_hash: str
     input_snapshot_path: str
     preflight_inventory: Mapping[str, object] = field(default_factory=dict)
+    online_parse_selection: OnlineParseSelection | None = None
+    online_parse_job: OnlineParseJob | None = None
+    input_filename: str = ""
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> ConversionRequest:
@@ -32,6 +36,17 @@ class ConversionRequest:
             input_snapshot_hash=str(value["input_snapshot_hash"]),
             input_snapshot_path=str(value["input_snapshot_path"]),
             preflight_inventory=dict(value.get("preflight_inventory", {})),
+            online_parse_selection=(
+                OnlineParseSelection.from_dict(dict(value["online_parse_selection"]))
+                if isinstance(value.get("online_parse_selection"), Mapping)
+                else None
+            ),
+            online_parse_job=(
+                OnlineParseJob.from_dict(dict(value["online_parse_job"]))
+                if isinstance(value.get("online_parse_job"), Mapping)
+                else None
+            ),
+            input_filename=str(value.get("input_filename") or ""),
         )
         if not request.input_snapshot_path or request.source_sha256 != request.input_snapshot_hash:
             raise ValueError("Conversion requests require a verified immutable input snapshot.")
@@ -155,6 +170,7 @@ def conversion_items(
     launcher: ConversionLauncher | None = None,
     should_cancel: Callable[[], bool] | None = None,
     record_rejected_attempt: Callable[[RejectedConversionCandidate], bool] | None = None,
+    record_online_job: Callable[[OnlineParseJob], bool] | None = None,
 ) -> Iterator[dict[str, object]]:
     """Emit service-owned events while never exposing mutable source paths to a launcher."""
 
@@ -170,8 +186,11 @@ def conversion_items(
             if launcher is None:
                 raise RuntimeError("No provisioned converter launcher is available in this build.")
             request = ConversionRequest.from_dict(item)
+            online_convert = getattr(launcher, "convert_with_online_job", None)
             staged_convert = getattr(launcher, "convert_after_primary_persisted", None)
-            if callable(staged_convert) and record_rejected_attempt is not None:
+            if callable(online_convert) and request.online_parse_selection is not None:
+                outcome = online_convert(request, record_online_job)
+            elif callable(staged_convert) and record_rejected_attempt is not None:
                 outcome = staged_convert(request, record_rejected_attempt)
             else:
                 outcome = launcher.convert(request)
@@ -278,10 +297,25 @@ def run_conversion_worker(
             and confirmation.get("persisted") is True
         )
 
+    def record_online_job(job: OnlineParseJob) -> bool:
+        if rejected_attempt_confirmations is None:
+            return False
+        queue.put({"type": "online-parse-submitted", "job": job.to_dict()})
+        try:
+            confirmation = rejected_attempt_confirmations.get(timeout=30)
+        except Exception:
+            return False
+        return (
+            isinstance(confirmation, dict)
+            and confirmation.get("remote_job_id") == job.remote_job_id
+            and confirmation.get("persisted") is True
+        )
+
     for event in conversion_items(
         items,
         launcher=launcher,
         should_cancel=cancelled.is_set,
         record_rejected_attempt=record_rejected_attempt,
+        record_online_job=record_online_job,
     ):
         queue.put(event)

@@ -34,7 +34,12 @@ def main() -> None:
                 converter_profiles=ProvisionedProfiles(
                     Path("test-converters"),
                     {},
-                    {"mineru": "test-disabled", "pandoc": "test-disabled", "docling": "test-disabled"},
+                    {
+                        "mineru": "test-disabled",
+                        "pandoc": "test-disabled",
+                        "docling": "test-disabled",
+                        "paddleocr-vl": "test-disabled",
+                    },
                 ),
             ),
             host=DEFAULT_HOST,

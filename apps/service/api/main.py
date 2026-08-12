@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 import webbrowser
+from contextlib import asynccontextmanager
 from pathlib import Path
 from queue import Queue
 from typing import Annotated, Literal
@@ -32,6 +33,8 @@ from adapters.sqlite_source_repository import SqliteSourceRepository
 from adapters.sqlite_task_repository import SqliteImportTaskRepository
 from adapters.sqlite_vault_repository import SqliteVaultRepository
 from adapters.windows_credential_manager import WindowsCredentialManager
+from adapters.official_online_document_parser import OfficialOnlineDocumentParser
+from adapters.sqlite_online_parse_provider_repository import SqliteOnlineParseProviderRepository
 from adapters.windows_directory_picker import WindowsDirectoryPicker
 from adapters.windows_import_picker import WindowsImportPicker
 from application.directory_selections import DirectorySelectionError, DirectorySelectionStore
@@ -63,10 +66,17 @@ from application.providers import (
     ProviderValidationError,
 )
 from application.markdown_structuring import MarkdownStructuringService
+from application.online_parse_providers import (
+    OnlineParseProviderService,
+    OnlineParseProviderUnavailableError,
+    OnlineParseProviderValidationError,
+)
 from application.sessions import SessionNotFoundError, SessionService, SessionValidationError
 from application.vaults import VaultConflictError, VaultService, VaultValidationError
+from application.workbench_overview import WorkbenchOverview, WorkbenchOverviewService
 from ports.import_upload_store import ImportUploadStore, ImportUploadStoreError
 from workers.converters.artifact_store import PrivateArtifactStore
+from workers.converters.online_launcher import OnlinePdfConversionLauncher
 from workers.converters.launcher import ProvisionedConversionLauncher
 from workers.converters.provisioning import ProvisionedProfiles, load_provisioned_profiles
 from api.errors import error_response
@@ -94,7 +104,7 @@ from domain.derived_notes import (
 from domain.classification import ClassificationSuggestion
 from domain.candidate_links import CandidateLinkProposal
 from domain.metadata_tags import MetadataTagProposal, TagChangePreview, TagDefinition
-from domain.evidence import EvidenceLocator
+from domain.evidence import DocxOoxmlLocator, EvidenceLocator, ParseEvidence, PdfRegionLocator
 from domain.indexing import IndexBlock, IndexHealth
 from domain.review_commits import CommitJournal, ReviewSnapshot
 from domain.retrieval_query import QueryScopeSelection
@@ -477,6 +487,14 @@ class ModelTestCommand(BaseModel):
     model_id: str
 
 
+class MarkdownStructureBudgetCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    minimum_tokens: int = Field(ge=1, le=20_000)
+    target_tokens: int = Field(ge=1, le=20_000)
+    maximum_tokens: int = Field(ge=1, le=20_000)
+
+
 class ImportFilesSelectionCommand(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -488,6 +506,15 @@ class ImportTaskCommand(BaseModel):
 
     vault_id: str
     selection_id: str
+    online_parse_enabled: bool = False
+    online_parse_provider_id: str | None = None
+
+
+class OnlineParseProviderCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    endpoint: str | None = None
+    secret: str | None = None
 
 
 class OcrDecisionCommand(BaseModel):
@@ -553,6 +580,16 @@ def require_retrieval_chunking_lab_build(build_directory: Path) -> Path:
             "Retrieval chunking test UI build is missing. Run npm run build:retrieval-chunking-lab."
         )
     return build_directory
+
+
+@asynccontextmanager
+async def reconcile_indexes_after_startup(app: FastAPI):
+    threading.Thread(
+        target=app.state.indexing_service.reconcile_all,
+        name="obsidian-index-reconcile",
+        daemon=True,
+    ).start()
+    yield
 
 
 def workbench_response(local_session: LocalSession) -> FileResponse:
@@ -1577,6 +1614,31 @@ def import_task_payload(task: ImportTask) -> dict[str, object]:
         "parent_task_id": task.parent_task_id,
         "created_at": task.created_at,
         "updated_at": task.updated_at,
+        "online_parse": (
+            {
+                "enabled": True,
+                "provider_id": task.online_parse_selection.provider_id,
+                "provider_name": task.online_parse_selection.provider_name,
+                "model": task.online_parse_selection.model,
+                "status": task.online_parse_job.status if task.online_parse_job is not None else "not-submitted",
+            }
+            if task.online_parse_selection is not None
+            else {"enabled": False}
+        ),
+    }
+
+
+def online_parse_provider_payload(provider) -> dict[str, object]:
+    return {
+        "provider_id": provider.provider_id,
+        "name": provider.name,
+        "endpoint": provider.endpoint,
+        "uses_official_endpoint": provider.endpoint is None,
+        "model": provider.model,
+        "credential_configured": provider.credential_configured,
+        "verified": provider.verified,
+        "verification_reason": provider.verification_reason,
+        "last_tested_at": provider.last_tested_at,
     }
 
 
@@ -1667,6 +1729,51 @@ def conversion_review_graph_payload(item_id: int, graph) -> dict[str, object]:
                 ],
             }
             for block in graph.blocks
+        ],
+    }
+
+
+def source_parse_payload(item_id: int, graph) -> dict[str, object]:
+    if isinstance(graph, ParseEvidence):
+        def legacy_location_summary(unit) -> str:
+            locator = unit.locator
+            if locator.page is not None:
+                return f"第 {locator.page} 页"
+            if locator.docx_location:
+                return "DOCX 内容"
+            return "来源范围"
+
+        return {
+            "item_id": item_id,
+            "blocks": [
+                {
+                    "kind": unit.kind,
+                    "location": legacy_location_summary(unit),
+                    "content": unit.text,
+                }
+                for unit in graph.units
+                if unit.text.strip()
+            ],
+        }
+
+    def location_summary(block) -> str:
+        locator = block.locators[0]
+        if isinstance(locator, PdfRegionLocator):
+            return f"第 {locator.page} 页"
+        if isinstance(locator, DocxOoxmlLocator):
+            return "DOCX 内容"
+        return "来源范围"
+
+    return {
+        "item_id": item_id,
+        "blocks": [
+            {
+                "kind": block.kind,
+                "location": location_summary(block),
+                "content": block.retrieval_projection,
+            }
+            for block in graph.blocks
+            if block.retrieval_projection.strip()
         ],
     }
 
@@ -2076,7 +2183,7 @@ def provider_error(error: Exception) -> HTTPException:
                 "retryable": False,
             },
         )
-    if isinstance(error, ProviderValidationError):
+    if isinstance(error, (ProviderValidationError, OnlineParseProviderValidationError)):
         return HTTPException(
             status_code=400,
             detail={
@@ -2086,7 +2193,7 @@ def provider_error(error: Exception) -> HTTPException:
                 "retryable": True,
             },
         )
-    if isinstance(error, ProviderUnavailableError):
+    if isinstance(error, (ProviderUnavailableError, OnlineParseProviderUnavailableError)):
         return HTTPException(
             status_code=409,
             detail={
@@ -2158,12 +2265,83 @@ def vault_with_policy_payload(app: FastAPI, vault: Vault) -> dict[str, object]:
     return payload
 
 
+def workbench_overview_payload(overview: WorkbenchOverview) -> dict[str, object]:
+    def index_payload(index) -> dict[str, object] | None:
+        if index is None:
+            return None
+        return {
+            "status": index.status,
+            "updated_at": index.updated_at,
+            "current_count": index.current_count,
+            "stale_count": index.stale_count,
+            "pending_count": index.pending_count,
+            "failure_count": index.failure_count,
+            "semantic_status": index.semantic_status,
+            "semantic_covered_block_count": index.semantic_covered_block_count,
+            "semantic_eligible_block_count": index.semantic_eligible_block_count,
+        }
+
+    return {
+        "updated_at": overview.updated_at,
+        "vaults": [
+            {
+                "vault_id": vault.vault_id,
+                "display_name": vault.display_name,
+                "authorization_status": vault.authorization_status,
+                "access_status": vault.access_status,
+                "access_reason": vault.access_reason,
+                "is_current": vault.is_current,
+                "updated_at": vault.updated_at,
+                "state": vault.state,
+                "index": index_payload(vault.index),
+                "tasks": {
+                    "total": vault.tasks.total,
+                    "running": vault.tasks.running,
+                    "attention": vault.tasks.attention,
+                    "completed": vault.tasks.completed,
+                    "latest_at": vault.tasks.latest_at,
+                },
+                "sessions": {
+                    "total": vault.sessions.total,
+                    "latest_at": vault.sessions.latest_at,
+                },
+            }
+            for vault in overview.vaults
+        ],
+        "attention": [
+            {
+                "kind": item.kind,
+                "vault_id": item.vault_id,
+                "vault_label": item.vault_label,
+                "title": item.title,
+                "detail": item.detail,
+                "status": item.status,
+                "updated_at": item.updated_at,
+                "task_id": item.task_id,
+            }
+            for item in overview.attention
+        ],
+        "activity": [
+            {
+                "kind": item.kind,
+                "vault_id": item.vault_id,
+                "vault_label": item.vault_label,
+                "label": item.label,
+                "status": item.status,
+                "updated_at": item.updated_at,
+            }
+            for item in overview.activity
+        ],
+    }
+
+
 def create_app(
     *,
     runtime: RuntimeState | None = None,
     vault_service: VaultService | None = None,
     policy_service: PolicyService | None = None,
     provider_service: ProviderService | None = None,
+    online_parse_provider_service: OnlineParseProviderService | None = None,
     session_service: SessionService | None = None,
     directory_picker: WindowsDirectoryPicker | None = None,
     directory_selections: DirectorySelectionStore | None = None,
@@ -2173,6 +2351,7 @@ def create_app(
     import_picker: WindowsImportPicker | None = None,
     import_selections: ImportSelectionStore | None = None,
     import_upload_store: ImportUploadStore | None = None,
+    workbench_overview_service: WorkbenchOverviewService | None = None,
     converter_profiles: ProvisionedProfiles | None = None,
     retrieval_chunking_lab_build_directory: Path | None = None,
 ) -> FastAPI:
@@ -2182,7 +2361,10 @@ def create_app(
         retrieval_chunking_lab_build_directory = require_retrieval_chunking_lab_build(
             retrieval_chunking_lab_build_directory or RETRIEVAL_CHUNKING_LAB_BUILD_DIRECTORY
         )
-    app = FastAPI(title="Obsidian Personal Knowledge Platform")
+    app = FastAPI(
+        title="Obsidian Personal Knowledge Platform",
+        lifespan=reconcile_indexes_after_startup,
+    )
     app.state.runtime = runtime
     app.state.local_session = create_local_session()
 
@@ -2216,6 +2398,14 @@ def create_app(
         credentials=WindowsCredentialManager(),
         client=OpenAiCompatibleProviderClient(),
         unit_card_invalidator=app.state.indexing_service.repository,
+    )
+    online_parse_credentials = WindowsCredentialManager()
+    online_parser = OfficialOnlineDocumentParser()
+    app.state.online_parse_provider_service = online_parse_provider_service or OnlineParseProviderService(
+        repository=SqliteOnlineParseProviderRepository(runtime.data_directory / "vaults.sqlite3"),
+        credentials=online_parse_credentials,
+        parser=online_parser,
+        policy_service=app.state.policy_service,
     )
     app.state.embedding_batch_service = EmbeddingBatchService(
         app.state.vault_service,
@@ -2277,8 +2467,11 @@ def create_app(
         recovered_tasks = task_repository.recover_interrupted_tasks()
         provisioned_converters = converter_profiles or load_provisioned_profiles()
         artifact_store = PrivateArtifactStore(runtime.data_directory / "conversion-artifacts")
-        conversion_launcher = ProvisionedConversionLauncher(
+        local_conversion_launcher = ProvisionedConversionLauncher(
             provisioned_converters.profiles, artifact_store
+        )
+        conversion_launcher = OnlinePdfConversionLauncher(
+            local_conversion_launcher, artifact_store, online_parser, online_parse_credentials
         )
         import_task_service = ImportTaskService(
             app.state.vault_service,
@@ -2296,16 +2489,22 @@ def create_app(
             converter_profile=dict(provisioned_converters.profiles),
             artifact_store=artifact_store,
             upload_store=app.state.import_upload_store,
+            online_parse_provider_service=app.state.online_parse_provider_service,
         )
         import_task_service.recover_interrupted_commits(recovered_tasks)
+        import_task_service.start_queued_tasks()
     app.state.import_task_service = import_task_service
     app.state.knowledge_graph_service = knowledge_graph_service or KnowledgeGraphService(
         app.state.vault_service,
         app.state.indexing_service.repository,
         getattr(app.state.import_task_service, "repository", EmptyGraphCandidateRepository()),
     )
-    app.state.indexing_service.reconcile_all()
-
+    app.state.workbench_overview_service = workbench_overview_service or WorkbenchOverviewService(
+        app.state.vault_service,
+        app.state.indexing_service,
+        app.state.import_task_service,
+        app.state.session_service,
+    )
     @app.exception_handler(StarletteHTTPException)
     async def http_exception_handler(
         request: Request, exception: StarletteHTTPException
@@ -2820,11 +3019,80 @@ def create_app(
         except Exception as error:
             raise provider_error(error) from error
 
+    @app.get("/api/providers/markdown-structuring/budget")
+    def get_markdown_structure_budget(request: Request) -> dict[str, dict[str, int]]:
+        require_local_session(app, request)
+        try:
+            budget = app.state.provider_service.markdown_structure_budget()
+            return {
+                "budget": {
+                    "minimum_tokens": budget.minimum_tokens,
+                    "target_tokens": budget.target_tokens,
+                    "maximum_tokens": budget.maximum_tokens,
+                }
+            }
+        except Exception as error:
+            raise provider_error(error) from error
+
+    @app.put("/api/providers/markdown-structuring/budget")
+    def set_markdown_structure_budget(
+        request: Request, command: MarkdownStructureBudgetCommand
+    ) -> dict[str, dict[str, int]]:
+        require_local_session(app, request)
+        try:
+            budget = app.state.provider_service.set_markdown_structure_budget(
+                command.minimum_tokens, command.target_tokens, command.maximum_tokens
+            )
+            return {
+                "budget": {
+                    "minimum_tokens": budget.minimum_tokens,
+                    "target_tokens": budget.target_tokens,
+                    "maximum_tokens": budget.maximum_tokens,
+                }
+            }
+        except Exception as error:
+            raise provider_error(error) from error
+
     @app.get("/api/providers")
     def list_providers(request: Request) -> dict[str, list[dict[str, object]]]:
         require_local_session(app, request)
         try:
             return {"providers": [provider_payload(provider) for provider in app.state.provider_service.list()]}
+        except Exception as error:
+            raise provider_error(error) from error
+
+    @app.get("/api/online-parse-providers")
+    def list_online_parse_providers(request: Request) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            return {
+                "providers": [
+                    online_parse_provider_payload(provider)
+                    for provider in app.state.online_parse_provider_service.list()
+                ]
+            }
+        except Exception as error:
+            raise provider_error(error) from error
+
+    @app.put("/api/online-parse-providers/{provider_id}")
+    def configure_online_parse_provider(
+        request: Request, provider_id: str, command: OnlineParseProviderCommand
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            provider = app.state.online_parse_provider_service.configure(
+                provider_id, endpoint=command.endpoint, secret=command.secret
+            )
+            return {"provider": online_parse_provider_payload(provider)}
+        except Exception as error:
+            raise provider_error(error) from error
+
+    @app.post("/api/online-parse-providers/{provider_id}/test")
+    def test_online_parse_provider(request: Request, provider_id: str) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            provider = app.state.online_parse_provider_service.test(provider_id)
+            return {"provider": online_parse_provider_payload(provider)}
         except Exception as error:
             raise provider_error(error) from error
 
@@ -2998,8 +3266,19 @@ def create_app(
         session_secret = require_local_session(app, request)
         try:
             selection = app.state.import_selections.consume(command.selection_id, session_secret)
-            task = app.state.import_task_service.create(command.vault_id, selection)
-            return {"task": import_task_payload(task)}
+            if command.online_parse_enabled and not command.online_parse_provider_id:
+                raise ImportTaskError("请选择已验证的在线解析 Provider。")
+            if not command.online_parse_enabled and command.online_parse_provider_id is not None:
+                raise ImportTaskError("在线解析关闭时不能选择 Provider。")
+            tasks = app.state.import_task_service.create_tasks(
+                command.vault_id,
+                selection,
+                command.online_parse_provider_id if command.online_parse_enabled else None,
+            )
+            return {
+                "task": import_task_payload(tasks[0]),
+                "tasks": [import_task_payload(task) for task in tasks],
+            }
         except Exception as error:
             raise import_task_error(error) from error
 
@@ -3024,6 +3303,14 @@ def create_app(
             conversion_graphs = (
                 list_conversion_graphs(task_id) if list_conversion_graphs is not None else ()
             )
+            list_source_parse_evidence = getattr(
+                app.state.import_task_service, "list_source_parse_evidence", None
+            )
+            source_parses = (
+                list_source_parse_evidence(task_id)
+                if list_source_parse_evidence is not None
+                else conversion_graphs
+            )
             list_classifications = getattr(
                 app.state.import_task_service, "list_classification_suggestions", None
             )
@@ -3038,10 +3325,6 @@ def create_app(
             candidate_links = list_candidate_links(task_id) if list_candidate_links is not None else []
             list_commit_journals = getattr(app.state.import_task_service, "list_commit_journals", None)
             commit_journals = list_commit_journals(task_id) if list_commit_journals is not None else []
-            try:
-                index_health = index_health_payload(app.state.indexing_service.health(task.vault_id))
-            except KeyError:
-                index_health = None
             return {
                 "task": import_task_payload(task),
                 "items": [import_task_item_payload(item) for item in items],
@@ -3049,6 +3332,9 @@ def create_app(
                 "conversion_graphs": [
                     conversion_review_graph_payload(item_id, graph)
                     for item_id, graph in conversion_graphs
+                ],
+                "source_parses": [
+                    source_parse_payload(item_id, evidence) for item_id, evidence in source_parses
                 ],
                 "classification_suggestions": [
                     classification_suggestion_payload(suggestion) for suggestion in classifications
@@ -3060,7 +3346,7 @@ def create_app(
                     candidate_link_proposal_payload(proposal) for proposal in candidate_links
                 ],
                 "commit_journals": [commit_journal_payload(journal) for journal in commit_journals],
-                "index": index_health,
+                "index": None,
                 "event_cursor": event_cursor,
             }
         except Exception as error:
@@ -3513,6 +3799,11 @@ def create_app(
             }
         except Exception as error:
             raise vault_error(error) from error
+
+    @app.get("/api/workbench/overview")
+    def get_workbench_overview(request: Request) -> dict[str, object]:
+        require_local_session(app, request)
+        return workbench_overview_payload(app.state.workbench_overview_service.read())
 
     @app.post("/api/vaults")
     def authorize_vault(request: Request, command: VaultPathCommand) -> dict[str, object]:

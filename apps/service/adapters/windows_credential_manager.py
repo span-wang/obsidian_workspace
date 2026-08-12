@@ -49,6 +49,12 @@ class WindowsCredentialManager:
         self._advapi32.CredFree.argtypes = [ctypes.c_void_p]
         self._advapi32.CredFree.restype = None
 
+    def __getstate__(self) -> dict[str, object]:
+        return {}
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        self.__init__()
+
     def save(self, reference: str, secret: str) -> None:
         encoded = secret.encode("utf-16-le")
         blob = (ctypes.c_byte * len(encoded)).from_buffer_copy(encoded)
@@ -65,6 +71,8 @@ class WindowsCredentialManager:
     def read(self, reference: str) -> str:
         credential_pointer = PCREDENTIALW()
         if not self._advapi32.CredReadW(reference, CRED_TYPE_GENERIC, 0, ctypes.byref(credential_pointer)):
+            if ctypes.get_last_error() == 1168:
+                raise KeyError(reference)
             raise self._error("Credential is unavailable")
         try:
             credential = credential_pointer.contents

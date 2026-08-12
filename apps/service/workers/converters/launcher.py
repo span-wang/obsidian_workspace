@@ -12,7 +12,6 @@ import os
 import re
 import subprocess
 import time
-from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from hashlib import sha256
@@ -31,10 +30,8 @@ from domain.evidence import (
     DocumentGraphIssue,
     DocxOoxmlLocator,
     EvidenceRef,
-    ParseEvidence,
     PdfRegionLocator,
     SourceScopeLocator,
-    StructuredContentUnit,
 )
 from workers.converters.artifact_store import PrivateArtifactStore
 from workers.converters.profiles import ConverterProfile, require_profile
@@ -46,7 +43,7 @@ from workers.converters.runner import (
     ConversionOutcome,
     ConversionRequest,
 )
-from workers.document_parser import parse_document, preflight_document
+from workers.document_parser import preflight_document
 
 
 class LocalConverterError(RuntimeError):
@@ -84,9 +81,9 @@ class ProvisionedConversionLauncher(ConversionLauncher):
         request: ConversionRequest,
         record_rejected_attempt,
     ) -> ConversionOutcome:
-        primary_engine = "mineru" if request.document_kind == "pdf" else "pandoc"
+        primary_engine = "paddleocr-vl" if request.document_kind == "pdf" else "pandoc"
         primary = (
-            self._run_pdf_hybrid_attempt(request)
+            self._run_paddleocr_vl_attempt(request)
             if request.document_kind == "pdf"
             else self._run_attempt(primary_engine, request)
         )
@@ -120,13 +117,15 @@ class ProvisionedConversionLauncher(ConversionLauncher):
             )
         return self._selected_outcome(fallback, fallback_gate, request)
 
-    def _run_pdf_hybrid_attempt(self, request: ConversionRequest) -> _AttemptResult:
-        """Run MinerU once, then choose native text or MinerU per PDF page."""
+    def _run_paddleocr_vl_attempt(self, request: ConversionRequest) -> _AttemptResult:
+        """Run the approved local PaddleOCR-VL 1.6 pipeline for a whole PDF."""
 
-        profile = self._profiles.get("mineru")
-        gate = require_profile(profile, "mineru")
+        profile = self._profiles.get("paddleocr-vl")
+        gate = require_profile(profile, "paddleocr-vl")
         if not gate.allowed or profile is None:
-            raise LocalConverterError(gate.reason or "The MinerU profile is unavailable.")
+            raise LocalConverterError(gate.reason or "The PaddleOCR-VL profile is unavailable.")
+        if not profile.supports_backend("native"):
+            raise LocalConverterError("The approved PaddleOCR-VL profile does not provision native inference.")
         attempt_id = str(uuid4())
         temporary = self._artifact_store.create_attempt_directory(attempt_id)
         try:
@@ -134,9 +133,9 @@ class ProvisionedConversionLauncher(ConversionLauncher):
             source_bytes = source_path.read_bytes()
             if sha256(source_bytes).hexdigest() != request.source_sha256:
                 raise LocalConverterError("The PDF snapshot hash no longer matches the request.")
-            native_source = temporary / "native-source.pdf"
-            native_source.write_bytes(source_bytes)
-            command = self._command("mineru", profile, request, temporary)
+            staged_input = _stage_paddleocr_vl_input(source_bytes, temporary)
+            staged_request = replace(request, input_snapshot_path=str(staged_input))
+            command = self._command("paddleocr-vl", profile, staged_request, temporary)
             completed = _run_fixed_command(
                 command,
                 temporary,
@@ -144,10 +143,11 @@ class ProvisionedConversionLauncher(ConversionLauncher):
                 int(profile.resource_limits.get("wall_clock_seconds", 600)),
                 int(profile.resource_limits.get("workspace_bytes", 0)),
             )
+            staged_input.unlink(missing_ok=True)
             (temporary / "command.json").write_text(
                 json.dumps(
                     {
-                        "engine": "native-pdf+mineru",
+                        "engine": "paddleocr-vl-1.6",
                         "returncode": completed.returncode,
                         "stdout": completed.stdout.decode("utf-8", errors="replace"),
                         "stderr": completed.stderr.decode("utf-8", errors="replace"),
@@ -159,91 +159,37 @@ class ProvisionedConversionLauncher(ConversionLauncher):
             if completed.returncode != 0:
                 detail = completed.stderr.decode("utf-8", errors="replace").strip()
                 raise LocalConverterError(
-                    f"mineru exited with status {completed.returncode}: {detail[:500]}"
+                    f"PaddleOCR-VL exited with status {completed.returncode}: {detail[:500]}"
                 )
-            output = _output_json("mineru", temporary, output_root=temporary / "mineru")
-            native = parse_document(native_source, "pdf")
-            fallback_pages = _native_fallback_pages(native)
-            vlm_outputs: list[tuple[Path, int]] = []
-            if fallback_pages:
-                if not profile.supports_backend("vlm-engine"):
-                    raise LocalConverterError(
-                        "The approved MinerU profile does not provision the vlm-engine fallback backend."
-                    )
-                for range_start, range_end in _coalesced_page_ranges(fallback_pages):
-                    vlm_root = temporary / f"mineru-vlm-{range_start + 1}-{range_end + 1}"
-                    vlm_command = self._command(
-                        "mineru",
-                        profile,
-                        request,
-                        temporary,
-                        backend="vlm-engine",
-                        output_root=vlm_root,
-                        start_page=range_start,
-                        end_page=range_end,
-                    )
-                    vlm_completed = _run_fixed_command(
-                        vlm_command,
-                        temporary,
-                        _converter_environment(profile, temporary),
-                        int(profile.resource_limits.get("wall_clock_seconds", 600)),
-                        int(profile.resource_limits.get("workspace_bytes", 0)),
-                    )
-                    if vlm_completed.returncode != 0:
-                        detail = vlm_completed.stderr.decode("utf-8", errors="replace").strip()
-                        raise LocalConverterError(
-                            f"MinerU vlm-engine exited with status {vlm_completed.returncode}: {detail[:500]}"
-                        )
-                    vlm_output = _output_json("mineru", temporary, output_root=vlm_root)
-                    vlm_outputs.append((vlm_output, range_start))
             artifacts, drafts = _artifacts(attempt_id, temporary)
-            raw_mineru = next(
-                artifact
-                for artifact in artifacts
-                if artifact.producer_object_id == output.relative_to(temporary).as_posix()
-            )
-            native_artifact = next(
-                artifact for artifact in artifacts if artifact.producer_object_id == "native-source.pdf"
-            )
             assets: list[DocumentAsset] = []
             image_artifacts = {
                 artifact.producer_object_id: artifact
                 for artifact in artifacts
                 if artifact.role == "image" and artifact.producer_object_id
             }
-            payload = json.loads(output.read_text(encoding="utf-8"))
-            mineru_blocks, mineru_issues = _mineru_blocks(
-                payload, attempt_id, raw_mineru, image_artifacts, assets
-            )
-            for vlm_output, page_offset in vlm_outputs:
-                vlm_raw = next(
+            blocks: list[DocumentBlock] = []
+            issues: list[DocumentGraphIssue] = []
+            for output in _paddleocr_vl_outputs(temporary):
+                raw = next(
                     artifact
                     for artifact in artifacts
-                    if artifact.producer_object_id == vlm_output.relative_to(temporary).as_posix()
+                    if artifact.producer_object_id == output.relative_to(temporary).as_posix()
                 )
-                vlm_payload = json.loads(vlm_output.read_text(encoding="utf-8"))
-                vlm_page_blocks, vlm_page_issues = _mineru_blocks(
-                    vlm_payload,
+                page_blocks, page_issues = _paddleocr_vl_blocks(
+                    json.loads(output.read_text(encoding="utf-8")),
                     attempt_id,
-                    vlm_raw,
+                    raw,
                     image_artifacts,
                     assets,
-                    page_offset=page_offset,
+                    artifact_root=temporary,
                 )
-                mineru_blocks.extend(vlm_page_blocks)
-                mineru_issues.extend(vlm_page_issues)
-            graph = _hybrid_pdf_graph(
-                native,
-                mineru_blocks,
-                mineru_issues,
-                request,
-                attempt_id,
-                native_artifact,
-                assets,
-            )
+                blocks.extend(page_blocks)
+                issues.extend(page_issues)
+            graph = _paddleocr_vl_graph(request, attempt_id, blocks, assets, issues)
             return _AttemptResult(
                 attempt_id,
-                "native-pdf+mineru",
+                "paddleocr-vl-1.6",
                 profile,
                 graph,
                 artifacts,
@@ -357,6 +303,27 @@ class ProvisionedConversionLauncher(ConversionLauncher):
         if not executable:
             raise LocalConverterError("A verified executable path is required.")
         input_path = request.input_snapshot_path
+        if engine == "paddleocr-vl":
+            if not profile.config_path:
+                raise LocalConverterError("PaddleOCR-VL requires a verified local pipeline config.")
+            return [
+                executable,
+                "doc_parser",
+                "--input",
+                input_path,
+                "--save_path",
+                str(temporary / "paddleocr-vl"),
+                "--pipeline_version",
+                "v1.6",
+                "--paddlex_config",
+                profile.config_path,
+                "--vl_rec_backend",
+                "native",
+                "--device",
+                "gpu:0",
+                "--format_block_content",
+                "true",
+            ]
         if engine == "mineru":
             command = [
                 executable,
@@ -394,9 +361,32 @@ class ProvisionedConversionLauncher(ConversionLauncher):
 
 
 def _converter_environment(profile: ConverterProfile, temporary: Path) -> dict[str, str]:
-    executable_parent = str(Path(profile.executable_path or "").parent)
+    executable_path = Path(profile.executable_path or "")
+    executable_parent = str(executable_path.parent)
+    path_entries = [executable_parent]
+    if getattr(profile, "engine", None) == "paddleocr-vl":
+        runtime_root = executable_path.parent.parent
+        site_packages = runtime_root / "Lib" / "site-packages"
+        path_entries.extend(
+            str(path)
+            for path in sorted(site_packages.glob("nvidia/*/bin"))
+            if path.is_dir()
+        )
+        paddle_libs = site_packages / "paddle" / "libs"
+        if paddle_libs.is_dir():
+            path_entries.append(str(paddle_libs))
+    paddle_cache = temporary / "paddle-cache"
+    if getattr(profile, "engine", None) == "paddleocr-vl":
+        model_paths = tuple(Path(path).resolve() for path in getattr(profile, "model_paths", ()))
+        cache_roots = {
+            path.parent.parent
+            for path in model_paths
+            if path.parent.name == "official_models"
+        }
+        if len(cache_roots) == 1:
+            paddle_cache = cache_roots.pop()
     environment = {
-        "PATH": executable_parent,
+        "PATH": os.pathsep.join(path_entries),
         "SYSTEMROOT": os.environ.get("SYSTEMROOT", r"C:\\Windows"),
         "WINDIR": os.environ.get("WINDIR", r"C:\\Windows"),
         "COMSPEC": os.environ.get("COMSPEC", r"C:\\Windows\\System32\\cmd.exe"),
@@ -408,6 +398,9 @@ def _converter_environment(profile: ConverterProfile, temporary: Path) -> dict[s
         "TMP": str(temporary),
         "HF_HUB_OFFLINE": "1",
         "TRANSFORMERS_OFFLINE": "1",
+        "PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK": "True",
+        "PADDLE_PDX_EAGER_INIT": "False",
+        "PADDLE_PDX_CACHE_HOME": str(paddle_cache),
         "DO_NOT_TRACK": "1",
         "PYTHONNOUSERSITE": "1",
         "MINERU_MODEL_SOURCE": "local",
@@ -537,178 +530,376 @@ def _adapt_graph(
     )
 
 
-def _hybrid_pdf_graph(
-    native: ParseEvidence,
-    mineru_blocks: list[DocumentBlock],
-    mineru_issues: list[DocumentGraphIssue],
+def _paddleocr_vl_outputs(temporary: Path) -> tuple[Path, ...]:
+    output_root = temporary / "paddleocr-vl"
+    matches = tuple(sorted(output_root.rglob("*_res.json")))
+    if not matches:
+        raise LocalConverterError("PaddleOCR-VL did not produce a canonical page JSON artifact.")
+    return matches
+
+
+def _stage_paddleocr_vl_input(source_bytes: bytes, temporary: Path) -> Path:
+    """Give Paddle's extension-sensitive CLI a private PDF input name."""
+
+    staged_input = temporary / "input.pdf"
+    staged_input.write_bytes(source_bytes)
+    return staged_input
+
+
+_PADDLEOCR_VL_FURNITURE_LABELS = frozenset(
+    {
+        "aside_text",
+        "footer",
+        "footer_image",
+        "footnote",
+        "formula_number",
+        "header",
+        "header_image",
+        "number",
+        "vision_footnote",
+    }
+)
+_PADDLEOCR_VL_HEADING_LEVELS = {"doc_title": 1, "paragraph_title": 2, "title": 2}
+_PADDLEOCR_VL_TEXT_LABELS = frozenset(
+    {"abstract", "algorithm", "content", "ocr", "reference", "reference_content", "text", "vertical_text"}
+)
+_PADDLEOCR_VL_FORMULA_LABELS = frozenset({"display_formula", "formula", "inline_formula"})
+_PADDLEOCR_VL_IMAGE_LABELS = frozenset({"chart", "image", "seal"})
+
+
+def _paddleocr_vl_graph(
     request: ConversionRequest,
     attempt_id: str,
-    native_artifact: ArtifactRef,
+    blocks: list[DocumentBlock],
     assets: list[DocumentAsset],
+    issues: list[DocumentGraphIssue],
 ) -> DocumentGraph:
-    """Merge page selections while retaining concrete locators and artifact lineage."""
-
-    pages = native.raw_extraction.get("pages", [])
-    page_texts: dict[int, str] = {}
-    if isinstance(pages, list):
-        for value in pages:
-            if isinstance(value, Mapping) and type(value.get("page")) is int:
-                page_texts[int(value["page"])] = str(value.get("text", ""))
-    page_candidates = [
-        *page_texts.keys(),
-        *(getattr(block.locators[0], "page", 0) for block in mineru_blocks),
-    ]
-    page_count = max(page_candidates, default=0)
-    native_units: dict[int, list[StructuredContentUnit]] = {}
-    for unit in native.units:
-        if unit.locator.page is not None:
-            native_units.setdefault(unit.locator.page, []).append(unit)
-    mineru_by_page: dict[int, list[DocumentBlock]] = {}
-    for block in mineru_blocks:
-        page = getattr(block.locators[0], "page", None)
-        if isinstance(page, int):
-            mineru_by_page.setdefault(page, []).append(block)
-
-    selected: list[tuple[int, int, DocumentBlock]] = []
-    issues: list[DocumentGraphIssue] = []
-    for page in range(1, page_count + 1):
-        text = page_texts.get(page, "")
-        units = native_units.get(page, [])
-        native_ok, reason = _native_page_quality(text, units)
-        page_mineru = mineru_by_page.get(page, [])
-        if native_ok:
-            for index, unit in enumerate(units):
-                selected.append((page, index, _native_block(unit, page, index, attempt_id, native_artifact)))
-            # Native pypdf has no image/formula geometry; retain those MinerU blocks.
-            for index, block in enumerate(page_mineru):
-                if block.kind in {"image", "formula", "table"}:
-                    selected.append((page, len(units) + index, block))
-        else:
-            locator = PdfRegionLocator(page, (0.0, 0.0, 1.0, 1.0), segment_id="native-fallback")
-            issues.append(
-                DocumentGraphIssue(
-                    "native-page-fallback",
-                    f"Native PDF text was not selected for page {page}: {reason}; MinerU was used.",
-                    locator,
-                    severity="warning",
-                    state="accepted",
-                )
-            )
-            for index, block in enumerate(page_mineru):
-                selected.append((page, index, block))
-
-    # Keep only MinerU issues attached to blocks/pages that made it into the graph.
-    selected_pages = {page for page, _, _ in selected}
-    for issue in mineru_issues:
-        page = getattr(issue.locator, "page", None)
-        if page is None or page in selected_pages:
-            issues.append(issue)
-    selected.sort(key=lambda value: (value[0], value[1], value[2].reading_order))
-    blocks = tuple(
+    ordered_blocks = sorted(
+        blocks,
+        key=lambda block: (getattr(block.locators[0], "page", 0), block.reading_order, block.block_id),
+    )
+    finalized_blocks = tuple(
         replace(block, reading_order=reading_order)
-        for reading_order, (_, _, block) in enumerate(selected)
+        for reading_order, block in enumerate(ordered_blocks)
     )
-    selected_block_ids = {block.block_id for block in blocks}
-    retained_assets = tuple(
-        asset for asset in assets if asset.source_block_id in selected_block_ids
-    )
-    graph_id = sha256(
-        f"{attempt_id}\x00native-pdf-page-hybrid\x00{request.input_snapshot_hash}".encode()
-    ).hexdigest()
+    selected_block_ids = {block.block_id for block in finalized_blocks}
     return DocumentGraph(
-        graph_id=graph_id,
+        graph_id=sha256(
+            f"{attempt_id}\x00paddleocr-vl-1.6\x00{request.input_snapshot_hash}".encode()
+        ).hexdigest(),
         source_sha256=request.source_sha256,
         input_snapshot_hash=request.input_snapshot_hash,
         selected_attempt_id=attempt_id,
-        blocks=blocks,
-        assets=retained_assets,
+        blocks=finalized_blocks,
+        assets=tuple(asset for asset in assets if asset.source_block_id in selected_block_ids),
         issues=tuple(issues),
     )
 
 
-def _native_page_quality(text: str, units: list[StructuredContentUnit]) -> tuple[bool, str]:
-    if not text.strip():
-        return False, "page has no native text"
-    if not units:
-        return False, "native text produced no content units"
-    source_tokens = Counter(_native_fidelity_tokens(text))
-    extracted_tokens = Counter(_native_fidelity_tokens("\n".join(unit.text for unit in units)))
-    missing = [token for token, count in source_tokens.items() if extracted_tokens[token] < count]
-    if missing:
-        return False, f"native token fidelity failed ({', '.join(sorted(set(missing))[:5])})"
-    return True, "native text and token fidelity passed"
-
-
-def _native_fallback_pages(native: ParseEvidence) -> tuple[int, ...]:
-    pages = native.raw_extraction.get("pages", [])
-    texts = {
-        int(value["page"]): str(value.get("text", ""))
-        for value in pages
-        if isinstance(value, Mapping) and type(value.get("page")) is int
-    } if isinstance(pages, list) else {}
-    units_by_page: dict[int, list[StructuredContentUnit]] = {}
-    for unit in native.units:
-        if unit.locator.page is not None:
-            units_by_page.setdefault(unit.locator.page, []).append(unit)
-    return tuple(
-        page
-        for page in sorted(texts)
-        if not _native_page_quality(texts[page], units_by_page.get(page, []))[0]
-    )
-
-
-def _coalesced_page_ranges(pages: tuple[int, ...], *, max_gap: int = 2) -> tuple[tuple[int, int], ...]:
-    """Group nearby zero-based MinerU ranges to avoid one VLM process per page."""
-
-    if not pages:
-        return ()
-    ranges: list[tuple[int, int]] = []
-    start = previous = pages[0] - 1
-    for page in pages[1:]:
-        zero_based = page - 1
-        if zero_based - previous <= max_gap:
-            previous = zero_based
-            continue
-        ranges.append((start, previous))
-        start = previous = zero_based
-    ranges.append((start, previous))
-    return tuple(ranges)
-
-
-def _native_fidelity_tokens(text: str) -> list[str]:
-    # Separate alphabetic and numeric runs so GB15577 and GB 15577 compare equally.
-    return [token.casefold() for token in re.findall(r"\d+(?:\.\d+)?|[A-Za-z]{2,}", text)]
-
-
-def _native_block(
-    unit: StructuredContentUnit,
-    page: int,
-    index: int,
+def _paddleocr_vl_blocks(
+    payload: object,
     attempt_id: str,
-    artifact: ArtifactRef,
-) -> DocumentBlock:
-    kind = "heading" if unit.kind.startswith("heading") else "paragraph"
-    payload: dict[str, object] = {"inline_runs": _runs(unit.text)}
-    if kind == "heading":
-        payload["level"] = 2
-    return DocumentBlock(
-        block_id=DocumentBlock.deterministic_id(
-            attempt_id, artifact.producer_object_id or artifact.artifact_id, f"page:{page}:native:{index}"
-        ),
-        kind=kind,
-        reading_order=index,
-        locators=(PdfRegionLocator(page, (0.0, 0.0, 1.0, 1.0), segment_id=f"native-line:{index}"),),
-        confidence=0.98,
-        payload=BlockPayload.from_dict(kind, payload),
-        evidence_refs=(
-            EvidenceRef(
-                artifact.artifact_id,
-                artifact.sha256,
-                producer_object_id=artifact.producer_object_id or artifact.artifact_id,
-            ),
-        ),
-        retrieval_projection=unit.text,
+    raw: ArtifactRef,
+    image_artifacts: Mapping[str, ArtifactRef] | None = None,
+    assets: list[DocumentAsset] | None = None,
+    *,
+    artifact_root: Path | None = None,
+) -> tuple[list[DocumentBlock], list[DocumentGraphIssue]]:
+    blocks: list[DocumentBlock] = []
+    issues: list[DocumentGraphIssue] = []
+    image_artifacts = image_artifacts or {}
+    assets = assets if assets is not None else []
+    page_payload = payload.get("res") if isinstance(payload, Mapping) else None
+    if (
+        not isinstance(page_payload, Mapping)
+        and isinstance(payload, Mapping)
+        and "page_index" in payload
+        and "parsing_res_list" in payload
+    ):
+        # PaddleOCR's save_to_json output serializes the page result directly.
+        page_payload = payload
+    if not isinstance(page_payload, Mapping):
+        return blocks, [
+            DocumentGraphIssue(
+                "paddleocr-vl-json-invalid",
+                "PaddleOCR-VL page result has no compatible page object.",
+                SourceScopeLocator("document", "invalid PaddleOCR-VL page JSON"),
+            )
+        ]
+    page_index = page_payload.get("page_index")
+    if type(page_index) is not int or page_index < 0:
+        return blocks, [
+            DocumentGraphIssue(
+                "paddleocr-vl-page-invalid",
+                "PaddleOCR-VL page result has no zero-based page index.",
+                SourceScopeLocator("document", "missing PaddleOCR-VL page index"),
+            )
+        ]
+    page = page_index + 1
+    values = page_payload.get("parsing_res_list")
+    if not isinstance(values, list):
+        return blocks, [
+            DocumentGraphIssue(
+                "paddleocr-vl-blocks-invalid",
+                "PaddleOCR-VL page result has no block list.",
+                SourceScopeLocator(f"page:{page}", "missing PaddleOCR-VL blocks"),
+            )
+        ]
+    for source_index, value in enumerate(values):
+        if not isinstance(value, Mapping):
+            issues.append(
+                DocumentGraphIssue(
+                    "paddleocr-vl-block-invalid",
+                    "PaddleOCR-VL emitted a non-object block.",
+                    SourceScopeLocator(f"page:{page}", "invalid PaddleOCR-VL block"),
+                )
+            )
+            continue
+        label = value.get("block_label")
+        if not isinstance(label, str) or not label:
+            issues.append(
+                DocumentGraphIssue(
+                    "paddleocr-vl-label-missing",
+                    "PaddleOCR-VL block has no label.",
+                    SourceScopeLocator(f"page:{page}", "missing PaddleOCR-VL block label"),
+                )
+            )
+            continue
+        bbox = _paddleocr_vl_bbox(value.get("block_bbox"))
+        if bbox is None:
+            issues.append(
+                DocumentGraphIssue(
+                    "paddleocr-vl-location-missing",
+                    "PaddleOCR-VL block has no valid region.",
+                    SourceScopeLocator(f"page:{page}", "missing PaddleOCR-VL bbox"),
+                )
+            )
+            continue
+        block_id = value.get("block_id", source_index)
+        stable = f"page:{page}:block:{block_id}"
+        locator = PdfRegionLocator(page, bbox, segment_id=f"paddleocr-vl:{block_id}")
+        order = value.get("block_order")
+        reading_order = order if type(order) is int and order >= 0 else source_index
+        text = _paddleocr_vl_text(value.get("block_content"))
+        if label in _PADDLEOCR_VL_FURNITURE_LABELS:
+            issues.append(
+                DocumentGraphIssue(
+                    "paddleocr-vl-page-furniture-omitted",
+                    f"PaddleOCR-VL classified a {label} region as page furniture.",
+                    SourceScopeLocator(f"page:{page}", "page furniture excluded from note content"),
+                    severity="warning",
+                    state="accepted",
+                )
+            )
+        elif label in _PADDLEOCR_VL_HEADING_LEVELS:
+            text = _paddleocr_vl_heading_text(text)
+            if text:
+                blocks.append(
+                    _block(
+                        "heading",
+                        text,
+                        locator,
+                        attempt_id,
+                        raw,
+                        stable,
+                        reading_order,
+                        {"level": _PADDLEOCR_VL_HEADING_LEVELS[label], "inline_runs": _runs(text)},
+                    )
+                )
+            else:
+                issues.append(_paddleocr_vl_empty_issue(label, locator))
+        elif label in _PADDLEOCR_VL_TEXT_LABELS:
+            if text:
+                blocks.append(
+                    _block(
+                        "paragraph",
+                        text,
+                        locator,
+                        attempt_id,
+                        raw,
+                        stable,
+                        reading_order,
+                        {"inline_runs": _runs(text)},
+                    )
+                )
+            else:
+                issues.append(_paddleocr_vl_empty_issue(label, locator))
+        elif label in _PADDLEOCR_VL_FORMULA_LABELS:
+            formula = _paddleocr_vl_formula(text)
+            if formula:
+                blocks.append(
+                    _block(
+                        "formula",
+                        formula,
+                        locator,
+                        attempt_id,
+                        raw,
+                        stable,
+                        reading_order,
+                        {"display_mode": label != "inline_formula", "state": "resolved", "latex": formula},
+                    )
+                )
+            else:
+                issues.append(_paddleocr_vl_empty_issue(label, locator))
+        elif label == "table":
+            table_payload = _mineru_table_payload({"html": text})
+            if table_payload is None:
+                issues.append(
+                    DocumentGraphIssue(
+                        "paddleocr-vl-table-unresolved",
+                        "PaddleOCR-VL table has no structured HTML representation.",
+                        locator,
+                    )
+                )
+            else:
+                blocks.append(
+                    _block(
+                        "table",
+                        _table_projection(table_payload),
+                        locator,
+                        attempt_id,
+                        raw,
+                        stable,
+                        reading_order,
+                        table_payload,
+                    )
+                )
+        elif label in _PADDLEOCR_VL_IMAGE_LABELS:
+            image_path = _paddleocr_vl_image_path(text)
+            image_artifact = _paddleocr_vl_image_artifact(
+                raw, image_path, image_artifacts, artifact_root
+            )
+            if image_artifact is None:
+                issues.append(
+                    DocumentGraphIssue(
+                        "paddleocr-vl-image-artifact-missing",
+                        "PaddleOCR-VL image output has no matching verified image artifact.",
+                        locator,
+                    )
+                )
+                continue
+            asset_id = sha256(f"{attempt_id}\x00{image_artifact.artifact_id}".encode()).hexdigest()
+            alt_text = _paddleocr_vl_image_alt_text(text)
+            image_block = _block(
+                "image",
+                alt_text or "Image",
+                locator,
+                attempt_id,
+                raw,
+                stable,
+                reading_order,
+                {"asset_id": asset_id, "alt_text": alt_text},
+            )
+            blocks.append(image_block)
+            if not any(asset.asset_id == asset_id for asset in assets):
+                suffix = PurePosixPath(image_artifact.producer_object_id or "").suffix.lower()
+                assets.append(
+                    DocumentAsset(
+                        asset_id=asset_id,
+                        artifact_ref=image_artifact,
+                        sha256=image_artifact.sha256,
+                        media_type=image_artifact.media_type,
+                        original_name=PurePosixPath(image_artifact.producer_object_id or "image").name,
+                        locators=(locator,),
+                        source_block_id=image_block.block_id,
+                        safe_extension=suffix,
+                    )
+                )
+        else:
+            issues.append(
+                DocumentGraphIssue(
+                    "paddleocr-vl-unsupported-block",
+                    f"Unsupported PaddleOCR-VL block type: {label}.",
+                    SourceScopeLocator(f"page:{page}", "converter block needs review"),
+                )
+            )
+    return blocks, issues
+
+
+def _paddleocr_vl_bbox(value: object) -> tuple[float, float, float, float] | None:
+    if not isinstance(value, list) or len(value) != 4:
+        return None
+    try:
+        bbox = tuple(float(number) for number in value)
+    except (TypeError, ValueError):
+        return None
+    return bbox if all(number >= 0 for number in bbox) else None
+
+
+def _paddleocr_vl_empty_issue(label: str, locator: PdfRegionLocator) -> DocumentGraphIssue:
+    if label in _PADDLEOCR_VL_TEXT_LABELS:
+        return DocumentGraphIssue(
+            "paddleocr-vl-empty-text",
+            "PaddleOCR-VL produced an empty text region that was omitted.",
+            locator,
+            severity="warning",
+            state="accepted",
+        )
+    return DocumentGraphIssue(
+        "paddleocr-vl-empty-text",
+        f"PaddleOCR-VL produced an empty {label} region.",
+        locator,
     )
+
+
+def _paddleocr_vl_text(value: object) -> str:
+    text = _text(value).strip()
+    text = re.sub(r"^<div[^>]*>", "", text).removesuffix("</div>").strip()
+    return text
+
+
+def _paddleocr_vl_heading_text(text: str) -> str:
+    return re.sub(r"^#{1,6}\s+", "", text).strip()
+
+
+def _paddleocr_vl_formula(text: str) -> str:
+    return re.sub(r"^(?:\$\$?|\\\[)\s*|\s*(?:\$\$?|\\\])$", "", text).strip()
+
+
+def _paddleocr_vl_image_path(text: str) -> str | None:
+    match = re.search(r"(?:!\[[^\]]*\]\(|<img\s+[^>]*src=[\"'])([^\"')]+)", text)
+    if match:
+        return match.group(1).strip()
+    return text if PurePosixPath(text).suffix.lower() in _IMAGE_MEDIA_TYPES else None
+
+
+def _paddleocr_vl_image_alt_text(text: str) -> str:
+    markdown = re.search(r"!\[([^\]]*)\]", text)
+    if markdown:
+        return markdown.group(1).strip()
+    html = re.search(r"alt=[\"']([^\"']+)", text)
+    return html.group(1).strip() if html else ""
+
+
+def _paddleocr_vl_image_artifact(
+    raw: ArtifactRef,
+    image_path: str | None,
+    image_artifacts: Mapping[str, ArtifactRef],
+    artifact_root: Path | None,
+) -> ArtifactRef | None:
+    if not image_path:
+        return None
+    candidate = PurePosixPath(image_path)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        return None
+    raw_object = PurePosixPath(raw.producer_object_id or "")
+    relative = (raw_object.parent / candidate).as_posix()
+    if relative in image_artifacts:
+        return image_artifacts[relative]
+    if artifact_root is not None:
+        try:
+            resolved = (artifact_root / Path(candidate)).resolve()
+            relative = resolved.relative_to(artifact_root.resolve()).as_posix()
+        except (OSError, ValueError):
+            return None
+        if relative in image_artifacts:
+            return image_artifacts[relative]
+    matches = [
+        artifact
+        for producer, artifact in image_artifacts.items()
+        if PurePosixPath(producer).name == candidate.name
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 _IMAGE_MEDIA_TYPES = {
@@ -1089,7 +1280,7 @@ def _pandoc_blocks(
                             {
                                 "ordered": True,
                                 "items": [{"text": text}],
-                                "nesting": max(0, list_nesting - 1),
+                                "nesting": [max(0, list_nesting - 1)],
                             },
                         )
                     )

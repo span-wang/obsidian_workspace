@@ -26,7 +26,7 @@ def test_derivation_keeps_atomic_content_without_same_source_navigation() -> Non
         source_sha256="a" * 64,
         managed_root="platform",
         source_suffix=".pdf",
-        source_label="English Book",
+        source_label="English Book.pdf",
         evidence=_evidence(
             StructuredContentUnit("heading", "Unit One", EvidenceLocator(page=1)),
             StructuredContentUnit("paragraph", "A short introduction.", EvidenceLocator(page=1)),
@@ -37,20 +37,20 @@ def test_derivation_keeps_atomic_content_without_same_source_navigation() -> Non
         ),
     )
 
-    assert proposal.source_relative_path == "platform/sources/source-1-aaaaaaaaaaaaaaaa.pdf"
-    assert proposal.index_note.relative_path == "platform/notes/source-1/index.md"
+    assert proposal.source_relative_path == "platform/sources/English Book.pdf"
+    assert proposal.index_note.relative_path == "platform/notes/English Book/English Book - 目录.md"
+    assert proposal.notes[0].relative_path == "platform/notes/English Book/Unit One.md"
     assert len(proposal.notes) == 1
     assert proposal.notes[0].source_locators == (
         EvidenceLocator(page=1),
         EvidenceLocator(page=2),
         EvidenceLocator(page=3),
     )
-    assert "[[platform/sources/source-1-aaaaaaaaaaaaaaaa.pdf|原始资料]]" in proposal.notes[0].markdown
-    assert "[[platform/notes/source-1/index|目录]]" not in proposal.notes[0].markdown
+    assert "[[platform/sources/English Book.pdf|原始资料]]" in proposal.notes[0].markdown
+    assert "source-1" not in proposal.notes[0].relative_path
     assert "Question: Why?" in proposal.notes[0].markdown
     assert "Answer: Because." in proposal.notes[0].markdown
-    assert "[[platform/notes/source-1/01-unit-one|Unit One]]" not in proposal.index_note.markdown
-    assert "[[platform/sources/source-1-aaaaaaaaaaaaaaaa.pdf|原始资料]]" in proposal.index_note.markdown
+    assert "[[platform/sources/English Book.pdf|原始资料]]" in proposal.index_note.markdown
 
 
 def test_derivation_uses_docx_locations_without_fabricating_pages() -> None:
@@ -76,6 +76,29 @@ def test_derivation_uses_docx_locations_without_fabricating_pages() -> None:
     assert locator == {"docx_location": "paragraph:1"}
     assert "page" not in locator
     assert "docx_location: \"paragraph:1\"" in proposal.notes[0].markdown
+
+
+def test_derivation_keeps_chinese_import_and_heading_names_readable() -> None:
+    from domain.derived_notes import derive_markdown_proposal
+
+    proposal = derive_markdown_proposal(
+        item_id=7,
+        vault_id="vault-1",
+        source_id="source-1",
+        processing_task_id="task-1",
+        source_sha256="a" * 64,
+        managed_root="platform",
+        source_suffix=".pdf",
+        source_label="初中数学.pdf",
+        evidence=_evidence(
+            StructuredContentUnit("heading", "一次函数", EvidenceLocator(page=1)),
+            StructuredContentUnit("paragraph", "函数图像。", EvidenceLocator(page=1)),
+        ),
+    )
+
+    assert proposal.source_relative_path == "platform/sources/初中数学.pdf"
+    assert proposal.index_note.relative_path == "platform/notes/初中数学/初中数学 - 目录.md"
+    assert proposal.notes[0].relative_path == "platform/notes/初中数学/一次函数.md"
 
 
 def test_provenance_rejects_unknown_schema_and_invalid_locator() -> None:
@@ -369,8 +392,8 @@ def test_relocating_a_derived_proposal_only_changes_private_planned_paths() -> N
 
     assert relocated.revision == proposal.revision + 1
     assert relocated.source_relative_path == "platform/sources/mathematics/algebra-workbook.pdf"
-    assert relocated.index_note.relative_path == "platform/notes/mathematics/source-1/index.md"
-    assert relocated.notes[0].relative_path == "platform/notes/mathematics/source-1/01-one.md"
+    assert relocated.index_note.relative_path == "platform/notes/mathematics/algebra-workbook/algebra-workbook - 目录.md"
+    assert relocated.notes[0].relative_path == "platform/notes/mathematics/algebra-workbook/One.md"
     assert "[[platform/sources/mathematics/algebra-workbook.pdf|原始资料]]" in relocated.notes[0].markdown
     assert "[[platform/notes/mathematics/source-1/02-two|下一篇：Two]]" not in relocated.notes[0].markdown
 

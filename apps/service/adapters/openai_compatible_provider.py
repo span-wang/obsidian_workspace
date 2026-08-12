@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import socket
 import ssl
 import time
@@ -23,7 +24,7 @@ class OpenAiCompatibleProviderClient:
     _MAX_EMBEDDING_INPUTS = 128
     _MAX_EMBEDDING_INPUT_CHARS = 200_000
     _MAX_EMBEDDING_BATCH_CHARS = 500_000
-    _MAX_GENERATION_OUTPUT_TOKENS = 4_096
+    _MAX_GENERATION_OUTPUT_TOKENS = 24_576
     _MAX_RERANK_DOCUMENTS = 20
     _MAX_RERANK_QUERY_CHARS = 2_000
     _MAX_RERANK_DOCUMENT_CHARS = 12_000
@@ -32,6 +33,12 @@ class OpenAiCompatibleProviderClient:
         "Return only the requested final content. Do not include reasoning, thinking, analysis, "
         "chain-of-thought, or scratch work."
     )
+    _LEADING_REASONING_BLOCK = re.compile(
+        r"\A\s*<(?P<tag>think|thinking)>[\s\S]*?</(?P=tag)>\s*",
+        re.IGNORECASE,
+    )
+    _LEADING_REASONING_END = re.compile(r"\A\s*</(?:think|thinking)>\s*", re.IGNORECASE)
+    _LEADING_REASONING_START = re.compile(r"\A\s*<(?:think|thinking)>[\s\S]*\Z", re.IGNORECASE)
 
     def __init__(self, timeout_seconds: float = 60) -> None:
         self.timeout_seconds = timeout_seconds
@@ -222,7 +229,12 @@ class OpenAiCompatibleProviderClient:
             if saw_reasoning:
                 raise ProviderClientError("Generation returned reasoning but no final content.")
             raise ProviderClientError("Generation returned no usable content.")
-        return ChatGeneration("".join(content).strip(), usage)
+        final_content = self._without_leading_reasoning("".join(content))
+        if not final_content:
+            if saw_reasoning or content:
+                raise ProviderClientError("Generation returned reasoning but no final content.")
+            raise ProviderClientError("Generation returned no usable content.")
+        return ChatGeneration(final_content, usage)
 
     def stream_chat(
         self,
@@ -467,6 +479,22 @@ class OpenAiCompatibleProviderClient:
             isinstance(delta.get(field), str) and bool(delta[field])
             for field in ("reasoning_content", "reasoning")
         )
+
+    @classmethod
+    def _without_leading_reasoning(cls, content: str) -> str:
+        """Drop model reasoning wrappers while preserving the final response."""
+
+        normalized = content.strip()
+        if not normalized:
+            return ""
+        match = cls._LEADING_REASONING_BLOCK.match(normalized)
+        if match:
+            return normalized[match.end() :].strip()
+        if cls._LEADING_REASONING_END.match(normalized):
+            return cls._LEADING_REASONING_END.sub("", normalized, count=1).strip()
+        if cls._LEADING_REASONING_START.match(normalized):
+            return ""
+        return normalized
 
     @classmethod
     def _chat_payload(

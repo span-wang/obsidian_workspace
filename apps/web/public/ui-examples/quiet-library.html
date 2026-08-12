@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="icon" href="data:,">
+    <title>工作台示例 A · Quiet Library</title>
+    <link rel="stylesheet" href="./ui-examples.css">
+    <style>
+      .style-a { --page: #f7f7f3; --surface: #ffffff; --wash: #efefe9; --ink: #202721; --muted: #6c716c; --line: #e2e3dc; --line-strong: #afb5aa; --accent: #286348; --accent-strong: #1d4936; --accent-soft: #e2eee6; --warning: #ad762d; }
+    </style>
+  </head>
+  <body class="style-a">
+    <div class="preview-app">
+      <header class="preview-topbar">
+        <a class="wordmark" href="./quiet-library.html" aria-label="返回 Quiet Library 示例"><span class="wordmark-mark">O</span><span>知识工作台</span></a>
+        <div class="workspace-switcher"><span>当前资料库</span><strong>产品研究 · 2026</strong><span aria-hidden="true">⌄</span></div>
+        <span class="topbar-spacer"></span>
+        <span class="topbar-meta">本地工作区</span>
+        <button class="icon-button" type="button" data-action="notify" data-message="通知面板仅作风格示例" aria-label="查看通知">◌</button>
+        <button class="icon-button" type="button" data-action="notify" data-message="设置按钮仅作风格示例" aria-label="打开设置">⋯</button>
+      </header>
+      <div class="preview-layout">
+        <aside class="preview-rail">
+          <div>
+            <p class="rail-label">工作区</p>
+            <nav class="rail-nav" aria-label="主导航">
+              <a class="rail-link" href="#" aria-current="page"><span class="rail-link-mark">⌂</span>工作台</a>
+              <a class="rail-link" href="#"><span class="rail-link-mark">▧</span>资料</a>
+              <a class="rail-link" href="#"><span class="rail-link-mark">↺</span>会话</a>
+              <a class="rail-link" href="#"><span class="rail-link-mark">◫</span>任务</a>
+            </nav>
+          </div>
+          <div>
+            <p class="rail-label">管理</p>
+            <nav class="rail-nav" aria-label="管理导航">
+              <a class="rail-link" href="#"><span class="rail-link-mark">◌</span>设置</a>
+              <a class="rail-link" href="./focus-canvas.html"><span class="rail-link-mark">↗</span>查看方向 B</a>
+            </nav>
+          </div>
+          <div class="rail-foot">索引已更新<br><strong>2,418</strong> 个可检索块</div>
+        </aside>
+        <main class="preview-main">
+          <div class="preview-main-inner">
+            <div class="page-heading">
+              <div><p class="kicker">Quiet Library · A</p><h1>工作台</h1><p class="heading-copy">资料、会话、任务，一眼可见。</p></div>
+              <div class="heading-actions"><button class="secondary-button" type="button" data-action="notify" data-message="筛选面板仅作风格示例">筛选</button><button class="primary-button" type="button" data-action="notify" data-message="新会话按钮仅作风格示例">新会话</button></div>
+            </div>
+            <section class="summary-strip" aria-label="工作区概览">
+              <div class="summary-item"><p class="summary-label">本周检索</p><p class="summary-value">38</p><p class="summary-note">较上周 +12%</p></div>
+              <div class="summary-item"><p class="summary-label">待处理任务</p><p class="summary-value">06</p><p class="summary-note">2 个需确认</p></div>
+              <div class="summary-item"><p class="summary-label">资料库</p><p class="summary-value">14</p><p class="summary-note">已授权</p></div>
+              <div class="summary-item"><p class="summary-label">索引状态</p><p class="summary-value">98%</p><p class="summary-note">4 分钟前更新</p></div>
+            </section>
+            <section class="search-block" aria-label="检索">
+              <form class="search-bar" data-search-form><span class="search-symbol" aria-hidden="true">⌕</span><input name="query" placeholder="搜索资料、标题或概念" autocomplete="off"><span class="search-hint">⌘ K</span><button class="icon-button" type="submit" aria-label="提交搜索">↗</button></form>
+              <div class="filter-row" aria-label="检索筛选"><button class="filter" type="button" aria-pressed="true" data-filter>全部资料</button><button class="filter" type="button" aria-pressed="false" data-filter>最近更新</button><button class="filter" type="button" aria-pressed="false" data-filter>PDF</button><button class="filter" type="button" aria-pressed="false" data-filter>会话记录</button></div>
+            </section>
+            <div class="content-grid">
+              <section><div class="section-header"><h2>最近结果</h2><span data-result-count>4 条示例结果</span></div><div class="result-list">
+                <article class="result-row is-selected"><div><h3>研究方法：从问题到可验证假设</h3><p>先拆变量，再决定要收集什么证据。</p><div class="result-meta"><strong>研究方法</strong><span>产品研究 / 02 章节</span><span>今天</span></div></div><span class="result-score">0.94</span></article>
+                <article class="result-row"><div><h3>访谈记录 · 用户为什么放弃第二步</h3><p>状态要贴近动作，反馈要短。</p><div class="result-meta"><strong>访谈记录</strong><span>用户研究 / 11 月</span><span>昨天</span></div></div><span class="result-score">0.89</span></article>
+                <article class="result-row"><div><h3>信息架构评审清单</h3><p>每个导航项只回答一个问题。</p><div class="result-meta"><strong>工作流</strong><span>设计规范 / 资料库</span><span>3 天前</span></div></div><span class="result-score">0.86</span></article>
+                <article class="result-row"><div><h3>索引质量复盘 · 8 月第 1 周</h3><p>减少重复命中，保留可回溯的上下文。</p><div class="result-meta"><strong>质量复盘</strong><span>平台记录 / 2026-08-01</span><span>5 天前</span></div></div><span class="result-score">0.81</span></article>
+              </div></section>
+              <aside>
+                <section class="side-section"><div class="section-header"><h2>最近会话</h2><button class="text-button" type="button" data-action="notify" data-message="会话列表仅作风格示例">查看全部</button></div><div class="session-item"><button type="button" data-action="notify" data-message="已选中会话：重做资料库首页">重做资料库首页</button><span>今天 · 12 条消息</span></div><div class="session-item"><button type="button" data-action="notify" data-message="已选中会话：整理访谈证据">整理访谈证据</button><span>昨天 · 8 条消息</span></div><div class="session-item"><button type="button" data-action="notify" data-message="已选中会话：检查索引缺口">检查索引缺口</button><span>周一 · 5 条消息</span></div></section>
+                <section class="side-section"><div class="section-header"><h2>今日状态</h2><span>08 / 06</span></div><div class="status-item"><div class="status-line"><span class="status-label"><i class="status-dot"></i>索引服务</span><strong>正常</strong></div></div><div class="status-item"><div class="status-line"><span class="status-label"><i class="status-dot"></i>资料同步</span><strong>已完成</strong></div></div><div class="status-item"><div class="status-line"><span class="status-label"><i class="status-dot pending"></i>待审核建议</span><strong>02</strong></div></div></section>
+              </aside>
+            </div>
+            <p class="prototype-note">示例数据 · 方向 A：安静、可扫描、以任务为中心。</p>
+          </div>
+        </main>
+      </div>
+      <div class="toast" role="status" aria-live="polite"></div>
+    </div>
+    <script>
+      const toast = document.querySelector('.toast');
+      let toastTimer;
+      function showToast(message) { toast.textContent = message; toast.classList.add('is-visible'); clearTimeout(toastTimer); toastTimer = setTimeout(() => toast.classList.remove('is-visible'), 2200); }
+      document.querySelectorAll('[data-action="notify"]').forEach((button) => button.addEventListener('click', () => showToast(button.dataset.message)));
+      document.querySelectorAll('[data-filter]').forEach((button) => button.addEventListener('click', () => { document.querySelectorAll('[data-filter]').forEach((item) => item.setAttribute('aria-pressed', item === button ? 'true' : 'false')); showToast(`已切换：${button.textContent}`); }));
+      document.querySelector('[data-search-form]').addEventListener('submit', (event) => { event.preventDefault(); const query = event.currentTarget.query.value.trim(); showToast(query ? `正在预览检索：${query}` : '请输入检索词'); });
+    </script>
+  </body>
+</html>

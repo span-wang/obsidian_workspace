@@ -116,3 +116,46 @@ class SqliteSourceRepository:
                 identity_status="new",
                 version_suggestion=suggestion,
             )
+
+    def purge(self, vault_id: str, source_ids: tuple[str, ...]) -> None:
+        ids = tuple(dict.fromkeys(source_ids))
+        if not ids:
+            return
+        with self._connect() as connection:
+            task_items_table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'import_task_items'"
+            ).fetchone()
+            placeholders = ", ".join("?" for _ in ids)
+            if task_items_table is None:
+                connection.execute(
+                    f"DELETE FROM source_identities WHERE vault_id = ? AND source_id IN ({placeholders})",
+                    [vault_id, *ids],
+                )
+            else:
+                connection.execute(
+                    f"""
+                    DELETE FROM source_identities
+                    WHERE vault_id = ? AND source_id IN ({placeholders})
+                      AND NOT EXISTS (
+                          SELECT 1 FROM import_task_items AS items
+                          WHERE items.source_id = source_identities.source_id
+                      )
+                    """,
+                    [vault_id, *ids],
+                )
+                connection.execute(
+                    f"""
+                    UPDATE source_identities
+                    SET processing_task_id = (
+                        SELECT tasks.task_id
+                        FROM import_task_items AS items
+                        JOIN import_tasks AS tasks ON tasks.task_id = items.task_id
+                        WHERE tasks.vault_id = source_identities.vault_id
+                          AND items.source_id = source_identities.source_id
+                        ORDER BY tasks.created_at, tasks.task_id
+                        LIMIT 1
+                    )
+                    WHERE vault_id = ? AND source_id IN ({placeholders})
+                    """,
+                    [vault_id, *ids],
+                )

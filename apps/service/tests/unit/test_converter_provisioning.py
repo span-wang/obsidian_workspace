@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ from docx import Document as WordDocument
 from domain.derived_notes import render_document_graph
 from domain.evidence import ArtifactRef, DocumentGraph, PdfRegionLocator
 from workers.converters.launcher import (
+    _converter_environment,
     _adapt_graph,
     _artifacts,
     _docling_blocks,
@@ -137,7 +139,12 @@ def test_composition_root_injects_one_private_store_and_unavailable_profile_map(
         lambda: ProvisionedProfiles(
             root,
             {},
-            {"mineru": "profile-missing", "pandoc": "profile-missing", "docling": "profile-missing"},
+            {
+                "mineru": "profile-missing",
+                "pandoc": "profile-missing",
+                "docling": "profile-missing",
+                "paddleocr-vl": "profile-missing",
+            },
         ),
     )
     runtime = RuntimeState(data_directory=tmp_path / "app-data", sqlite_version="3.45.1")
@@ -194,6 +201,105 @@ def test_loader_requires_a_hash_bound_local_approval_record(tmp_path: Path) -> N
     assert profile is not None
     assert profile.release_approved is True
     assert require_profile(profile, "pandoc").allowed is True
+
+
+def test_loader_accepts_only_an_approved_native_paddleocr_vl_profile(tmp_path: Path) -> None:
+    root = tmp_path / "converters"
+    executable = root / "paddleocr" / "paddleocr.exe"
+    config = root / "profiles" / "paddleocr-vl-1.6.yaml"
+    model = root / "models" / "PaddleOCR-VL-1.6-0.9B.bin"
+    executable.parent.mkdir(parents=True)
+    config.parent.mkdir(parents=True)
+    model.parent.mkdir(parents=True)
+    executable.write_bytes(b"paddleocr executable")
+    config.write_text("pipeline_name: PaddleOCR-VL-1.6\n", encoding="utf-8")
+    model.write_bytes(b"local model")
+    profile_entry = {
+        "profile_id": "paddleocr-vl-1.6-local",
+        "engine": "paddleocr-vl",
+        "engine_version": "3.7.0",
+        "executable": "paddleocr/paddleocr.exe",
+        "executable_sha256": _digest(executable),
+        "config": "profiles/paddleocr-vl-1.6.yaml",
+        "config_sha256": _digest(config),
+        "models": [{"path": "models/PaddleOCR-VL-1.6-0.9B.bin", "sha256": _digest(model)}],
+        "resource_limits": {"wall_clock_seconds": 60, "memory_mb": 4096},
+        "backends": ["native"],
+    }
+    _write_manifest(root, profile_entry)
+    (root / "converter-release-approval.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "approved_profiles": [
+                    {
+                        "engine": "paddleocr-vl",
+                        "profile_id": profile_entry["profile_id"],
+                        "executable_sha256": profile_entry["executable_sha256"],
+                        "config_hash": profile_entry["config_sha256"],
+                        "model_hashes": [_digest(model)],
+                        "license_disposition": "local-use",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    profile = load_provisioned_profiles(root).profile_for("paddleocr-vl")
+
+    assert profile is not None
+    assert profile.release_approved is True
+    assert profile.supports_backend("native") is True
+    assert require_profile(profile, "paddleocr-vl").allowed is True
+
+
+def test_converter_environment_keeps_paddleocr_vl_offline(tmp_path: Path) -> None:
+    profile = SimpleNamespace(executable_path=r"C:\\converter\\paddleocr.exe", config_path=None)
+
+    environment = _converter_environment(profile, tmp_path)
+
+    assert environment["HF_HUB_OFFLINE"] == "1"
+    assert environment["TRANSFORMERS_OFFLINE"] == "1"
+    assert environment["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] == "True"
+    assert environment["PADDLE_PDX_CACHE_HOME"] == str(tmp_path / "paddle-cache")
+    assert "HTTP_PROXY" not in environment
+    assert "HTTPS_PROXY" not in environment
+
+
+def test_converter_environment_uses_the_preprovisioned_paddleocr_cache(tmp_path: Path) -> None:
+    model = tmp_path / "paddleocr-vl-1.6" / "official_models" / "PaddleOCR-VL-1.6"
+    model.mkdir(parents=True)
+    profile = SimpleNamespace(
+        engine="paddleocr-vl",
+        executable_path=r"C:\\converter\\paddleocr.exe",
+        config_path=None,
+        model_paths=(str(model),),
+    )
+
+    environment = _converter_environment(profile, tmp_path / "attempt")
+
+    assert environment["PADDLE_PDX_CACHE_HOME"] == str(model.parent.parent)
+
+
+def test_converter_environment_adds_only_paddle_runtime_dll_directories(tmp_path: Path) -> None:
+    executable = tmp_path / "runtime" / "Scripts" / "paddleocr.exe"
+    paddle_libs = tmp_path / "runtime" / "Lib" / "site-packages" / "paddle" / "libs"
+    nvidia_bin = tmp_path / "runtime" / "Lib" / "site-packages" / "nvidia" / "cudnn" / "bin"
+    executable.parent.mkdir(parents=True)
+    paddle_libs.mkdir(parents=True)
+    nvidia_bin.mkdir(parents=True)
+    profile = SimpleNamespace(
+        engine="paddleocr-vl",
+        executable_path=str(executable),
+        config_path=None,
+        model_paths=(),
+    )
+
+    environment = _converter_environment(profile, tmp_path / "attempt")
+
+    path_entries = environment["PATH"].split(os.pathsep)
+    assert path_entries == [str(executable.parent), str(nvidia_bin), str(paddle_libs)]
 
 
 def test_pandoc_adapter_skips_layout_only_docx_paragraphs_and_supports_quotes(

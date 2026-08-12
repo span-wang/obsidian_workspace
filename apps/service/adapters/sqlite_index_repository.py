@@ -2055,12 +2055,17 @@ class SqliteIndexRepository:
         with self._connect(vector_mutation_vault_ids={vault_id}) as connection:
             backfilled_block_count = 0
             graph_backfilled_block_count = 0
+            projection_rows_by_location = self._graph_projection_rows_by_location(
+                connection, vault_id
+            )
             for row in self._current_block_rows(connection, vault_id):
                 legacy_block = self._legacy_block_from_row(row)
                 if legacy_block is None:
                     continue
                 updates: dict[str, object] = {}
-                graph_updates, graph_issue = self._graph_projection_updates(connection, row)
+                graph_updates, graph_issue = self._graph_projection_updates(
+                    row, projection_rows_by_location
+                )
                 if graph_issue is not None:
                     continue
                 if row["block_content_sha256"] == "":
@@ -2147,7 +2152,7 @@ class SqliteIndexRepository:
 
     @classmethod
     def _graph_projection_updates(
-        cls, connection: sqlite3.Connection, row: sqlite3.Row
+        cls, row: sqlite3.Row, projection_rows_by_location: dict[str, tuple[sqlite3.Row, ...]]
     ) -> tuple[dict[str, object] | None, str | None]:
         location = row["location"]
         if not isinstance(location, str) or not location.startswith("graph:"):
@@ -2157,22 +2162,7 @@ class SqliteIndexRepository:
             not chunk_suffix.isascii() or not chunk_suffix.isdecimal() or int(chunk_suffix) < 1
         ):
             return None, "graph-projection-invalid"
-        projection_rows = connection.execute(
-            """
-            SELECT projections.source_id, projections.source_sha256, projections.source_path,
-                   blocks.block_id, blocks.kind, blocks.reading_order, blocks.locators_json,
-                   blocks.confidence, blocks.retrieval_projection
-            FROM graph_projections AS projections
-            JOIN graph_projection_blocks AS blocks
-              ON blocks.vault_id = projections.vault_id
-             AND blocks.graph_id = projections.graph_id
-             AND blocks.graph_revision = projections.graph_revision
-            WHERE projections.vault_id = ?
-              AND ? = 'graph:' || projections.graph_id || ':' || projections.graph_revision || ':' || blocks.block_id
-            LIMIT 2
-            """,
-            (row["vault_id"], projection_location),
-        ).fetchall()
+        projection_rows = projection_rows_by_location.get(projection_location, ())
         if not projection_rows:
             return None, "graph-projection-missing"
         if len(projection_rows) > 1:
@@ -2223,6 +2213,31 @@ class SqliteIndexRepository:
             None,
         )
 
+    @staticmethod
+    def _graph_projection_rows_by_location(
+        connection: sqlite3.Connection, vault_id: str
+    ) -> dict[str, tuple[sqlite3.Row, ...]]:
+        rows = connection.execute(
+            """
+            SELECT projections.source_id, projections.source_sha256, projections.source_path,
+                   blocks.graph_id, blocks.graph_revision, blocks.block_id, blocks.kind,
+                   blocks.reading_order, blocks.locators_json, blocks.confidence,
+                   blocks.retrieval_projection
+            FROM graph_projections AS projections
+            JOIN graph_projection_blocks AS blocks
+              ON blocks.vault_id = projections.vault_id
+             AND blocks.graph_id = projections.graph_id
+             AND blocks.graph_revision = projections.graph_revision
+            WHERE projections.vault_id = ?
+            """,
+            (vault_id,),
+        ).fetchall()
+        grouped: dict[str, list[sqlite3.Row]] = {}
+        for row in rows:
+            location = f"graph:{row['graph_id']}:{row['graph_revision']}:{row['block_id']}"
+            grouped.setdefault(location, []).append(row)
+        return {location: tuple(matches) for location, matches in grouped.items()}
+
     @classmethod
     def _current_block_report(
         cls,
@@ -2232,6 +2247,7 @@ class SqliteIndexRepository:
         graph_backfilled_block_count: int,
     ) -> IndexBlockBackfillReport:
         rows = cls._current_block_rows(connection, vault_id)
+        projection_rows_by_location = cls._graph_projection_rows_by_location(connection, vault_id)
         issues: list[IndexBlockConsistencyIssue] = []
         default_structure_block_count = 0
         for row in rows:
@@ -2258,7 +2274,9 @@ class SqliteIndexRepository:
                 issues.append(cls._consistency_issue(row, "text-mismatch"))
             if cls._has_default_structure(row):
                 default_structure_block_count += 1
-            graph_updates, graph_issue = cls._graph_projection_updates(connection, row)
+            graph_updates, graph_issue = cls._graph_projection_updates(
+                row, projection_rows_by_location
+            )
             if graph_issue is not None:
                 issues.append(cls._consistency_issue(row, graph_issue))
             elif graph_updates is not None and not cls._matches_graph_structure(rich_block, graph_updates):
@@ -2856,6 +2874,167 @@ class SqliteIndexRepository:
         with self._connect(vector_mutation_vault_ids={vault_id}) as connection:
             self._invalidate_current_path(connection, vault_id, relative_path, reason)
 
+    def purge_paths(
+        self, vault_id: str, relative_paths: tuple[str, ...], source_ids: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        """Physically remove task-owned index state after its Vault files are removed."""
+        paths = tuple(dict.fromkeys(relative_paths))
+        sources = tuple(dict.fromkeys(source_ids))
+        if not paths and not sources:
+            return ()
+        with self._connect(vector_mutation_vault_ids={vault_id}) as connection:
+            conditions: list[str] = []
+            parameters: list[object] = [vault_id]
+            if paths:
+                placeholders = ", ".join("?" for _ in paths)
+                conditions.append(f"relative_path IN ({placeholders})")
+                parameters.extend(paths)
+            rows = (
+                connection.execute(
+                    f"SELECT document_id FROM index_documents WHERE vault_id = ? AND ({' OR '.join(conditions)})",
+                    parameters,
+                ).fetchall()
+                if conditions
+                else ()
+            )
+            document_ids = tuple(str(row["document_id"]) for row in rows)
+            self._purge_documents(connection, vault_id, document_ids)
+            self._purge_paths_from_jobs(connection, vault_id, paths)
+            purgeable_sources: tuple[str, ...] = ()
+            if sources:
+                placeholders = ", ".join("?" for _ in sources)
+                orphan_rows = connection.execute(
+                    f"""
+                    SELECT documents.document_id
+                    FROM index_documents AS documents
+                    WHERE documents.vault_id = ? AND documents.source_id IN ({placeholders})
+                      AND NOT EXISTS (
+                          SELECT 1 FROM index_documents AS current_documents
+                          WHERE current_documents.vault_id = documents.vault_id
+                            AND current_documents.source_id = documents.source_id
+                            AND current_documents.is_current = 1
+                      )
+                    """,
+                    [vault_id, *sources],
+                ).fetchall()
+                self._purge_documents(
+                    connection, vault_id, tuple(str(row["document_id"]) for row in orphan_rows)
+                )
+                retained_rows = connection.execute(
+                    f"SELECT DISTINCT source_id FROM index_documents WHERE vault_id = ? AND source_id IN ({placeholders})",
+                    [vault_id, *sources],
+                ).fetchall()
+                retained_sources = {str(row["source_id"]) for row in retained_rows}
+                purgeable_sources = tuple(
+                    source_id for source_id in sources if source_id not in retained_sources
+                )
+                projection_rows = (
+                    connection.execute(
+                        f"""
+                        SELECT vault_id, graph_id, graph_revision
+                        FROM graph_projections
+                        WHERE vault_id = ? AND source_id IN ({', '.join('?' for _ in purgeable_sources)})
+                          AND NOT EXISTS (
+                              SELECT 1 FROM index_documents AS documents
+                              WHERE documents.vault_id = graph_projections.vault_id
+                                AND documents.source_id = graph_projections.source_id
+                          )
+                        """,
+                        [vault_id, *purgeable_sources],
+                    ).fetchall()
+                    if purgeable_sources
+                    else ()
+                )
+                for row in projection_rows:
+                    connection.execute(
+                        "DELETE FROM graph_projection_blocks WHERE vault_id = ? AND graph_id = ? AND graph_revision = ?",
+                        (row["vault_id"], row["graph_id"], row["graph_revision"]),
+                    )
+                    connection.execute(
+                        "DELETE FROM graph_projections WHERE vault_id = ? AND graph_id = ? AND graph_revision = ?",
+                        (row["vault_id"], row["graph_id"], row["graph_revision"]),
+                    )
+            return purgeable_sources
+
+    @staticmethod
+    def _purge_paths_from_jobs(
+        connection: sqlite3.Connection, vault_id: str, paths: tuple[str, ...]
+    ) -> None:
+        if not paths:
+            return
+        deleted_paths = set(paths)
+        jobs = connection.execute(
+            "SELECT job_id, relative_paths_json FROM index_jobs WHERE vault_id = ?", (vault_id,)
+        ).fetchall()
+        for job in jobs:
+            relative_paths = tuple(str(path) for path in json.loads(str(job["relative_paths_json"])))
+            retained_paths = tuple(path for path in relative_paths if path not in deleted_paths)
+            if retained_paths == relative_paths:
+                continue
+            if not retained_paths:
+                connection.execute("DELETE FROM index_jobs WHERE job_id = ?", (job["job_id"],))
+                continue
+            connection.execute(
+                "UPDATE index_jobs SET relative_paths_json = ?, updated_at = ? WHERE job_id = ?",
+                (json.dumps(retained_paths), utc_now(), job["job_id"]),
+            )
+
+    @classmethod
+    def _purge_documents(
+        cls, connection: sqlite3.Connection, vault_id: str, document_ids: tuple[str, ...]
+    ) -> None:
+        if not document_ids:
+            return
+        placeholders = ", ".join("?" for _ in document_ids)
+        for document_id in document_ids:
+            cls._invalidate_unit_cards_for_document(connection, vault_id, document_id)
+        input_rows = connection.execute(
+            f"""
+            SELECT DISTINCT contextual_prefix, retrieval_text, text
+            FROM index_blocks WHERE document_id IN ({placeholders})
+            """,
+            document_ids,
+        ).fetchall()
+        input_sha256s = tuple(
+            dict.fromkeys(
+                embedding_input_sha256(
+                    embedding_input_text(
+                        str(row["contextual_prefix"]), str(row["retrieval_text"]), str(row["text"])
+                    )
+                )
+                for row in input_rows
+            )
+        )
+        fts_rows = connection.execute(
+            f"SELECT rowid FROM index_block_fts_map WHERE document_id IN ({placeholders})",
+            document_ids,
+        ).fetchall()
+        cls._delete_fts_rows(connection, tuple(int(row["rowid"]) for row in fts_rows))
+        connection.execute(
+            f"DELETE FROM index_block_vectors WHERE document_id IN ({placeholders})",
+            document_ids,
+        )
+        if input_sha256s:
+            input_placeholders = ", ".join("?" for _ in input_sha256s)
+            connection.execute(
+                f"""
+                DELETE FROM embedding_cache AS cache
+                WHERE cache.input_sha256 IN ({input_placeholders})
+                  AND NOT EXISTS (
+                      SELECT 1 FROM index_block_vectors AS vectors
+                      WHERE vectors.embedding_profile_fingerprint = cache.embedding_profile_fingerprint
+                        AND vectors.input_sha256 = cache.input_sha256
+                  )
+                """,
+                input_sha256s,
+            )
+        connection.execute(
+            f"DELETE FROM index_metadata_candidates WHERE document_id IN ({placeholders})",
+            document_ids,
+        )
+        connection.execute(f"DELETE FROM index_blocks WHERE document_id IN ({placeholders})", document_ids)
+        connection.execute(f"DELETE FROM index_documents WHERE document_id IN ({placeholders})", document_ids)
+
     def resolve_pending_association(self, vault_id: str, relative_path: str, resolution: str) -> None:
         with self._connect(vector_mutation_vault_ids={vault_id}) as connection:
             if resolution == "confirm-delete":
@@ -2961,7 +3140,13 @@ class SqliteIndexRepository:
                 """,
                 (vault_id,),
             ).fetchone()
-            block_report = self._current_block_report(connection, vault_id, 0, 0)
+            # Legacy reads do not consume rich consistency findings, so keep the deep audit
+            # out of the default health path unless rich reads are enabled.
+            block_report = (
+                self._current_block_report(connection, vault_id, 0, 0)
+                if self.rich_block_reads_enabled
+                else None
+            )
             semantic_eligible_block_count = int(
                 connection.execute(
                     """
@@ -3042,7 +3227,11 @@ class SqliteIndexRepository:
         failed_paths = tuple(
             dict.fromkeys(path for row in failure_rows for path in json.loads(row["relative_paths_json"]))
         )
-        rich_block_issue_codes = tuple(sorted({issue.code for issue in block_report.issues}))
+        rich_block_issue_codes = (
+            tuple(sorted({issue.code for issue in block_report.issues}))
+            if block_report is not None
+            else ()
+        )
         if invalid_vector is None:
             for row in vector_input_rows:
                 try:

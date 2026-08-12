@@ -1,6 +1,401 @@
 {
   "logs": [
     {
+      "date": "2026-08-12",
+      "taskId": "RET-29-01",
+      "action": "完成当前页导入任务多选删除",
+      "result": "当前 Vault 的导入任务列表现支持逐项选择、全选当前页中的非运行任务和删除所选。删除确认明确说明影响范围，并逐项复用既有单任务删除请求，因此仍受 Vault 提交文件 SHA-256 校验、受限回退和索引清理保护。成功项立即移出列表；失败项保留选中状态并显示任务名和错误。切换页大小、页码或 Vault 会清空选择，不会形成跨页删除范围。RET-R019 的安全删除风险保持已关闭；本步未新增技术债。",
+      "verification": [
+        "前端单测（38 passed）、lint 与生产构建（通过；包含窄屏任务多选行对齐复核）",
+        "OBSIDIAN_PLATFORM_TEST_PORT=6431 完整浏览器回归：新增批量删除用例通过，确认运行中任务不会被全选、成功项移除、失败项保留；全套 24 项中 16 项通过，另有 8 项在既有工作台、设置和会话 UI 场景失败，未归因于本任务。",
+        "隔离端口 6432 单独重跑新增用例时，服务未在 10 秒健康检查窗口内启动；此前完整套件中该用例已通过。",
+        "进度构建、进度检查与 git diff --check（通过；仅既有 Windows 行尾提示）"
+      ],
+      "files": [
+        "apps/web/src/app.js",
+        "apps/web/src/style.css",
+        "apps/web/tests/app.test.js",
+        "browser-tests/loopback.spec.mjs",
+        "progress/"
+      ],
+      "next": "如需跨页选择、服务端批量事务或撤销删除，应先建立并发、原子性和恢复语义的独立任务。"
+    },
+    {
+      "date": "2026-08-12",
+      "taskId": "RET-18-02",
+      "action": "完成任务删除全链路清理",
+      "result": "从任务列表删除已提交任务时，服务先校验提交哈希并恢复或删除该任务拥有的 Vault 原始资料、派生笔记和附件；随后物理清理索引文档、块、FTS、向量、无引用 Embedding 缓存、元数据候选、依赖单元卡、索引任务路径和无引用 graph projection。任务、来源身份和解析证据只在没有其他任务引用时删除；共享来源会保留并转交存活任务。",
+      "verification": [
+        "删除链路服务端定向回归（65 passed，2 skipped）",
+        "受影响文件 Ruff（All checks passed）",
+        "OBSIDIAN_PLATFORM_TEST_PORT=6428 integration（12 passed，2 skipped，1 failed：当前在线解析恢复动作与断言不一致；与删除链路无交集）",
+        "git diff --check（通过；仅既有 Windows 行尾提示）"
+      ],
+      "files": [
+        "apps/service/application/ingest.py",
+        "apps/service/application/indexing.py",
+        "apps/service/adapters/sqlite_index_repository.py",
+        "apps/service/adapters/sqlite_source_repository.py",
+        "apps/service/ports/index_repository.py",
+        "apps/service/ports/source_repository.py",
+        "apps/service/tests/unit/test_import_tasks.py",
+        "apps/service/tests/unit/test_source_identities.py",
+        "apps/service/tests/unit/test_sqlite_index_graph_projection.py",
+        "apps/service/tests/unit/test_sqlite_index_vectors.py",
+        "progress/"
+      ],
+      "next": "重启本机工作台后，任务列表中的新删除操作会使用全链路清理。"
+    },
+    {
+      "date": "2026-08-12",
+      "taskId": "RET-28-01",
+      "action": "完成双语标题来源链接核验修复",
+      "result": "来源链接校验器不再把中英文两行标题中的英文副标题误认为正文。它允许一级标题后的单行副标题，再核验精确来源链接；来源链接缺失或仅位于后续正文时仍保持 source-link-broken。既有同原因 stale 文档会在下一次 reconcile 自动重新核验，因此 CME 的两份笔记无需变更哈希或来源路径即可恢复可核验状态。",
+      "verification": [
+        "test_index_service.py（19 passed；修复前新增回归失败，修复后通过，并覆盖既有 stale 文档恢复）",
+        "Ruff（All checks passed）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过）"
+      ],
+      "files": [
+        "apps/service/application/indexing.py",
+        "apps/service/tests/unit/test_index_service.py",
+        "progress/"
+      ],
+      "next": "在受影响 Vault 的下一次 reconcile 或重建中重新核验既有派生笔记；不需要修改笔记的来源链接、哈希或路径。"
+    },
+    {
+      "date": "2026-08-12",
+      "taskId": "RET-28-01",
+      "action": "开始修复双语标题来源链接误判",
+      "result": "用户确认：CME 索引 stale 的直接原因是来源链接校验器把英文副标题当作一级标题后的唯一允许内容，提前标记 source-link-broken；本步只修复顶部来源链接核验并保留正文链接不作为来源凭据的边界。",
+      "verification": [],
+      "files": [
+        "apps/service/application/indexing.py",
+        "apps/service/tests/unit/test_index_service.py",
+        "progress/"
+      ],
+      "next": "先加入双语标题失败回归，再完成最小核验修复并运行定向验证。"
+    },
+    {
+      "date": "2026-08-11",
+      "taskId": "RET-27-01",
+      "action": "开始设计任务级在线 OCR Provider",
+      "result": "用户明确确认：仅在创建导入任务时打开在线解析开关后，可将该任务原始 PDF/DOCX 与文件名上传至所选 PaddleOCR 官方云 API 或 MinerU。默认关闭；Provider 失败不静默回退；取消仅停止本机等待。已基于官方 API 文档冻结 PaddleOCR-VL 1.6 的异步文档解析与 MinerU v4 本地上传、批次轮询方案。",
+      "verification": [
+        "官方文档：PaddleOCR official API Python SDK（PaddleOCR-VL-1.6 document parsing）",
+        "官方文档：MinerU API v4（file-urls/batch 与 extract-results/batch）",
+        "npm run progress:check（待实现与记录完成后执行）"
+      ],
+      "files": [
+        "docs/online-ocr-providers.md",
+        "progress/config.json",
+        "progress/tasks/retrieval.json",
+        "progress/risks.json",
+        "progress/logs.json"
+      ],
+      "next": "先以 fake SDK/HTTP 响应建立 PaddleOCR 与 MinerU Provider 合同测试，再接入任务状态、出网门禁、设置和任务创建界面。"
+    },
+    {
+      "date": "2026-08-11",
+      "taskId": "RET-27-01",
+      "action": "收窄在线解析文件范围",
+      "result": "用户明确将在线解析限制为 PDF；DOCX、Markdown 和其他格式不显示在线解析选择且始终使用现有本地路径。",
+      "verification": [],
+      "files": [
+        "docs/online-ocr-providers.md",
+        "progress/tasks/retrieval.json",
+        "progress/risks.json",
+        "progress/logs.json"
+      ],
+      "next": "在 PDF 转换分支接入在线 Provider，并为非 PDF 的零外发路径增加回归。"
+    },
+    {
+      "date": "2026-08-11",
+      "taskId": "RET-25-01",
+      "action": "完成会话首次进入的即时最新消息定位",
+      "result": "会话正文容器不再继承默认 scroll-behavior: smooth，因此首次进入时既有的底部定位直接完成，不再从首条消息动画下滚；问答定位按钮继续通过显式 smooth 行为平滑定位。",
+      "verification": [
+        "npm --prefix apps/web run test（35 passed）",
+        "npm --prefix apps/web run lint（通过）",
+        "npm --prefix apps/web run build（通过）",
+        "OBSIDIAN_PLATFORM_TEST_PORT=6451 npm run browser-test：会话首次定位的 scroll-behavior: auto 断言、底部定位和问答定位点击均已执行通过；全套 23 项中 15 项通过，另有 8 项在当前进行中的工作台、设置和会话 UI 重构断言处失败，未归因于本次滚动改动。"
+      ],
+      "files": [
+        "apps/web/src/style.css",
+        "browser-tests/loopback.spec.mjs",
+        "progress/tasks/retrieval.json",
+        "progress/risks.json",
+        "progress/logs.json"
+      ],
+      "next": "继续收敛 RET-25-01 的其他 UI 变更后，修复并重跑完整浏览器回归；本任务仍保持进行中。"
+    },
+    {
+      "date": "2026-08-11",
+      "taskId": "RET-25-01",
+      "action": "开始修复会话首次进入的下滚动画",
+      "result": "用户确认会话首次进入应直接展示最新消息，不从首条消息平滑下滚；本步仅移除会话正文容器的默认平滑滚动，保留问答定位按钮显式触发的平滑定位。",
+      "verification": [],
+      "files": [
+        "progress/tasks/retrieval.json",
+        "progress/logs.json",
+        "apps/web/src/style.css",
+        "browser-tests/loopback.spec.mjs"
+      ],
+      "next": "运行前端单测、lint、构建和独立端口浏览器回归，确认首次定位即时完成且问答定位仍可用。"
+    },
+    {
+      "date": "2026-08-07",
+      "taskId": "RET-23-01",
+      "action": "完成 Markdown Provider 大 token 结构安全分块与设置",
+      "result": "Markdown Provider 默认按 10k/16k/20k 的最小、目标和最大正文 token 预算聚合，不再受 24k 字符或 24 源单位上限约束。整篇不足最小值、最终尾块不足最小值和结构边界迫使的小块仍会发送；单个超过最大值的不可拆结构保留原文且不出网。Provider 设置页可保存三项预算，后端持久化至 vaults.sqlite3 并在后续导入中即时使用。Markdown 专用输出预算提升为 24576，普通聊天预算保持 4096。",
+      "verification": [
+        "Markdown/Provider/API/SQLite 定向回归（108 passed）",
+        "受影响服务文件 Ruff（All checks passed）",
+        "前端单测（33 passed）、lint 与生产构建（通过）",
+        "进度检查与 git diff --check（通过；仅 Windows 行尾提示）"
+      ],
+      "files": [
+        "apps/service/domain/markdown_structuring.py",
+        "apps/service/application/markdown_structuring.py",
+        "apps/service/application/providers.py",
+        "apps/service/ports/provider_repository.py",
+        "apps/service/adapters/sqlite_provider_repository.py",
+        "apps/service/api/main.py",
+        "apps/service/adapters/openai_compatible_provider.py",
+        "apps/service/tests/unit/test_markdown_structuring.py",
+        "apps/service/tests/unit/test_providers.py",
+        "apps/service/tests/unit/test_openai_compatible_provider.py",
+        "apps/service/tests/unit/test_sqlite_provider_repository_rerank.py",
+        "apps/service/tests/unit/test_vault_api.py",
+        "apps/web/src/app.js",
+        "apps/web/tests/app.test.js",
+        "progress/"
+      ],
+      "next": "如需按具体 Markdown 模型的 context window 自动协商上限，另立 Provider capability 合同任务，并以脱敏长文测量质量、延迟和费用。"
+    },
+    {
+      "date": "2026-08-07",
+      "taskId": "RET-23-01",
+      "action": "开始 Markdown Provider 大 token 结构安全分块",
+      "result": "用户确认将每次 Markdown Provider 结构化请求提高至约 10k 至 20k token，以减少重复提示词开销，并要求在设置页持久化调整最小、目标和最大值。实现将默认以 10k/16k/20k 作为正文预算；整篇不足最小值、最终尾块不足最小值或结构边界形成的小块仍发送，标题、列表、表格、引用和代码围栏保持原子边界，单个超过上限的不可拆结构不发送给 Provider。Markdown 专用输出预算会同步提高，普通聊天生成不变。",
+      "verification": [],
+      "files": [
+        "progress/config.json",
+        "progress/tasks/retrieval.json",
+        "progress/risks.json",
+        "progress/logs.json"
+      ],
+      "next": "以定向失败测试固定 token 预算、结构边界、尾块和输出预算，再完成最小实现与质量验证。"
+    },
+    {
+      "date": "2026-08-07",
+      "taskId": "RET-21-01",
+      "action": "为解析任务补充解析器标签",
+      "result": "用户确认在不新增 API 字段、SQLite migration 或任务状态机变化的前提下，复用已有 conversion_engine，在自动导入详情和兼容审核详情的资料项中显示‘解析器’标签；未选择引擎的资料项不显示标签。",
+      "verification": [
+        "npm --prefix apps/web run test（33 passed）",
+        "npm --prefix apps/web run lint（通过）",
+        "npm --prefix apps/web run build（通过）",
+        "npm run browser-test：未运行浏览器断言；127.0.0.1:6240 已被 PID 23772 的 python 进程占用，启动前置检查失败。",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过；仅 Windows 行尾提示）"
+      ],
+      "files": [
+        "apps/web/src/app.js",
+        "apps/web/src/style.css",
+        "apps/web/tests/app.test.js",
+        "progress/tasks/retrieval.json",
+        "progress/logs.json"
+      ],
+      "next": "在 127.0.0.1:6240 空闲后运行完整浏览器回归；继续完成 RET-21-01 其余工作台验收。"
+    },
+    {
+      "date": "2026-08-07",
+      "taskId": "RET-22-01",
+      "action": "完成 GPU PaddleOCR-VL 1.6 PDF 解析接入",
+      "result": "按用户批准重装并接入本机 PaddleOCR-VL 1.6。受控 runtime 仅安装 paddlepaddle-gpu 3.2.2，cuda=True、device=gpu:0，CPU paddlepaddle distribution absent。应用现对 Paddle 真实保存的顶层页面 JSON 与既有 res 包装兼容；哈希命名的不可变快照会在尝试目录内短暂提供 input.pdf，执行后删除而不收集为 artifact。脱敏 PDF application smoke 选中 paddleocr-vl-1.6，quality=accepted，生成 18 个带页码 bbox 的文本/表格 blocks 和 5 个 artifact drafts。",
+      "verification": [
+        "GPU runtime 自检：paddlepaddle-gpu 3.2.2、cuda=True、device=gpu:0、CPU paddlepaddle distribution absent",
+        "PaddleOCR-VL 保存页面 JSON 与 input.pdf staging 单测；转换器相关回归（67 passed）",
+        "受影响文件 Ruff（All checks passed）",
+        "PaddleOCR-VL 1.6 脱敏 PDF application smoke：engine=paddleocr-vl-1.6、quality=accepted、18 blocks、page 1 bbox、5 artifact drafts",
+        "完整服务端 unit 在 180 秒上限内未完成且未输出失败断言；未记为通过"
+      ],
+      "files": [
+        "apps/service/pyproject.toml",
+        "apps/service/uv.lock",
+        "apps/service/workers/converters/launcher.py",
+        "apps/service/tests/unit/test_document_conversion_v2.py",
+        "apps/service/tests/fixtures/paddleocr-vl-1.6-page-result.json",
+        "progress/"
+      ],
+      "next": "以更多脱敏 PDF 监测已观测到的 CUDNN 9.9 与系统 9.5 版本警告；如需解决该兼容性警告，另立运行时任务。"
+    },
+    {
+      "date": "2026-08-07",
+      "taskId": "RET-22-01",
+      "action": "按用户要求移除本机 PaddleOCR 模型与依赖",
+      "result": "已将 C:/Users/panshimao/.paddlex/official_models 下 18 个 PaddleOCR/PaddleX 官方模型目录（约 4.2 GiB）送入回收站；服务虚拟环境已卸载 paddleocr 3.7.0 与 PaddleX 3.7.2，并从项目依赖和锁文件移除。没有创建或批准 PaddleOCR-VL profile。PDF 转换适配仍受 profile 门禁保护，当前会失败关闭而不会下载或调用远程模型。",
+      "verification": [
+        "uv lock && uv sync --project apps/service --all-groups（Resolved 32 packages；移除 49 个相关包）",
+        "official_models 无剩余模型目录；服务虚拟环境无 paddleocr/paddlex 模块和命令",
+        "转换器相关单测（47 passed）与 Ruff（All checks passed）"
+      ],
+      "files": [
+        "apps/service/pyproject.toml",
+        "apps/service/uv.lock",
+        "progress/"
+      ],
+      "next": "仅在用户再次明确授权后，安装并审批确切的 PaddleOCR-VL-1.6 本机 runtime、模型和 profile，再运行脱敏 PDF smoke。"
+    },
+    {
+      "date": "2026-08-07",
+      "taskId": "RET-22-01",
+      "action": "完成 PaddleOCR-VL 1.6 PDF 转换器实现，等待本机 profile smoke",
+      "result": "PDF V2 主路径已从 native-pdf+MinerU 按页混合替换为受 profile 门禁保护的 PaddleOCR-VL 1.6 native pipeline。Paddle 页面 JSON 的标题、正文、表格、公式、图片与 bbox 映射到既有 DocumentGraph 和私有 artifact；页眉页脚保留为 accepted warning，缺 bbox、无关联图片 artifact 或未知块失败关闭。已锁定 paddleocr 3.7.0 / PaddleX 3.7.2，Paddle 子进程禁用模型源检查并使用离线缓存。当前没有已验证的 PaddlePaddle/VL 模型 profile，任务保持进行中。",
+      "verification": [
+        "PaddleOCR-VL 映射、profile 与预检定向回归（63 passed）",
+        "Ruff（All checks passed）",
+        "服务端完整 unit（652 passed，2 skipped）"
+      ],
+      "files": [
+        "apps/service/pyproject.toml",
+        "apps/service/uv.lock",
+        "apps/service/workers/converters/launcher.py",
+        "apps/service/workers/converters/provisioning.py",
+        "apps/service/tests/unit/test_document_conversion_v2.py",
+        "apps/service/tests/unit/test_converter_provisioning.py",
+        "apps/service/tests/integration/server.py",
+        "progress/"
+      ],
+      "next": "在本机安装并审批 PaddleOCR-VL-1.6 的 PaddlePaddle 推理运行时、pipeline config 和模型 profile 后，运行脱敏真实 PDF smoke，核验文本、表格、公式、图片和页码 bbox。"
+    },
+    {
+      "date": "2026-08-07",
+      "taskId": "RET-22-01",
+      "action": "开始以 PaddleOCR-VL 1.6 替换 PDF 解析",
+      "result": "用户确认将 PDF V2 的 native-pdf+MinerU 混合路径替换为本机 PaddleOCR-VL 1.6。当前环境仅发现未锁定的 paddleocr 3.7.0 命令包，未发现已验证的 PaddlePaddle 推理运行时和模型 profile；本步保持离线、失败关闭，不下载模型。",
+      "verification": [],
+      "files": [
+        "progress/config.json",
+        "progress/tasks/retrieval.json",
+        "progress/risks.json",
+        "progress/logs.json"
+      ],
+      "next": "先锁定 PaddleOCR 依赖并实现 profile/命令/输出适配，再以 fixture 回归；模型可用后补真实 PDF smoke。"
+    },
+    {
+      "date": "2026-08-07",
+      "taskId": "RET-21-01",
+      "action": "开始多 Vault 工作台全景与二级上下文交互",
+      "result": "用户确认从零重构工作台，不沿用既有 UI 示例；本任务将以跨 Vault 摘要全景、优先处理队列、最近动态和 Vault 二级详情抽屉承载更多内容，并保持正文、绝对路径、凭据和跨 Vault 图谱关系不进入聚合视图。",
+      "verification": [],
+      "files": [
+        "progress/config.json",
+        "progress/tasks/retrieval.json",
+        "progress/risks.json",
+        "progress/logs.json"
+      ],
+      "next": "先实现工作台摘要读取合同和服务端定向测试，再重构 React 工作台首页与共享控件。"
+    },
+    {
+      "date": "2026-08-07",
+      "taskId": "RET-20-01",
+      "action": "开始 Markdown Provider 层级与去重质量约束",
+      "result": "用户确认优化 Markdown 结构化提示词，以处理不准确、内容重复、层级跳级及部分内容缺失层级的问题。任务将补充文档级标题纲要、明确的跨块保真与去重规则，以及合并结果的机械性标题校验；不改变 Provider、出网、原文、Vault 提交、索引或 SQLite。",
+      "verification": [],
+      "files": [
+        "progress/config.json",
+        "progress/tasks/retrieval.json",
+        "progress/risks.json",
+        "progress/logs.json"
+      ],
+      "next": "实现标题纲要和提示词契约，补充定向回归，并运行 Ruff 与进度检查。"
+    },
+    {
+      "date": "2026-08-06",
+      "taskId": "RET-18-02",
+      "action": "完成导入任务展示与已提交文件删除",
+      "result": "任务页现只展示当前 vault 的任务，默认每页 10 条，支持 10、20、50 条切换及上一页、下一页翻页。删除成功后直接从前端状态移除任务，不重新加载任务列表。已完成任务会根据最新 committed journal 安全回退 Vault 内 Markdown、源文件和资料附件：新增文件删除，覆盖文件恢复提交前备份；任一文件缺失或内容哈希不匹配时整次失败关闭并保留任务和 Vault。删除后同步索引，上传时的本地原件不会删除。未新增技术债。",
+      "verification": [
+        "服务端文件回退定向回归（19 passed，2 skipped）与 Ruff（通过）",
+        "服务端完整 unit（646 passed，2 skipped）",
+        "前端 unit（31 passed）、lint、build（通过）",
+        "独立端口 loopback 集成（13 passed，2 skipped）与浏览器回归（23 passed）",
+        "进度检查与 git diff --check（通过；仅 Windows 行尾提示）"
+      ],
+      "files": [
+        "apps/service/application/ingest.py",
+        "apps/service/adapters/filesystem_vault_committer.py",
+        "apps/service/ports/vault_committer.py",
+        "apps/service/tests/unit/test_import_tasks.py",
+        "apps/service/tests/unit/test_filesystem_vault_committer.py",
+        "apps/web/src/app.js",
+        "apps/web/src/style.css",
+        "apps/web/tests/app.test.js",
+        "progress/"
+      ],
+      "next": "如需按服务端数据库分页或为已被修改的任务文件提供逐文件冲突解决，另立性能或恢复交互任务。"
+    },
+    {
+      "date": "2026-08-06",
+      "taskId": "RET-18-02",
+      "action": "开始导入任务展示与已提交文件删除",
+      "result": "用户确认任务页仅展示当前 vault 的任务，默认每页 10 条并支持调整和翻页；删除成功后不重新加载列表。用户明确要求删除任务时同时回退 Vault 内该任务提交的 Markdown、源文件和资料附件，但不删除上传时的本地原件。为防止覆盖后续编辑，删除将以提交日志和内容哈希失败关闭。",
+      "verification": [],
+      "files": [
+        "progress/config.json",
+        "progress/tasks/retrieval.json",
+        "progress/risks.json",
+        "progress/logs.json"
+      ],
+      "next": "实现提交文件安全回退、索引同步、当前 vault 列表分页和无刷新删除，并运行定向及浏览器回归。"
+    },
+    {
+      "date": "2026-08-07",
+      "taskId": "RET-24-01",
+      "action": "开始导入任务排队与 Word 本地提案修复",
+      "result": "用户确认批量导入应按队列推进，并明确 DOCX/PDF 不得发送给 Markdown Provider。现场任务记录显示多条任务停在 deriving-markdown，详情接口被导入状态锁阻塞；本步将只修复队列、DocumentGraph 本地提案和详情读取边界。",
+      "verification": [
+        "已读取运行中任务、事件元数据及详情接口超时证据；尚未运行修复后回归。"
+      ],
+      "files": [
+        "apps/service/application/ingest.py",
+        "apps/service/tests/unit/test_import_service.py",
+        "progress/"
+      ],
+      "next": "先以定向回归固定队列顺序、DOCX/PDF 零 Markdown Provider 调用和详情读取，再重启本机服务恢复中断队列。"
+    },
+    {
+      "date": "2026-08-09",
+      "taskId": "RET-24-01",
+      "action": "完成导入队列、Word 本地派生与非阻塞提交重试",
+      "result": "批量选择现在为每个文件创建独立任务，并以单消费者 FIFO 队列运行；恢复、重新派生与重试提交同样先排队。DOCX/PDF 的 DocumentGraph 只在本地渲染，旧 DOCX 单项列表图也已兼容；两项现场 Word 任务完成且提案 provider_markdown 均为 null。任务详情不再等待导入状态锁或索引健康度；重试提交改为后台启动，避免操作请求超时。",
+      "verification": [
+        "服务端定向回归：61 passed",
+        "受影响服务文件 Ruff：All checks passed",
+        "前端：33 passed，lint/build 通过",
+        "现场：任务 03/09 完成；详情接口 62/63 ms；running=0，queued=0，provider_markdown=null",
+        "npm run progress:build && npm run progress:check",
+        "git diff --check"
+      ],
+      "files": [
+        "apps/service/application/ingest.py",
+        "apps/service/domain/derived_notes.py",
+        "apps/service/workers/converters/launcher.py",
+        "apps/service/api/main.py",
+        "apps/service/domain/tasks.py",
+        "apps/service/tests/unit/test_document_conversion_v2.py",
+        "apps/service/tests/unit/test_import_service.py",
+        "apps/service/tests/unit/test_import_tasks.py",
+        "apps/service/tests/unit/test_import_api.py",
+        "apps/web/src/app.js",
+        "progress/"
+      ],
+      "next": "如需配置并发、暂停或重排队列，另立带持久化调度合同的任务。"
+    },
+    {
       "date": "2026-08-05",
       "taskId": "RET-18-01",
       "action": "完成自动化导入提交与私有建议隔离",
@@ -1447,6 +1842,99 @@
         "progress/"
       ],
       "next": "如需跨服务重启保存模式或缓存重复查询的 Embedding，另立运行时配置和查询向量缓存任务。"
+    },
+    {
+      "date": "2026-08-10",
+      "taskId": "RET-24-02",
+      "action": "开始导入任务源解析与结构化结果对照",
+      "result": "用户确认在任务详情中展示已选本机 DocumentGraph 的可读解析正文，并与同一资料项的结构化 Markdown 并列比较。范围仅包含最小化 API 合同与只读界面，不展示 raw extraction、绝对路径、哈希、转换工件或内部身份。",
+      "verification": [],
+      "files": [
+        "progress/",
+        "apps/service/api/main.py",
+        "apps/service/tests/unit/test_import_api.py",
+        "apps/web/src/app.js",
+        "apps/web/src/style.css",
+        "apps/web/tests/app.test.js"
+      ],
+      "next": "先补 API 和前端失败测试，再实现最小字段映射与并列展示。"
+    },
+    {
+      "date": "2026-08-10",
+      "taskId": "RET-24-02",
+      "action": "完成导入任务源解析与结构化结果对照",
+      "result": "任务详情现从已选 DocumentGraph 的 retrieval_projection 或兼容 ParseEvidence.units 返回源解析内容，并以资料项标签、块类型和页码/DOCX 内容位置与结构化 Markdown 两栏并列。响应和页面不包含 raw extraction、转换工件、bbox、哈希、绝对路径或内部 graph/block 身份；窄屏自动改为上下排列。",
+      "verification": [
+        "服务端 import API/ingest 定向回归（17 passed）与 Ruff（All checks passed）",
+        "前端单测（34 passed）、lint 与 build（通过）",
+        "OBSIDIAN_PLATFORM_TEST_PORT=6424 浏览器回归（23 passed）",
+        "进度检查与 git diff --check（通过）"
+      ],
+      "files": [
+        "apps/service/api/main.py",
+        "apps/service/tests/unit/test_import_api.py",
+        "apps/web/src/app.js",
+        "apps/web/src/style.css",
+        "apps/web/tests/app.test.js",
+        "browser-tests/loopback.spec.mjs",
+        "progress/"
+      ],
+      "next": "如需逐页原始文件预览、区域高亮或自动差异评估，另立受控媒体读取或脱敏质量评测任务。"
+    },
+    {
+      "date": "2026-08-11",
+      "taskId": "RET-25-01",
+      "action": "开始 iOS 设计语言统一前端 UI 重构",
+      "result": "用户已确认借用 Apple 原生设计语言而不模拟放大 iPhone，覆盖工作台、资料、会话、任务和设置五个入口；保持桌面三栏、移动端逐层操作、浅色主题、蓝色交互色和极限顺滑但可减少动态的连续反馈。DESIGN.md 已成为生产 UI 的强制规范。",
+      "verification": [],
+      "files": [
+        "DESIGN.md",
+        "AGENTS.md",
+        "progress/",
+        "apps/web/src/app.js",
+        "apps/web/src/style.css",
+        "apps/web/tests/app.test.js",
+        "browser-tests/loopback.spec.mjs"
+      ],
+      "next": "先建立共享 tokens、图标、控件和全局应用外壳，再迁移工作台与会话页并进行桌面和移动端截图检查。"
+    },
+    {
+      "date": "2026-08-11",
+      "taskId": "RET-26-01",
+      "action": "开始解析产物可读命名与同名保护",
+      "result": "用户确认新导入的解析产物应以导入文件名表达语义，不再暴露成组的内部 ID、哈希和章节序号。实施范围为新导入路径、同名保护及目录页索引排除；历史 Vault 不迁移。",
+      "verification": [],
+      "files": [
+        "progress/",
+        "apps/service/domain/derived_notes.py",
+        "apps/service/application/ingest.py",
+        "apps/service/application/indexing.py",
+        "apps/service/tests/unit/"
+      ],
+      "next": "完成完整服务端回归、进度构建和差异检查后记录实际结果。"
+    },
+    {
+      "date": "2026-08-11",
+      "taskId": "RET-26-01",
+      "action": "完成解析产物可读命名与同名保护",
+      "result": "新导入原件保留导入文件名，解析笔记目录使用文件主名，目录页为‘文件名 - 目录.md’，章节笔记保留解析标题；路径不再暴露 source ID、内容哈希或顺序前缀。相同文件名但内容不同时只使用常规‘（2）’后缀，原始内部身份和前言溯源不变。索引同时排除新目录页与历史 index.md，历史 Vault 不做迁移。未新增技术债。",
+      "verification": [
+        "派生、自动导入、同名、中文命名、标签和索引定向回归（59 passed）",
+        "受影响文件 Ruff（All checks passed）",
+        "进度构建、进度检查与 git diff --check（通过；仅既有 Windows 行尾提示）",
+        "完整服务端 unit 在 184 秒上限内未完成且未输出失败断言；未记为通过。"
+      ],
+      "files": [
+        "apps/service/domain/derived_notes.py",
+        "apps/service/application/ingest.py",
+        "apps/service/application/indexing.py",
+        "apps/service/tests/unit/test_derived_notes.py",
+        "apps/service/tests/unit/test_import_service.py",
+        "apps/service/tests/unit/test_metadata_tags.py",
+        "apps/service/tests/unit/test_index_service.py",
+        "progress/"
+      ],
+      "next": "如需迁移历史导入或允许用户批量自定义命名，应先建立可预览、可回滚的 Vault 迁移与冲突确认任务。"
     }
   ]
 }

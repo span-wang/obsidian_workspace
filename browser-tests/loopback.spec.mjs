@@ -112,7 +112,7 @@ test("previews synthetic Markdown in the isolated retrieval chunking lab", async
   expect(previewRequests).toEqual([`${baseUrl}/api/_test/retrieval/chunk-preview`]);
 });
 
-test("uses the current-vault graph as the default workbench without widening other scopes", async ({ page }) => {
+test("shows the all-vault overview before loading a selected graph drawer", async ({ page }) => {
   const firstVault = {
     vault_id: "vault-graph-first",
     path: "C:\\fixture\\First Graph Vault",
@@ -122,6 +122,39 @@ test("uses the current-vault graph as the default workbench without widening oth
     index: { status: "stale", current_count: 2, stale_count: 1, failure_count: 0, pending_count: 0, failed_paths: [], stale_paths: ["notes/old.md"], semantic_status: "unavailable" }
   };
   const secondVault = { ...firstVault, vault_id: "vault-graph-second", path: "C:\\fixture\\Second Graph Vault", is_current: false };
+  const overview = {
+    updated_at: "2026-08-07T09:30:00+00:00",
+    vaults: [
+      {
+        vault_id: firstVault.vault_id,
+        display_name: "First Graph Vault",
+        authorization_status: "active",
+        access_status: "available",
+        access_reason: null,
+        is_current: true,
+        updated_at: "2026-08-07T09:20:00+00:00",
+        state: "attention",
+        index: { ...firstVault.index, updated_at: "2026-08-07T09:20:00+00:00", semantic_covered_block_count: 0, semantic_eligible_block_count: 0 },
+        tasks: { total: 0, running: 0, attention: 0, completed: 0, latest_at: null },
+        sessions: { total: 0, latest_at: null }
+      },
+      {
+        vault_id: secondVault.vault_id,
+        display_name: "Second Graph Vault",
+        authorization_status: "active",
+        access_status: "available",
+        access_reason: null,
+        is_current: false,
+        updated_at: "2026-08-07T09:20:00+00:00",
+        state: "healthy",
+        index: { ...secondVault.index, updated_at: "2026-08-07T09:20:00+00:00", semantic_covered_block_count: 0, semantic_eligible_block_count: 0 },
+        tasks: { total: 0, running: 0, attention: 0, completed: 0, latest_at: null },
+        sessions: { total: 0, latest_at: null }
+      }
+    ],
+    attention: [],
+    activity: []
+  };
   const primaryGraph = {
     vault_id: firstVault.vault_id,
     nodes: [
@@ -137,59 +170,54 @@ test("uses the current-vault graph as the default workbench without widening oth
     index: firstVault.index
   };
   const secondGraph = { ...primaryGraph, vault_id: secondVault.vault_id, nodes: [{ relative_path: "notes/other.md", title: "other", directory: "notes", tags: [], source: "native" }], edges: [] };
-  const refreshedGraph = {
-    ...primaryGraph,
-    index: { ...firstVault.index, status: "failed", failure_count: 1, failed_paths: ["notes/two.md"] }
-  };
   const graphRequests = [];
-  let graphRefreshSent = false;
+  const workbenchRequests = [];
+  const vaultRequests = [];
 
   await page.route("**/api/vaults/vault-graph-first/graph**", async (route) => {
     graphRequests.push(route.request().url());
-    const graph = route.request().url().includes("relationship_state=candidate")
-      ? { ...primaryGraph, nodes: primaryGraph.nodes, edges: [primaryGraph.edges[1]] }
-      : graphRefreshSent ? refreshedGraph : primaryGraph;
-    await route.fulfill({ json: { graph } });
+    await route.fulfill({ json: { graph: primaryGraph } });
   });
   await page.route("**/api/vaults/vault-graph-second/graph**", async (route) => {
     graphRequests.push(route.request().url());
-    const graph = route.request().url().includes("relationship_state=")
-      ? { ...secondGraph, nodes: [], edges: [] }
-      : secondGraph;
-    await route.fulfill({ json: { graph } });
+    await route.fulfill({ json: { graph: secondGraph } });
   });
-  await page.route("**/api/vaults/vault-graph-second/current", async (route) => {
-    await route.fulfill({ json: { vault: { ...secondVault, is_current: true } } });
-  });
-  await page.route("**/api/vaults/*/graph/events", async (route) => {
-    const body = graphRefreshSent
-      ? ": connected\n\n"
-      : "event: graph-refresh\ndata: {\"reason\":\"changed\"}\n\n";
-    graphRefreshSent = true;
-    await route.fulfill({ contentType: "text/event-stream", body });
+  await page.route("**/api/workbench/overview", async (route) => {
+    workbenchRequests.push(route.request().url());
+    await route.fulfill({ json: overview });
   });
   await page.route("**/api/vaults", async (route) => {
+    vaultRequests.push(route.request().url());
     await route.fulfill({ json: { vaults: [firstVault, secondVault] } });
   });
 
   await page.goto("/");
-  await expect(page.getByLabel("图谱节点").getByRole("button", { name: /one/ })).toBeVisible();
-  await expect.poll(() => graphRequests.filter((url) => url.includes("/api/vaults/vault-graph-first/graph") && !url.includes("/events")).length).toBeGreaterThanOrEqual(2);
-  await expect(page.getByText("已确认（实线）：notes/one.md -> notes/two.md")).toBeVisible();
-  await expect(page.getByText("失败对象：notes/two.md")).toBeVisible();
-  const candidate = page.getByRole("button", { name: "候选（虚线）：notes/two.md -> notes/one.md" });
-  await candidate.focus();
-  await expect(candidate).toBeFocused();
-  await page.getByLabel("按关系状态筛选图谱").selectOption("candidate");
-  await expect(page.getByText("候选（虚线）：notes/two.md -> notes/one.md")).toBeVisible();
-  await expect(graphRequests.at(-1)).toContain("relationship_state=candidate");
-  await page.getByLabel("当前 vault").selectOption("vault-graph-second");
-  await expect(page.getByRole("button", { name: /other/ })).toBeVisible();
-  expect(graphRequests.at(-1)).not.toContain("relationship_state=");
-  await expect(page.getByText("notes/one.md")).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Vault 全景" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "First Graph Vault 当前工作上下文" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Second Graph Vault 已授权资料库" })).toBeVisible();
+  expect(workbenchRequests).toEqual([`${baseUrl}/api/workbench/overview`]);
+  expect(vaultRequests).toEqual([]);
+  expect(graphRequests).toEqual([]);
+
+  await page.getByRole("link", { name: "资料" }).click();
+  await expect(page.getByRole("button", { name: "First Graph Vault" })).toBeVisible();
+  expect(vaultRequests).toEqual([`${baseUrl}/api/vaults`]);
+
+  await page.getByRole("link", { name: "工作台" }).click();
+
+  await page.getByRole("button", { name: "First Graph Vault 当前工作上下文" }).click();
+  const drawer = page.getByRole("dialog", { name: "First Graph Vault详情" });
+  await expect(drawer).toBeVisible();
+  await drawer.getByRole("tab", { name: "图谱" }).click();
+  await expect(drawer.getByLabel("知识图谱摘要")).toContainText("节点");
+  await expect(drawer.getByText("one")).toBeVisible();
+  expect(graphRequests).toEqual([`${baseUrl}/api/vaults/vault-graph-first/graph?relationship_state=all`]);
+
+  await page.keyboard.press("Escape");
+  await expect(drawer).toBeHidden();
 });
 
-test("does not render a stale graph while a vault switch is completing", async ({ page }) => {
+test("does not render a stale graph when the selected drawer changes", async ({ page }) => {
   const firstVault = {
     vault_id: "vault-race-first",
     path: "C:\\fixture\\First Race Vault",
@@ -199,6 +227,39 @@ test("does not render a stale graph while a vault switch is completing", async (
     index: { status: "healthy", current_count: 1, stale_count: 0, failure_count: 0, pending_count: 0, failed_paths: [], stale_paths: [], semantic_status: "unavailable" }
   };
   const secondVault = { ...firstVault, vault_id: "vault-race-second", path: "C:\\fixture\\Second Race Vault", is_current: false };
+  const overview = {
+    updated_at: "2026-08-07T09:30:00+00:00",
+    vaults: [
+      {
+        vault_id: firstVault.vault_id,
+        display_name: "First Race Vault",
+        authorization_status: "active",
+        access_status: "available",
+        access_reason: null,
+        is_current: true,
+        updated_at: "2026-08-07T09:20:00+00:00",
+        state: "healthy",
+        index: { ...firstVault.index, updated_at: "2026-08-07T09:20:00+00:00", semantic_covered_block_count: 0, semantic_eligible_block_count: 0 },
+        tasks: { total: 0, running: 0, attention: 0, completed: 0, latest_at: null },
+        sessions: { total: 0, latest_at: null }
+      },
+      {
+        vault_id: secondVault.vault_id,
+        display_name: "Second Race Vault",
+        authorization_status: "active",
+        access_status: "available",
+        access_reason: null,
+        is_current: false,
+        updated_at: "2026-08-07T09:20:00+00:00",
+        state: "healthy",
+        index: { ...secondVault.index, updated_at: "2026-08-07T09:20:00+00:00", semantic_covered_block_count: 0, semantic_eligible_block_count: 0 },
+        tasks: { total: 0, running: 0, attention: 0, completed: 0, latest_at: null },
+        sessions: { total: 0, latest_at: null }
+      }
+    ],
+    attention: [],
+    activity: []
+  };
   const firstGraph = {
     vault_id: firstVault.vault_id,
     nodes: [{ relative_path: "notes/first.md", title: "first", directory: "first-directory", tags: [], source: "native" }],
@@ -216,7 +277,6 @@ test("does not render a stale graph while a vault switch is completing", async (
   };
   let releaseFirstGraph;
   let releaseSecondGraph;
-  let releaseSwitch;
 
   await page.route("**/api/vaults/vault-race-first/graph**", async (route) => {
     await new Promise((resolve) => {
@@ -234,33 +294,29 @@ test("does not render a stale graph while a vault switch is completing", async (
       };
     });
   });
-  await page.route("**/api/vaults/vault-race-second/current", async (route) => {
-    await new Promise((resolve) => {
-      releaseSwitch = async () => {
-        await route.fulfill({ json: { vault: { ...secondVault, is_current: true } } });
-        resolve();
-      };
-    });
-  });
-  await page.route("**/api/vaults/*/graph/events", async (route) => {
-    await route.fulfill({ contentType: "text/event-stream", body: ": connected\n\n" });
+  await page.route("**/api/workbench/overview", async (route) => {
+    await route.fulfill({ json: overview });
   });
   await page.route("**/api/vaults", async (route) => {
     await route.fulfill({ json: { vaults: [firstVault, secondVault] } });
   });
 
   await page.goto("/");
+  await page.getByRole("button", { name: "First Race Vault 当前工作上下文" }).click();
+  const firstDrawer = page.getByRole("dialog", { name: "First Race Vault详情" });
+  await firstDrawer.getByRole("tab", { name: "图谱" }).click();
   await expect.poll(() => Boolean(releaseFirstGraph)).toBe(true);
-  await page.getByLabel("当前 vault").selectOption(secondVault.vault_id);
-  await expect.poll(() => Boolean(releaseSwitch)).toBe(true);
-  await releaseFirstGraph();
-  await releaseSwitch();
-  await expect(page.getByLabel("当前 vault")).toHaveValue(secondVault.vault_id);
-  await expect(page.getByLabel("图谱节点").getByRole("button", { name: "first" })).toHaveCount(0);
-  await expect(page.getByLabel("按目录筛选图谱").getByRole("option", { name: "first-directory" })).toHaveCount(0);
+  await page.keyboard.press("Escape");
+  await expect(firstDrawer).toBeHidden();
+
+  await page.getByRole("button", { name: "Second Race Vault 已授权资料库" }).click();
+  const secondDrawer = page.getByRole("dialog", { name: "Second Race Vault详情" });
+  await secondDrawer.getByRole("tab", { name: "图谱" }).click();
   await expect.poll(() => Boolean(releaseSecondGraph)).toBe(true);
+  await releaseFirstGraph();
+  await expect(secondDrawer.getByText("first")).toHaveCount(0);
   await releaseSecondGraph();
-  await expect(page.getByRole("button", { name: /second/ })).toBeVisible();
+  await expect(secondDrawer.getByText("second")).toBeVisible();
 });
 
 test("uses a keyboard-accessible single navigation panel at narrow desktop widths", async ({ page }) => {
@@ -367,9 +423,9 @@ test("keeps exactly one current vault after switching", async ({ page }) => {
   await page.getByRole("button", { name: /Second Vault/ }).click();
   await page.getByRole("button", { name: "设为当前 vault" }).click();
 
-  await expect(page.getByText("本机 / 当前 vault：Second Vault")).toBeVisible();
+  await expect(page.locator(".context-vault-marker")).toHaveText("Second Vault");
   await page.getByRole("button", { name: "返回 vault 列表" }).click();
-  await expect(page.locator(".vault-list .row-status").filter({ hasText: "当前" })).toHaveCount(1);
+  await expect(page.locator(".vault-list .row-status").filter({ hasText: "当前" })).toHaveCount(0);
 });
 
 test("cancels an open vault form when navigating to another workspace", async ({ page }) => {
@@ -694,6 +750,18 @@ test("runs import tasks automatically and keeps suggestions read-only", async ({
             markdown: "# Chapter Two\n\nMore preview text"
           }]
         }],
+        source_parses: [{
+          item_id: 1,
+          blocks: [{
+            kind: "heading",
+            location: "第 1 页",
+            content: "Chapter One"
+          }, {
+            kind: "paragraph",
+            location: "第 1 页",
+            content: "Source parsing preview text"
+          }]
+        }],
         classification_suggestions: [{
           item_id: 1,
           revision: 1,
@@ -828,6 +896,9 @@ test("runs import tasks automatically and keeps suggestions read-only", async ({
   await expect(page.getByText("已解析 1")).toBeVisible();
   await expect(page.getByText("已解析；已选择完整转换图；OCR 完成", { exact: true })).toBeVisible();
   await expect(page.getByText("PDF（电子/扫描待识别）")).toBeVisible();
+  const sourceParses = page.getByLabel("源解析内容");
+  await expect(sourceParses.getByRole("heading", { name: "源解析内容" })).toBeVisible();
+  await expect(sourceParses).toContainText("Source parsing preview text");
   const markdownResults = page.getByLabel("Markdown 结果");
   await expect(markdownResults.getByRole("heading", { name: "Markdown 结果" })).toBeVisible();
   await expect(markdownResults.locator("pre.markdown-preview").nth(0)).toContainText("# Book index");
@@ -845,6 +916,7 @@ test("runs import tasks automatically and keeps suggestions read-only", async ({
   await expect(page.locator("body")).not.toContainText("task-import");
   await expect(page.locator("body")).not.toContainText("unit:0");
   await expect(page.locator("body")).not.toContainText("page 2 box:10,20,60,12");
+  await expect(page.locator("body")).not.toContainText("internal-block-id");
   await expect(page.locator(".commit-journal-list")).toBeVisible();
 });
 
@@ -1063,6 +1135,75 @@ test("shows a task loading failure instead of an empty task list", async ({ page
   await expect(page.getByText("当前没有导入任务。")).toHaveCount(0);
 });
 
+test("deletes selected current-page tasks while retaining an item that fails safe deletion", async ({ page }) => {
+  const vault = {
+    vault_id: "vault-bulk-delete",
+    display_name: "Bulk Delete Vault",
+    authorization_status: "active",
+    access_status: "available",
+    is_current: true
+  };
+  const task = (taskId, scopeLabel, lifecycle = "complete") => ({
+    task_id: taskId,
+    vault_id: vault.vault_id,
+    vault_label: vault.display_name,
+    scope_label: scopeLabel,
+    lifecycle,
+    phase: lifecycle === "running" ? "scanning" : "completed",
+    current_item_label: null,
+    counts: { discovered: 1, new: 1, duplicate: 0, possible_version: 0, identity_failed: 0, parsed: 1, parse_failed: 0, required_check: 0, failed: 0 },
+    recovery_actions: [],
+    failure_reason: null,
+    parent_task_id: null,
+    created_at: "2026-08-12T00:00:00+00:00",
+    updated_at: "2026-08-12T00:00:00+00:00"
+  });
+  const first = task("task-delete-first", "first.pdf");
+  const running = task("task-delete-running", "running.pdf", "running");
+  const third = task("task-delete-third", "third.pdf");
+  const deletedTaskIds = [];
+
+  await page.route("**/api/vaults", async (route) => {
+    await route.fulfill({ json: { vaults: [vault] } });
+  });
+  await page.route("**/api/import-tasks", async (route) => {
+    await route.fulfill({ json: { tasks: [first, running, third] } });
+  });
+  await page.route("**/api/import-tasks/*", async (route) => {
+    const taskId = new URL(route.request().url()).pathname.split("/").at(-1);
+    deletedTaskIds.push(taskId);
+    if (taskId === third.task_id) {
+      await route.fulfill({
+        status: 409,
+        json: { message: "Vault 文件已被修改。" }
+      });
+      return;
+    }
+    await route.fulfill({ status: 204 });
+  });
+
+  await page.goto("/");
+  await page.getByRole("link", { name: "任务", exact: true }).click();
+  const selectAll = page.getByRole("checkbox", { name: "全选当前页可删除任务" });
+  await expect(selectAll).toBeVisible();
+  await expect(page.getByRole("checkbox", { name: "选择任务 running.pdf" })).toHaveCount(0);
+  await selectAll.check();
+  await expect(page.getByText("已选择 2 项", { exact: true })).toBeVisible();
+
+  page.once("dialog", (dialog) => {
+    expect(dialog.message()).toContain("删除所选 2 个任务");
+    void dialog.accept();
+  });
+  await page.getByRole("button", { name: "删除所选", exact: true }).click();
+
+  await expect.poll(() => deletedTaskIds).toEqual([first.task_id, third.task_id]);
+  await expect(page.getByText("first.pdf", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("running.pdf", { exact: true })).toBeVisible();
+  await expect(page.getByText("third.pdf", { exact: true })).toBeVisible();
+  await expect(page.getByRole("checkbox", { name: "选择任务 third.pdf" })).toBeChecked();
+  await expect(page.getByText("无法删除导入任务：third.pdf：Vault 文件已被修改。", { exact: true })).toBeVisible();
+});
+
 test("configures independent chat and Rerank models without requiring an Embedding model", async ({ page }) => {
   let providers = [];
   let defaults = {
@@ -1200,15 +1341,18 @@ test("configures independent chat and Rerank models without requiring an Embeddi
   await expect(page.getByText("服务健康：通过")).toBeVisible();
   await expect(page.getByRole("heading", { name: "Embedding 模型" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Rerank（重排）模型" })).toBeVisible();
-  await page.getByLabel("model/chat::primary 模型类型").selectOption("chat");
-  await page.getByRole("button", { name: "测试模型" }).click();
-  await expect(page.getByText("模型验证已完成。")).toBeVisible();
+  await expect(page.getByText("model/chat::primary", { exact: true })).toHaveCount(0);
+  await page.getByRole("button", { name: "添加模型" }).click();
+  await page.getByLabel("类型").selectOption("chat");
+  await page.getByRole("button", { name: "添加并验证" }).click();
+  await expect(page.getByText("模型已添加并验证。", { exact: true })).toBeVisible();
+  await expect(page.getByLabel("model/chat::primary 模型类型")).toHaveValue("chat");
   await page.getByLabel("全局对话/文本生成 Model").selectOption(JSON.stringify(["provider-test", "model/chat::primary"]));
   await expect(page.getByText("对话/文本生成默认 Model 已更新。")).toBeVisible();
   await page.getByLabel("全局对话/文本生成 Model").selectOption("");
   await expect(page.getByText("对话/文本生成默认 Model 已清除。")).toBeVisible();
   await page.getByLabel("model/chat::primary 模型类型").selectOption("rerank");
-  await page.getByRole("button", { name: "测试模型" }).click();
+  await expect(page.getByText("模型类型已更新并验证。", { exact: true })).toBeVisible();
   await page.getByLabel("全局 Rerank（重排）Model").selectOption(JSON.stringify(["provider-test", "model/chat::primary"]));
   await expect(page.getByText("Rerank（重排）默认 Model 已更新。")).toBeVisible();
   const deleteButton = page.getByRole("button", { name: "删除" });
@@ -1347,10 +1491,11 @@ test("manages bounded private sessions without inheriting a vault or closing del
   const messageList = page.locator(".session-message-list");
   const turnNavigator = page.getByLabel("问答定位");
   await expect(turnNavigator.getByRole("button")).toHaveCount(2);
+  await expect(messageList).toHaveCSS("scroll-behavior", "auto");
   await expect.poll(() => messageList.evaluate((element) => element.scrollTop)).toBeGreaterThan(32);
   await turnNavigator.getByRole("button").first().click();
   await expect.poll(() => messageList.evaluate((element) => element.scrollTop)).toBeLessThan(32);
-  await expect(page.getByText("notes/algebra.md", { exact: true })).toBeVisible();
+  await expect(page.getByText("algebra.md", { exact: true })).toBeVisible();
   await expect(page.getByText("第 1 / 2 页", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "下一页" }).click();
   await expect(page.getByRole("button", { name: /会话 26/ })).toBeVisible();
@@ -1627,8 +1772,8 @@ test("submits the selected session context and question in one request", async (
   await expect(conversation).toContainText("可直接使用的回答。");
   await expect(conversation).toContainText("[1]");
   await expect(conversation).not.toContainText("可提交给模型的证据");
-  await expect(page.getByRole("complementary", { name: "应用证据" })).toContainText("notes/unit.md");
-  await conversation.getByRole("link", { name: "查看来源 notes/unit.md" }).click();
+  await expect(page.getByRole("complementary", { name: "应用证据" })).toContainText("unit.md");
+  await conversation.getByRole("link", { name: "查看来源 unit.md" }).click();
   await expect.poll(() => page.evaluate(() => document.activeElement?.id || "")).toMatch(/^application-evidence-/);
   await page.getByRole("button", { name: "复制正文", exact: true }).click();
   await expect.poll(() => page.evaluate(() => globalThis.__copiedSessionAnswer)).toBe("可直接使用的回答。");
@@ -1723,7 +1868,7 @@ test("renders keyboard-accessible paragraph editing and verification controls", 
   await expect(conversation).toContainText("[1]");
   await expect(conversation).not.toContainText("Provider：provider-1");
   await expect(conversation).not.toContainText("用户约束：仅限本地资料。");
-  await expect(page.getByRole("complementary", { name: "应用证据" })).toContainText("notes/unit.md");
+  await expect(page.getByRole("complementary", { name: "应用证据" })).toContainText("unit.md");
 
   const editButton = page.getByRole("button", { name: "编辑回答", exact: true });
   await editButton.focus();
@@ -1878,8 +2023,9 @@ test("moves uncited source-lookup material into the application-evidence pane", 
   await expect(evidencePane.locator(".session-citation")).toHaveCount(3);
   await expect(evidenceRows).toHaveCount(3);
   await evidenceRows.first().locator("summary").click();
-  await expect(evidencePane).toContainText("知识库：Session Vault");
-  await expect(evidenceRows.first()).toContainText("原始资料：sources/lesson.pdf");
+  await expect(evidencePane).not.toContainText("知识库：Session Vault");
+  await expect(evidenceRows.first()).toContainText("原始资料：lesson.pdf");
+  await expect(evidencePane).not.toContainText("notes/lesson-a.md");
   await expect(evidenceRows.first()).not.toContainText("source-lesson");
   await expect(evidenceRows.first()).not.toContainText("b".repeat(64));
 });
@@ -1937,7 +2083,7 @@ test("shows completeness coverage gaps and stale sources without claiming comple
   await expect(page.getByText("排除 1 项", { exact: true })).toBeVisible();
   const excluded = page.getByRole("complementary", { name: "应用证据" })
     .locator(".session-citation")
-    .filter({ hasText: "notes/excluded.md" })
+    .filter({ hasText: "excluded.md" })
     .locator(".evidence-row");
   await excluded.locator("summary").click();
   await expect(excluded).toContainText("内容被当前排除规则确认排除。");

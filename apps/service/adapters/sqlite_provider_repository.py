@@ -4,12 +4,14 @@ import json
 import sqlite3
 from pathlib import Path
 
+from domain.markdown_structuring import MarkdownProviderChunkBudget
 from domain.providers import ModelSelection, ProbeResult, Provider, ProviderModel, ProviderProbeResults
 from domain.tasks import utc_now
 
 
 _RERANK_MODEL_TYPE_MIGRATION_ID = "ret-09-02-provider-rerank-model-type-v1"
 _MARKDOWN_MODEL_TYPE_MIGRATION_ID = "ret-17-01-provider-markdown-model-type-v1"
+_MARKDOWN_CHUNK_BUDGET_MIGRATION_ID = "ret-23-01-provider-markdown-chunk-budget-v1"
 _LEGACY_MODEL_TYPES = frozenset({"chat", "embedding"})
 
 
@@ -56,6 +58,7 @@ class SqliteProviderRepository:
             self._migrate_legacy_default(connection)
             self._apply_rerank_model_type_migration(connection)
             self._apply_markdown_model_type_migration(connection)
+            self._apply_markdown_chunk_budget_migration(connection)
 
     @staticmethod
     def _add_model_columns(connection: sqlite3.Connection) -> None:
@@ -170,6 +173,43 @@ class SqliteProviderRepository:
         else:
             connection.execute("RELEASE provider_markdown_model_type_migration")
 
+    @staticmethod
+    def _apply_markdown_chunk_budget_migration(connection: sqlite3.Connection) -> None:
+        connection.execute("SAVEPOINT provider_markdown_chunk_budget_migration")
+        try:
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS provider_schema_migrations (
+                    migration_id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"""
+            )
+            applied = connection.execute(
+                "SELECT 1 FROM provider_schema_migrations WHERE migration_id = ?",
+                (_MARKDOWN_CHUNK_BUDGET_MIGRATION_ID,),
+            ).fetchone()
+            if applied is None:
+                connection.execute("""CREATE TABLE markdown_structure_budgets (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    minimum_tokens INTEGER NOT NULL,
+                    target_tokens INTEGER NOT NULL,
+                    maximum_tokens INTEGER NOT NULL,
+                    CHECK (minimum_tokens >= 1 AND minimum_tokens <= target_tokens
+                        AND target_tokens <= maximum_tokens AND maximum_tokens <= 20000))""")
+                budget = MarkdownProviderChunkBudget()
+                connection.execute(
+                    """INSERT INTO markdown_structure_budgets
+                    (singleton, minimum_tokens, target_tokens, maximum_tokens) VALUES (1, ?, ?, ?)""",
+                    (budget.minimum_tokens, budget.target_tokens, budget.maximum_tokens),
+                )
+                connection.execute(
+                    "INSERT INTO provider_schema_migrations (migration_id, applied_at) VALUES (?, ?)",
+                    (_MARKDOWN_CHUNK_BUDGET_MIGRATION_ID, utc_now()),
+                )
+        except Exception:
+            connection.execute("ROLLBACK TO provider_markdown_chunk_budget_migration")
+            connection.execute("RELEASE provider_markdown_chunk_budget_migration")
+            raise
+        else:
+            connection.execute("RELEASE provider_markdown_chunk_budget_migration")
+
     def save(self, provider: Provider) -> None:
         with self._connect() as connection:
             connection.execute("""INSERT INTO providers (provider_id, name, endpoint, credential_reference,
@@ -244,6 +284,25 @@ class SqliteProviderRepository:
             connection.execute("DELETE FROM model_defaults_v2 WHERE model_type = ?", (model_type,))
             if model_type in _LEGACY_MODEL_TYPES:
                 connection.execute("DELETE FROM model_defaults WHERE model_type = ?", (model_type,))
+
+    def get_markdown_structure_budget(self) -> MarkdownProviderChunkBudget:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT minimum_tokens, target_tokens, maximum_tokens FROM markdown_structure_budgets WHERE singleton = 1"
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("Markdown structure budget is not initialized.")
+        return MarkdownProviderChunkBudget(
+            row["minimum_tokens"], row["target_tokens"], row["maximum_tokens"]
+        )
+
+    def save_markdown_structure_budget(self, budget: MarkdownProviderChunkBudget) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """UPDATE markdown_structure_budgets
+                SET minimum_tokens = ?, target_tokens = ?, maximum_tokens = ? WHERE singleton = 1""",
+                (budget.minimum_tokens, budget.target_tokens, budget.maximum_tokens),
+            )
 
     @staticmethod
     def _provider_from_row(row: sqlite3.Row, models: list[sqlite3.Row]) -> Provider:

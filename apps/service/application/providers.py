@@ -19,6 +19,7 @@ from domain.providers import (
     ProviderProbeResults,
     ResolvedProviderModel,
 )
+from domain.markdown_structuring import MAX_MARKDOWN_PROVIDER_OUTPUT_TOKENS, MarkdownProviderChunkBudget
 from ports.credential_store import CredentialStore
 from ports.provider_client import ProviderClient, ProviderClientError
 from ports.provider_repository import ProviderRepository
@@ -120,6 +121,19 @@ class ProviderService:
 
     def list(self) -> list[Provider]:
         return self.repository.list()
+
+    def markdown_structure_budget(self) -> MarkdownProviderChunkBudget:
+        return self.repository.get_markdown_structure_budget()
+
+    def set_markdown_structure_budget(
+        self, minimum_tokens: int, target_tokens: int, maximum_tokens: int
+    ) -> MarkdownProviderChunkBudget:
+        try:
+            budget = MarkdownProviderChunkBudget(minimum_tokens, target_tokens, maximum_tokens)
+        except ValueError as error:
+            raise ProviderValidationError(str(error)) from error
+        self.repository.save_markdown_structure_budget(budget)
+        return budget
 
     def delete(self, provider_id: str) -> None:
         with self._provider_lock(provider_id):
@@ -366,7 +380,10 @@ class ProviderService:
         normalized_prompt = prompt.strip()
         if not normalized_prompt or len(normalized_prompt) > 200_000:
             raise ProviderUnavailableError("The Markdown structuring request is invalid.")
-        if type(max_output_tokens) is not int or not 1 <= max_output_tokens <= 4_096:
+        if (
+            type(max_output_tokens) is not int
+            or not 1 <= max_output_tokens <= MAX_MARKDOWN_PROVIDER_OUTPUT_TOKENS
+        ):
             raise ProviderUnavailableError("The Markdown structuring output token limit is invalid.")
         if expected_provider_updated_at is not None and not expected_provider_updated_at:
             raise ProviderUnavailableError("The Markdown Provider configuration revision is invalid.")

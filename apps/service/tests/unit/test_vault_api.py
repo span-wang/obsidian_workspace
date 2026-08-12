@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 from adapters.windows_directory_picker import WindowsDirectoryPicker
-from application.providers import utc_now
+from application.providers import ProviderValidationError, utc_now
 from application.unit_card_service import UnitCardExecutionError
 from api.main import create_app, publish_graph_refresh
 from api.runtime import RuntimeState
@@ -17,7 +17,9 @@ from domain.embeddings import EmbeddingProfileLocator
 from domain.graph_projection import DurableGraphProjection, GraphProjectionBlock
 from domain.indexing import IndexBlock, IndexBlockMetadata, IndexedDocument, LexicalQuery
 from domain.metadata_extraction import MetadataCandidate
+from domain.markdown_structuring import MarkdownProviderChunkBudget
 from domain.providers import ModelSelection, ProbeResult, Provider, ProviderModel, ProviderProbeResults, ResolvedProviderModel
+from workers.converters.provisioning import ProvisionedProfiles
 
 
 class FakeDirectoryPicker(WindowsDirectoryPicker):
@@ -37,6 +39,53 @@ def create_app_for_test(tmp_path: Path, picker: WindowsDirectoryPicker, provider
     )
 
 
+def test_index_reconciliation_does_not_delay_the_health_endpoint(tmp_path: Path) -> None:
+    reconciliation_started = threading.Event()
+    allow_reconciliation_to_finish = threading.Event()
+    reconciliation_finished = threading.Event()
+
+    class BlockingIndexingService:
+        repository = SimpleNamespace()
+
+        def reconcile_all(self) -> None:
+            reconciliation_started.set()
+            allow_reconciliation_to_finish.wait(timeout=1)
+            reconciliation_finished.set()
+
+    app = create_app(
+        runtime=RuntimeState(data_directory=tmp_path / "app-data", sqlite_version="3.45.1"),
+        directory_picker=FakeDirectoryPicker(tmp_path),
+        indexing_service=BlockingIndexingService(),
+        converter_profiles=ProvisionedProfiles(
+            tmp_path / "converters",
+            {},
+            {
+                "mineru": "test-disabled",
+                "pandoc": "test-disabled",
+                "docling": "test-disabled",
+                "paddleocr-vl": "test-disabled",
+            },
+        ),
+    )
+
+    async def verify() -> None:
+        async with app.router.lifespan_context(app):
+            try:
+                assert reconciliation_started.wait(timeout=1)
+                assert not reconciliation_finished.is_set()
+                health = next(
+                    route.endpoint
+                    for route in app.router.routes
+                    if getattr(route, "path", None) == "/api/health"
+                )
+                assert health()["status"] == "ok"
+            finally:
+                allow_reconciliation_to_finish.set()
+        assert reconciliation_finished.wait(timeout=1)
+
+    asyncio.run(verify())
+
+
 class FakeProviderService:
     def __init__(self) -> None:
         self.providers: dict[str, Provider] = {}
@@ -44,6 +93,7 @@ class FakeProviderService:
         self.secrets: list[str | None] = []
         self.embedding_inputs: list[tuple[str, ...]] = []
         self.metadata_prompts: list[str] = []
+        self.markdown_budget = MarkdownProviderChunkBudget()
 
     def create(self, name: str, endpoint: str, secret: str | None = None) -> Provider:
         self.secrets.append(secret)
@@ -102,6 +152,20 @@ class FakeProviderService:
 
     def clear_default(self, model_type: str) -> None:
         self.defaults.pop(model_type, None)
+
+    def markdown_structure_budget(self) -> MarkdownProviderChunkBudget:
+        return self.markdown_budget
+
+    def set_markdown_structure_budget(
+        self, minimum_tokens: int, target_tokens: int, maximum_tokens: int
+    ) -> MarkdownProviderChunkBudget:
+        try:
+            self.markdown_budget = MarkdownProviderChunkBudget(
+                minimum_tokens, target_tokens, maximum_tokens
+            )
+        except ValueError as error:
+            raise ProviderValidationError(str(error)) from error
+        return self.markdown_budget
 
     def resolve_model(self, model_type: str) -> ResolvedProviderModel:
         selection = self.defaults.get(model_type)
@@ -265,6 +329,32 @@ def test_vault_commands_require_a_local_session_and_use_the_native_picker(tmp_pa
     assert json.loads(unauthenticated_body)["code"] == "local_session_required"
     assert root_status == 200
     assert selection_id
+
+
+def test_workbench_overview_requires_a_local_session_and_omits_vault_paths(tmp_path: Path) -> None:
+    vault_path = tmp_path / "vault"
+    vault_path.mkdir()
+    app = create_app_for_test(tmp_path, FakeDirectoryPicker(vault_path))
+
+    denied_status, _, _ = asgi_request(app, "GET", "/api/workbench/overview")
+    _, root_headers, _ = asgi_request(app, "GET", "/")
+    cookie = root_headers["set-cookie"].split(";", maxsplit=1)[0]
+    selection_id = select_directory(app, cookie)
+    asgi_request(
+        app,
+        "POST",
+        "/api/vaults",
+        body={"selection_id": selection_id, "managed_root": "platform"},
+        cookie=cookie,
+    )
+    status, _, body = asgi_request(app, "GET", "/api/workbench/overview", cookie=cookie)
+    payload = json.loads(body)
+
+    assert denied_status == 403
+    assert status == 200
+    assert payload["vaults"][0]["display_name"] == "vault"
+    assert "path" not in payload["vaults"][0]
+    assert "managed_root" not in payload["vaults"][0]
 
 
 def test_unit_card_execution_api_preserves_stable_blocked_error_codes(tmp_path: Path) -> None:
@@ -872,6 +962,49 @@ def test_metadata_api_runs_without_an_authorization_and_keeps_block_text_private
     assert body_text.encode() not in execute_body
     assert body_text.encode() not in candidates_body
     assert provider_service.metadata_prompts
+
+
+def test_markdown_structure_budget_api_requires_a_local_session_and_persists_valid_values(
+    tmp_path: Path,
+) -> None:
+    provider_service = FakeProviderService()
+    app = create_app_for_test(
+        tmp_path, FakeDirectoryPicker(tmp_path / "vault"), provider_service=provider_service
+    )
+    _, root_headers, _ = asgi_request(app, "GET", "/")
+    cookie = root_headers["set-cookie"].split(";", maxsplit=1)[0]
+
+    denied_status, _, _ = asgi_request(
+        app, "GET", "/api/providers/markdown-structuring/budget"
+    )
+    get_status, _, get_body = asgi_request(
+        app, "GET", "/api/providers/markdown-structuring/budget", cookie=cookie
+    )
+    update_status, _, update_body = asgi_request(
+        app,
+        "PUT",
+        "/api/providers/markdown-structuring/budget",
+        body={"minimum_tokens": 10_000, "target_tokens": 15_000, "maximum_tokens": 20_000},
+        cookie=cookie,
+    )
+    invalid_status, _, _ = asgi_request(
+        app,
+        "PUT",
+        "/api/providers/markdown-structuring/budget",
+        body={"minimum_tokens": 16_000, "target_tokens": 10_000, "maximum_tokens": 20_000},
+        cookie=cookie,
+    )
+
+    assert denied_status == 403
+    assert get_status == 200
+    assert json.loads(get_body)["budget"] == {
+        "minimum_tokens": 10_000,
+        "target_tokens": 16_000,
+        "maximum_tokens": 20_000,
+    }
+    assert update_status == 200
+    assert json.loads(update_body)["budget"]["target_tokens"] == 15_000
+    assert invalid_status == 400
 
 
 def test_provider_api_requires_a_local_session_and_never_returns_submitted_credentials(

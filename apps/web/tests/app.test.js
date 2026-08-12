@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -15,8 +18,14 @@ import {
   HEALTH_ENDPOINT,
   IMPORT_DIRECTORY_SELECTION_ENDPOINT,
   IMPORT_FILES_SELECTION_ENDPOINT,
+  loadOnlineParseProviderId,
+  MARKDOWN_STRUCTURE_BUDGET_ENDPOINT,
+  ONLINE_PARSE_PROVIDERS_ENDPOINT,
+  ONLINE_PARSE_SELECTION_STORAGE_KEY,
   IMPORT_UPLOAD_ENDPOINT,
   ImportTaskCenter,
+  ImportParserTag,
+  ImportContentComparison,
   IMPORT_TASK_EVENT_NAMES,
   IMPORT_TASKS_ENDPOINT,
   KnowledgeGraphWorkbench,
@@ -27,21 +36,42 @@ import {
   ProviderManagement,
   PROVIDERS_ENDPOINT,
   RETRIEVAL_MODE_ENDPOINT,
+  saveOnlineParseProviderId,
   SESSIONS_ENDPOINT,
   SessionManagement,
   TagManagement,
+  WORKBENCH_OVERVIEW_ENDPOINT,
   userFacingEvidenceLocation,
   userFacingEvidenceSource,
   userFacingImportIssue,
   userFacingImportLocation,
   userFacingSourceSample,
   VaultIndexStatus,
-  VAULTS_ENDPOINT
+  VAULTS_ENDPOINT,
+  WorkbenchOverview
 } from "../src/app.js";
 
 function visibleText(markup) {
   return markup.replace(/<[^>]*>/g, "");
 }
+
+test("changes retrieval mode without writing session history status or reloading session data", () => {
+  const testDirectory = dirname(fileURLToPath(import.meta.url));
+  const source = readFileSync(resolve(testDirectory, "../src/app.js"), "utf8");
+  const sessionComponentStart = source.indexOf("export function SessionManagement");
+  const handlerStart = source.indexOf("async function changeRetrievalMode(mode)", sessionComponentStart);
+  const handlerEnd = source.indexOf("function retrievalStatusText", handlerStart);
+  const handler = source.slice(handlerStart, handlerEnd);
+  const appHandlerStart = source.indexOf("async function changeRetrievalMode(mode)", handlerEnd);
+  const appHandlerEnd = source.indexOf("const loadSessionDetail", appHandlerStart);
+  const appHandler = source.slice(appHandlerStart, appHandlerEnd);
+
+  assert.ok(handlerStart > sessionComponentStart);
+  assert.doesNotMatch(handler, /setStatus\(/);
+  assert.match(handler, /setRetrievalModeError\(requestError\.message\)/);
+  assert.match(handler, /await onRetrievalModeChange\(mode\)/);
+  assert.doesNotMatch(appHandler, /loadSessions|loadSessionDetail/);
+});
 
 test("formats source metadata for readers without exposing internal identity", () => {
   const internalLocation = "graph:745b58a99c49033e041e15dbef498fafb0a24a450ff32ac6d087c996ed60aec1:1:f50de8acf3da3b02d96907d440f394d268753f4b4409bcc2e631814fe9fb263c#chunk:1";
@@ -55,7 +85,8 @@ test("formats source metadata for readers without exposing internal identity", (
   assert.equal(userFacingEvidenceLocation({ location: "word/document.xml:42" }), "");
   assert.equal(userFacingEvidenceLocation({ location: "line:42" }), "");
   assert.equal(userFacingEvidenceLocation({ location: "第 2 节" }), "第 2 节");
-  assert.equal(userFacingEvidenceSource({ identity_kind: "derived", source_path: "sources/book.pdf" }), "原始资料：sources/book.pdf");
+  assert.equal(userFacingEvidenceSource({ identity_kind: "derived", source_path: "sources/book.pdf" }), "原始资料：book.pdf");
+  assert.equal(userFacingEvidenceSource({ identity_kind: "derived", source_path: "sources\\book.pdf" }), "原始资料：book.pdf");
   assert.equal(userFacingEvidenceSource({ identity_kind: "native" }), "来源类型：原生 Markdown");
   assert.equal(userFacingSourceSample({ source_path: "sources/book.pdf", relative_path: "notes/book.md" }), "sources/book.pdf");
   assert.equal(userFacingSourceSample({ relative_path: "notes/native.md" }), "notes/native.md");
@@ -70,6 +101,17 @@ test("formats source metadata for readers without exposing internal identity", (
   assert.equal(userFacingImportIssue("paragraph:1: Paragraph needs review."), "Paragraph needs review.");
   assert.equal(userFacingImportIssue("image:1: Image description needs review."), "Image description needs review.");
   assert.equal(userFacingImportIssue("table:1/row:1/cell:1: Table needs review."), "Table needs review.");
+});
+
+test("marks parsed import items with their selected parser", () => {
+  const markup = renderToStaticMarkup(React.createElement(ImportParserTag, { engine: "paddleocr-vl-1.6" }));
+  const emptyMarkup = renderToStaticMarkup(React.createElement(ImportParserTag, { engine: null }));
+
+  assert.match(markup, /class="parser-tag"/);
+  assert.match(markup, /aria-label="解析器：paddleocr-vl-1\.6"/);
+  assert.match(markup, /解析器/);
+  assert.match(markup, /paddleocr-vl-1\.6/);
+  assert.equal(emptyMarkup, "");
 });
 
 test("hides derived-note provenance frontmatter from Markdown previews", () => {
@@ -112,6 +154,34 @@ test("renders automatic Markdown results as read-only previews", () => {
   assert.doesNotMatch(markup, /提交审核|接受|保存修正/);
 });
 
+test("places source parsing beside the matching structured Markdown result", () => {
+  const markup = renderToStaticMarkup(React.createElement(ImportContentComparison, {
+    items: [{ item_id: 2, label: "book.pdf" }],
+    sourceParses: [{
+      item_id: 2,
+      blocks: [
+        { kind: "heading", location: "第 1 页", content: "第一章" },
+        { kind: "paragraph", location: "第 1 页", content: "源解析正文。" }
+      ]
+    }],
+    noteProposals: [{
+      kind: "derived",
+      item_id: 2,
+      revision: 3,
+      index_note: { relative_path: "notes/book/index.md", markdown: "# Book index" },
+      notes: [{ note_id: "note-1", sequence: 1, title: "Chapter One", relative_path: "notes/book/01.md", markdown: "# 第一章\n\n结构化正文。" }]
+    }]
+  }));
+
+  assert.match(markup, /class="import-content-comparison"/);
+  assert.match(markup, /源解析内容/);
+  assert.match(markup, /book\.pdf/);
+  assert.match(markup, /第一章/);
+  assert.match(markup, /源解析正文。/);
+  assert.match(markup, /Markdown 结果/);
+  assert.match(markup, /结构化正文。/);
+});
+
 test("copies only direct answer content without application-evidence markers", async () => {
   const writes = [];
   const clipboard = { writeText: async (value) => writes.push(value) };
@@ -151,7 +221,7 @@ test("renders the five-destination local workbench shell", () => {
   assert.match(markup, /本机知识工作台/);
   assert.match(markup, /工作台/);
   assert.match(markup, /本机服务正在验证/);
-  assert.match(markup, /正在加载 vault 授权。/);
+  assert.match(markup, /正在构建 Vault 全景/);
 });
 
 test("uses relative same-origin endpoints for health and local session checks", () => {
@@ -159,8 +229,11 @@ test("uses relative same-origin endpoints for health and local session checks", 
   assert.equal(LOCAL_SESSION_ENDPOINT, "/api/session");
   assert.equal(VAULTS_ENDPOINT, "/api/vaults");
   assert.equal(PROVIDERS_ENDPOINT, "/api/providers");
+  assert.equal(MARKDOWN_STRUCTURE_BUDGET_ENDPOINT, "/api/providers/markdown-structuring/budget");
+  assert.equal(ONLINE_PARSE_PROVIDERS_ENDPOINT, "/api/online-parse-providers");
   assert.equal(SESSIONS_ENDPOINT, "/api/sessions");
   assert.equal(RETRIEVAL_MODE_ENDPOINT, "/api/retrieval/mode");
+  assert.equal(WORKBENCH_OVERVIEW_ENDPOINT, "/api/workbench/overview");
   assert.equal(IMPORT_TASKS_ENDPOINT, "/api/import-tasks");
   assert.equal(IMPORT_FILES_SELECTION_ENDPOINT, "/api/import-selections/files");
   assert.equal(IMPORT_UPLOAD_ENDPOINT, "/api/import-selections/uploads");
@@ -222,7 +295,61 @@ test("uses relative same-origin endpoints for health and local session checks", 
   ]);
 });
 
-test("renders independent Rerank and Markdown model type selectors", () => {
+test("renders a dense all-vault panorama and second-level detail drawer", () => {
+  const overview = {
+    updated_at: "2026-08-07T09:30:00+00:00",
+    vaults: [{
+      vault_id: "vault-a",
+      display_name: "研究资料",
+      authorization_status: "active",
+      access_status: "available",
+      access_reason: null,
+      is_current: true,
+      updated_at: "2026-08-07T09:20:00+00:00",
+      state: "attention",
+      index: {
+        status: "stale",
+        updated_at: "2026-08-07T09:15:00+00:00",
+        current_count: 42,
+        stale_count: 2,
+        pending_count: 1,
+        failure_count: 0,
+        semantic_status: "healthy",
+        semantic_covered_block_count: 38,
+        semantic_eligible_block_count: 42
+      },
+      tasks: { total: 3, running: 1, attention: 1, completed: 2, latest_at: "2026-08-07T09:18:00+00:00" },
+      sessions: { total: 4, latest_at: "2026-08-07T09:19:00+00:00" }
+    }],
+    attention: [{ kind: "index", vault_id: "vault-a", vault_label: "研究资料", title: "索引需要处理", detail: "失效 2；待关联 1；失败 0。", status: "attention", updated_at: "2026-08-07T09:15:00+00:00", task_id: null }],
+    activity: [{ kind: "session", vault_id: "vault-a", vault_label: "研究资料", label: "近期会话", status: "active", updated_at: "2026-08-07T09:19:00+00:00" }]
+  };
+  const markup = renderToStaticMarkup(React.createElement(WorkbenchOverview, {
+    overview,
+    isLoading: false,
+    error: "",
+    selectedVaultId: "vault-a",
+    onSelectVault: () => {},
+    onRefresh: () => {},
+    onNavigate: () => {}
+  }));
+
+  assert.match(markup, /aria-label="刷新工作台"/);
+  assert.doesNotMatch(markup, /所有 Vault，一处掌握|CONTROL DESK/);
+  assert.match(markup, /研究资料/);
+  assert.match(markup, /可检索块/);
+  assert.match(markup, /优先处理/);
+  assert.match(markup, /最近动态/);
+  assert.match(markup, /概况/);
+  assert.match(markup, /索引/);
+  assert.match(markup, /资料任务/);
+  assert.match(markup, /图谱/);
+  assert.match(markup, /会话/);
+  assert.match(markup, /策略/);
+  assert.doesNotMatch(markup, /研究资料\/platform/);
+});
+
+test("groups model defaults and Provider actions into a scannable settings layout", () => {
   const markup = renderToStaticMarkup(React.createElement(ProviderManagement, {
     providers: [{
       provider_id: "provider-1",
@@ -235,6 +362,11 @@ test("renders independent Rerank and Markdown model type selectors", () => {
         model_type: "rerank",
         is_discovered: true,
         verification: { ok: true }
+      }, {
+        model_id: "unused-provider-model",
+        model_type: null,
+        is_discovered: true,
+        verification: { ok: false, reason: "Not yet verified." }
       }]
     }],
     isLoading: false,
@@ -250,15 +382,26 @@ test("renders independent Rerank and Markdown model type selectors", () => {
     onDefaultsChange: async () => {}
   }));
 
-  assert.match(markup, /Rerank（重排）模型/);
-  assert.match(markup, /全局 Rerank（重排）Model/);
-  assert.match(markup, /默认关闭，启用后仅发送允许外发的候选。/);
-  assert.match(markup, /<option value="rerank" selected="">Rerank（重排）<\/option>/);
-  assert.match(markup, /Markdown 结构化模型/);
-  assert.match(markup, /全局 Markdown 结构化 Model/);
-  assert.match(markup, /<option value="markdown">Markdown 结构化<\/option>/);
+  assert.match(markup, /class="provider-model-settings"/);
+  assert.match(markup, /class="model-default-icon"/);
+  assert.match(markup, /候选重排/);
+  assert.match(markup, /候选重排默认模型/);
+  assert.match(markup, /默认关闭；启用后仅发送允许外发的候选。/);
+  assert.match(markup, /Rerank（重排）/);
+  assert.doesNotMatch(markup, /unused-provider-model/);
+  assert.match(markup, /添加模型/);
+  assert.match(markup, /Markdown 结构化/);
+  assert.match(markup, /Markdown 结构化默认模型/);
+  assert.match(markup, /Markdown 分块 Token 预算/);
+  assert.match(markup, /在线解析/);
+  assert.match(markup, /最小 Token/);
+  assert.match(markup, /目标 Token/);
+  assert.match(markup, /最大 Token/);
   assert.match(markup, /Rerank Provider \/ rerank-1/);
   assert.match(markup, /API Key：未配置/);
+  assert.match(markup, /aria-label="测试 Rerank Provider"/);
+  assert.match(markup, /aria-label="编辑 Rerank Provider"/);
+  assert.match(markup, /aria-label="删除 Rerank Provider"/);
 });
 
 test("renders a bounded three-pane session workspace with a context composer", () => {
@@ -418,6 +561,8 @@ test("renders a bounded three-pane session workspace with a context composer", (
   assert.match(markup, /aria-label="搜索会话"/);
   assert.match(markup, /aria-label="会话历史"/);
   assert.match(markup, /aria-label="会话内容"/);
+  assert.match(markup, /aria-label="返回会话列表"/);
+  assert.match(markup, /aria-label="查看应用证据"/);
   assert.match(markup, /aria-label="问答定位"/);
   assert.match(markup, /class="session-turn-navigator-button"/);
   const conversationMarkup = markup.slice(
@@ -436,12 +581,15 @@ test("renders a bounded three-pane session workspace with a context composer", (
   assert.match(conversationMarkup, /二次方程可用求根公式求解。/);
   assert.match(conversationMarkup, /正在更新会话内容。/);
   assert.match(conversationMarkup, /\[1\]/);
+  assert.match(conversationMarkup, /aria-label="查看来源 algebra\.md"/);
+  assert.doesNotMatch(conversationMarkup, /aria-label="查看来源 notes\/algebra\.md"/);
   assert.ok(conversationMarkup.includes(`href="#${evidenceId}"`));
   assert.match(conversationMarkup, /复制正文/);
   assert.doesNotMatch(conversationMarkup, /所用 vault：English|范围：整个 vault|Model：chat-1/);
   assert.doesNotMatch(conversationText, /原始段落摘录。|notes\/algebra\.md|知识库|检索|证据|引用/);
   assert.ok(evidenceMarkup.includes(`id="${evidenceId}"`));
-  assert.match(evidenceMarkup, /notes\/algebra\.md/);
+  assert.match(evidenceMarkup, /algebra\.md/);
+  assert.doesNotMatch(evidenceMarkup, /notes\/algebra\.md/);
   assert.match(evidenceMarkup, /原始段落摘录。/);
   assert.match(markup, /上一页/);
   assert.match(markup, /下一页/);
@@ -462,11 +610,11 @@ test("renders a bounded three-pane session workspace with a context composer", (
   assert.match(markup, /发送/);
   assert.doesNotMatch(markup, /保存语境|准备任务|固定快照|任务快照状态|执行检索/);
   assert.match(evidenceMarkup, /二次方程 · 第 2 页/);
-  assert.match(evidenceMarkup, /原始资料：sources\/algebra\.pdf/);
+  assert.match(evidenceMarkup, /原始资料：algebra\.pdf/);
   assert.doesNotMatch(evidenceMarkup, /Source ID|源内容哈希|内容哈希|来源摘要|graph:/);
   assert.doesNotMatch(evidenceMarkup, /[a-f0-9]{64}/i);
   assert.match(evidenceMarkup, /在 Obsidian 中打开/);
-  assert.match(evidenceMarkup, /知识库：Mathematics/);
+  assert.doesNotMatch(evidenceMarkup, /知识库：|Mathematics/);
   assert.match(evidenceMarkup, /\/api\/vaults\/vault-2\/open\?file=notes%2Falgebra.md/);
 });
 
@@ -495,7 +643,8 @@ test("renders completeness coverage with explicit gaps and stale source status",
   assert.match(conversationMarkup, /加载更多/);
   assert.doesNotMatch(conversationText, /根据检索证据|word|内容被排除|notes\/|知识库|检索|证据|引用/);
   assert.match(evidenceMarkup, /应用证据/);
-  assert.match(evidenceMarkup, /notes\/unit\.md/);
+  assert.match(evidenceMarkup, /unit\.md/);
+  assert.doesNotMatch(evidenceMarkup, /notes\/unit\.md/);
   assert.match(evidenceMarkup, /word/);
   assert.match(evidenceMarkup, /内容被排除/);
   assert.doesNotMatch(evidenceMarkup, /graph:|内容哈希|[ab]{64}/);
@@ -531,7 +680,8 @@ test("renders an evidence-bound knowledge organization conclusion with expandabl
   assert.match(evidenceMarkup, /应用证据/);
   assert.match(evidenceMarkup, /整理应用/);
   assert.match(evidenceMarkup, /在 Obsidian 中打开/);
-  assert.match(evidenceMarkup, /notes\/unit\/vocabulary\.md/);
+  assert.match(evidenceMarkup, /vocabulary\.md/);
+  assert.doesNotMatch(evidenceMarkup, /notes\/unit\/vocabulary\.md/);
   assert.match(evidenceMarkup, /word evidence/);
   assert.doesNotMatch(evidenceMarkup, /内容哈希|Source ID|graph:|a{64}/);
 });
@@ -569,7 +719,8 @@ test("renders deep creation as direct content with application evidence in the s
   assert.doesNotMatch(conversationText, /word evidence|模型判断|notes\/unit\/vocabulary\.md|知识库|检索|证据|引用/);
   assert.match(evidenceMarkup, /应用证据/);
   assert.match(evidenceMarkup, /创作应用/);
-  assert.match(evidenceMarkup, /notes\/unit\/vocabulary\.md/);
+  assert.match(evidenceMarkup, /vocabulary\.md/);
+  assert.doesNotMatch(evidenceMarkup, /notes\/unit\/vocabulary\.md/);
   assert.match(evidenceMarkup, /word evidence/);
   assert.doesNotMatch(evidenceMarkup, /互联网证据/);
 });
@@ -692,8 +843,9 @@ test("keeps pending-answer citations in the application-evidence pane", () => {
   assert.match(conversationMarkup, /重新确认/);
   assert.doesNotMatch(conversationText, /引用待核验|范围：notes|Provider：provider-history|用户约束|vault-history|notes\/unit\.md|知识库|检索|证据|引用/);
   assert.match(evidenceMarkup, /应用证据/);
-  assert.match(evidenceMarkup, /知识库：历史知识库不可用/);
-  assert.match(evidenceMarkup, /notes\/unit\.md/);
+  assert.doesNotMatch(evidenceMarkup, /知识库：|历史知识库不可用/);
+  assert.match(evidenceMarkup, /unit\.md/);
+  assert.doesNotMatch(evidenceMarkup, /notes\/unit\.md/);
   assert.match(evidenceMarkup, /待核验/);
 });
 
@@ -808,10 +960,11 @@ test("keeps uncited stale source-lookup evidence in the application-evidence pan
   assert.match(evidenceMarkup, /应用证据/);
   assert.match(evidenceMarkup, /定位应用/);
   assert.match(evidenceMarkup, /已失效/);
-  assert.match(evidenceMarkup, /知识库：证据 vault/);
+  assert.doesNotMatch(evidenceMarkup, /知识库：|证据 vault/);
   assert.match(evidenceMarkup, /\/api\/vaults\/vault-2\/open\?file=notes%2Fevidence.md/);
   assert.match(evidenceMarkup, /历史证据。/);
-  assert.match(evidenceMarkup, /notes\/other-evidence.md/);
+  assert.match(evidenceMarkup, /other-evidence\.md/);
+  assert.doesNotMatch(evidenceMarkup, /notes\/other-evidence\.md/);
 });
 
 test("keeps a stale generated answer instead of showing an empty source-lookup fallback", () => {
@@ -860,7 +1013,8 @@ test("keeps a stale generated answer instead of showing an empty source-lookup f
   assert.match(conversationMarkup, /保留的回答。/);
   assert.doesNotMatch(conversationMarkup, /暂未生成可用回答。/);
   assert.doesNotMatch(conversationText, /关联摘录。|notes\/unit\.md|知识库|检索|证据|引用/);
-  assert.match(evidenceMarkup, /notes\/unit\.md/);
+  assert.match(evidenceMarkup, /unit\.md/);
+  assert.doesNotMatch(evidenceMarkup, /notes\/unit\.md/);
   assert.match(evidenceMarkup, /关联摘录。/);
 });
 
@@ -931,6 +1085,7 @@ test("shows all identity counts in task center rows", () => {
     React.createElement(ImportTaskCenter, {
       tasks: [{
         task_id: "task-1",
+        vault_id: "vault-1",
         scope_label: "book.pdf",
         vault_label: "Vault",
         lifecycle: "queued",
@@ -953,8 +1108,9 @@ test("shows all identity counts in task center rows", () => {
       selectedTaskId: null,
       onSelect: () => {},
       onTaskChanged: () => {},
+      onTaskDeleted: () => {},
       onTaskSnapshot: () => {},
-      vault: null
+      vault: { vault_id: "vault-1" }
     })
   );
 
@@ -987,12 +1143,47 @@ test("offers browser file and folder uploads for an available vault", () => {
   assert.match(markup, /aria-label="上传本机资料文件"/);
   assert.match(markup, /aria-label="上传本机资料文件夹"/);
   assert.match(markup, /webkitdirectory=""/);
+  assert.doesNotMatch(markup, /选择服务机文件/);
   assert.match(markup, />上传文件夹<\/button>/);
+});
+
+test("requires an explicit online parse Provider selection", () => {
+  const testDirectory = dirname(fileURLToPath(import.meta.url));
+  const source = readFileSync(resolve(testDirectory, "../src/app.js"), "utf8");
+  const componentStart = source.indexOf("function ImportTaskLauncher");
+  const componentEnd = source.indexOf("function projectionSummaryText", componentStart);
+  const component = source.slice(componentStart, componentEnd);
+
+  assert.ok(componentStart >= 0);
+  assert.match(component, /const \[onlineParseEnabled, setOnlineParseEnabled\] = React\.useState\(false\)/);
+  assert.match(component, /React\.useState\(loadOnlineParseProviderId\)/);
+  assert.match(component, /saveOnlineParseProviderId\(onlineParseProviderId\)/);
+  assert.match(component, /onlineParseEnabled && !onlineParseProviderId/);
+  assert.match(component, /请选择在线解析 Provider/);
+  assert.doesNotMatch(component, /providers\.find\(\(provider\) => provider\.verified\)/);
+});
+
+test("persists the last selected online parse Provider without enabling online parsing", () => {
+  const values = new Map();
+  const storage = {
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value),
+    removeItem: (key) => values.delete(key)
+  };
+
+  saveOnlineParseProviderId(" mineru-official ", storage);
+
+  assert.equal(loadOnlineParseProviderId(storage), "mineru-official");
+  assert.equal(values.get(ONLINE_PARSE_SELECTION_STORAGE_KEY), '{"providerId":"mineru-official"}');
+
+  saveOnlineParseProviderId("", storage);
+  assert.equal(loadOnlineParseProviderId(storage), "");
 });
 
 test("offers an accessible deletion action only for non-running import tasks", () => {
   const task = {
     task_id: "task-1",
+    vault_id: "vault-1",
     scope_label: "book.pdf",
     vault_label: "Vault",
     lifecycle: "complete",
@@ -1020,7 +1211,7 @@ test("offers an accessible deletion action only for non-running import tasks", (
       onTaskChanged: () => {},
       onTaskDeleted: () => {},
       onTaskSnapshot: () => {},
-      vault: null
+      vault: { vault_id: "vault-1" }
     })
   );
   const runningMarkup = renderToStaticMarkup(
@@ -1033,13 +1224,89 @@ test("offers an accessible deletion action only for non-running import tasks", (
       onTaskChanged: () => {},
       onTaskDeleted: () => {},
       onTaskSnapshot: () => {},
-      vault: null
+      vault: { vault_id: "vault-1" }
     })
   );
 
   assert.match(markup, /aria-label="删除任务 book\.pdf"/);
   assert.match(markup, />删除<\/button>/);
   assert.doesNotMatch(runningMarkup, /删除任务 book\.pdf/);
+});
+
+test("offers current-page task selection and bulk deletion without selecting running tasks", () => {
+  const task = (taskId, scopeLabel, lifecycle = "complete") => ({
+    task_id: taskId,
+    vault_id: "vault-1",
+    scope_label: scopeLabel,
+    vault_label: "Vault",
+    lifecycle,
+    phase: lifecycle === "running" ? "scanning" : "completed",
+    recovery_actions: [],
+    counts: { discovered: 1, new: 1, duplicate: 0, possible_version: 0, identity_failed: 0, parsed: 1, parse_failed: 0, required_check: 0, failed: 0 }
+  });
+  const markup = renderToStaticMarkup(
+    React.createElement(ImportTaskCenter, {
+      tasks: [task("task-1", "first.pdf"), task("task-2", "running.pdf", "running"), task("task-3", "third.pdf")],
+      error: "",
+      isLoading: false,
+      selectedTaskId: null,
+      onSelect: () => {},
+      onTaskChanged: () => {},
+      onTaskDeleted: () => {},
+      onTaskSnapshot: () => {},
+      vault: { vault_id: "vault-1" }
+    })
+  );
+
+  assert.match(markup, /aria-label="全选当前页可删除任务"/);
+  assert.match(markup, /aria-label="选择任务 first\.pdf"/);
+  assert.match(markup, /aria-label="选择任务 third\.pdf"/);
+  assert.doesNotMatch(markup, /aria-label="选择任务 running\.pdf"/);
+  assert.match(markup, />删除所选<\/button>/);
+});
+
+test("filters import tasks to the current vault and paginates ten tasks by default", () => {
+  const task = (index, vaultId = "vault-1") => ({
+    task_id: `task-${index}`,
+    vault_id: vaultId,
+    scope_label: index === 13 ? "其他 vault 任务" : `当前任务 ${index}`,
+    vault_label: vaultId === "vault-1" ? "当前 Vault" : "其他 Vault",
+    lifecycle: "queued",
+    phase: "waiting-for-next-stage",
+    recovery_actions: [],
+    counts: {
+      discovered: 1,
+      new: 1,
+      duplicate: 0,
+      possible_version: 0,
+      identity_failed: 0,
+      parsed: 0,
+      parse_failed: 0,
+      required_check: 0,
+      failed: 0
+    }
+  });
+  const markup = renderToStaticMarkup(
+    React.createElement(ImportTaskCenter, {
+      tasks: [...Array.from({ length: 12 }, (_, index) => task(index + 1)), task(13, "vault-2")],
+      error: "",
+      isLoading: false,
+      selectedTaskId: null,
+      onSelect: () => {},
+      onTaskChanged: () => {},
+      onTaskDeleted: () => {},
+      onTaskSnapshot: () => {},
+      vault: { vault_id: "vault-1" }
+    })
+  );
+
+  assert.match(markup, /当前任务 10/);
+  assert.doesNotMatch(markup, /当前任务 11/);
+  assert.doesNotMatch(markup, /其他 vault 任务/);
+  assert.match(markup, /aria-label="每页任务数量"/);
+  assert.match(markup, /第 1 \/ 2 页/);
+  assert.match(markup, /上一页/);
+  assert.match(markup, /下一页/);
 });
 
 test("renders the projection rebuild verification panel without projection content", () => {

@@ -1,0 +1,37 @@
+{
+  "input_path": "C:\\private\\fixture.pdf",
+  "page_index": 0,
+  "page_count": 1,
+  "width": 1201,
+  "height": 1227,
+  "model_settings": {
+    "format_block_content": true,
+    "merge_layout_blocks": true
+  },
+  "parsing_res_list": [
+    {
+      "block_label": "text",
+      "block_content": "本机 PDF 解析",
+      "block_bbox": [18, 21, 118, 41],
+      "block_id": 0,
+      "block_order": 1,
+      "group_id": 0
+    },
+    {
+      "block_label": "table",
+      "block_content": "<table><tr><th>术语</th><th>值</th></tr><tr><td>频率</td><td>15 min</td></tr></table>",
+      "block_bbox": [228, 26, 649, 1227],
+      "block_id": 1,
+      "block_order": null,
+      "group_id": 1
+    },
+    {
+      "block_label": "text",
+      "block_content": "",
+      "block_bbox": [1106, 195, 1160, 213],
+      "block_id": 2,
+      "block_order": 2,
+      "group_id": 2
+    }
+  ]
+}

@@ -408,6 +408,19 @@ def test_measured_chat_generation_uses_the_streaming_contract_and_keeps_only_usa
     )
 
 
+def test_measured_chat_generation_accepts_the_markdown_output_budget() -> None:
+    def verify(client, endpoint) -> None:
+        generation = client.generate_chat_with_usage(
+            endpoint, "test-secret", "model-alpha", "完整返回 Markdown。", 24_576
+        )
+
+        assert generation.content == "结构化结论"
+
+    with_fixture_provider(verify)
+
+    assert FixtureProviderHandler.calls[-1][2]["max_tokens"] == 24_576
+
+
 def test_measured_chat_generation_keeps_a_valid_response_when_usage_is_not_reported() -> None:
     def verify(client, endpoint) -> None:
         generation = client.generate_chat_with_usage(
@@ -432,6 +445,21 @@ def test_measured_chat_generation_ignores_reasoning_before_a_final_message_conte
 
         assert generation.content == '{"results":[]}'
         assert "intermediate" not in generation.content
+
+    with_fixture_provider(verify)
+
+
+def test_measured_chat_generation_keeps_final_content_after_embedded_think_block() -> None:
+    def verify(client, endpoint) -> None:
+        FixtureProviderHandler.stream_events = [
+            {"choices": [{"delta": {"content": "<think>先分析一下"}}]},
+            {"choices": [{"delta": {"content": "</think>\n\n# 最终内容"}}]},
+        ]
+        generation = client.generate_chat_with_usage(
+            endpoint, "test-secret", "model-alpha", "structure", 128
+        )
+
+        assert generation.content == "# 最终内容"
 
     with_fixture_provider(verify)
 

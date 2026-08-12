@@ -5,6 +5,7 @@ import pytest
 
 from adapters.sqlite_provider_repository import SqliteProviderRepository
 from application.providers import ProviderService, ProviderUnavailableError, ProviderValidationError
+from domain.markdown_structuring import MarkdownProviderChunkBudget
 from domain.providers import ChatGeneration, ChatUsage
 from ports.provider_client import ProviderClientError
 
@@ -13,6 +14,7 @@ class FakeRepository:
     def __init__(self) -> None:
         self.providers = {}
         self.defaults = {}
+        self.markdown_budget = MarkdownProviderChunkBudget()
 
     def save(self, provider) -> None:
         self.providers[provider.provider_id] = provider
@@ -37,6 +39,12 @@ class FakeRepository:
 
     def delete_default(self, model_type) -> None:
         self.defaults.pop(model_type, None)
+
+    def get_markdown_structure_budget(self):
+        return self.markdown_budget
+
+    def save_markdown_structure_budget(self, budget) -> None:
+        self.markdown_budget = budget
 
 
 class FakeCredentials:
@@ -222,6 +230,36 @@ def test_markdown_model_is_verified_and_generation_is_locked_to_its_default() ->
         expected_provider_updated_at=verified.updated_at,
     ) == '{"blocks":[]}'
     assert ("chat", "markdown-model") in client.calls
+
+
+def test_markdown_generation_allows_the_large_structuring_output_budget() -> None:
+    client = FakeClient()
+    service, _, _ = make_service(client=client)
+    provider = discovered_provider(service)
+    service.configure_model(provider.provider_id, "markdown-model", "markdown")
+    verified = service.test_model(provider.provider_id, "markdown-model")
+
+    service.generate_markdown(
+        verified.provider_id,
+        "markdown-model",
+        "structure this",
+        max_output_tokens=24_576,
+        expected_provider_updated_at=verified.updated_at,
+    )
+
+    assert client.calls[-1] == ("generate-chat-with-usage", "markdown-model", 24_576)
+
+
+def test_markdown_structure_budget_is_validated_and_persisted() -> None:
+    service, repository, _ = make_service()
+
+    assert service.markdown_structure_budget() == MarkdownProviderChunkBudget()
+    configured = service.set_markdown_structure_budget(10_000, 15_000, 20_000)
+
+    assert configured == MarkdownProviderChunkBudget(10_000, 15_000, 20_000)
+    assert repository.get_markdown_structure_budget() == configured
+    with pytest.raises(ProviderValidationError, match="budget"):
+        service.set_markdown_structure_budget(16_000, 10_000, 20_000)
 
 
 def test_refresh_invalidates_previously_verified_models() -> None:

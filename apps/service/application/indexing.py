@@ -117,8 +117,7 @@ class IndexingService:
                     path
                     for path, candidate in discovered.items()
                     if (
-                        path.rsplit("/", 1)[-1] == "index.md"
-                        and _is_platform_derived_index_note(path, candidate.read_text(encoding="utf-8"))
+                        _is_platform_derived_index_note(path, candidate.read_text(encoding="utf-8"))
                     )
                     or self._needs_index(vault, candidate, current.get(path))
                 )
@@ -217,6 +216,13 @@ class IndexingService:
             if resolution == "link-fixed":
                 return self.reconcile(vault_id)
             return self._sync_health(vault_id)
+
+    def purge_paths(
+        self, vault_id: str, relative_paths: tuple[str, ...], source_ids: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        self._available_vault(vault_id)
+        with self._vault_lock(vault_id):
+            return self.repository.purge_paths(vault_id, relative_paths, source_ids)
 
     def report_failure(self, vault_id: str, reason: str, error: Exception) -> IndexHealth:
         self._record_failure(vault_id, reason, error)
@@ -447,6 +453,8 @@ class IndexingService:
                 provenance = None
             if provenance is not None:
                 return True
+        if existing.stale_reason == "source-link-broken":
+            return True
         if existing.source_path is None:
             return False
         source = vault.path / existing.source_path
@@ -538,7 +546,8 @@ def _platform_provenance(markdown: str) -> tuple[dict[str, object] | None, str |
 
 
 def _is_platform_derived_index_note(relative_path: str, markdown: str) -> bool:
-    if relative_path.rsplit("/", 1)[-1] != "index.md":
+    filename = relative_path.rsplit("/", 1)[-1]
+    if filename != "index.md" and not filename.endswith(" - 目录.md"):
         return False
     provenance, _reason = _platform_provenance(markdown)
     return provenance is not None
@@ -657,9 +666,14 @@ def _tags(markdown: str) -> tuple[str, ...]:
 def _has_top_source_link(markdown: str, source_path: str) -> bool:
     frontmatter = _FRONTMATTER.match(markdown)
     body = markdown[frontmatter.end() :] if frontmatter is not None else markdown
+    subtitle_seen = False
     for line in body.splitlines():
         stripped = line.strip()
         if not stripped or _HEADING.match(stripped):
             continue
-        return source_path in {match.strip() for match in _LINK.findall(stripped)}
+        if source_path in {match.strip() for match in _LINK.findall(stripped)}:
+            return True
+        if subtitle_seen:
+            return False
+        subtitle_seen = True
     return False

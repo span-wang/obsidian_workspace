@@ -20,8 +20,9 @@ from workers.converters.profiles import ConverterProfile
 
 PROFILE_MANIFEST_NAME = "converter-profiles.json"
 APPROVAL_MANIFEST_NAME = "converter-release-approval.json"
-_SUPPORTED_ENGINES = frozenset({"mineru", "pandoc", "docling"})
+_SUPPORTED_ENGINES = frozenset({"mineru", "pandoc", "docling", "paddleocr-vl"})
 _SUPPORTED_MINERU_BACKENDS = frozenset({"pipeline", "vlm-engine"})
+_SUPPORTED_PADDLEOCR_VL_BACKENDS = frozenset({"native"})
 
 
 @dataclass(frozen=True)
@@ -145,7 +146,10 @@ def _profile_from_manifest_entry(
         executable_path=str(executable),
         config_path=str(config),
         model_paths=tuple(str(path) for path, _ in models),
-        backends=_backends(engine, entry.get("backends", ["pipeline"])),
+        backends=_backends(
+            engine,
+            entry.get("backends", ["native"] if engine == "paddleocr-vl" else ["pipeline"]),
+        ),
         isolation_boundary="local-process",
     )
 
@@ -201,7 +205,13 @@ def _backends(engine: str, value: object) -> tuple[str, ...]:
     backends = tuple(value)
     if len(set(backends)) != len(backends):
         raise ValueError("Profile backends must not repeat a backend.")
-    allowed = _SUPPORTED_MINERU_BACKENDS if engine == "mineru" else frozenset({"pipeline"})
+    allowed = (
+        _SUPPORTED_MINERU_BACKENDS
+        if engine == "mineru"
+        else _SUPPORTED_PADDLEOCR_VL_BACKENDS
+        if engine == "paddleocr-vl"
+        else frozenset({"pipeline"})
+    )
     if not set(backends).issubset(allowed):
         raise ValueError("Profile backend is unsupported for this engine.")
     return backends

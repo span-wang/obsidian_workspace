@@ -55,7 +55,9 @@ def test_governance_proposal_keeps_required_metadata_and_reuses_active_tags() ->
     assert proposal.tags[0].name == "mathematics"
     assert proposal.tags[0].is_new is False
     assert proposal.tags[0].status == "pending"
-    assert proposal.tags[0].document_paths == ("platform/notes/source-1/index.md",)
+    assert proposal.tags[0].document_paths == (
+        "platform/notes/algebra-workbook/algebra-workbook - 目录.md",
+    )
     assert proposal.tags[0].note_paths
 
 
@@ -107,8 +109,8 @@ def test_tag_change_preview_includes_every_affected_note_and_rejects_stale_catal
     )
 
     assert preview.affected_paths == (
-        "platform/notes/source-1/01-algebra.md",
-        "platform/notes/source-1/index.md",
+        "platform/notes/algebra-workbook/Algebra.md",
+        "platform/notes/algebra-workbook/algebra-workbook - 目录.md",
     )
     assert preview.validate(catalog_revision=2, proposals=(proposal,)).is_stale is False
     stale = preview.validate(catalog_revision=3, proposals=(proposal,))
@@ -150,8 +152,8 @@ def test_delete_tag_change_removes_private_references_and_keeps_vaults_isolated(
     changed = apply_tag_change(proposal, preview, "2026-07-22T00:01:00+00:00")
 
     assert preview.affected_paths == (
-        "platform/notes/source-1/01-algebra.md",
-        "platform/notes/source-1/index.md",
+        "platform/notes/algebra-workbook/Algebra.md",
+        "platform/notes/algebra-workbook/algebra-workbook - 目录.md",
     )
     assert preview.proposal_versions == ((proposal.item_id, proposal.revision),)
     assert preview.validate(catalog_revision=2, proposals=(proposal,)).is_stale is True

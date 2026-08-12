@@ -1,3 +1,4 @@
+from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 import sqlite3
@@ -66,6 +67,82 @@ def test_reconcile_keeps_derived_and_native_evidence_identities_distinct(tmp_pat
     assert documents["native.md"].heading_locations == ("line:1",)
 
 
+def test_reconcile_accepts_a_source_link_after_a_bilingual_top_level_title(tmp_path: Path) -> None:
+    service, repository, vault = _service(tmp_path)
+    source_hash = sha256(b"source").hexdigest()
+    source = vault.path / "platform" / "sources" / "book.pdf"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"source")
+    note = vault.path / "platform" / "notes" / "book.md"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text(
+        _derived_markdown(vault.vault_id, source_hash).replace(
+            "# Derived note\n\n来源：", "# 中文标题\nEnglish subtitle\n\n来源："
+        ),
+        encoding="utf-8",
+    )
+
+    health = service.reconcile(vault.vault_id)
+    document = repository.current_documents(vault.vault_id)[0]
+
+    assert health.status == "healthy"
+    assert document.verifiable is True
+    assert document.stale_reason is None
+
+
+def test_reconcile_rejects_a_source_link_after_top_level_body_content(tmp_path: Path) -> None:
+    service, repository, vault = _service(tmp_path)
+    source_hash = sha256(b"source").hexdigest()
+    source = vault.path / "platform" / "sources" / "book.pdf"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"source")
+    note = vault.path / "platform" / "notes" / "book.md"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text(
+        _derived_markdown(vault.vault_id, source_hash).replace(
+            "# Derived note\n\n来源：", "# 中文标题\nEnglish subtitle\n正文内容。\n\n来源："
+        ),
+        encoding="utf-8",
+    )
+
+    service.reconcile(vault.vault_id)
+    document = repository.current_documents(vault.vault_id)[0]
+
+    assert document.verifiable is False
+    assert document.stale_reason == "source-link-broken"
+
+
+def test_reconcile_revalidates_existing_source_link_broken_document(tmp_path: Path) -> None:
+    service, repository, vault = _service(tmp_path)
+    source_hash = sha256(b"source").hexdigest()
+    source = vault.path / "platform" / "sources" / "book.pdf"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"source")
+    note = vault.path / "platform" / "notes" / "book.md"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    markdown = _derived_markdown(vault.vault_id, source_hash).replace(
+        "# Derived note\n\n来源：", "# 中文标题\nEnglish subtitle\n\n来源："
+    )
+    note.write_text(markdown, encoding="utf-8")
+    current = service._document_from_markdown(
+        vault.vault_id,
+        "platform/notes/book.md",
+        markdown,
+        note,
+        pending_association=False,
+    )
+    repository.save_document(
+        replace(current, verifiable=False, stale_reason="source-link-broken")
+    )
+
+    health = service.reconcile(vault.vault_id)
+    document = repository.current_documents(vault.vault_id)[0]
+
+    assert health.status == "healthy"
+    assert document.verifiable is True
+    assert document.stale_reason is None
+
+
 def test_reconcile_excludes_platform_derived_index_notes_and_invalidates_historical_copy(
     tmp_path: Path,
 ) -> None:
@@ -74,14 +151,14 @@ def test_reconcile_excludes_platform_derived_index_notes_and_invalidates_histori
     source = vault.path / "platform" / "sources" / "book.pdf"
     source.parent.mkdir(parents=True, exist_ok=True)
     source.write_bytes(b"source")
-    note = vault.path / "platform" / "notes" / "source-1" / "01-note.md"
-    directory = note.with_name("index.md")
+    note = vault.path / "platform" / "notes" / "book" / "Note.md"
+    directory = note.with_name("book - 目录.md")
     note.parent.mkdir(parents=True, exist_ok=True)
     note.write_text(_derived_markdown(vault.vault_id, source_hash), encoding="utf-8")
     directory.write_text(_derived_markdown(vault.vault_id, source_hash), encoding="utf-8")
     historical = service._document_from_markdown(
         vault.vault_id,
-        "platform/notes/source-1/index.md",
+        "platform/notes/book/book - 目录.md",
         directory.read_text(encoding="utf-8"),
         directory,
         pending_association=False,
@@ -93,15 +170,15 @@ def test_reconcile_excludes_platform_derived_index_notes_and_invalidates_histori
     historical_index = next(
         document
         for document in repository.documents(vault.vault_id)
-        if document.relative_path == "platform/notes/source-1/index.md"
+        if document.relative_path == "platform/notes/book/book - 目录.md"
     )
 
     assert health.status == "healthy"
-    assert current_paths == ["platform/notes/source-1/01-note.md"]
+    assert current_paths == ["platform/notes/book/Note.md"]
     assert historical_index.is_current is False
     assert service.rebuild(vault.vault_id).status == "healthy"
     assert [document.relative_path for document in repository.current_documents(vault.vault_id)] == [
-        "platform/notes/source-1/01-note.md"
+        "platform/notes/book/Note.md"
     ]
 
 
@@ -111,8 +188,8 @@ def test_committed_unit_does_not_index_a_platform_derived_index_note(tmp_path: P
     source = vault.path / "platform" / "sources" / "book.pdf"
     source.parent.mkdir(parents=True, exist_ok=True)
     source.write_bytes(b"source")
-    note = vault.path / "platform" / "notes" / "source-1" / "01-note.md"
-    directory = note.with_name("index.md")
+    note = vault.path / "platform" / "notes" / "book" / "Note.md"
+    directory = note.with_name("book - 目录.md")
     note.parent.mkdir(parents=True, exist_ok=True)
     note_markdown = _derived_markdown(vault.vault_id, source_hash)
     directory_markdown = _derived_markdown(vault.vault_id, source_hash)
@@ -125,14 +202,14 @@ def test_committed_unit_does_not_index_a_platform_derived_index_note(tmp_path: P
         "source",
         (
             CommitFile(
-                "platform/notes/source-1/01-note.md",
+                "platform/notes/book/Note.md",
                 "markdown",
                 note_markdown,
                 sha256(note_markdown.encode("utf-8")).hexdigest(),
                 None,
             ),
             CommitFile(
-                "platform/notes/source-1/index.md",
+                "platform/notes/book/book - 目录.md",
                 "markdown",
                 directory_markdown,
                 sha256(directory_markdown.encode("utf-8")).hexdigest(),
@@ -145,7 +222,7 @@ def test_committed_unit_does_not_index_a_platform_derived_index_note(tmp_path: P
 
     assert health.status == "healthy"
     assert [document.relative_path for document in repository.current_documents(vault.vault_id)] == [
-        "platform/notes/source-1/01-note.md"
+        "platform/notes/book/Note.md"
     ]
 
 

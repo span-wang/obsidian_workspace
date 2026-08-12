@@ -1,5 +1,6 @@
 from typing import Protocol
 
+from domain.markdown_structuring import MarkdownProviderChunkBudget
 from domain.providers import ModelSelection, Provider
 
 
@@ -17,3 +18,7 @@ class ProviderRepository(Protocol):
     def save_default(self, selection: ModelSelection) -> None: ...
 
     def delete_default(self, model_type: str) -> None: ...
+
+    def get_markdown_structure_budget(self) -> MarkdownProviderChunkBudget: ...
+
+    def save_markdown_structure_budget(self, budget: MarkdownProviderChunkBudget) -> None: ...

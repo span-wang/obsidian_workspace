@@ -1,7 +1,7 @@
 {
   "projectName": "Obsidian Personal Knowledge Platform",
   "initiativeName": "Retrieval Redesign",
-  "updatedOn": "2026-08-05",
+  "updatedOn": "2026-08-12",
   "planDocument": "docs/retrieval-redesign.md",
   "generatedFile": "docs/retrieval-progress.md",
   "sourceFiles": [
@@ -133,6 +133,56 @@
       "id": "RET-19",
       "label": "PDF 原生优先解析",
       "goal": "按页优先使用原生 PDF 文本，原生文本为空或质量不通过时回退 MinerU，同时保留数字、图片和公式。"
+    },
+    {
+      "id": "RET-20",
+      "label": "Markdown 结构化质量",
+      "goal": "以全局标题纲要、明确的保真去重规则和可验证的层级约束，提升 Markdown Provider 的结构化稳定性。"
+    },
+    {
+      "id": "RET-21",
+      "label": "多 Vault 工作台重构",
+      "goal": "以跨 Vault 摘要全景和二级上下文交互提升工作台的信息承载、扫描效率与操作密度。"
+    },
+    {
+      "id": "RET-22",
+      "label": "PaddleOCR-VL PDF 解析",
+      "goal": "以本机 PaddleOCR-VL 1.6 替换 PDF 的 native/MinerU 混合解析，同时保持可核验 DocumentGraph 溯源。"
+    },
+    {
+      "id": "RET-23",
+      "label": "Markdown Provider Token 预算",
+      "goal": "以结构安全的 token 聚合降低 Markdown Provider 的重复提示词开销，并避免长文输出截断。"
+    },
+    {
+      "id": "RET-24",
+      "label": "导入任务队列与本地 Word 提案",
+      "goal": "让批量导入按可见队列逐项推进，并确保 Word/PDF 的本地 DocumentGraph 不会发送给 Markdown Provider。"
+    },
+    {
+      "id": "RET-25",
+      "label": "iOS 设计语言统一",
+      "goal": "以 DESIGN.md 定义的原生感、扁平、状态连续和全端可操作标准，统一生产工作台的视觉与交互。"
+    },
+    {
+      "id": "RET-26",
+      "label": "可读导入文件命名",
+      "goal": "让导入原件、解析笔记及目录以导入文件名和解析标题命名，同时保留可核验身份并防止同名覆盖。"
+    },
+    {
+      "id": "RET-27",
+      "label": "受控在线文档解析",
+      "goal": "以任务级显式授权和 Vault 出网策略门禁接入 PaddleOCR-VL 1.6 与 MinerU 官方在线解析。"
+    },
+    {
+      "id": "RET-28",
+      "label": "来源链接核验修复",
+      "goal": "修复双语标题导致已存在来源链接被错误标记为 stale 的索引核验缺陷。"
+    },
+    {
+      "id": "RET-29",
+      "label": "当前页任务批量删除",
+      "goal": "让当前页导入任务可多选或全选，并在既有安全删除语义下逐项删除。"
     }
   ],
   "trackingRules": [

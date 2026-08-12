@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from adapters.filesystem_vault_committer import LocalVaultCommitter
+from domain.review_commits import CommitBackup
 from ports.vault_committer import VaultCommitError, VaultWrite
 
 
@@ -113,6 +114,37 @@ def test_recovery_restores_backups_after_an_interrupted_multi_file_commit(tmp_pa
 
     assert not (vault / "platform" / "sources" / "book.pdf").exists()
     assert existing.read_text(encoding="utf-8") == "before"
+
+
+def test_restore_validates_all_current_hashes_before_changing_any_file(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    left = vault / "platform" / "notes" / "left.md"
+    right = vault / "platform" / "notes" / "right.md"
+    left.parent.mkdir(parents=True)
+    left.write_text("submitted-left", encoding="utf-8")
+    right.write_text("submitted-right", encoding="utf-8")
+    committer = LocalVaultCommitter()
+    backups = (
+        CommitBackup.from_bytes("platform/notes/left.md", None),
+        CommitBackup.from_bytes("platform/notes/right.md", None),
+    )
+    expected = {
+        "platform/notes/left.md": sha256(b"submitted-left").hexdigest(),
+        "platform/notes/right.md": sha256(b"submitted-right").hexdigest(),
+    }
+    right.write_text("changed-after-submit", encoding="utf-8")
+
+    with pytest.raises(VaultCommitError, match="changed after"):
+        committer.restore(
+            vault,
+            backups,
+            "platform",
+            expected_current_sha256=expected,
+        )
+
+    assert left.read_text(encoding="utf-8") == "submitted-left"
+    assert right.read_text(encoding="utf-8") == "changed-after-submit"
 
 
 def test_commit_refuses_a_managed_root_linked_elsewhere_inside_the_vault(tmp_path: Path) -> None:

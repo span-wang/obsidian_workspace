@@ -10,6 +10,7 @@ import pytest
 from adapters.sqlite_index_repository import SqliteIndexRepository
 from domain.embeddings import (
     EmbeddingBlockVector,
+    EmbeddingCacheEntry,
     EmbeddingProfile,
     EmbeddingProfileLocator,
     EmbeddingVectorConsistencyError,
@@ -203,6 +204,30 @@ def test_vector_matrix_is_invalidated_after_current_document_changes(tmp_path: P
     assert [hit.document_id for hit in repository.search_vector(
         "vault-1", _query(profile, (0.0, 1.0), ("notes/unit.md",))
     )] == ["replacement"]
+
+
+def test_purge_paths_removes_unshared_vector_and_embedding_cache(tmp_path: Path) -> None:
+    repository = SqliteIndexRepository(tmp_path / "indexes.sqlite3")
+    document = _document("unit", "notes/unit.md", (_block(1, "One"),))
+    profile = _profile()
+    repository.save_document(document)
+    repository.save_block_vectors("vault-1", (_binding(document, document.blocks[0], profile, (1.0, 0.0)),))
+    repository.save_embedding_cache(
+        (
+            EmbeddingCacheEntry.from_input(
+                profile,
+                _input_text(document.blocks[0]),
+                (1.0, 0.0),
+                "2026-08-12T00:00:00Z",
+            ),
+        )
+    )
+
+    repository.purge_paths("vault-1", (document.relative_path,), ())
+
+    with sqlite3.connect(repository.database_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM index_block_vectors").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM embedding_cache").fetchone()[0] == 0
 
 
 def test_semantic_health_reports_current_profile_coverage_and_blocks_invalid_vectors(tmp_path: Path) -> None:
