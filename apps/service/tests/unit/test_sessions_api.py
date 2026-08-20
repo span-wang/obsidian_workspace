@@ -40,7 +40,15 @@ from domain.sessions import (
 )
 
 
-def asgi_request(app, method: str, path: str, *, body: dict[str, object] | None = None, cookie: str = ""):
+def asgi_request(
+    app,
+    method: str,
+    path: str,
+    *,
+    body: dict[str, object] | None = None,
+    cookie: str = "",
+    disconnect: bool = True,
+):
     target = urlsplit(path)
     request_body = json.dumps(body).encode() if body is not None else b""
     messages: list[dict[str, object]] = []
@@ -49,7 +57,9 @@ def asgi_request(app, method: str, path: str, *, body: dict[str, object] | None 
     async def receive() -> dict[str, object]:
         nonlocal sent
         if sent:
-            return {"type": "http.disconnect"}
+            if disconnect:
+                return {"type": "http.disconnect"}
+            await asyncio.Event().wait()
         sent = True
         return {"type": "http.request", "body": request_body, "more_body": False}
 
@@ -146,6 +156,10 @@ def test_session_run_route_forwards_one_submission_without_a_staging_step(tmp_pa
 
         def run_task(self, session_id: str, content: str, **kwargs) -> SessionRetrievalResult:
             self.calls.append((session_id, content, kwargs))
+            on_stream_chunk = kwargs.get("on_stream_chunk")
+            if on_stream_chunk is not None:
+                on_stream_chunk(1, "first")
+                on_stream_chunk(1, "second")
             return result
 
         @staticmethod
@@ -186,26 +200,41 @@ def test_session_run_route_forwards_one_submission_without_a_staging_step(tmp_pa
     status, _, body = asgi_request(
         app, "POST", "/api/sessions/session-1/run", body=command, cookie=cookie
     )
+    stream_status, stream_headers, stream_body = asgi_request(
+        app,
+        "POST",
+        "/api/sessions/session-1/run/stream",
+        body=command,
+        cookie=cookie,
+        disconnect=False,
+    )
 
     assert denied_status == 403
     assert invalid_status == 422
     assert status == 200
     assert json.loads(body)["result"]["status"] == "completed"
-    assert sessions.calls == [
-        (
-            "session-1",
-            "定位证据",
-            {
-                "vault_id": "vault-1",
-                "scope_kind": "directory",
-                "scope_path": "notes",
-                "provider_id": "provider-1",
-                "model_id": "chat-1",
-                "intent": "source-lookup",
-                "query_scope": None,
-            },
-        )
-    ]
+    assert stream_status == 200
+    assert stream_headers["content-type"].startswith("text/event-stream")
+    stream_text = stream_body.decode()
+    assert "event: chunk\ndata: {\"ordinal\":1,\"content\":\"first\"}" in stream_text, stream_text
+    assert stream_text.index("event: chunk\ndata: {\"ordinal\":1,\"content\":\"first\"}") < stream_text.index(
+        "event: result"
+    )
+    assert "event: chunk\ndata: {\"ordinal\":1,\"content\":\"second\"}" in stream_text
+    assert sessions.calls[0] == (
+        "session-1",
+        "定位证据",
+        {
+            "vault_id": "vault-1",
+            "scope_kind": "directory",
+            "scope_path": "notes",
+            "provider_id": "provider-1",
+            "model_id": "chat-1",
+            "intent": "source-lookup",
+            "query_scope": None,
+        },
+    )
+    assert callable(sessions.calls[1][2]["on_stream_chunk"])
 
 
 def test_completeness_payload_marks_invalidated_snapshot_as_source_changed() -> None:

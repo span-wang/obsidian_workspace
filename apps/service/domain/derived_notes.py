@@ -52,7 +52,11 @@ def render_document_graph(graph: DocumentGraph) -> RenderedDocumentGraph:
             "DocumentGraph has unresolved required-check content and cannot produce Markdown."
         )
     assets = {asset.asset_id: asset for asset in graph.assets}
-    rendered_blocks = tuple(_render_document_block(block, assets) for block in graph.blocks)
+    rendered_blocks = tuple(
+        rendered
+        for block in graph.blocks
+        if (rendered := _render_document_block(block, assets))
+    )
     return RenderedDocumentGraph(
         graph_id=graph.graph_id,
         graph_revision=graph.graph_revision,
@@ -68,6 +72,8 @@ def render_document_graph(graph: DocumentGraph) -> RenderedDocumentGraph:
 
 def _render_document_block(block: DocumentBlock, assets: dict[str, DocumentAsset]) -> str:
     payload = block.payload.to_dict()
+    if block.kind == "noise":
+        return ""
     if block.kind == "heading":
         return f"{'#' * int(payload['level'])} {_render_inline_runs(payload['inline_runs'])}"
     if block.kind == "paragraph":
@@ -530,6 +536,8 @@ def derive_graph_markdown_proposal(
     units: list[StructuredContentUnit] = []
     block_locators: list[tuple[EvidenceLocator, ...]] = []
     for block in graph.blocks:
+        if block.kind == "noise":
+            continue
         locators = tuple(
             EvidenceLocator(document_locator=locator.to_dict()) for locator in block.locators
         )
@@ -614,7 +622,8 @@ def _align_provider_markdown_to_graph(
     if not normalized:
         raise ValueError("Markdown Provider returned empty Markdown.")
     assets = {asset.asset_id: asset for asset in graph.assets}
-    source_blocks = tuple(_render_document_block(block, assets) for block in graph.blocks)
+    content_blocks = tuple(block for block in graph.blocks if block.kind != "noise")
+    source_blocks = tuple(_render_document_block(block, assets) for block in content_blocks)
     repeated = {
         block_text.strip()
         for block_text in source_blocks
@@ -623,7 +632,7 @@ def _align_provider_markdown_to_graph(
     cursor = 0
     aligned: list[str] = []
     noise_ids: list[str] = []
-    for graph_block, source_text in zip(graph.blocks, source_blocks):
+    for graph_block, source_text in zip(content_blocks, source_blocks):
         position = normalized.find(source_text, cursor)
         if position >= cursor:
             aligned.append(source_text)
@@ -678,7 +687,7 @@ def _with_graph_provenance(
             graph_revision=graph.graph_revision,
             selected_attempt_id=graph.selected_attempt_id,
         )
-        body = "\n\n".join(proposal.units[index].text for index in note.unit_indexes)
+        body = _note_body(proposal.units, note.unit_indexes, note.title)
         notes.append(
             replace(
                 note,
@@ -1097,7 +1106,7 @@ def _render_proposal(
             source_relative_path=source_relative_path,
             locators=locators,
         )
-        body = "\n\n".join(units[index].text for index in group)
+        body = _note_body(units, group, title)
         markdown = (
             f"{_frontmatter(provenance)}\n# {title}\n\n"
             f"来源：[[{source_relative_path}|原始资料]]\n\n{body}\n"
@@ -1306,6 +1315,19 @@ def _group_title(units: tuple[StructuredContentUnit, ...], group: tuple[int, ...
         if _is_heading(units[index]):
             return units[index].text.strip().lstrip("#").strip() or fallback
     return fallback
+
+
+def _note_body(
+    units: tuple[StructuredContentUnit, ...], group: tuple[int, ...], title: str
+) -> str:
+    body_indexes = group
+    if (
+        group
+        and _is_heading(units[group[0]])
+        and units[group[0]].text.strip().lstrip("#").strip() == title
+    ):
+        body_indexes = group[1:]
+    return "\n\n".join(units[index].text for index in body_indexes)
 
 
 def _group_characters(

@@ -8,7 +8,18 @@ from typing import Any, Mapping
 
 _SHA256_LENGTH = 64
 _DOCUMENT_BLOCK_KINDS = frozenset(
-    {"heading", "paragraph", "list", "table", "formula", "image", "caption", "code", "unresolved"}
+    {
+        "heading",
+        "paragraph",
+        "list",
+        "table",
+        "formula",
+        "image",
+        "caption",
+        "code",
+        "noise",
+        "unresolved",
+    }
 )
 _INLINE_RUN_KINDS = frozenset({"text", "emphasis", "strong", "link", "break", "literal"})
 _SAFE_RASTER_ASSET_TYPES = {
@@ -345,10 +356,15 @@ class DocumentBlock:
     evidence_refs: tuple[EvidenceRef, ...]
     retrieval_projection: str
     supersedes_block_id: str | None = None
+    origin_block_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.block_id or self.kind not in _DOCUMENT_BLOCK_KINDS:
             raise ValueError("Document blocks need a supported kind and immutable block ID.")
+        if any(not isinstance(block_id, str) or not block_id for block_id in self.origin_block_ids):
+            raise ValueError("Document block origins must use non-empty immutable IDs.")
+        if len(set(self.origin_block_ids)) != len(self.origin_block_ids):
+            raise ValueError("Document block origins must not repeat an immutable ID.")
         if self.payload.kind != self.kind:
             raise ValueError("Document block payload discriminator must match its block kind.")
         if type(self.reading_order) is not int or self.reading_order < 0:
@@ -362,7 +378,7 @@ class DocumentBlock:
             raise ValueError("Only unresolved blocks may use a source-scope locator.")
         if not is_unresolved and not self.evidence_refs:
             raise ValueError("Resolved document blocks need hash evidence.")
-        if not self.retrieval_projection and not is_unresolved:
+        if not self.retrieval_projection and self.kind not in {"noise", "unresolved"}:
             raise ValueError("Resolved document blocks need a retrieval projection.")
 
     @classmethod
@@ -384,6 +400,8 @@ class DocumentBlock:
         }
         if self.supersedes_block_id:
             value["supersedes_block_id"] = self.supersedes_block_id
+        if self.origin_block_ids:
+            value["origin_block_ids"] = list(self.origin_block_ids)
         return value
 
 
@@ -422,6 +440,7 @@ class DocumentGraph:
     graph_id: str
     graph_revision: int = 1
     base_graph_id: str | None = None
+    normalization_profile: str | None = None
     schema_version: int = 2
 
     def __post_init__(self) -> None:
@@ -433,6 +452,8 @@ class DocumentGraph:
             raise ValueError("Selected graph must be derived from the verified input snapshot.")
         if not self.graph_id or not self.selected_attempt_id or self.graph_revision < 1:
             raise ValueError("Document graphs need immutable ID, selected attempt, and revision.")
+        if self.normalization_profile is not None and not self.normalization_profile:
+            raise ValueError("Document graph normalization profiles must be non-empty when present.")
         orders = [block.reading_order for block in self.blocks]
         if len(set(block.block_id for block in self.blocks)) != len(self.blocks) or orders != sorted(orders):
             raise ValueError("Document graph block IDs and reading order must be deterministic.")
@@ -464,6 +485,8 @@ class DocumentGraph:
         }
         if self.base_graph_id:
             value["base_graph_id"] = self.base_graph_id
+        if self.normalization_profile:
+            value["normalization_profile"] = self.normalization_profile
         return value
 
     @classmethod
@@ -477,6 +500,11 @@ class DocumentGraph:
             graph_id=str(value["graph_id"]),
             graph_revision=int(value.get("graph_revision", 1)),
             base_graph_id=str(value["base_graph_id"]) if value.get("base_graph_id") else None,
+            normalization_profile=(
+                str(value["normalization_profile"])
+                if value.get("normalization_profile")
+                else None
+            ),
             source_sha256=str(value["source_sha256"]),
             input_snapshot_hash=str(value["input_snapshot_hash"]),
             selected_attempt_id=str(value["selected_attempt_id"]),
@@ -499,7 +527,6 @@ class ConversionAttempt:
     status: str
     output_artifact_refs: tuple[ArtifactRef, ...] = ()
     graph_id: str | None = None
-    quality_gate_decision_id: str | None = None
     failure_code: str | None = None
     idempotency_key: str | None = None
 
@@ -512,8 +539,6 @@ class ConversionAttempt:
         _require_sha256(self.input_snapshot_hash, "Input snapshot hash")
         if self.status in {"succeeded", "selected", "rejected"} and (not self.graph_id or not self.output_artifact_refs):
             raise ValueError("Completed conversion attempts need a promoted graph and artifacts.")
-        if self.status == "selected" and not self.quality_gate_decision_id:
-            raise ValueError("A selected attempt needs a persisted quality gate decision.")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -528,7 +553,6 @@ class ConversionAttempt:
             "status": self.status,
             "output_artifact_refs": [artifact.to_dict() for artifact in self.output_artifact_refs],
             "graph_id": self.graph_id,
-            "quality_gate_decision_id": self.quality_gate_decision_id,
             "failure_code": self.failure_code,
             "idempotency_key": self.idempotency_key,
         }
@@ -781,6 +805,7 @@ def _validate_payload(kind: str, value: Mapping[str, object]) -> None:
         "image": {"asset_id"},
         "caption": {"inline_runs", "target_block_id"},
         "code": {"text"},
+        "noise": {"source_kind", "reason"},
         "unresolved": {"source_kind", "reason"},
     }
     if kind not in required or not required[kind].issubset(value):
@@ -834,6 +859,7 @@ def _document_block_from_dict(value: Mapping[str, object]) -> DocumentBlock:
         evidence_refs=tuple(_evidence_ref_from_dict(dict(ref)) for ref in list(value.get("evidence_refs", []))),
         retrieval_projection=str(value.get("retrieval_projection", "")),
         supersedes_block_id=str(value["supersedes_block_id"]) if value.get("supersedes_block_id") else None,
+        origin_block_ids=tuple(str(block_id) for block_id in list(value.get("origin_block_ids", []))),
     )
 
 
@@ -873,7 +899,6 @@ def _conversion_attempt_from_dict(value: Mapping[str, object]) -> ConversionAtte
         status=str(value["status"]),
         output_artifact_refs=tuple(_artifact_ref_from_dict(dict(ref)) for ref in list(value.get("output_artifact_refs", []))),
         graph_id=str(value["graph_id"]) if value.get("graph_id") else None,
-        quality_gate_decision_id=str(value["quality_gate_decision_id"]) if value.get("quality_gate_decision_id") else None,
         failure_code=str(value["failure_code"]) if value.get("failure_code") else None,
         idempotency_key=str(value["idempotency_key"]) if value.get("idempotency_key") else None,
     )

@@ -23,7 +23,6 @@ RETRIEVAL_CHANNELS = frozenset(
         "lexical",
         "heading",
         "neighborhood",
-        "unit-card",
     }
 )
 RETRIEVAL_RESULT_STATUSES = frozenset(

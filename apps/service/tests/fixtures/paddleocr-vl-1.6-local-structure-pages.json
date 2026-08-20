@@ -1,0 +1,81 @@
+{
+  "pages": [
+    {
+      "page_index": 0,
+      "width": 1000,
+      "height": 1000,
+      "parsing_res_list": [
+        {
+          "block_label": "text",
+          "block_content": "英语教材",
+          "block_bbox": [100, 40, 360, 80],
+          "block_id": "title",
+          "block_order": 2
+        },
+        {
+          "block_label": "text",
+          "block_content": "课程页眉",
+          "block_bbox": [30, 8, 140, 24],
+          "block_id": "header",
+          "block_order": 1
+        },
+        {
+          "block_label": "text",
+          "block_content": "这是跨块",
+          "block_bbox": [100, 200, 700, 224],
+          "block_id": "paragraph-a",
+          "block_order": 3
+        },
+        {
+          "block_label": "text",
+          "block_content": "段落。",
+          "block_bbox": [100, 226, 700, 250],
+          "block_id": "paragraph-b",
+          "block_order": 4
+        },
+        {
+          "block_label": "text",
+          "block_content": "- word\n- phrase",
+          "block_bbox": [100, 300, 500, 360],
+          "block_id": "list",
+          "block_order": 5
+        },
+        {
+          "block_label": "text",
+          "block_content": "页末内容一",
+          "block_bbox": [100, 900, 700, 930],
+          "block_id": "anchor",
+          "block_order": 6
+        }
+      ]
+    },
+    {
+      "page_index": 1,
+      "width": 1000,
+      "height": 1000,
+      "parsing_res_list": [
+        {
+          "block_label": "text",
+          "block_content": "课程页眉",
+          "block_bbox": [30, 8, 140, 24],
+          "block_id": "header",
+          "block_order": 1
+        },
+        {
+          "block_label": "text",
+          "block_content": "第二页正文。",
+          "block_bbox": [100, 200, 700, 230],
+          "block_id": "body",
+          "block_order": 2
+        },
+        {
+          "block_label": "text",
+          "block_content": "页末内容二",
+          "block_bbox": [100, 900, 700, 930],
+          "block_id": "anchor",
+          "block_order": 3
+        }
+      ]
+    }
+  ]
+}

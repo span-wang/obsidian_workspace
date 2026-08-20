@@ -33,12 +33,11 @@ from domain.evidence import (
     PdfRegionLocator,
     SourceScopeLocator,
 )
+from domain.local_markdown_structure import normalize_local_pdf_graph
 from workers.converters.artifact_store import PrivateArtifactStore
 from workers.converters.profiles import ConverterProfile, require_profile
-from workers.converters.quality_gate import QualityGateDecision, StructuralQualityGate
 from workers.converters.runner import (
     ConversionArtifactDraft,
-    RejectedConversionCandidate,
     ConversionLauncher,
     ConversionOutcome,
     ConversionRequest,
@@ -73,49 +72,14 @@ class ProvisionedConversionLauncher(ConversionLauncher):
         self._artifact_store = artifact_store
 
     def convert(self, request: ConversionRequest) -> ConversionOutcome:
-        """Fail closed when no service is available to persist a rejected primary."""
-        return self.convert_after_primary_persisted(request, lambda _candidate: False)
-
-    def convert_after_primary_persisted(
-        self,
-        request: ConversionRequest,
-        record_rejected_attempt,
-    ) -> ConversionOutcome:
+        """Return the verified primary conversion graph without structural selection."""
         primary_engine = "paddleocr-vl" if request.document_kind == "pdf" else "pandoc"
         primary = (
             self._run_paddleocr_vl_attempt(request)
             if request.document_kind == "pdf"
             else self._run_attempt(primary_engine, request)
         )
-        inventory = dict(request.preflight_inventory)
-        primary_gate = StructuralQualityGate().evaluate(primary.graph, inventory)
-        if primary_gate.action == "accepted":
-            return self._selected_outcome(primary, primary_gate, request)
-
-        if not record_rejected_attempt(self._rejected_candidate(primary, primary_gate, request)):
-            self._artifact_store.discard_attempt_directory(primary.temporary_directory)
-            return ConversionOutcome(
-                failure_reason="The rejected primary conversion attempt could not be persisted.",
-            )
-
-        fallback = self._run_attempt("docling", request)
-        fallback_gate = StructuralQualityGate().evaluate(fallback.graph, inventory)
-        if fallback_gate.action != "accepted":
-            final_gate = QualityGateDecision(
-                fallback_gate.decision_id,
-                fallback_gate.policy_id,
-                fallback_gate.policy_version,
-                "waiting-for-review",
-                False,
-                fallback_gate.rule_ids,
-                fallback_gate.issues,
-            )
-            if not record_rejected_attempt(self._rejected_candidate(fallback, final_gate, request)):
-                self._artifact_store.discard_attempt_directory(fallback.temporary_directory)
-            return ConversionOutcome(
-                failure_reason="Neither local converter produced an acceptable complete graph.",
-            )
-        return self._selected_outcome(fallback, fallback_gate, request)
+        return self._selected_outcome(primary, request)
 
     def _run_paddleocr_vl_attempt(self, request: ConversionRequest) -> _AttemptResult:
         """Run the approved local PaddleOCR-VL 1.6 pipeline for a whole PDF."""
@@ -186,7 +150,10 @@ class ProvisionedConversionLauncher(ConversionLauncher):
                 )
                 blocks.extend(page_blocks)
                 issues.extend(page_issues)
-            graph = _paddleocr_vl_graph(request, attempt_id, blocks, assets, issues)
+            graph = normalize_local_pdf_graph(
+                _paddleocr_vl_graph(request, attempt_id, blocks, assets, issues),
+                request.local_structure_profile,
+            )
             return _AttemptResult(
                 attempt_id,
                 "paddleocr-vl-1.6",
@@ -200,21 +167,8 @@ class ProvisionedConversionLauncher(ConversionLauncher):
             self._artifact_store.discard_attempt_directory(temporary)
             raise
 
-    def _rejected_candidate(
-        self, result: _AttemptResult, gate: QualityGateDecision, request: ConversionRequest
-    ) -> RejectedConversionCandidate:
-        return RejectedConversionCandidate(
-            self._recorded_attempt(result, "rejected", gate, request),
-            result.graph,
-            str(result.temporary_directory),
-            result.drafts,
-            gate.to_dict(),
-        )
-
-    def _selected_outcome(
-        self, result: _AttemptResult, gate: QualityGateDecision, request: ConversionRequest
-    ) -> ConversionOutcome:
-        attempt = self._recorded_attempt(result, "selected", gate, request)
+    def _selected_outcome(self, result: _AttemptResult, request: ConversionRequest) -> ConversionOutcome:
+        attempt = self._recorded_attempt(result, "selected", request)
         evidence = ConversionEvidence(request.document_kind, result.graph, attempt)
         return ConversionOutcome(
             evidence=evidence,
@@ -223,7 +177,7 @@ class ProvisionedConversionLauncher(ConversionLauncher):
         )
 
     def _recorded_attempt(
-        self, result: _AttemptResult, status: str, gate: QualityGateDecision, request: ConversionRequest
+        self, result: _AttemptResult, status: str, request: ConversionRequest
     ) -> ConversionAttempt:
         return ConversionAttempt(
             attempt_id=result.attempt_id,
@@ -237,10 +191,6 @@ class ProvisionedConversionLauncher(ConversionLauncher):
             status=status,
             output_artifact_refs=result.artifacts,
             graph_id=result.graph.graph_id,
-            quality_gate_decision_id=(
-                gate.decision_id if status in {"selected", "rejected"} else None
-            ),
-            failure_code=(gate.rule_ids[0] if status == "rejected" and gate.rule_ids else None),
         )
 
     def _run_attempt(self, engine: str, request: ConversionRequest) -> _AttemptResult:
@@ -282,6 +232,8 @@ class ProvisionedConversionLauncher(ConversionLauncher):
             if raw is None:
                 raise LocalConverterError("The converter JSON artifact was not collected.")
             graph = _adapt_graph(engine, output, request, attempt_id, raw, artifacts)
+            if request.document_kind == "pdf":
+                graph = normalize_local_pdf_graph(graph, request.local_structure_profile)
             return _AttemptResult(attempt_id, engine, profile, graph, artifacts, temporary, drafts)
         except Exception:
             self._artifact_store.discard_attempt_directory(temporary)
@@ -561,7 +513,17 @@ _PADDLEOCR_VL_FURNITURE_LABELS = frozenset(
 )
 _PADDLEOCR_VL_HEADING_LEVELS = {"doc_title": 1, "paragraph_title": 2, "title": 2}
 _PADDLEOCR_VL_TEXT_LABELS = frozenset(
-    {"abstract", "algorithm", "content", "ocr", "reference", "reference_content", "text", "vertical_text"}
+    {
+        "abstract",
+        "algorithm",
+        "content",
+        "figure_title",
+        "ocr",
+        "reference",
+        "reference_content",
+        "text",
+        "vertical_text",
+    }
 )
 _PADDLEOCR_VL_FORMULA_LABELS = frozenset({"display_formula", "formula", "inline_formula"})
 _PADDLEOCR_VL_IMAGE_LABELS = frozenset({"chart", "image", "seal"})
@@ -773,8 +735,10 @@ def _paddleocr_vl_blocks(
                 issues.append(
                     DocumentGraphIssue(
                         "paddleocr-vl-image-artifact-missing",
-                        "PaddleOCR-VL image output has no matching verified image artifact.",
+                        "PaddleOCR-VL image output was excluded because no verified image artifact is available.",
                         locator,
+                        severity="warning",
+                        state="accepted",
                     )
                 )
                 continue

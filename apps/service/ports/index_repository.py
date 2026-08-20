@@ -14,8 +14,6 @@ from domain.indexing import (
     LexicalQuery,
     VectorQuery,
 )
-from domain.metadata_extraction import MetadataCandidate
-from domain.unit_cards import UnitCard, UnitCardHit, UnitCardVector
 
 
 class IndexRepository(Protocol):
@@ -37,22 +35,6 @@ class IndexRepository(Protocol):
 
     def current_embedding_documents(self, vault_id: str) -> list[IndexedDocument]: ...
 
-    def current_metadata_documents(self, vault_id: str) -> list[IndexedDocument]: ...
-
-    def save_metadata_candidates(
-        self, vault_id: str, candidates: tuple[MetadataCandidate, ...]
-    ) -> None: ...
-
-    def list_metadata_candidates(
-        self, vault_id: str, statuses: tuple[str, ...]
-    ) -> list[MetadataCandidate]: ...
-
-    def accepted_metadata_concept_keys(self, vault_id: str) -> set[str]: ...
-
-    def decide_metadata_candidate(
-        self, vault_id: str, candidate_id: str, decision: str, reason: str
-    ) -> MetadataCandidate: ...
-
     def filter_blocks(self, vault_id: str, filters: BlockFilter) -> list[IndexBlockRef]: ...
 
     def search_lexical(self, vault_id: str, query: LexicalQuery) -> list[BlockHit]: ...
@@ -70,25 +52,6 @@ class IndexRepository(Protocol):
     def save_embedding_cache(self, entries: tuple[EmbeddingCacheEntry, ...]) -> None: ...
 
     def save_block_vectors(self, vault_id: str, vectors: tuple[EmbeddingBlockVector, ...]) -> None: ...
-
-    def save_unit_cards(
-        self,
-        vault_id: str,
-        cards: tuple[UnitCard, ...],
-        vectors: tuple[UnitCardVector, ...],
-    ) -> None: ...
-
-    def search_unit_cards_lexical(
-        self, vault_id: str, query: LexicalQuery
-    ) -> list[UnitCardHit]: ...
-
-    def search_unit_cards_vector(
-        self, vault_id: str, query: VectorQuery
-    ) -> list[UnitCardHit]: ...
-
-    def resolve_unit_card_sources(
-        self, vault_id: str, card_id: str, allowed_relative_paths: tuple[str, ...]
-    ) -> list[IndexBlockRef]: ...
 
     def backfill_current_blocks(self, vault_id: str) -> IndexBlockBackfillReport: ...
 

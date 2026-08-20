@@ -25,7 +25,7 @@ def _model(model_id: str, model_type: str) -> ProviderModel:
     )
 
 
-def _provider(*models: ProviderModel) -> Provider:
+def _provider(*models: ProviderModel, api_mode: str = "chat-completions") -> Provider:
     return Provider(
         "provider-1",
         "Provider One",
@@ -37,6 +37,7 @@ def _provider(*models: ProviderModel) -> Provider:
         _UPDATED_AT,
         _CREATED_AT,
         _UPDATED_AT,
+        api_mode=api_mode,
     )
 
 
@@ -184,7 +185,8 @@ def test_legacy_database_keeps_old_constraints_and_persists_rerank_separately(tm
         assert rerank_row == (None, "rerank")
         assert legacy_defaults == [("chat",)]
         assert v2_defaults == [("chat",), ("rerank",)]
-        assert migration_count == 1
+    assert migration_count == 1
+    with sqlite3.connect(database_path) as connection:
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
                 """INSERT INTO provider_models (
@@ -192,6 +194,40 @@ def test_legacy_database_keeps_old_constraints_and_persists_rerank_separately(tm
                     VALUES (?, ?, '[]', 'rerank', 0, 1)""",
                 ("provider-1", "legacy-rerank-column"),
             )
+
+
+def test_existing_database_migrates_and_persists_responses_api_mode(tmp_path: Path) -> None:
+    database_path = tmp_path / "providers.sqlite3"
+    _create_legacy_database(database_path)
+
+    repository = SqliteProviderRepository(database_path)
+    assert repository.get("provider-1").api_mode == "chat-completions"
+
+    repository.save(_provider(_model("chat-model", "chat"), api_mode="responses"))
+
+    reopened = SqliteProviderRepository(database_path)
+    assert reopened.get("provider-1").api_mode == "responses"
+
+    with sqlite3.connect(database_path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(providers)").fetchall()}
+        assert "api_mode" in columns
+
+
+def test_removing_a_model_clears_its_matching_defaults_atomically(tmp_path: Path) -> None:
+    repository = SqliteProviderRepository(tmp_path / "providers.sqlite3")
+    repository.save(_provider(_model("chat-model", "chat"), _model("rerank-model", "rerank")))
+    repository.save_default(ModelSelection("chat", "provider-1", "chat-model", _UPDATED_AT))
+    repository.save_default(ModelSelection("rerank", "provider-1", "rerank-model", _UPDATED_AT))
+
+    repository.remove_model("provider-1", "chat-model", "2026-08-19T00:00:00+00:00")
+
+    provider = repository.get("provider-1")
+    assert [model.model_id for model in provider.models] == ["rerank-model"]
+    assert provider.updated_at == "2026-08-19T00:00:00+00:00"
+    assert repository.get_default("chat") is None
+    assert repository.get_default("rerank") == ModelSelection(
+        "rerank", "provider-1", "rerank-model", _UPDATED_AT
+    )
 
 
 def test_fresh_database_rerank_default_survives_repeated_initialization(tmp_path: Path) -> None:

@@ -123,7 +123,7 @@ def test_import_automatically_parses_structures_commits_and_embeds(tmp_path: Pat
     ]
 
 
-def test_private_suggestions_do_not_block_or_change_an_automatic_commit(tmp_path: Path) -> None:
+def test_classification_suggestions_do_not_block_or_change_an_automatic_commit(tmp_path: Path) -> None:
     service, vault, source_file = _service(tmp_path, committer=LocalVaultCommitter())
 
     task = service.create(vault.vault_id, ImportSelection("session", "files", (source_file,), 999.0))
@@ -131,8 +131,6 @@ def test_private_suggestions_do_not_block_or_change_an_automatic_commit(tmp_path
 
     assert task.lifecycle == "complete"
     assert service.list_classification_suggestions(task.task_id)
-    assert service.list_metadata_tag_proposals(task.task_id)
-    assert service.list_candidate_link_proposals(task.task_id) == []
     rendered = (vault.path / proposal.notes[0].relative_path).read_text(encoding="utf-8")
     assert "tags:" not in rendered
 

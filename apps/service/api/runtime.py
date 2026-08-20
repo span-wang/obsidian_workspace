@@ -8,7 +8,6 @@ MINIMUM_SQLITE_VERSION = "3.45.1"
 RICH_BLOCK_READS_ENVIRONMENT_VARIABLE = "OBSIDIAN_PLATFORM_RICH_BLOCK_READS"
 LEXICAL_RETRIEVAL_ENVIRONMENT_VARIABLE = "OBSIDIAN_PLATFORM_LEXICAL_RETRIEVAL"
 HYBRID_RETRIEVAL_ENVIRONMENT_VARIABLE = "OBSIDIAN_PLATFORM_HYBRID_RETRIEVAL"
-UNIT_CARD_RETRIEVAL_ENVIRONMENT_VARIABLE = "OBSIDIAN_PLATFORM_UNIT_CARD_RETRIEVAL"
 RERANK_RETRIEVAL_ENVIRONMENT_VARIABLE = "OBSIDIAN_PLATFORM_RERANK_RETRIEVAL"
 RETRIEVAL_TEST_UI_ENVIRONMENT_VARIABLE = "OBSIDIAN_PLATFORM_RETRIEVAL_TEST_UI"
 
@@ -24,7 +23,6 @@ class RuntimeState:
     rich_block_reads_enabled: bool = False
     lexical_retrieval_enabled: bool = True
     hybrid_retrieval_enabled: bool = False
-    unit_card_retrieval_enabled: bool = False
     rerank_retrieval_enabled: bool = False
     retrieval_test_ui_enabled: bool = False
 
@@ -74,17 +72,6 @@ def hybrid_retrieval_enabled(value: str | None) -> bool:
     raise ValueError(f"{HYBRID_RETRIEVAL_ENVIRONMENT_VARIABLE} must be a boolean value.")
 
 
-def unit_card_retrieval_enabled(value: str | None) -> bool:
-    if value is None:
-        return False
-    normalized = value.strip().lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    raise ValueError(f"{UNIT_CARD_RETRIEVAL_ENVIRONMENT_VARIABLE} must be a boolean value.")
-
-
 def rerank_retrieval_enabled(value: str | None) -> bool:
     if value is None:
         return False
@@ -127,9 +114,6 @@ def initialize_runtime() -> RuntimeState:
         ),
         hybrid_retrieval_enabled=hybrid_retrieval_enabled(
             os.environ.get(HYBRID_RETRIEVAL_ENVIRONMENT_VARIABLE)
-        ),
-        unit_card_retrieval_enabled=unit_card_retrieval_enabled(
-            os.environ.get(UNIT_CARD_RETRIEVAL_ENVIRONMENT_VARIABLE)
         ),
         rerank_retrieval_enabled=rerank_retrieval_enabled(
             os.environ.get(RERANK_RETRIEVAL_ENVIRONMENT_VARIABLE)

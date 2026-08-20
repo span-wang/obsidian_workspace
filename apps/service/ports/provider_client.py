@@ -19,6 +19,10 @@ class ProviderClient(Protocol):
         self, endpoint: str, secret: str, model_id: str, cancel_event: Event | None = None
     ) -> None: ...
 
+    def probe_responses_generation(
+        self, endpoint: str, secret: str, model_id: str, cancel_event: Event | None = None
+    ) -> None: ...
+
     def probe_embedding(
         self, endpoint: str, secret: str, model_id: str, cancel_event: Event | None = None
     ) -> None: ...
@@ -55,6 +59,15 @@ class ProviderClient(Protocol):
         cancel_event: Event | None = None,
     ) -> str: ...
 
+    def generate_responses(
+        self,
+        endpoint: str,
+        secret: str,
+        model_id: str,
+        prompt: str,
+        cancel_event: Event | None = None,
+    ) -> str: ...
+
     def generate_chat_with_usage(
         self,
         endpoint: str,
@@ -65,7 +78,26 @@ class ProviderClient(Protocol):
         cancel_event: Event | None = None,
     ) -> ChatGeneration: ...
 
+    def generate_responses_with_usage(
+        self,
+        endpoint: str,
+        secret: str,
+        model_id: str,
+        prompt: str,
+        max_output_tokens: int,
+        cancel_event: Event | None = None,
+    ) -> ChatGeneration: ...
+
     def stream_chat(
+        self,
+        endpoint: str,
+        secret: str,
+        model_id: str,
+        prompt: str,
+        cancel_event: Event | None = None,
+    ) -> Iterable[str]: ...
+
+    def stream_responses(
         self,
         endpoint: str,
         secret: str,

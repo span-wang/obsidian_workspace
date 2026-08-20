@@ -38,7 +38,9 @@ class SqliteProviderRepository:
                 streaming_ok INTEGER NOT NULL CHECK (streaming_ok IN (0, 1)), streaming_reason TEXT,
                 embedding_ok INTEGER NOT NULL CHECK (embedding_ok IN (0, 1)), embedding_reason TEXT,
                 last_tested_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                transport TEXT NOT NULL CHECK (transport = 'openai-compatible'))""")
+                transport TEXT NOT NULL CHECK (transport = 'openai-compatible'),
+                api_mode TEXT NOT NULL DEFAULT 'chat-completions'
+                    CHECK (api_mode IN ('chat-completions', 'responses')))""")
             connection.execute("""CREATE TABLE IF NOT EXISTS provider_models (
                 provider_id TEXT NOT NULL REFERENCES providers(provider_id) ON DELETE CASCADE,
                 model_id TEXT NOT NULL, capabilities_json TEXT NOT NULL DEFAULT '[]',
@@ -47,6 +49,7 @@ class SqliteProviderRepository:
                 verification_reason TEXT, is_discovered INTEGER NOT NULL DEFAULT 1 CHECK (is_discovered IN (0, 1)),
                 verified_at TEXT, PRIMARY KEY (provider_id, model_id))""")
             self._add_model_columns(connection)
+            self._add_api_mode_column(connection)
             connection.execute("""CREATE TABLE IF NOT EXISTS background_model_default (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 provider_id TEXT NOT NULL REFERENCES providers(provider_id) ON DELETE CASCADE,
@@ -73,6 +76,16 @@ class SqliteProviderRepository:
         for name, statement in migrations.items():
             if name not in columns:
                 connection.execute(statement)
+
+    @staticmethod
+    def _add_api_mode_column(connection: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(providers)").fetchall()}
+        if "api_mode" not in columns:
+            connection.execute(
+                """ALTER TABLE providers ADD COLUMN api_mode TEXT NOT NULL
+                DEFAULT 'chat-completions'
+                CHECK (api_mode IN ('chat-completions', 'responses'))"""
+            )
 
     @staticmethod
     def _migrate_legacy_default(connection: sqlite3.Connection) -> None:
@@ -214,20 +227,22 @@ class SqliteProviderRepository:
         with self._connect() as connection:
             connection.execute("""INSERT INTO providers (provider_id, name, endpoint, credential_reference,
                 credential_configured, discovery_ok, discovery_reason, health_ok, health_reason, streaming_ok,
-                streaming_reason, embedding_ok, embedding_reason, last_tested_at, created_at, updated_at, transport)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                streaming_reason, embedding_ok, embedding_reason, last_tested_at, created_at, updated_at,
+                transport, api_mode)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(provider_id) DO UPDATE SET name=excluded.name, endpoint=excluded.endpoint,
                 credential_reference=excluded.credential_reference, credential_configured=excluded.credential_configured,
                 discovery_ok=excluded.discovery_ok, discovery_reason=excluded.discovery_reason, health_ok=excluded.health_ok,
                 health_reason=excluded.health_reason, streaming_ok=excluded.streaming_ok,
                 streaming_reason=excluded.streaming_reason, embedding_ok=excluded.embedding_ok,
                 embedding_reason=excluded.embedding_reason, last_tested_at=excluded.last_tested_at,
-                updated_at=excluded.updated_at, transport=excluded.transport""",
+                updated_at=excluded.updated_at, transport=excluded.transport, api_mode=excluded.api_mode""",
                 (provider.provider_id, provider.name, provider.endpoint, provider.credential_reference,
                  int(provider.credential_configured), int(provider.verification.discovery.ok), provider.verification.discovery.reason,
                  int(provider.verification.health.ok), provider.verification.health.reason, 0,
                  "Model verification is configured per model.", 0, "Model verification is configured per model.",
-                 provider.last_tested_at, provider.created_at, provider.updated_at, provider.transport))
+                 provider.last_tested_at, provider.created_at, provider.updated_at, provider.transport,
+                 provider.api_mode))
             connection.execute("DELETE FROM provider_models WHERE provider_id = ?", (provider.provider_id,))
             connection.executemany("""INSERT INTO provider_models (provider_id, model_id, capabilities_json,
                 model_type, configured_model_type, verification_ok, verification_reason, is_discovered, verified_at)
@@ -257,6 +272,25 @@ class SqliteProviderRepository:
     def delete(self, provider_id: str) -> None:
         with self._connect() as connection:
             connection.execute("DELETE FROM providers WHERE provider_id = ?", (provider_id,))
+
+    def remove_model(self, provider_id: str, model_id: str, updated_at: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM model_defaults_v2 WHERE provider_id = ? AND model_id = ?",
+                (provider_id, model_id),
+            )
+            connection.execute(
+                "DELETE FROM model_defaults WHERE provider_id = ? AND model_id = ?",
+                (provider_id, model_id),
+            )
+            connection.execute(
+                "DELETE FROM provider_models WHERE provider_id = ? AND model_id = ?",
+                (provider_id, model_id),
+            )
+            connection.execute(
+                "UPDATE providers SET updated_at = ? WHERE provider_id = ?",
+                (updated_at, provider_id),
+            )
 
     def get_default(self, model_type: str) -> ModelSelection | None:
         with self._connect() as connection:
@@ -316,4 +350,5 @@ class SqliteProviderRepository:
                                             else model["model_type"],
                                             ProbeResult(bool(model["verification_ok"]), model["verification_reason"]),
                                             bool(model["is_discovered"]), model["verified_at"])
-                              for model in models), row["last_tested_at"], row["created_at"], row["updated_at"], row["transport"])
+                              for model in models), row["last_tested_at"], row["created_at"], row["updated_at"],
+                        row["transport"], row["api_mode"])

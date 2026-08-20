@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from domain.embeddings import EmbeddingProfileLocator
 from domain.providers import (
+    API_MODES,
     ChatGeneration,
     MODEL_TYPES,
     ModelSelection,
@@ -23,7 +24,6 @@ from domain.markdown_structuring import MAX_MARKDOWN_PROVIDER_OUTPUT_TOKENS, Mar
 from ports.credential_store import CredentialStore
 from ports.provider_client import ProviderClient, ProviderClientError
 from ports.provider_repository import ProviderRepository
-from ports.provider_unit_card_invalidator import ProviderUnitCardInvalidator
 
 
 class ProviderValidationError(ValueError):
@@ -45,18 +45,23 @@ class ProviderService:
         repository: ProviderRepository,
         credentials: CredentialStore,
         client: ProviderClient,
-        unit_card_invalidator: ProviderUnitCardInvalidator | None = None,
     ) -> None:
         self.repository = repository
         self.credentials = credentials
         self.client = client
-        self.unit_card_invalidator = unit_card_invalidator
         self._locks_guard = Lock()
         self._provider_locks: dict[str, RLock] = {}
 
-    def create(self, name: str, endpoint: str, secret: str | None = None) -> Provider:
+    def create(
+        self,
+        name: str,
+        endpoint: str,
+        secret: str | None = None,
+        api_mode: str = "chat-completions",
+    ) -> Provider:
         normalized_name = self._validate_name(name)
         normalized_endpoint = self._normalize_endpoint(endpoint)
+        normalized_api_mode = self._validate_api_mode(api_mode)
         if secret is not None and not isinstance(secret, str):
             raise ProviderValidationError("Provider credential is invalid.")
         secret = secret.strip() if secret is not None else None
@@ -72,25 +77,36 @@ class ProviderService:
         if secret is not None:
             self.credentials.save(reference, secret)
         provider = Provider(provider_id, normalized_name, normalized_endpoint, reference, secret is not None,
-                            ProviderProbeResults.not_run(), (), None, timestamp, timestamp)
+                            ProviderProbeResults.not_run(), (), None, timestamp, timestamp,
+                            api_mode=normalized_api_mode)
         try:
             self.repository.save(provider)
         except Exception:
             if secret is not None:
                 self.credentials.delete(reference)
             raise
-        self._invalidate(provider_id, timestamp)
         return provider
 
-    def update(self, provider_id: str, name: str, endpoint: str, secret: str | None = None) -> Provider:
+    def update(
+        self,
+        provider_id: str,
+        name: str,
+        endpoint: str,
+        secret: str | None = None,
+        api_mode: str | None = None,
+    ) -> Provider:
         normalized_name = self._validate_name(name)
         normalized_endpoint = self._normalize_endpoint(endpoint)
         if secret is not None:
             self._validate_secret(secret)
         with self._provider_lock(provider_id):
             existing = self.repository.get(provider_id)
+            normalized_api_mode = (
+                existing.api_mode if api_mode is None else self._validate_api_mode(api_mode)
+            )
             timestamp = utc_now()
             updated = replace(existing, name=normalized_name, endpoint=normalized_endpoint,
+                              api_mode=normalized_api_mode,
                               credential_configured=existing.credential_configured or secret is not None,
                               verification=ProviderProbeResults.not_run(), models=(),
                               last_tested_at=None, updated_at=timestamp)
@@ -113,7 +129,6 @@ class ProviderService:
                     except Exception:
                         pass
                 raise
-            self._invalidate(provider_id, timestamp)
             return updated
 
     def get(self, provider_id: str) -> Provider:
@@ -138,10 +153,15 @@ class ProviderService:
     def delete(self, provider_id: str) -> None:
         with self._provider_lock(provider_id):
             provider = self.repository.get(provider_id)
-            timestamp = utc_now()
             self.credentials.delete(provider.credential_reference)
             self.repository.delete(provider_id)
-            self._invalidate(provider_id, timestamp)
+
+    def remove_model(self, provider_id: str, model_id: str) -> Provider:
+        with self._provider_lock(provider_id):
+            provider = self.repository.get(provider_id)
+            self._find_model(provider, model_id)
+            self.repository.remove_model(provider_id, model_id, utc_now())
+            return self.repository.get(provider_id)
 
     def test(self, provider_id: str, cancel_event: Event | None = None) -> Provider:
         with self._provider_lock(provider_id):
@@ -156,7 +176,6 @@ class ProviderService:
                 updated_at=timestamp,
             )
             self.repository.save(invalidated)
-            self._invalidate(provider_id, timestamp)
             try:
                 secret = self._credential_for(provider)
             except ProviderUnavailableError:
@@ -164,7 +183,6 @@ class ProviderService:
                                       verification=self._failed_verification("Credential is unavailable."),
                                       last_tested_at=timestamp)
                 self.repository.save(unavailable)
-                self._invalidate(provider_id, timestamp)
                 return unavailable
 
             discovered_models, discovery = self._probe_discovery(invalidated, secret, cancel_event)
@@ -185,7 +203,6 @@ class ProviderService:
             tested = replace(invalidated, verification=verification,
                              models=models + disappeared_models, last_tested_at=timestamp)
             self.repository.save(tested)
-            self._invalidate(provider_id, timestamp)
             return tested
 
     def configure_model(self, provider_id: str, model_id: str, model_type: str) -> Provider:
@@ -202,7 +219,6 @@ class ProviderService:
             updated = replace(provider, models=tuple(configured if item.model_id == model_id else item
                                                       for item in provider.models), updated_at=timestamp)
             self.repository.save(updated)
-            self._invalidate(provider_id, timestamp)
             return updated
 
     def test_model(self, provider_id: str, model_id: str, cancel_event: Event | None = None) -> Provider:
@@ -220,7 +236,6 @@ class ProviderService:
                 invalidated_model if item.model_id == model_id else item for item in provider.models
             ), updated_at=timestamp)
             self.repository.save(invalidated)
-            self._invalidate(provider_id, timestamp)
             if model.model_type == "rerank" and not self._is_secure_endpoint(provider.endpoint):
                 tested_model = replace(
                     invalidated_model,
@@ -242,11 +257,20 @@ class ProviderService:
                     updated = replace(invalidated, credential_configured=False)
                 else:
                     if model.model_type in {"chat", "markdown"}:
+                        probe = (
+                            self.client.probe_responses_generation
+                            if provider.api_mode == "responses"
+                            else self.client.probe_streaming_generation
+                        )
                         verification = self._probe(
-                            lambda: self.client.probe_streaming_generation(
+                            lambda: probe(
                                 invalidated.endpoint, secret, model_id, cancel_event
                             ),
-                            "Chat model verification could not be completed.",
+                            (
+                                "Responses model verification could not be completed."
+                                if provider.api_mode == "responses"
+                                else "Chat model verification could not be completed."
+                            ),
                         )
                     elif model.model_type == "embedding":
                         verification = self._probe(
@@ -270,7 +294,6 @@ class ProviderService:
                 tested_model if item.model_id == model_id else item for item in updated.models
             ), updated_at=timestamp)
             self.repository.save(updated)
-            self._invalidate(provider_id, timestamp)
             return updated
 
     def get_default(self, model_type: str) -> ModelSelection | None:
@@ -288,12 +311,8 @@ class ProviderService:
                 raise ProviderValidationError("The selected Provider has not passed discovery and health checks.")
             if not self._credential_is_available(provider):
                 raise ProviderValidationError("The selected Provider credential is unavailable.")
-            previous = self.repository.get_default(model_type)
             selection = ModelSelection(model_type, provider_id, model_id, utc_now())
             self.repository.save_default(selection)
-            if previous is not None and previous.provider_id != provider_id:
-                self._invalidate(previous.provider_id, selection.updated_at)
-            self._invalidate(provider_id, selection.updated_at)
             return selection
 
     def clear_default(self, model_type: str) -> None:
@@ -303,7 +322,6 @@ class ProviderService:
             return
         with self._provider_lock(previous.provider_id):
             self.repository.delete_default(model_type)
-            self._invalidate(previous.provider_id, utc_now())
 
     def resolve_model(self, model_type: str) -> ResolvedProviderModel:
         self._validate_model_type(model_type)
@@ -358,7 +376,12 @@ class ProviderService:
                 )
             secret = self._credential_for(resolved.provider)
             try:
-                return self.client.generate_chat(
+                generator = (
+                    self.client.generate_responses
+                    if resolved.provider.api_mode == "responses"
+                    else self.client.generate_chat
+                )
+                return generator(
                     resolved.provider.endpoint, secret, resolved.model.model_id, normalized_prompt
                 )
             except ProviderClientError as error:
@@ -398,7 +421,12 @@ class ProviderService:
                 )
             secret = self._credential_for(resolved.provider)
             try:
-                return self.client.generate_chat_with_usage(
+                generator = (
+                    self.client.generate_responses_with_usage
+                    if resolved.provider.api_mode == "responses"
+                    else self.client.generate_chat_with_usage
+                )
+                return generator(
                     resolved.provider.endpoint,
                     secret,
                     resolved.model.model_id,
@@ -443,7 +471,12 @@ class ProviderService:
                 )
             secret = self._credential_for(resolved.provider)
             try:
-                return self.client.generate_chat_with_usage(
+                generator = (
+                    self.client.generate_responses_with_usage
+                    if resolved.provider.api_mode == "responses"
+                    else self.client.generate_chat_with_usage
+                )
+                return generator(
                     resolved.provider.endpoint,
                     secret,
                     resolved.model.model_id,
@@ -465,7 +498,12 @@ class ProviderService:
             resolved = self.resolve_specific_model("chat", provider_id, model_id)
             secret = self._credential_for(resolved.provider)
             try:
-                yield from self.client.stream_chat(
+                generator = (
+                    self.client.stream_responses
+                    if resolved.provider.api_mode == "responses"
+                    else self.client.stream_chat
+                )
+                yield from generator(
                     resolved.provider.endpoint, secret, resolved.model.model_id, normalized_prompt
                 )
             except ProviderClientError as error:
@@ -599,6 +637,12 @@ class ProviderService:
             raise ProviderValidationError("Model type must be chat, embedding, rerank, or markdown.")
 
     @staticmethod
+    def _validate_api_mode(api_mode: str) -> str:
+        if api_mode not in API_MODES:
+            raise ProviderValidationError("Provider API mode must be chat-completions or responses.")
+        return api_mode
+
+    @staticmethod
     def _find_model(provider: Provider, model_id: str) -> ProviderModel:
         for model in provider.models:
             if model.model_id == model_id:
@@ -657,6 +701,8 @@ class ProviderService:
     def _probe(operation, failure_reason: str) -> ProbeResult:
         try:
             operation()
+        except ProviderClientError as error:
+            return ProbeResult.failed(f"{failure_reason} {error}")
         except Exception:
             return ProbeResult.failed(failure_reason)
         return ProbeResult.success()
@@ -665,10 +711,6 @@ class ProviderService:
     def _failed_verification(reason: str) -> ProviderProbeResults:
         failed = ProbeResult.failed(reason)
         return ProviderProbeResults(failed, failed)
-
-    def _invalidate(self, provider_id: str, timestamp: str) -> None:
-        if self.unit_card_invalidator is not None:
-            self.unit_card_invalidator.invalidate_unit_cards_for_provider_change(provider_id, timestamp)
 
     @contextmanager
     def _provider_lock(self, provider_id: str):

@@ -31,6 +31,17 @@ class FakeRepository:
             if selection.provider_id == provider_id:
                 del self.defaults[model_type]
 
+    def remove_model(self, provider_id, model_id, updated_at) -> None:
+        provider = self.providers[provider_id]
+        self.providers[provider_id] = replace(
+            provider,
+            models=tuple(model for model in provider.models if model.model_id != model_id),
+            updated_at=updated_at,
+        )
+        for model_type, selection in list(self.defaults.items()):
+            if selection.provider_id == provider_id and selection.model_id == model_id:
+                del self.defaults[model_type]
+
     def get_default(self, model_type):
         return self.defaults.get(model_type)
 
@@ -87,6 +98,10 @@ class FakeClient:
             self.stream_started.set()
             self.release_stream.wait(timeout=2)
 
+    def probe_responses_generation(self, endpoint, secret, model_id, cancel_event=None) -> None:
+        self.secrets.append(secret)
+        self.calls.append(("responses", model_id))
+
     def probe_embedding(self, endpoint, secret, model_id, cancel_event=None) -> None:
         self.secrets.append(secret)
         self.calls.append(("embedding", model_id))
@@ -113,22 +128,30 @@ class FakeClient:
         self.calls.append(("generate-chat-with-usage", model_id, max_output_tokens))
         return ChatGeneration(self.chat_response, ChatUsage(10, 5, 15))
 
+    def generate_responses(self, endpoint, secret, model_id, prompt, cancel_event=None):
+        self.secrets.append(secret)
+        self.calls.append(("generate-responses", model_id))
+        return self.chat_response
 
-class FakeUnitCardInvalidator:
-    def __init__(self) -> None:
-        self.calls = []
+    def generate_responses_with_usage(
+        self, endpoint, secret, model_id, prompt, max_output_tokens, cancel_event=None
+    ):
+        self.secrets.append(secret)
+        self.calls.append(("generate-responses-with-usage", model_id, max_output_tokens))
+        return ChatGeneration(self.chat_response, ChatUsage(10, 5, 15))
 
-    def invalidate_unit_cards_for_provider_change(self, provider_id, updated_at) -> None:
-        self.calls.append((provider_id, updated_at))
+    def stream_responses(self, endpoint, secret, model_id, prompt, cancel_event=None):
+        self.secrets.append(secret)
+        self.calls.append(("stream-responses", model_id))
+        yield self.chat_response
 
 
-def make_service(*, repository=None, client=None, unit_card_invalidator=None):
+def make_service(*, repository=None, client=None):
     credentials = FakeCredentials()
     service = ProviderService(
         repository=repository or FakeRepository(),
         credentials=credentials,
         client=client or FakeClient(),
-        unit_card_invalidator=unit_card_invalidator,
     )
     return service, service.repository, credentials
 
@@ -212,6 +235,60 @@ def test_models_are_verified_by_type_and_defaults_are_independent() -> None:
     assert service.resolve_model("rerank").model.model_id == "rerank-model"
 
 
+def test_responses_mode_probes_and_generates_with_the_responses_contract() -> None:
+    client = FakeClient()
+    service, _, _ = make_service(client=client)
+    provider = service.create(
+        "Responses Cloud", "https://provider.example/v1", "secret", api_mode="responses"
+    )
+    discovered = service.test(provider.provider_id)
+    service.configure_model(discovered.provider_id, "chat-model", "chat")
+    verified = service.test_model(discovered.provider_id, "chat-model")
+
+    generation = service.generate_chat_with_usage(
+        verified.provider_id,
+        "chat-model",
+        "rank these candidates",
+        max_output_tokens=128,
+        expected_provider_updated_at=verified.updated_at,
+    )
+
+    assert verified.api_mode == "responses"
+    assert ("responses", "chat-model") in client.calls
+    assert generation.content == '{"results":[]}'
+    assert client.calls[-1] == ("generate-responses-with-usage", "chat-model", 128)
+
+
+def test_model_verification_preserves_safe_provider_client_errors() -> None:
+    class FailingClient(FakeClient):
+        def probe_streaming_generation(self, endpoint, secret, model_id, cancel_event=None) -> None:
+            raise ProviderClientError("Provider TLS connection failed.")
+
+    service, _, _ = make_service(client=FailingClient())
+    provider = discovered_provider(service)
+    service.configure_model(provider.provider_id, "chat-model", "chat")
+
+    tested = service.test_model(provider.provider_id, "chat-model")
+
+    model = next(item for item in tested.models if item.model_id == "chat-model")
+    assert model.verification.ok is False
+    assert model.verification.reason == (
+        "Chat model verification could not be completed. Provider TLS connection failed."
+    )
+
+
+def test_removing_a_model_clears_its_defaults_regardless_of_verification_result() -> None:
+    service, _, _ = make_service()
+    provider = discovered_provider(service)
+    service.configure_model(provider.provider_id, "chat-model", "chat")
+    verified = service.test_model(provider.provider_id, "chat-model")
+    service.set_default("chat", verified.provider_id, "chat-model")
+
+    removed = service.remove_model(verified.provider_id, "chat-model")
+
+    assert all(model.model_id != "chat-model" for model in removed.models)
+    assert service.get_default("chat") is None
+
 def test_markdown_model_is_verified_and_generation_is_locked_to_its_default() -> None:
     client = FakeClient()
     client.chat_response = '{"blocks":[]}'
@@ -275,21 +352,6 @@ def test_refresh_invalidates_previously_verified_models() -> None:
     assert chat.verification.ok is False
     with pytest.raises(ProviderUnavailableError, match="unavailable"):
         service.resolve_model("chat")
-
-
-def test_provider_selection_changes_invalidate_unit_card_projections() -> None:
-    unit_card_invalidator = FakeUnitCardInvalidator()
-    service, _, _ = make_service(unit_card_invalidator=unit_card_invalidator)
-    provider = discovered_provider(service)
-    service.configure_model(provider.provider_id, "chat-model", "chat")
-    service.test_model(provider.provider_id, "chat-model")
-    unit_card_invalidator.calls.clear()
-
-    service.set_default("chat", provider.provider_id, "chat-model")
-
-    assert [provider_id for provider_id, _updated_at in unit_card_invalidator.calls] == [
-        provider.provider_id
-    ]
 
 
 def test_invalid_update_keeps_the_existing_credential() -> None:

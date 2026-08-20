@@ -273,8 +273,6 @@ def test_structured_documents_skip_unstructured_legacy_rows_without_weakening_ri
     assert repository.current_heading_scope_documents("vault-1") == []
     with pytest.raises(ValueError, match="block-content-sha256-missing"):
         repository.current_embedding_documents("vault-1")
-    with pytest.raises(ValueError, match="block-content-sha256-missing"):
-        repository.current_metadata_documents("vault-1")
 
 
 def test_structured_documents_ignore_an_unstructured_legacy_document_beside_rich_data(

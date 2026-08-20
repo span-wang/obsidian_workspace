@@ -21,6 +21,7 @@ from domain.derived_notes import (
     split_note_at_unit,
     structure_graph_markdown_proposal,
 )
+from domain.local_markdown_structure import DEFAULT_LOCAL_MARKDOWN_STRUCTURE_PROFILE
 from domain.classification import (
     ClassificationSuggestion,
     LOW_CONFIDENCE_THRESHOLD,
@@ -30,24 +31,8 @@ from domain.classification import (
     validate_filename_for_proposal,
     validate_target_within_managed_root,
 )
-from domain.candidate_links import (
-    CandidateLinkProposal,
-    discover_candidate_links,
-    proposal_sha256,
-)
-from domain.metadata_tags import (
-    apply_tag_change,
-    MetadataTagProposal,
-    TagChangePreview,
-    TagDefinition,
-    normalize_tag,
-    plan_tag_change,
-    suggest_metadata_tags,
-)
 from domain.evidence import (
-    ConversionAttempt,
     ConversionEvidence,
-    DocumentGraph,
     BlockPayload,
     correct_document_graph,
     DocumentBlock,
@@ -75,7 +60,15 @@ from domain.review_commits import (
 )
 from domain.sources import VersionSuggestion
 from domain.online_document_parser import OnlineParseJob
-from domain.tasks import ImportTask, ImportTaskCounts, ImportTaskItem, new_import_task, utc_now
+from domain.tasks import (
+    MARKDOWN_PIPELINES,
+    ImportTask,
+    ImportTaskCounts,
+    ImportTaskItem,
+    MarkdownPipeline,
+    new_import_task,
+    utc_now,
+)
 from ports.source_repository import SourceRepository
 from ports.task_repository import TaskRepository
 from ports.task_worker import TaskWorker
@@ -150,19 +143,34 @@ class ImportTaskService:
         self._next_queue_order = 0
 
     def create(
-        self, vault_id: str, selection: ImportSelection, online_parse_provider_id: str | None = None
+        self,
+        vault_id: str,
+        selection: ImportSelection,
+        online_parse_provider_id: str | None = None,
+        markdown_pipeline: MarkdownPipeline | None = None,
     ) -> ImportTask:
         with self._state_lock:
             source_paths = self._selected_files(selection)
             if len(source_paths) != 1:
                 raise ImportTaskError("Use create_tasks when the import selection contains multiple files.")
-            return self._create_tasks(vault_id, selection, source_paths, online_parse_provider_id)[0]
+            return self._create_tasks(
+                vault_id, selection, source_paths, online_parse_provider_id, markdown_pipeline
+            )[0]
 
     def create_tasks(
-        self, vault_id: str, selection: ImportSelection, online_parse_provider_id: str | None = None
+        self,
+        vault_id: str,
+        selection: ImportSelection,
+        online_parse_provider_id: str | None = None,
+        markdown_pipeline: MarkdownPipeline | None = None,
     ) -> tuple[ImportTask, ...]:
         with self._state_lock:
-            return self._create_tasks(vault_id, selection, online_parse_provider_id=online_parse_provider_id)
+            return self._create_tasks(
+                vault_id,
+                selection,
+                online_parse_provider_id=online_parse_provider_id,
+                markdown_pipeline=markdown_pipeline,
+            )
 
     def _create_tasks(
         self,
@@ -170,9 +178,12 @@ class ImportTaskService:
         selection: ImportSelection,
         source_paths: tuple[Path, ...] | None = None,
         online_parse_provider_id: str | None = None,
+        markdown_pipeline: MarkdownPipeline | None = None,
     ) -> tuple[ImportTask, ...]:
         vault = self._available_vault(vault_id)
         source_paths = source_paths or self._selected_files(selection)
+        if markdown_pipeline is not None and markdown_pipeline not in MARKDOWN_PIPELINES:
+            raise ImportTaskError("Unsupported Markdown pipeline.")
         online_parse_selections = {}
         if online_parse_provider_id is not None:
             if self.online_parse_provider_service is None:
@@ -193,6 +204,14 @@ class ImportTaskService:
                 source_paths=(source_path,),
                 scope_label=self._scope_label((source_path,)),
                 online_parse_selection=online_parse_selections.get(source_path),
+                markdown_pipeline=(
+                    markdown_pipeline if source_path.suffix.casefold() == ".pdf" else None
+                ),
+                local_structure_profile=(
+                    DEFAULT_LOCAL_MARKDOWN_STRUCTURE_PROFILE
+                    if source_path.suffix.casefold() == ".pdf"
+                    else None
+                ),
             )
             for source_path in source_paths
         )
@@ -332,6 +351,20 @@ class ImportTaskService:
                     self.repository.save(restarting, "ocr-dequeued")
                     started = self._start_ocr(restarting, persist_start=False, retry_failed=True)
                 elif "restart-derivation" in next_task.recovery_actions:
+                    conversion_retry = self._prepare_blocked_conversion_retry(next_task)
+                    if conversion_retry is not None:
+                        queued_conversion = replace(
+                            conversion_retry,
+                            lifecycle="queued",
+                            phase="queued",
+                            current_item_label=None,
+                            recovery_actions=("restart-conversion",),
+                            failure_reason=None,
+                            updated_at=utc_now(),
+                        )
+                        self.repository.save(queued_conversion, "conversion-requeued")
+                        self._record_queue_order(next_task.task_id)
+                        continue
                     restarting = replace(
                         next_task,
                         lifecycle="running",
@@ -645,6 +678,9 @@ class ImportTaskService:
                     source_paths=task.source_paths,
                     scope_label=task.scope_label,
                     parent_task_id=task.task_id,
+                    online_parse_selection=task.online_parse_selection,
+                    markdown_pipeline=task.markdown_pipeline,
+                    local_structure_profile=task.local_structure_profile,
                 )
                 self.repository.save(
                     replace(task, recovery_actions=(), updated_at=utc_now()), "cancel-replaced"
@@ -659,6 +695,11 @@ class ImportTaskService:
             if "restart-ocr" in task.recovery_actions:
                 return self._enqueue_recovery(task, "restart-ocr", "ocr-requeued")
             if "restart-derivation" in task.recovery_actions:
+                task_for_conversion = self._prepare_blocked_conversion_retry(task)
+                if task_for_conversion is not None:
+                    return self._enqueue_recovery(
+                        task_for_conversion, "restart-conversion", "conversion-requeued"
+                    )
                 return self._enqueue_recovery(task, "restart-derivation", "derivation-requeued")
             if "retry-commit" in task.recovery_actions:
                 return self._enqueue_recovery(task, "retry-commit", "commit-requeued")
@@ -680,6 +721,20 @@ class ImportTaskService:
         self._record_queue_order(task.task_id)
         self._start_next_queued_task()
         return self.get(task.task_id)
+
+    def _prepare_blocked_conversion_retry(self, task: ImportTask) -> ImportTask | None:
+        updated = task
+        found_blocked_graph = False
+        for item in self.repository.list_items(task.task_id):
+            evidence = self.repository.get_conversion_evidence(item.item_id)
+            if evidence is None or not evidence.graph.has_blocking_unresolved_content():
+                continue
+            found_blocked_graph = True
+            updated = self.repository.record_conversion_rejection(
+                item.item_id,
+                "The selected conversion graph contains unresolved content and will be regenerated.",
+            )
+        return updated if found_blocked_graph else None
 
     def _record_queue_order(self, task_id: str) -> None:
         if task_id in self._queue_order:
@@ -720,9 +775,9 @@ class ImportTaskService:
             try:
                 task = self.get(task_id)
             except KeyError:
-                return False if event.get("type") == "conversion-attempted" else None
+                return None
             if task.lifecycle != "running":
-                return False if event.get("type") == "conversion-attempted" else None
+                return None
             event_type = event["type"]
             if event_type == "item":
                 self.repository.append_item(task_id, self._item_from_event(task, event))
@@ -786,8 +841,6 @@ class ImportTaskService:
                 return
             if event_type == "online-parse-submitted":
                 return self._record_online_parse_job(task, event)
-            if event_type == "conversion-attempted":
-                return self._record_rejected_conversion_attempt(task, event)
             if event_type == "conversion-failed-item":
                 updated = self.repository.record_conversion_rejection(
                     int(event["item_id"]),
@@ -1133,20 +1186,6 @@ class ImportTaskService:
         if evidence.attempt.task_id != task.task_id or evidence.attempt.item_id != item_id:
             self.repository.record_conversion_rejection(item_id, "Conversion event identity did not match its task item.")
             return
-        decision = event.get("quality_gate_decision")
-        if not isinstance(decision, dict) or decision.get("action") != "accepted":
-            self.repository.record_conversion_rejection(
-                item_id, "The selected conversion graph has no accepted structural quality decision."
-            )
-            return
-        if decision.get("decision_id") != evidence.attempt.quality_gate_decision_id:
-            self.repository.record_conversion_rejection(
-                item_id, "The selected conversion graph quality decision does not match its attempt."
-            )
-            return
-        self.repository.record_conversion_quality_gate_decision(
-            evidence.attempt, evidence.graph.graph_id, decision
-        )
         updated = self.repository.record_conversion_evidence(item_id, evidence)
         self._set_online_parse_job_status(updated, "completed", "online-parse-completed")
 
@@ -1169,34 +1208,6 @@ class ImportTaskService:
             replace(task, online_parse_job=replace(job, status=status, updated_at=utc_now()), updated_at=utc_now()),
             event_type,
         )
-
-    def _record_rejected_conversion_attempt(
-        self, task: ImportTask, event: dict[str, object]
-    ) -> bool:
-        item_id = int(event["item_id"])
-        item = next(
-            (candidate for candidate in self.repository.list_items(task.task_id) if candidate.item_id == item_id),
-            None,
-        )
-        if item is None:
-            raise ValueError("Rejected conversion attempt has no task item.")
-        attempt = ConversionAttempt.from_dict(dict(event["attempt"]))
-        graph = DocumentGraph.from_dict(dict(event["graph"]))
-        decision = event.get("quality_gate_decision")
-        if (
-            attempt.task_id != task.task_id
-            or attempt.item_id != item_id
-            or attempt.status != "rejected"
-            or item.content_sha256 != graph.source_sha256
-            or graph.input_snapshot_hash != attempt.input_snapshot_hash
-            or graph.selected_attempt_id != attempt.attempt_id
-            or not isinstance(decision, dict)
-            or decision.get("decision_id") != attempt.quality_gate_decision_id
-            or decision.get("action") not in {"fallback", "waiting-for-review"}
-        ):
-            raise ValueError("Rejected conversion attempt failed immutable snapshot or gate validation.")
-        self.repository.record_rejected_conversion_attempt(item_id, attempt, graph, decision)
-        return True
 
     def _record_parse_item(self, task: ImportTask, event: dict[str, object]) -> None:
         item_id = int(event["item_id"])
@@ -1227,9 +1238,9 @@ class ImportTaskService:
             self._record_source_change(task, item_id)
             return
         proposal = proposal_from_dict(dict(event["proposal"]))
-        if task.online_parse_selection is not None and isinstance(proposal, DerivedMarkdownProposal):
+        if task.resolved_markdown_pipeline() == "ai" and isinstance(proposal, DerivedMarkdownProposal):
             try:
-                proposal = self._structure_online_graph_proposal(task, item, proposal)
+                proposal = self._structure_graph_proposal(task, item, proposal)
             except MarkdownStructuringError as error:
                 self._record_markdown_structure_failure(task, item_id, str(error))
                 return
@@ -1238,14 +1249,17 @@ class ImportTaskService:
             proposal = replace(proposal, revision=existing.revision + 1)
         self.repository.record_note_proposal(item_id, proposal)
 
-    def _structure_online_graph_proposal(
+    def _structure_graph_proposal(
         self, task: ImportTask, item: ImportTaskItem, proposal: DerivedMarkdownProposal
     ) -> DerivedMarkdownProposal:
         if self.markdown_structuring_service is None:
             raise MarkdownStructuringError("Markdown structuring service is unavailable.")
-        selection = task.online_parse_selection
-        assert selection is not None
-        if not self._markdown_outbound_allowed(task, selection.policy_path):
+        policy_path = (
+            task.online_parse_selection.policy_path
+            if task.online_parse_selection is not None
+            else item.source_path.name
+        )
+        if not self._markdown_outbound_allowed(task, policy_path):
             raise MarkdownStructuringError("Markdown structuring is blocked by the vault outbound policy.")
         evidence = self.repository.get_conversion_evidence(item.item_id)
         if evidence is None:
@@ -1263,13 +1277,7 @@ class ImportTaskService:
             raise MarkdownStructuringError(str(error)) from error
 
     def _record_source_change(self, task: ImportTask, item_id: int) -> None:
-        self.repository.invalidate_candidate_link_proposals(
-            task.task_id,
-            item_id,
-            "Source content changed after scanning; restart the scan before reviewing this candidate link.",
-        )
         self.repository.invalidate_note_proposals(task.task_id, item_id)
-        self.repository.invalidate_metadata_tag_proposals(task.task_id, item_id)
         self.repository.record_parse_failure(
             item_id,
             "Source content changed after scanning; restart the scan before parsing this file.",
@@ -1557,11 +1565,7 @@ class ImportTaskService:
         )
         current = self.get(task.task_id)
 
-        # These three pipelines are task-private observations. They intentionally do not
-        # participate in planning, rendering, indexing, or committing the Vault files.
         self._ensure_classification_suggestions(current)
-        self._ensure_metadata_tag_proposals(current)
-        self._ensure_candidate_link_proposals(current)
         return self.commit_automatically(current.task_id)
 
     def _automatic_blockers(self, task: ImportTask) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -1723,75 +1727,6 @@ class ImportTaskService:
                 proposal.item_id, generated, "classification-generated"
             )
 
-    def _ensure_metadata_tag_proposals(self, task: ImportTask) -> None:
-        # Metadata/tag generation remains independent of classification decisions and
-        # never modifies the Markdown being committed by this task.
-        vault = self._available_vault(task.vault_id)
-        classifications = {
-            suggestion.item_id: suggestion
-            for suggestion in self.repository.list_classification_suggestions(task.task_id)
-        }
-        items = {item.item_id: item for item in self.repository.list_items(task.task_id)}
-        existing_tags = tuple(self.repository.list_vault_tags(vault.vault_id))
-        for proposal in self.repository.list_note_proposals(task.task_id):
-            item = items.get(proposal.item_id)
-            classification = classifications.get(proposal.item_id)
-            if item is None or classification is None:
-                continue
-            proposal_hash = (
-                proposal.source_sha256
-                if isinstance(proposal, DerivedMarkdownProposal)
-                else proposal.content_sha256
-            )
-            existing = self.repository.get_metadata_tag_proposal(proposal.item_id)
-            if (
-                existing is not None
-                and existing.vault_id == task.vault_id
-                and existing.proposal_revision == getattr(proposal, "revision", 1)
-                and existing.content_sha256 == proposal_hash
-                and existing.domain == classification.domain
-                and existing.domain_confidence == classification.confidence
-            ):
-                continue
-            generated = suggest_metadata_tags(
-                task_id=task.task_id,
-                proposal=proposal,
-                source_type=item.document_kind or "unknown",
-                source_file=item.label,
-                ingested_at=task.created_at,
-                processing_status=task.phase,
-                domain=classification.domain,
-                domain_confidence=classification.confidence,
-                existing_tags=existing_tags,
-                created_at=utc_now(),
-            )
-            if existing is not None:
-                generated = replace(generated, revision=existing.revision + 1)
-            self.repository.record_metadata_tag_proposal(
-                proposal.item_id, generated, "metadata-tags-generated"
-            )
-
-    def _ensure_candidate_link_proposals(self, task: ImportTask) -> None:
-        # Candidate links are private evidence records. They are not appended to notes
-        # and cannot block, select, or alter an automatic Vault commit.
-        proposals = tuple(self.repository.list_note_proposals(task.task_id))
-        existing = {
-            proposal.review_item_id: proposal
-            for proposal in self.repository.list_candidate_link_proposals(task.task_id)
-            if not proposal.is_legacy_isolated
-        }
-        for generated in discover_candidate_links(task.task_id, proposals, utc_now()):
-            current = existing.get(generated.review_item_id)
-            if (
-                current is not None
-                and current.source_proposal_revision == generated.source_proposal_revision
-                and current.source_proposal_sha256 == generated.source_proposal_sha256
-                and current.target_proposal_revision == generated.target_proposal_revision
-                and current.target_proposal_sha256 == generated.target_proposal_sha256
-            ):
-                continue
-            self.repository.record_candidate_link_proposal(generated, "candidate-links-generated")
-
     def _require_classification_review_task(self, task: ImportTask) -> None:
         if task.lifecycle != "waiting-for-review":
             raise ImportTaskError("Classification decisions need a task waiting for review.")
@@ -1843,14 +1778,6 @@ class ImportTaskService:
     def list_classification_suggestions(self, task_id: str) -> list[ClassificationSuggestion]:
         self.get(task_id)
         return self.repository.list_classification_suggestions(task_id)
-
-    def list_metadata_tag_proposals(self, task_id: str) -> list[MetadataTagProposal]:
-        self.get(task_id)
-        return self.repository.list_metadata_tag_proposals(task_id)
-
-    def list_candidate_link_proposals(self, task_id: str) -> list[CandidateLinkProposal]:
-        self.get(task_id)
-        return self.repository.list_candidate_link_proposals(task_id)
 
     def get_review_snapshot(self, task_id: str) -> ReviewSnapshot | None:
         self.get(task_id)
@@ -2048,8 +1975,6 @@ class ImportTaskService:
         updated_evidence = ConversionEvidence(evidence.document_kind, graph, evidence.attempt)
         self.repository.record_conversion_evidence(item_id, updated_evidence)
         self.repository.invalidate_note_proposals(task.task_id, item_id)
-        self.repository.invalidate_candidate_link_proposals(task.task_id, item_id, reason)
-        self.repository.invalidate_metadata_tag_proposals(task.task_id, item_id)
         return self._start_derivation(self.get(task.task_id))
 
     def _conversion_evidence_for_item(self, task: ImportTask, item_id: int) -> ConversionEvidence:
@@ -2818,265 +2743,6 @@ class ImportTaskService:
                 raise ImportTaskError("An existing Vault source cannot be read.") from error
             sequence += 1
 
-    def decide_candidate_link_proposal(
-        self, task_id: str, review_item_id: str, decision: str, reason: str
-    ) -> ImportTask:
-        with self._state_lock:
-            task = self.get(task_id)
-            self._require_classification_review_task(task)
-            self._available_vault(task.vault_id)
-            candidate = self.repository.get_candidate_link_proposal(task_id, review_item_id)
-            if candidate is None or candidate.vault_id != task.vault_id:
-                raise ImportTaskError("This candidate link does not belong to the import task.")
-            if candidate.status == "stale":
-                raise ImportTaskError(
-                    candidate.stale_reason or "The candidate link is stale and must be regenerated."
-                )
-            if candidate.decision is not None:
-                raise ImportTaskError("The candidate link already has a review decision.")
-            items = {item.item_id: item for item in self.repository.list_items(task_id)}
-            source_item = items.get(candidate.source_item_id)
-            target_item = items.get(candidate.target_item_id)
-            source = self.repository.get_note_proposal(candidate.source_item_id)
-            target = self.repository.get_note_proposal(candidate.target_item_id)
-            if source_item is None or target_item is None or source is None or target is None:
-                raise ImportTaskError("The candidate link is stale; regenerate the review proposals.")
-            source_matches = self._source_matches_scanned_content(source_item)
-            target_matches = self._source_matches_scanned_content(target_item)
-            if not source_matches or not target_matches:
-                changed_item_id = (
-                    candidate.source_item_id
-                    if not source_matches
-                    else candidate.target_item_id
-                )
-                self._record_source_change(task, changed_item_id)
-                raise ImportTaskError("The candidate link is stale; restart the scan before reviewing it.")
-            if (
-                candidate.source_proposal_revision != getattr(source, "revision", 1)
-                or candidate.source_proposal_sha256 != proposal_sha256(source)
-                or candidate.target_proposal_revision != getattr(target, "revision", 1)
-                or candidate.target_proposal_sha256 != proposal_sha256(target)
-            ):
-                self.repository.invalidate_candidate_link_proposals(
-                    task_id,
-                    candidate.source_item_id,
-                    "A related note proposal changed; regenerate candidate links.",
-                )
-                self.repository.invalidate_candidate_link_proposals(
-                    task_id,
-                    candidate.target_item_id,
-                    "A related note proposal changed; regenerate candidate links.",
-                )
-                raise ImportTaskError("The candidate link proposal is stale and must be regenerated.")
-            try:
-                decided = candidate.with_decision(decision, reason, utc_now())
-            except ValueError as error:
-                raise ImportTaskError(str(error)) from error
-            return self.repository.record_candidate_link_proposal(
-                decided, f"candidate-links-{decision}"
-            )
-
-    def decide_metadata_tag_proposal(
-        self, task_id: str, item_id: int, decision: str, reason: str
-    ) -> ImportTask:
-        with self._state_lock:
-            task = self.get(task_id)
-            self._require_classification_review_task(task)
-            vault = self._available_vault(task.vault_id)
-            item = next((candidate for candidate in self.repository.list_items(task_id) if candidate.item_id == item_id), None)
-            proposal = self.repository.get_note_proposal(item_id)
-            governance = self.repository.get_metadata_tag_proposal(item_id)
-            if item is None or proposal is None or governance is None:
-                raise ImportTaskError("This import item has no metadata and tag proposal to review.")
-            if governance.vault_id != vault.vault_id or not self._source_matches_scanned_content(item):
-                raise ImportTaskError("The metadata and tag proposal is stale; restart the scan before reviewing it.")
-            proposal_hash = proposal.source_sha256 if isinstance(proposal, DerivedMarkdownProposal) else proposal.content_sha256
-            if governance.proposal_revision != getattr(proposal, "revision", 1) or governance.content_sha256 != proposal_hash:
-                raise ImportTaskError("The metadata and tag proposal is stale and must be regenerated.")
-            decided = governance.with_decision(decision, reason, utc_now())
-            if decision == "accepted":
-                known = {
-                    tag.name: tag
-                    for tag in self.repository.list_vault_tags(vault.vault_id, include_deleted=True)
-                }
-                for tag in decided.tags:
-                    existing = known.get(tag.name)
-                    if not tag.is_new or (existing is not None and existing.status != "deleted"):
-                        continue
-                    self.repository.record_vault_tag(
-                        TagDefinition(
-                            vault.vault_id,
-                            tag.name,
-                            "active",
-                            0,
-                            (existing.revision + 1) if existing is not None else 1,
-                            utc_now(),
-                        )
-                    )
-            return self.repository.record_metadata_tag_proposal(
-                item_id, decided, f"metadata-tags-{decision}"
-            )
-
-    def list_vault_tags(self, vault_id: str, search: str = "") -> list[TagDefinition]:
-        with self._state_lock:
-            self._available_vault(vault_id)
-            tags = self.repository.list_vault_tags(vault_id, search)
-            proposals = self.repository.list_metadata_tag_proposals_for_vault(vault_id)
-            usages = {
-                tag.name: sum(
-                    1
-                    for proposal in proposals
-                    if proposal.decision == "accepted" and any(candidate.name == tag.name for candidate in proposal.tags)
-                )
-                for tag in tags
-            }
-            return [replace(tag, usage_count=usages[tag.name]) for tag in tags]
-
-    def create_vault_tag(self, vault_id: str, name: str) -> TagDefinition:
-        with self._state_lock:
-            self._available_vault(vault_id)
-            name = normalize_tag(name)
-            existing = next(
-                (
-                    tag
-                    for tag in self.repository.list_vault_tags(vault_id, include_deleted=True)
-                    if tag.name == name
-                ),
-                None,
-            )
-            if existing is not None and existing.status != "deleted":
-                raise ImportTaskError("This vault tag already exists.")
-            return self.repository.record_vault_tag(
-                TagDefinition(
-                    vault_id,
-                    name,
-                    "active",
-                    0,
-                    (existing.revision + 1) if existing is not None else 1,
-                    utc_now(),
-                )
-            )
-
-    def preview_vault_tag_change(
-        self,
-        vault_id: str,
-        operation: str,
-        source_tag: str,
-        target_tag: str | None = None,
-    ) -> TagChangePreview:
-        with self._state_lock:
-            self._available_vault(vault_id)
-            tags = self.repository.list_vault_tags(vault_id)
-            source_tag = normalize_tag(source_tag)
-            source = next(
-                (
-                    tag
-                    for tag in tags
-                    if tag.name == source_tag
-                    and (tag.status == "active" or (operation == "delete" and tag.status == "inactive"))
-                ),
-                None,
-            )
-            if source is None:
-                if operation == "delete":
-                    raise ImportTaskError("The source tag is not available for deletion in this vault.")
-                raise ImportTaskError("The source tag is not an active tag in this vault.")
-            catalog_revision = sum(tag.revision for tag in tags) or 1
-            preview = plan_tag_change(
-                vault_id=vault_id,
-                operation=operation,
-                source_tag=source_tag,
-                target_tag=target_tag,
-                catalog_revision=catalog_revision,
-                proposals=tuple(self.repository.list_metadata_tag_proposals_for_vault(vault_id)),
-            )
-            target_tag = normalize_tag(target_tag) if target_tag else None
-            target = next((tag for tag in tags if tag.name == target_tag and tag.status == "active"), None)
-            if operation == "rename" and target is not None:
-                message = (
-                    "重命名目标必须不同于当前标签。"
-                    if target.name == source_tag
-                    else f"标签 {target.name} 已存在；请改用合并或选择新名称。"
-                )
-                preview = replace(preview, conflicts=(*preview.conflicts, message))
-            if operation == "merge" and target is None:
-                preview = replace(
-                    preview,
-                    conflicts=(*preview.conflicts, "合并目标必须是当前 vault 中的可用标签。"),
-                )
-            if operation == "merge" and target is not None and target.name == source_tag:
-                preview = replace(preview, conflicts=(*preview.conflicts, "合并目标必须不同于当前标签。"))
-            return self.repository.record_tag_change_preview(preview, utc_now())
-
-    def apply_vault_tag_change(
-        self,
-        vault_id: str,
-        operation: str,
-        source_tag: str,
-        target_tag: str | None,
-        catalog_revision: int,
-        proposal_versions: tuple[tuple[int, int], ...],
-    ) -> TagChangePreview:
-        with self._state_lock:
-            preview = self.preview_vault_tag_change(vault_id, operation, source_tag, target_tag)
-            current_proposals = tuple(self.repository.list_metadata_tag_proposals_for_vault(vault_id))
-            expected = preview.validate(
-                catalog_revision=catalog_revision,
-                proposals=current_proposals,
-            )
-            if expected.is_stale or expected.proposal_versions != tuple(sorted(proposal_versions)):
-                raise ImportTaskError("The tag change preview is stale; refresh the affected Markdown list.")
-            if expected.conflicts:
-                raise ImportTaskError("Resolve tag conflicts before confirming this change.")
-            tags = self.repository.list_vault_tags(vault_id)
-            source = next(
-                tag
-                for tag in tags
-                if tag.name == expected.source_tag
-                and (tag.status == "active" or (expected.operation == "delete" and tag.status == "inactive"))
-            )
-            timestamp = utc_now()
-            self.repository.record_vault_tag(
-                replace(
-                    source,
-                    status="deleted" if expected.operation == "delete" else "inactive",
-                    revision=source.revision + 1,
-                    updated_at=timestamp,
-                )
-            )
-            if expected.operation == "rename":
-                historical_target = next(
-                    (
-                        tag
-                        for tag in self.repository.list_vault_tags(vault_id, include_deleted=True)
-                        if tag.name == expected.target_tag
-                    ),
-                    None,
-                )
-                self.repository.record_vault_tag(
-                    TagDefinition(
-                        vault_id,
-                        expected.target_tag or "",
-                        "active",
-                        0,
-                        (historical_target.revision + 1) if historical_target is not None else 1,
-                        timestamp,
-                    )
-                )
-            for proposal in current_proposals:
-                updated = apply_tag_change(proposal, expected, timestamp)
-                if updated is proposal:
-                    continue
-                try:
-                    self.repository.get(proposal.task_id)
-                except KeyError:
-                    self.repository.record_vault_metadata_tag_proposal(updated)
-                else:
-                    self.repository.record_metadata_tag_proposal(
-                        proposal.item_id, updated, "metadata-tags-tag-change"
-                    )
-            return expected
-
     def revise_classification_suggestion(
         self,
         task_id: str,
@@ -3124,9 +2790,7 @@ class ImportTaskService:
                 proposal_revision=getattr(revised_proposal, "revision", 1),
                 proposal_content_sha256=proposal_content_sha256(revised_proposal),
             )
-            updated = self.repository.record_classification_revision(item_id, revised_proposal, revised)
-            self._ensure_metadata_tag_proposals(updated)
-            self._ensure_candidate_link_proposals(updated)
+            self.repository.record_classification_revision(item_id, revised_proposal, revised)
             return self.get(task_id)
 
     def decide_classification_suggestion(
@@ -3176,8 +2840,6 @@ class ImportTaskService:
                 return self.get(task_id)
             updated = self.repository.record_note_proposal(item_id, merge_adjacent_notes(proposal, before_sequence))
             self._ensure_classification_suggestions(updated)
-            self._ensure_metadata_tag_proposals(updated)
-            self._ensure_candidate_link_proposals(updated)
             return self.get(task_id)
 
     def split_note_proposal(self, task_id: str, item_id: int, sequence: int, after_unit_index: int):
@@ -3197,8 +2859,6 @@ class ImportTaskService:
                 item_id, split_note_at_unit(proposal, sequence, after_unit_index)
             )
             self._ensure_classification_suggestions(updated)
-            self._ensure_metadata_tag_proposals(updated)
-            self._ensure_candidate_link_proposals(updated)
             return self.get(task_id)
 
     def retry_ocr_target(self, task_id: str, item_id: int, target_id: str) -> ImportTask:

@@ -22,6 +22,8 @@ class FixtureProviderHandler(BaseHTTPRequestHandler):
     expected_authorization: str | None = "Bearer test-secret"
     stream_event = {"choices": [{"delta": {"content": "结构化结论"}}]}
     stream_events: list[dict[str, object]] = []
+    responses_event = {"type": "response.output_text.delta", "delta": "结构化结论"}
+    responses_events: list[dict[str, object]] = []
     embedding_data = [{"embedding": [0.1]}]
     rerank_results = [{"index": 0, "relevance_score": 0.9}]
     response_delay_seconds = 0
@@ -46,6 +48,17 @@ class FixtureProviderHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
             events = self.stream_events or [self.stream_event]
+            for event in events:
+                if self.response_delay_seconds:
+                    time.sleep(self.response_delay_seconds)
+                self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
+                self.wfile.flush()
+            return
+        if self.path == "/v1/responses":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            events = self.responses_events or [self.responses_event]
             for event in events:
                 if self.response_delay_seconds:
                     time.sleep(self.response_delay_seconds)
@@ -109,6 +122,11 @@ def with_fixture_provider(callback) -> None:
     FixtureProviderHandler.expected_authorization = "Bearer test-secret"
     FixtureProviderHandler.stream_event = {"choices": [{"delta": {"content": "结构化结论"}}]}
     FixtureProviderHandler.stream_events = []
+    FixtureProviderHandler.responses_event = {
+        "type": "response.output_text.delta",
+        "delta": "结构化结论",
+    }
+    FixtureProviderHandler.responses_events = []
     FixtureProviderHandler.embedding_data = [{"embedding": [0.1]}]
     FixtureProviderHandler.rerank_results = [{"index": 0, "relevance_score": 0.9}]
     FixtureProviderHandler.response_delay_seconds = 0
@@ -313,6 +331,64 @@ def test_openai_compatible_adapter_collects_streaming_chat_content() -> None:
                 {"role": "user", "content": "仅使用此段证据。"},
             ],
             "stream": True,
+        },
+    )
+
+
+def test_responses_adapter_probes_and_collects_streaming_content() -> None:
+    def verify(client, endpoint) -> None:
+        client.probe_responses_generation(endpoint, "test-secret", "model-alpha")
+        assert client.generate_responses(
+            endpoint, "test-secret", "model-alpha", "仅使用此段证据。"
+        ) == "结构化结论"
+
+    with_fixture_provider(verify)
+
+    assert FixtureProviderHandler.calls[-1] == (
+        "POST",
+        "/v1/responses",
+        {
+            "model": "model-alpha",
+            "instructions": FINAL_RESPONSE_ONLY_INSTRUCTION,
+            "input": "仅使用此段证据。",
+            "stream": True,
+        },
+    )
+
+
+def test_responses_adapter_keeps_usage_reported_on_completion() -> None:
+    def verify(client, endpoint) -> None:
+        FixtureProviderHandler.responses_events = [
+            {"type": "response.output_text.delta", "delta": '{"results":['},
+            {"type": "response.output_text.delta", "delta": "]}"},
+            {
+                "type": "response.completed",
+                "response": {
+                    "usage": {"input_tokens": 101, "output_tokens": 11, "total_tokens": 112}
+                },
+            },
+        ]
+        generation = client.generate_responses_with_usage(
+            endpoint, "test-secret", "model-alpha", "仅排序候选。", 128
+        )
+
+        assert generation.content == '{"results":[]}'
+        assert generation.usage is not None
+        assert generation.usage.prompt_tokens == 101
+        assert generation.usage.completion_tokens == 11
+        assert generation.usage.total_tokens == 112
+
+    with_fixture_provider(verify)
+
+    assert FixtureProviderHandler.calls[-1] == (
+        "POST",
+        "/v1/responses",
+        {
+            "model": "model-alpha",
+            "instructions": FINAL_RESPONSE_ONLY_INSTRUCTION,
+            "input": "仅排序候选。",
+            "stream": True,
+            "max_output_tokens": 128,
         },
     )
 

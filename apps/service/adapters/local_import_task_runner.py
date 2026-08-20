@@ -16,11 +16,9 @@ from domain.tasks import ImportTask, ImportTaskItem
 from workers.document_ocr import run_ocr_worker
 from workers.document_parser import preflight_document, run_parse_worker
 from workers.converters.artifact_store import PrivateArtifactStore
-from workers.converters.quality_gate import StructuralQualityGate
 from workers.converters.runner import (
     ConversionArtifactDraft,
     ConversionLauncher,
-    RejectedConversionCandidate,
     run_conversion_worker,
 )
 from workers.import_scanner import run_scan_worker
@@ -97,7 +95,7 @@ class LocalImportTaskRunner:
             target = partial(
                 run_conversion_worker,
                 launcher=self._conversion_launcher,
-                rejected_attempt_confirmations=confirmations,
+                online_job_confirmations=confirmations,
             )
             inputs_by_item = {int(item["item_id"]): item for item in converter_items}
 
@@ -121,36 +119,6 @@ class LocalImportTaskRunner:
                         )
                     finally:
                         confirmations.put({"remote_job_id": remote_job_id, "persisted": persisted})
-                    return
-                if event["type"] == "conversion-attempted":
-                    candidate = dict(event.get("candidate", {}))
-                    attempt_id = str(dict(candidate.get("attempt", {})).get("attempt_id", ""))
-                    persisted = False
-                    prepared: dict[str, object] | None = None
-                    try:
-                        prepared = self._prepare_rejected_conversion_event(event, inputs_by_item)
-                        if on_event(event_task_id, prepared) is not True:
-                            raise RuntimeError("The service did not confirm rejected conversion persistence.")
-                        persisted = True
-                    except Exception as error:
-                        if prepared is not None and self._artifact_store is not None:
-                            self._artifact_store.discard_promoted_attempt(
-                                task_id=str(dict(prepared["attempt"])["task_id"]),
-                                item_id=int(prepared["item_id"]),
-                                attempt_id=str(dict(prepared["attempt"])["attempt_id"]),
-                            )
-                        else:
-                            self._discard_conversion_temporary_directories(event)
-                        on_event(
-                            event_task_id,
-                            {
-                                "type": "conversion-failed-item",
-                                "item_id": int(event.get("item_id", -1)),
-                                "reason": f"Rejected conversion persistence failed: {type(error).__name__}.",
-                            },
-                        )
-                    finally:
-                        confirmations.put({"attempt_id": attempt_id, "persisted": persisted})
                     return
                 if event["type"] == "conversion-failed-item":
                     self._discard_conversion_temporary_directories(event)
@@ -201,6 +169,11 @@ class LocalImportTaskRunner:
             "input_snapshot_path": str(snapshot.absolute_path),
             "preflight_inventory": {"document_kind": item.document_kind, **preflight.inventory},
             "input_filename": item.label,
+            "local_structure_profile": (
+                task.resolved_local_structure_profile()
+                if item.document_kind == "pdf"
+                else None
+            ),
             "online_parse_selection": (
                 task.online_parse_selection.to_dict()
                 if task.online_parse_selection is not None and item.document_kind == "pdf"
@@ -241,11 +214,6 @@ class LocalImportTaskRunner:
         manifest = self._promote_conversion_artifacts(
             request, evidence.attempt, temporary_directory, drafts
         )
-        decision = StructuralQualityGate().evaluate(
-            evidence.graph, dict(request["preflight_inventory"])
-        )
-        if decision.action != "accepted":
-            raise ValueError("The structural quality gate rejected the complete conversion graph.")
         promoted = {artifact.artifact_id: artifact for artifact in manifest.artifacts}
         graph = replace(
             evidence.graph,
@@ -257,7 +225,6 @@ class LocalImportTaskRunner:
         attempt = replace(
             evidence.attempt,
             output_artifact_refs=manifest.artifacts,
-            quality_gate_decision_id=decision.decision_id,
             status="selected",
         )
         trusted = ConversionEvidence(evidence.document_kind, graph, attempt)
@@ -266,48 +233,6 @@ class LocalImportTaskRunner:
             "item_id": item_id,
             "content_sha256": request["content_sha256"],
             "evidence": trusted.to_dict(),
-            "quality_gate_decision": decision.to_dict(),
-        }
-
-    def _prepare_rejected_conversion_event(
-        self, event: dict[str, object], inputs_by_item: dict[int, dict[str, object]]
-    ) -> dict[str, object]:
-        candidate = RejectedConversionCandidate.from_dict(dict(event["candidate"]))
-        item_id = int(event["item_id"])
-        request = inputs_by_item.get(item_id)
-        if request is None:
-            raise ValueError("The rejected conversion item is not part of this runner request.")
-        attempt = candidate.attempt
-        decision = candidate.quality_gate_decision
-        if (
-            attempt.task_id != request["task_id"]
-            or attempt.item_id != item_id
-            or candidate.graph.source_sha256 != request["content_sha256"]
-            or candidate.graph.input_snapshot_hash != request["input_snapshot_hash"]
-            or candidate.graph.selected_attempt_id != attempt.attempt_id
-            or decision.get("decision_id") != attempt.quality_gate_decision_id
-            or decision.get("action") not in {"fallback", "waiting-for-review"}
-        ):
-            raise ValueError("The rejected conversion candidate does not match the verified runner input.")
-        drafts = candidate.artifact_drafts
-        manifest = self._promote_conversion_artifacts(
-            request, attempt, candidate.temporary_directory, drafts
-        )
-        promoted = {artifact.artifact_id: artifact for artifact in manifest.artifacts}
-        graph = replace(
-            candidate.graph,
-            assets=tuple(
-                replace(asset, artifact_ref=promoted[asset.artifact_ref.artifact_id])
-                for asset in candidate.graph.assets
-            ),
-        )
-        persisted_attempt = replace(attempt, output_artifact_refs=manifest.artifacts)
-        return {
-            "type": "conversion-attempted",
-            "item_id": item_id,
-            "attempt": persisted_attempt.to_dict(),
-            "graph": graph.to_dict(),
-            "quality_gate_decision": decision,
         }
 
     def _promote_conversion_artifacts(

@@ -9,14 +9,12 @@ from urllib.parse import urlsplit
 
 from adapters.windows_directory_picker import WindowsDirectoryPicker
 from application.providers import ProviderValidationError, utc_now
-from application.unit_card_service import UnitCardExecutionError
-from api.main import create_app, publish_graph_refresh
+from api.main import create_app
 from api.runtime import RuntimeState
 from domain.evidence import DocxOoxmlLocator, PdfRegionLocator
 from domain.embeddings import EmbeddingProfileLocator
 from domain.graph_projection import DurableGraphProjection, GraphProjectionBlock
-from domain.indexing import IndexBlock, IndexBlockMetadata, IndexedDocument, LexicalQuery
-from domain.metadata_extraction import MetadataCandidate
+from domain.indexing import IndexBlock, IndexedDocument
 from domain.markdown_structuring import MarkdownProviderChunkBudget
 from domain.providers import ModelSelection, ProbeResult, Provider, ProviderModel, ProviderProbeResults, ResolvedProviderModel
 from workers.converters.provisioning import ProvisionedProfiles
@@ -92,20 +90,40 @@ class FakeProviderService:
         self.defaults: dict[str, ModelSelection] = {}
         self.secrets: list[str | None] = []
         self.embedding_inputs: list[tuple[str, ...]] = []
-        self.metadata_prompts: list[str] = []
+        self.chat_prompts: list[str] = []
         self.markdown_budget = MarkdownProviderChunkBudget()
 
-    def create(self, name: str, endpoint: str, secret: str | None = None) -> Provider:
+    def create(
+        self,
+        name: str,
+        endpoint: str,
+        secret: str | None = None,
+        api_mode: str = "chat-completions",
+    ) -> Provider:
         self.secrets.append(secret)
-        provider = self._provider(f"provider-{len(self.providers) + 1}", name, endpoint)
+        provider = self._provider(
+            f"provider-{len(self.providers) + 1}", name, endpoint, api_mode=api_mode
+        )
         provider = replace(provider, credential_configured=secret is not None)
         self.providers[provider.provider_id] = provider
         return provider
 
-    def update(self, provider_id: str, name: str, endpoint: str, secret: str | None = None) -> Provider:
+    def update(
+        self,
+        provider_id: str,
+        name: str,
+        endpoint: str,
+        secret: str | None = None,
+        api_mode: str | None = None,
+    ) -> Provider:
         if secret is not None:
             self.secrets.append(secret)
-        provider = self._provider(provider_id, name, endpoint)
+        provider = self._provider(
+            provider_id,
+            name,
+            endpoint,
+            api_mode=api_mode or self.providers[provider_id].api_mode,
+        )
         self.providers[provider_id] = provider
         return provider
 
@@ -118,9 +136,27 @@ class FakeProviderService:
     def delete(self, provider_id: str) -> None:
         del self.providers[provider_id]
 
+    def remove_model(self, provider_id: str, model_id: str) -> Provider:
+        provider = self.providers[provider_id]
+        self.providers[provider_id] = replace(
+            provider,
+            models=tuple(model for model in provider.models if model.model_id != model_id),
+            updated_at=utc_now(),
+        )
+        for model_type, selection in list(self.defaults.items()):
+            if selection.provider_id == provider_id and selection.model_id == model_id:
+                del self.defaults[model_type]
+        return self.providers[provider_id]
+
     def test(self, provider_id: str) -> Provider:
         previous = self.providers[provider_id]
-        discovered = self._provider(provider_id, previous.name, previous.endpoint, discovered=True)
+        discovered = self._provider(
+            provider_id,
+            previous.name,
+            previous.endpoint,
+            discovered=True,
+            api_mode=previous.api_mode,
+        )
         self.providers[provider_id] = discovered
         return discovered
 
@@ -210,34 +246,17 @@ class FakeProviderService:
         provider = self.providers[provider_id]
         assert provider.updated_at == expected_provider_updated_at
         assert any(model.model_id == model_id and model.model_type == "chat" for model in provider.models)
-        self.metadata_prompts.append(prompt)
-        if "Create a constrained unit-card map summary" in prompt:
-            return json.dumps(
-                {
-                    "items": [
-                        {
-                            "knowledge_kind": "grammar",
-                            "concept_keys": ["subject verb agreement"],
-                        }
-                    ]
-                }
-            )
-        return json.dumps(
-            {
-                "items": [
-                    {
-                        "item_id": 1,
-                        "knowledge_kind": "grammar",
-                        "concept_keys": ["subject verb agreement"],
-                        "confidence": 0.91,
-                    }
-                ]
-            }
-        )
+        self.chat_prompts.append(prompt)
+        return "Generated response."
 
     @staticmethod
     def _provider(
-        provider_id: str, name: str, endpoint: str, *, discovered: bool = False
+        provider_id: str,
+        name: str,
+        endpoint: str,
+        *,
+        discovered: bool = False,
+        api_mode: str = "chat-completions",
     ) -> Provider:
         probe = ProbeResult.success() if discovered else ProbeResult.not_run()
         return Provider(
@@ -253,6 +272,7 @@ class FakeProviderService:
             last_tested_at=utc_now() if discovered else None,
             created_at=utc_now(),
             updated_at=utc_now(),
+            api_mode=api_mode,
         )
 
 
@@ -355,125 +375,6 @@ def test_workbench_overview_requires_a_local_session_and_omits_vault_paths(tmp_p
     assert payload["vaults"][0]["display_name"] == "vault"
     assert "path" not in payload["vaults"][0]
     assert "managed_root" not in payload["vaults"][0]
-
-
-def test_unit_card_execution_api_preserves_stable_blocked_error_codes(tmp_path: Path) -> None:
-    vault_path = tmp_path / "vault"
-    vault_path.mkdir()
-    app = create_app_for_test(tmp_path, FakeDirectoryPicker(vault_path))
-    _, root_headers, _ = asgi_request(app, "GET", "/")
-    cookie = root_headers["set-cookie"].split(";", maxsplit=1)[0]
-
-    class FailingUnitCardService:
-        def __init__(self, error: Exception) -> None:
-            self.error = error
-
-        def execute(self, *_args):
-            raise self.error
-
-    endpoint = "/api/vaults/vault-a/unit-cards/build"
-    body = {"scope_kind": "vault"}
-    app.state.unit_card_service = FailingUnitCardService(
-        UnitCardExecutionError("Unit card Provider is unavailable.")
-    )
-    execution_status, _, execution_body = asgi_request(
-        app, "POST", endpoint, body=body, cookie=cookie
-    )
-    assert execution_status == 409
-    assert json.loads(execution_body)["code"] == "unit_card_execution_blocked"
-
-
-def test_unit_card_api_builds_directly_and_keeps_source_text_private(
-    tmp_path: Path,
-) -> None:
-    vault_path = tmp_path / "vault"
-    vault_path.mkdir()
-    provider_service = FakeProviderService()
-    app = create_app_for_test(
-        tmp_path, FakeDirectoryPicker(vault_path), provider_service=provider_service
-    )
-    _, root_headers, _ = asgi_request(app, "GET", "/")
-    cookie = root_headers["set-cookie"].split(";", maxsplit=1)[0]
-    selection_id = select_directory(app, cookie)
-    _, _, created_body = asgi_request(
-        app,
-        "POST",
-        "/api/vaults",
-        body={"selection_id": selection_id, "managed_root": "platform"},
-        cookie=cookie,
-    )
-    vault_id = json.loads(created_body)["vault"]["vault_id"]
-
-    chat_provider = provider_service.create("Card Chat", "https://chat.example/v1", "chat-secret")
-    provider_service.test(chat_provider.provider_id)
-    provider_service.configure_model(chat_provider.provider_id, "model-alpha", "chat")
-    provider_service.test_model(chat_provider.provider_id, "model-alpha")
-    provider_service.set_default("chat", chat_provider.provider_id, "model-alpha")
-    embedding_provider = provider_service.create(
-        "Card Embedding", "https://embed.example/v1", "embedding-secret"
-    )
-    provider_service.test(embedding_provider.provider_id)
-    provider_service.configure_model(embedding_provider.provider_id, "model-alpha", "embedding")
-    provider_service.test_model(embedding_provider.provider_id, "model-alpha")
-    provider_service.set_default("embedding", embedding_provider.provider_id, "model-alpha")
-
-    source_text = "This indexed source text must not appear in unit-card API responses."
-    document = IndexedDocument(
-        document_id="unit-card-api-document",
-        vault_id=vault_id,
-        relative_path="teaching/unit-1.md",
-        content_sha256=sha256(source_text.encode("utf-8")).hexdigest(),
-        document_kind="native",
-        heading_locations=(),
-        links=(),
-        tags=(),
-        blocks=(IndexBlock(1, "line:1", source_text, retrieval_text=source_text),),
-        indexed_at="2026-07-27T00:00:00+00:00",
-        block_metadata=(
-            IndexBlockMetadata(1, "english", "7a", 1, "textbook", "human", 1.0, "accepted"),
-        ),
-    )
-    repository = app.state.indexing_service.repository
-    repository.save_document(document)
-    candidate = MetadataCandidate(
-        candidate_id="unit-card-api-candidate",
-        vault_id=vault_id,
-        document_id=document.document_id,
-        relative_path=document.relative_path,
-        sequence=1,
-        block_content_sha256=document.blocks[0].block_content_sha256,
-        knowledge_kind="grammar",
-        concept_keys=("subject verb agreement",),
-        confidence=0.91,
-        provider_id=chat_provider.provider_id,
-        model_id="model-alpha",
-        provider_configuration_revision=provider_service.get(chat_provider.provider_id).updated_at,
-        status="accepted",
-        review_reason=None,
-        decision_reason="Reviewed.",
-        created_at="2026-07-27T00:00:00+00:00",
-        updated_at="2026-07-27T00:00:00+00:00",
-    )
-    repository.save_metadata_candidates(vault_id, (candidate,))
-
-    endpoint = f"/api/vaults/{vault_id}/unit-cards/build"
-    unauthorized_status, _, _ = asgi_request(
-        app, "POST", endpoint, body={"scope_kind": "vault"}
-    )
-    execution_status, _, execution_body = asgi_request(
-        app, "POST", endpoint, body={"scope_kind": "vault"}, cookie=cookie
-    )
-
-    execution = json.loads(execution_body)["report"]
-    hits = repository.search_unit_cards_lexical(
-        vault_id, LexicalQuery("subject agreement", 8, (document.relative_path,))
-    )
-    assert unauthorized_status == 403
-    assert execution_status == 200
-    assert execution["status"] == "completed"
-    assert execution["chat_network_request_count"] == execution["embedding_network_request_count"] == 1
-    assert [hit.card.card_id for hit in hits]
-    assert source_text.encode() not in execution_body
 
 
 def test_vault_commands_persist_application_state_without_changing_existing_vault_files(
@@ -643,91 +544,38 @@ def test_graph_projection_summary_api_is_session_protected_and_content_free(tmp_
     assert "source-private" not in body.decode()
 
 
-def test_vault_graph_api_is_session_protected_and_never_exposes_absolute_paths(tmp_path: Path) -> None:
-    vault_path = tmp_path / "vault"
-    vault_path.mkdir()
-    (vault_path / "one.md").write_text("# One\n[[two]]\n", encoding="utf-8")
-    (vault_path / "two.md").write_text("# Two\n", encoding="utf-8")
-    app = create_app_for_test(tmp_path, FakeDirectoryPicker(vault_path))
+def test_retired_governance_and_user_graph_routes_are_not_registered(tmp_path: Path) -> None:
+    app = create_app_for_test(tmp_path, FakeDirectoryPicker(tmp_path))
     _, root_headers, _ = asgi_request(app, "GET", "/")
     cookie = root_headers["set-cookie"].split(";", maxsplit=1)[0]
-    selection_id = select_directory(app, cookie)
-    _, _, created_body = asgi_request(
-        app,
-        "POST",
-        "/api/vaults",
-        body={"selection_id": selection_id, "managed_root": "platform"},
-        cookie=cookie,
+    routes = (
+        ("GET", "/api/vaults/vault-1/tags"),
+        ("POST", "/api/vaults/vault-1/tags"),
+        ("GET", "/api/import-tasks/task-1/metadata-tags"),
+        ("POST", "/api/import-tasks/task-1/metadata-tags/1/decision"),
+        ("GET", "/api/import-tasks/task-1/candidate-links"),
+        ("POST", "/api/import-tasks/task-1/candidate-links/link-1/decision"),
+        ("POST", "/api/vaults/vault-1/metadata/extract"),
+        ("GET", "/api/vaults/vault-1/metadata-candidates"),
+        ("POST", "/api/vaults/vault-1/unit-cards/build"),
+        ("GET", "/api/vaults/vault-1/graph"),
+        ("GET", "/api/vaults/vault-1/graph/events"),
     )
-    vault_id = json.loads(created_body)["vault"]["vault_id"]
-    asgi_request(app, "POST", f"/api/vaults/{vault_id}/index/reconcile", cookie=cookie)
 
-    denied, _, _ = asgi_request(app, "GET", f"/api/vaults/{vault_id}/graph")
-    status, _, body = asgi_request(app, "GET", f"/api/vaults/{vault_id}/graph", cookie=cookie)
-    filtered_status, _, filtered_body = asgi_request(
-        app,
-        "GET",
-        f"/api/vaults/{vault_id}/graph?relationship_state=confirmed",
-        cookie=cookie,
-    )
-    invalid_status, _, _ = asgi_request(
-        app,
-        "GET",
-        f"/api/vaults/{vault_id}/graph?unknown_filter=blocked",
-        cookie=cookie,
-    )
-    event_status, event_headers, event_body = asgi_request(
-        app,
-        "GET",
-        f"/api/vaults/{vault_id}/graph/events",
-        cookie=cookie,
-    )
-    graph = json.loads(body)["graph"]
-    filtered_graph = json.loads(filtered_body)["graph"]
-
-    assert denied == 403
-    assert status == 200
-    assert filtered_status == 200
-    assert invalid_status == 422
-    assert event_status == 200
-    assert event_headers["cache-control"] == "no-cache"
-    assert event_headers["x-accel-buffering"] == "no"
-    assert event_body == b": connected\n\n"
-    assert [node["relative_path"] for node in graph["nodes"]] == ["one.md", "two.md"]
-    assert graph["edges"] == [{"source_path": "one.md", "target_path": "two.md", "kind": "confirmed", "status": "confirmed"}]
-    assert filtered_graph["edges"] == graph["edges"]
-    assert str(vault_path) not in body.decode()
-
-
-def test_graph_refresh_notifications_remain_vault_scoped() -> None:
-    class Queue:
-        def __init__(self) -> None:
-            self.messages: list[str] = []
-
-        def put_nowait(self, message: str) -> None:
-            self.messages.append(message)
-
-    class Loop:
-        def call_soon_threadsafe(self, callback, *arguments) -> None:
-            callback(*arguments)
-
-    current_queue = Queue()
-    other_queue = Queue()
-    loop = Loop()
-    app = SimpleNamespace(
-        state=SimpleNamespace(
-            graph_subscribers={
-                "vault-current": {(loop, current_queue)},
-                "vault-other": {(loop, other_queue)},
-            },
-            graph_subscribers_lock=threading.Lock(),
+    for method, path in routes:
+        assert not any(
+            route.path == path and method in (route.methods or set())
+            for route in app.router.routes
+            if getattr(route, "path", None) is not None
+        ), path
+        status, _, _ = asgi_request(
+            app,
+            method,
+            path,
+            body={} if method == "POST" else None,
+            cookie=cookie,
         )
-    )
-
-    publish_graph_refresh(app, "vault-current")
-
-    assert current_queue.messages == ["refresh"]
-    assert other_queue.messages == []
+        assert status in {404, 405}, path
 
 
 def test_vault_policy_api_requires_the_local_session_and_previews_normalized_rules(
@@ -883,87 +731,6 @@ def test_embedding_api_runs_without_an_authorization_and_keeps_block_text_privat
     assert b"9.125" not in index_body
 
 
-def test_metadata_api_runs_without_an_authorization_and_keeps_block_text_private(tmp_path: Path) -> None:
-    vault_path = tmp_path / "vault"
-    vault_path.mkdir()
-    provider_service = FakeProviderService()
-    app = create_app_for_test(
-        tmp_path, FakeDirectoryPicker(vault_path), provider_service=provider_service
-    )
-    _, root_headers, _ = asgi_request(app, "GET", "/")
-    cookie = root_headers["set-cookie"].split(";", maxsplit=1)[0]
-    selection_id = select_directory(app, cookie)
-    _, _, created_body = asgi_request(
-        app,
-        "POST",
-        "/api/vaults",
-        body={"selection_id": selection_id, "managed_root": "platform"},
-        cookie=cookie,
-    )
-    vault_id = json.loads(created_body)["vault"]["vault_id"]
-    provider = provider_service.create("Metadata Cloud", "https://provider.example/v1", "secret")
-    provider_service.test(provider.provider_id)
-    provider_service.configure_model(provider.provider_id, "model-alpha", "chat")
-    provider_service.test_model(provider.provider_id, "model-alpha")
-    provider_service.set_default("chat", provider.provider_id, "model-alpha")
-    body_text = "This indexed block must not appear in metadata API responses."
-    app.state.indexing_service.repository.save_document(
-        IndexedDocument(
-            document_id="metadata-api-document",
-            vault_id=vault_id,
-            relative_path="teaching/unit-1.md",
-            content_sha256=sha256(body_text.encode("utf-8")).hexdigest(),
-            document_kind="native",
-            heading_locations=(),
-            links=(),
-            tags=(),
-            blocks=(IndexBlock(1, "line:1", body_text, retrieval_text=body_text),),
-            indexed_at="2026-07-27T00:00:00+00:00",
-        )
-    )
-
-    execute_status, _, execute_body = asgi_request(
-        app,
-        "POST",
-        f"/api/vaults/{vault_id}/metadata/extract",
-        body={"scope_kind": "vault"},
-        cookie=cookie,
-    )
-    candidates_status, _, candidates_body = asgi_request(
-        app,
-        "GET",
-        f"/api/vaults/{vault_id}/metadata-candidates?status=required-check",
-        cookie=cookie,
-    )
-    candidate_id = json.loads(candidates_body)["candidates"][0]["candidate_id"]
-    decision_status, _, decision_body = asgi_request(
-        app,
-        "POST",
-        f"/api/vaults/{vault_id}/metadata-candidates/{candidate_id}/decision",
-        body={"decision": "accepted", "reason": "Checked against the indexed block."},
-        cookie=cookie,
-    )
-    audited_status, _, audited_body = asgi_request(
-        app,
-        "GET",
-        f"/api/vaults/{vault_id}/metadata-candidates",
-        cookie=cookie,
-    )
-
-    assert execute_status == 200
-    assert json.loads(execute_body)["report"]["required_review_count"] == 1
-    assert candidates_status == 200
-    assert json.loads(candidates_body)["candidates"][0]["knowledge_kind"] == "grammar"
-    assert decision_status == 200
-    assert json.loads(decision_body)["candidate"]["status"] == "accepted"
-    assert json.loads(candidates_body)["audit"]["reviewed_count"] == 0
-    assert audited_status == 200
-    assert json.loads(audited_body)["audit"]["acceptance_rate"] == 1.0
-    assert body_text.encode() not in execute_body
-    assert body_text.encode() not in candidates_body
-    assert provider_service.metadata_prompts
-
-
 def test_markdown_structure_budget_api_requires_a_local_session_and_persists_valid_values(
     tmp_path: Path,
 ) -> None:
@@ -1028,6 +795,7 @@ def test_provider_api_requires_a_local_session_and_never_returns_submitted_crede
             "name": "Cloud AI",
             "endpoint": "https://provider.example/v1",
             "secret": "never-return-this",
+            "api_mode": "responses",
         },
         cookie=cookie,
     )
@@ -1083,6 +851,12 @@ def test_provider_api_requires_a_local_session_and_never_returns_submitted_crede
     rerank_resolved_status, _, rerank_resolved_body = asgi_request(
         app, "GET", "/api/providers/defaults/rerank/resolved", cookie=cookie
     )
+    remove_model_status, _, remove_model_body = asgi_request(
+        app, "DELETE", f"/api/providers/{provider_id}/models?model_id=model-alpha", cookie=cookie
+    )
+    defaults_after_removal_status, _, defaults_after_removal_body = asgi_request(
+        app, "GET", "/api/providers/defaults", cookie=cookie
+    )
     invalid_status, _, invalid_body = asgi_request(
         app,
         "POST",
@@ -1096,6 +870,7 @@ def test_provider_api_requires_a_local_session_and_never_returns_submitted_crede
     assert create_status == 200
     assert b"never-return-this" not in create_body
     assert create_payload["provider"]["credential_configured"] is True
+    assert create_payload["provider"]["api_mode"] == "responses"
     assert local_create_status == 200
     assert local_create_payload["provider"]["credential_configured"] is False
     assert "credential_reference" not in create_payload["provider"]
@@ -1118,6 +893,11 @@ def test_provider_api_requires_a_local_session_and_never_returns_submitted_crede
     assert json.loads(rerank_default_body)["default"]["model_id"] == "model-alpha"
     assert rerank_resolved_status == 200
     assert json.loads(rerank_resolved_body)["model"]["model_type"] == "rerank"
+    assert remove_model_status == 200
+    assert json.loads(remove_model_body)["provider"]["models"] == []
+    assert defaults_after_removal_status == 200
+    assert json.loads(defaults_after_removal_body)["chat"]["default"] is None
+    assert json.loads(defaults_after_removal_body)["rerank"]["default"] is None
     assert invalid_status == 422
     assert json.loads(invalid_body)["code"] == "request_validation_failed"
     assert b"must-not-leak" not in invalid_body

@@ -37,7 +37,7 @@ class DocumentParseCancelled(Exception):
 
 @dataclass(frozen=True)
 class DocumentPreflight:
-    """A non-canonical inventory used by the v2 converter quality gate."""
+    """A non-canonical inventory used to validate a converter's immutable input."""
 
     document_kind: str
     source_sha256: str

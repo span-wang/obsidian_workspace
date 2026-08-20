@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 
 MODEL_TYPES = frozenset({"chat", "embedding", "rerank", "markdown"})
+API_MODES = frozenset({"chat-completions", "responses"})
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,13 @@ class Provider:
     created_at: str
     updated_at: str
     transport: str = "openai-compatible"
+    api_mode: str = "chat-completions"
+
+    def __post_init__(self) -> None:
+        if self.transport != "openai-compatible":
+            raise ValueError("Unsupported Provider transport.")
+        if self.api_mode not in API_MODES:
+            raise ValueError("Unsupported Provider API mode.")
 
 
 @dataclass(frozen=True)

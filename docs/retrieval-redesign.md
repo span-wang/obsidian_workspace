@@ -2,7 +2,7 @@
 
 面向本仓库 `apps/service` 的现状改造。目标场景：一个知识库 = 一册教材 + 教辅 + 个人整理的单元知识清单 + 练习题；典型请求「输出七年级上册第一单元知识点汇总」要求穷尽覆盖并去重。
 
-已确认的技术选择：Embedding 走云端 OpenAI 兼容 Provider；元数据用「结构推断 + LLM 抽取」；汇总类任务按意图路由走全量枚举。检索栈由本方案给出推荐。
+已确认的技术选择：Embedding 走云端 OpenAI 兼容 Provider；范围元数据只做路径与标题的确定性结构推断；汇总类任务按意图路由走全量枚举。检索栈由本方案给出推荐。
 
 ## 对话呈现修订（2026-07-28）
 
@@ -22,7 +22,7 @@
 
 **P0-2：索引不能长期依赖 import task 数据库里的 `DocumentGraph`。** 当前 `import_conversion_graph_revisions` 确实保存 graph，但 `SqliteImportTaskRepository.delete()` 会随导入任务删除这些记录。推荐在提交派生笔记时，将选定 graph 的检索投影复制进索引侧的耐久表，至少保留 `graph_id / graph_revision / block_id / kind / reading_order / locators / confidence / retrieval_projection`。索引重建读取该投影，不跨库读取可被删除的任务记录。
 
-**P0-3：结构字段只能有一个真相源。** `block_kind / heading_path / locator / graph_block_id / reading_order / confidence` 属于索引块本体，持久化在 `index_blocks`；`subject / grade_volume / unit_no / material_type / knowledge_kinds / concept_keys` 才属于 `index_block_meta`。禁止两张表重复保存同一结构字段。
+**P0-3：结构字段只能有一个真相源。** `block_kind / heading_path / locator / graph_block_id / reading_order / confidence` 属于索引块本体，持久化在 `index_blocks`；`subject / grade_volume / unit_no / material_type` 属于确定性范围元数据，持久化在 `index_block_meta`。禁止两张表重复保存同一字段。
 
 **P0-4：Embedding 指纹不能只有 `model_id`。** OpenAI 兼容 Provider 可能在不同 endpoint 下复用相同模型名，Provider 配置也可能变更。缓存键与向量版本必须绑定 `provider_id + endpoint/config revision + model_id + dimension` 形成的 `embedding_profile_fingerprint`；仅用 `model_id` 会错误复用不可比较的向量。
 
@@ -32,7 +32,7 @@
 
 - `余弦 > 0.92`、`top-50`、`RRF k=60`、`top-8`、每批 `8k-12k`、总输入 `200k` 都是初始候选值，最终值必须由 golden set 与所选模型上下文窗口校准。
 - float16 落盘是否保持召回不能由一次 Linux 样本推出。V1 先用 float32 落盘与内存检索；只有 Windows 实机的 top-k 重合率、延迟和内存测试通过后，才单独引入 float16 优化。
-- `concept_keys` 有交集只能产生“候选重复”，不能直接合并。至少还要满足相同 scope、兼容的 `knowledge_kind`，并在原子知识条目层判断，避免一个多概念块把多个知识点错误并簇。
+- 去重只自动合并 `block_content_sha256` 完全相同的块；标题词归一或向量相似只能产生候选簇，不能静默合并原始证据。
 
 ### 开发原则
 
@@ -109,7 +109,7 @@ numpy 的依赖状态要说明清楚：`apps/service/.venv/Lib/site-packages` �
 
 FTS5 我也实测了：沙箱 SQLite 3.37.2（比 `scripts/preflight.mjs:7` 要求的 `3.45.1` 更旧，所以实机能力只会更强），`unicode61`、`porter unicode61`、`trigram` 三种 tokenizer 全部可建表；`bm25()` 支持按列加权（`bm25(f, 1.0, 1.0, 10.0)` 给 heading 列 10 倍权重）；跨列布尔查询 `cjk:"第一 单元" OR heading:Unit1` 正常返回并按加权分排序——第 4.4 节的双列设计与第 6.3 节的 heading 加权都是跑通过的，不是设想。
 
-**中文分词方案：双列 FTS5。** 一列 `porter unicode61` 处理英文（做词干还原，`run/runs/running` 归一，这对英语教材至关重要）；一列存**预分词的中文**——不用 trigram（噪声大），而是在写入时用一个轻量正向最大匹配分词器切好、空格分隔后存入。词典来源：知识库自身的标题层级、`tags`、`links`、以及 LLM 抽取出的知识点术语（第五节），构成一个领域词典。这样「第一单元」是一个 token 而不是 3 个 bigram。词典不覆盖的部分退化为 bigram，作为兜底。
+**中文分词方案：双列 FTS5。** 一列 `porter unicode61` 处理英文（做词干还原，`run/runs/running` 归一，这对英语教材至关重要）；一列存**预分词的中文**——不用 trigram（噪声大），而是在写入时用一个轻量正向最大匹配分词器切好、空格分隔后存入。词典来源：知识库自身的标题层级、Markdown 原生 `tags`、`links` 和查询词典。这样「第一单元」是一个 token 而不是 3 个 bigram。词典不覆盖的部分退化为 bigram，作为兜底。
 
 如果后续规模真的上到十万块以上，替换点是隔离的：只有 `VectorStore.search()` 一个方法需要改成 sqlite-vec 或 hnswlib，检索融合层不动。
 
@@ -121,15 +121,15 @@ FTS5 我也实测了：沙箱 SQLite 3.37.2（比 `scripts/preflight.mjs:7` 要�
 
 **(b) 模型指纹绑定。** 向量必须记录 `embedding_profile_fingerprint`、`embedding_model_id` 与 `embedding_dimension`。endpoint、Provider 配置 revision、模型名或维度任一变化，旧向量都不可比较，必须按 vault 重建，不能混用。这一点要写进 `IndexHealth`：`domain/indexing.py:104` 已经声明了 `semantic_status` 字段，但 `adapters/sqlite_index_repository.py:346` 的 `health()` 把它硬编码成 `"unavailable"`——这个已存在的空壳字段正是 embedding 覆盖率的归宿，改造时填真值即可，无需改 API 契约。
 
-**(c) 默认出网与排除规则（2026-07-27 已确认）。** 已验证的 HTTPS Provider 默认允许出网，不再创建、确认或重验逐任务授权。Embedding、元数据、单元卡片、会话生成和启用后的 rerank 都直接执行；旧 SQLite 中的历史授权记录保留但运行时不读取或写入。
+**(c) 默认出网与排除规则（2026-07-27 已确认）。** 已验证的 HTTPS Provider 默认允许出网，不再创建、确认或重验逐任务授权。Embedding、会话生成和启用后的 rerank 可直接执行；旧 SQLite 中的历史授权记录保留但运行时不读取或写入。
 
 默认允许不放宽内容边界：每个候选仍须通过 `preview(..., "outbound")`。`never-send-cloud` 匹配源不得外发；`do-not-index` 与 `completely-ignore` 继续阻止对应处理。HTTPS、已验证 Provider/model、内容哈希、向量维度和 Provider 响应校验同样保持失败关闭。
 
 导入提交必须在当前块的向量完整持久化后才可完成。若 Provider、内容、规则或向量校验失败，恢复本次提交的文件与索引并返回可重试状态，不保留部分完成提交。
 
-### 元数据：结构推断 + LLM 抽取（已确认）
+### 范围元数据：仅保留确定性结构推断
 
-见第五节。接现有的 `domain/classification.py`（`:23` 的 `_DOMAIN_RULES` 已有 `("language", ("english","vocabulary","grammar","language","英语","词汇","语法"))`，命中给 0.9 置信度（`:258-261`）；`:12` 的 `LOW_CONFIDENCE_THRESHOLD = 0.75`）与 `domain/metadata_tags.py:271` 的 `suggest_metadata_tags`（`:292` 已实现「新标签或置信度 < 0.75 → `required-check`」的审核门），低置信度进现有审核队列。
+见第五节。检索范围只使用路径、文件名和标题层级推断 `subject / grade_volume / unit_no / material_type`。LLM 元数据抽取、候选审核和私有标签目录已退役，不再参与导入、索引或检索。
 
 ---
 
@@ -201,18 +201,15 @@ CREATE TABLE index_repository_migrations (
 -- source_locators_json, graph_block_id, reading_order, confidence,
 -- retrieval_text, contextual_prefix, token_estimate
 
--- 块级语义元数据；不重复保存 index_blocks 的结构字段
+-- 块级确定性范围元数据；不重复保存 index_blocks 的结构字段
 CREATE TABLE index_block_meta (
     document_id TEXT NOT NULL,
     sequence INTEGER NOT NULL,
-    subject TEXT, grade_volume TEXT, unit_no INTEGER, lesson TEXT,
+    subject TEXT, grade_volume TEXT, unit_no INTEGER,
     material_type TEXT,          -- textbook/workbook/personal-note/exercise
-    knowledge_kinds_json TEXT,   -- ["grammar","vocabulary","phrase","sentence-pattern"]
-    difficulty TEXT,
-    meta_origin TEXT NOT NULL,   -- rule / llm / human
+    meta_origin TEXT NOT NULL,   -- rule
     meta_confidence REAL,
-    meta_status TEXT NOT NULL,   -- pending / required-check / accepted
-    concept_keys_json TEXT,      -- 归一化知识点键，用于跨资料去重
+    meta_status TEXT NOT NULL,   -- accepted / recoverable
     PRIMARY KEY (document_id, sequence),
     FOREIGN KEY (document_id) REFERENCES index_documents(document_id) ON DELETE CASCADE
 );
@@ -259,11 +256,9 @@ CREATE TABLE index_block_fts_map (
 
 FTS5 用外部 map 表而非 `content=` 外部内容表，是因为要索引的是「前缀 + 分词后」的加工文本，不等于任何一张表的原始列。检索必须通过 map 回连 `index_documents.is_current = 1`；失效、重建和失败回滚时，FTS、向量与结构行必须在同一事务中保持一致。
 
-### 4.5 摘要层（借鉴 RAPTOR，但只两层）
+### 4.5 不维护摘要投影
 
-为每个 `(subject, grade_volume, unit_no)` 生成一个**单元卡片**：由该单元全部块 map-reduce 出的结构化摘要（覆盖哪些语法点、词汇范围、涉及哪些资料）。卡片本身也 embedding + 入 FTS。
-
-作用有两个：一是「七上第一单元讲了什么」这类粗粒度问题直接命中卡片，不必扫全部块；二是当某个单元的块数超过生成预算时，卡片作为压缩兜底。不做 RAPTOR 的递归聚类——你的层级由教材目录天然给出，聚类是多余的。
+单元卡片及其 FTS、向量投影已退役。粗粒度与枚举型问题直接基于确定性范围过滤后的原始块汇总，证据始终回到原始资料块。
 
 ### 4.6 端口契约要补检索方法
 
@@ -283,7 +278,7 @@ def filter_blocks(self, vault_id: str, filters: BlockFilter) -> list[IndexBlockR
 
 ## 五 领域元数据：怎么才能定位到「七年级上册第一单元」
 
-这是精准命中的关键，分三层，置信度递减、成本递增。
+这是精准命中的关键，只使用两层确定性规则。
 
 ### 第一层：路径与文件名规则（确定性，零成本）
 
@@ -301,18 +296,7 @@ def filter_blocks(self, vault_id: str, filters: BlockFilter) -> list[IndexBlockR
 
 `heading_path` 里出现 `Unit 1` / `第一单元` 时覆盖或补全路径推断。这一层能处理**整册一个文件**的情况——教材 PDF 转出来常常是一个大 Markdown，路径里没有单元信息，全靠标题。此时同一文档的不同块会有不同的 `unit_no`，这正是需要块级元数据而非文档级元数据的原因。
 
-同时从标题关键词推断 `knowledge_kinds`：`Grammar Focus/语法` → grammar；`Words and Expressions/词汇/单词表` → vocabulary；`短语/Phrases` → phrase；`句型/Sentence Patterns` → sentence-pattern；`练习/Exercises/习题` → exercise。
-
-### 第三层：LLM 抽取（补语义，进审核）
-
-只对第一二层没定死的块调用，且**批量调用**（一次 20–40 块）。抽取两样东西：
-
-- `knowledge_kinds`：块讲的是语法/词汇/短语/句型/题目/文化背景。
-- `concept_keys`：**归一化的知识点键**，这是去重的基础设施。要求模型输出规范化短语而非自由文本，例如 `be动词-一般现在时-三种形式`、`this/that-指示代词`、`介绍自己-句型`。给模型一份该单元已有的 concept_keys 作为对齐提示，鼓励复用而非新造。
-
-置信度 < 0.75 或产生新 concept_key 时置 `meta_status = "required-check"`，进现有审核队列——这与 `domain/metadata_tags.py:292` 的 `suggest_metadata_tags` 已有逻辑（`"required-check" if is_new or confidence < 0.75 else "pending"`）一致，直接沿用同一门槛。
-
-注意：这一层同样要出网。已验证的 HTTPS Provider 默认允许执行，但每个来源仍受 `never-send-cloud` 等排除规则约束。
+标题层只补全确定性范围字段，不产生需要人工审核的概念或标签。无法由路径和标题确定范围时保持 recoverable，不调用 LLM 猜测。
 
 ### 元数据不足时的行为
 
@@ -331,7 +315,7 @@ def filter_blocks(self, vault_id: str, filters: BlockFilter) -> list[IndexBlockR
 ```
 
 **查询理解**做三件事：
-1. 抽取定位符：subject、grade_volume、unit_no、material_type、knowledge_kinds。「七年级上册第一单元」→ `{grade_volume: "七上", unit_no: 1}`；「第一单元的语法」再加 `{knowledge_kinds: ["grammar"]}`。用与第五节同一套规则，保证查询侧与索引侧的归一化一致——这一点很关键，两侧用不同的归一化是检索不准的经典来源。
+1. 抽取定位符：subject、grade_volume、unit_no、material_type。「七年级上册第一单元」→ `{grade_volume: "七上", unit_no: 1}`；「第一单元的语法」中的“语法”保留为查询词，不升级为治理元数据。用与第五节同一套范围规则，保证查询侧与索引侧的归一化一致——这一点很关键，两侧用不同的归一化是检索不准的经典来源。
 2. 判定意图。**枚举型**（汇总/整理/清单/全部/所有/知识点/默写/复习）vs **点查型**（某个具体问题）。判据除关键词外，加一条结构判据：如果查询解析出了明确的 `unit_no` 且没有具体疑问词，倾向枚举型。
 3. 决定预算：枚举型给大预算（下节），点查型给 top-k。
 
@@ -346,13 +330,12 @@ def filter_blocks(self, vault_id: str, filters: BlockFilter) -> list[IndexBlockR
    WHERE subject=? AND grade_volume=? AND unit_no=?
    → 该单元全部块（教材 + 教辅 + 清单 + 题库），通常 80–300 块
 
-2. 按 knowledge_kinds 分桶
-   grammar / vocabulary / phrase / sentence-pattern / exercise / other
+2. 按标题层级和原生标签词项组织原始块
+   grammar / vocabulary / phrase 等词项只辅助生成组织，不成为审核目录
 
 3. 桶内去重合并（三级，从便宜到贵）
    a. block_content_sha256 完全相同 → 直接合并
-   b. 同 scope、同 knowledge_kind 且原子 concept_key 相同 → 直接合并
-   c. concept_key 有交集或向量相似度达到评测阈值 → 只标为候选重复
+   b. 标题词归一或向量相似度达到评测阈值 → 只标为候选重复
    合并时保留全部来源引用，不丢证据。教材版本 + 教辅版本 + 你的清单版本
    合成一个知识点，三个出处。
 
@@ -439,11 +422,9 @@ rerank 放在最后且只对点查型生效。枚举型绝不 rerank——rerank
 
 退出条件：语义改写 recall@8 达标；BM25 漏召回时向量通道能独立救回；缓存与模型切换测试通过；`semantic_status` 反映真实覆盖率。
 
-**阶段 RET-07：受控增强**
+**阶段 RET-07：已退役的增强实验**
 
-产物：LLM 元数据抽取与审核、单元卡片、可选 rerank。三项分别受 feature flag 控制，不捆绑上线。
-
-退出条件：`concept_keys` 人工通过率、单元卡片覆盖率、rerank 增益分别达到阈值；没有可测增益的增强不进入默认路径。
+LLM 元数据抽取与审核、单元卡片已经退役，不再作为生产检索能力。历史评测只保留为决策记录；rerank 由 RET-08 和 RET-09 独立管理。
 
 **阶段 RET-08：受控 rerank 接入**
 
@@ -465,7 +446,7 @@ rerank 放在最后且只对点查型生效。枚举型绝不 rerank——rerank
 
 **D-001 Graph 生命周期（技术默认：索引侧耐久投影）。** 不让索引依赖 import task 数据库；提交时复制检索所需的不可变投影。该建议解除 RET-01 的架构歧义，开发前只需确认保留期限与删除语义。
 
-**D-002 出网粒度（2026-07-27 已更新）。** 已验证的 HTTPS Provider 默认允许出网，删除 Embedding、元数据、单元卡片、会话生成和 rerank 的逐任务授权与确认。点查与生成仅发送本次检索到且通过 outbound policy 的证据；`never-send-cloud` 一律不外发，`do-not-index` 与 `completely-ignore` 继续生效。source-lookup rerank 仍是独立 operation，默认开关保持关闭；启用后仅向独立、已验证的 HTTPS rerank 模型发送通过规则过滤的查询和候选块文本，并继续执行内容哈希、响应格式、并发和失败回退校验。旧 SQLite 历史授权记录不删除，但运行时不读取或写入。
+**D-002 出网粒度（2026-08-12 已更新）。** 已验证的 HTTPS Provider 默认允许 Embedding、会话生成和启用后的 rerank 出网，不再创建、确认或重验逐任务授权。点查与生成仅发送本次检索到且通过 outbound policy 的证据；`never-send-cloud` 一律不外发，`do-not-index` 与 `completely-ignore` 继续生效。source-lookup rerank 仍是独立 operation，默认开关保持关闭；启用后仅向独立、已验证的 HTTPS rerank 模型发送通过规则过滤的查询和候选块文本，并继续执行内容哈希、响应格式、并发和失败回退校验。LLM 元数据和单元卡片运行时已删除；旧 SQLite 历史记录不删除，也不再读取或写入。
 
 **D-003 目录规则（默认：适配真实资料，不强制迁移目录）。** RET-00 收集真实目录样本，规则由测试夹具驱动；推荐目录只作为新资料建议，不把重命名现有 vault 作为检索改造前置条件。
 
@@ -473,7 +454,20 @@ rerank 放在最后且只对点查型生效。枚举型绝不 rerank——rerank
 
 **D-005 向量精度（技术默认：float32 V1）。** float16 作为后续独立性能任务，只有 Windows 实机在 golden set 上证明 top-k 重合率和去重候选质量不回退后才启用。
 
+**D-006 PDF 结构化管线（2026-08-17 已确认）。** PDF 的 OCR 来源与 DocumentGraph 到 Markdown 的结构化方式必须拆分为两个独立、任务级冻结的选择。OCR 来源仍由“在线解析”控制：关闭时使用本机 PaddleOCR-VL，打开并选择已验证 Provider 时上传 PDF 原件与文件名并使用官方在线 OCR。结构化方式新增 `markdown_pipeline`，仅适用于 PDF：
+
+| OCR 来源 | `ai`（AI 结构化） | `local`（本地结构化） |
+| --- | --- | --- |
+| 本机 OCR | 将选定 DocumentGraph 的确定性 Markdown 发送给既有 Markdown Provider | 直接以 `render_document_graph()` 确定性渲染 |
+| 在线 OCR | 将选定 DocumentGraph 的确定性 Markdown 发送给既有 Markdown Provider | 直接以 `render_document_graph()` 确定性渲染 |
+
+`markdown_pipeline` 属于导入任务，不属于 Online OCR Provider 选择；新 PDF 任务默认 `ai`，重试、恢复与设置变更均不得改写已冻结的模式。AI 模式在派生前使用既有 Markdown outbound policy 校验，策略或 Provider 失败时进入可恢复失败并仅提供重新生成笔记，不自动回退为本地渲染。本地模式不得调用 Markdown Provider。在线 OCR 继续独立校验原件上传策略、Provider 与凭据；因此本机 OCR + AI 结构化只外发派生 Markdown，不上传 PDF 原件。
+
+该开关不改变原生 Markdown、DOCX、表格或其他格式的既有处理。历史任务若未持久化该字段，按历史行为推断：含在线 OCR 选择的 PDF 视为 `ai`，没有在线 OCR 选择的 PDF 视为 `local`，以避免重试时扩大外发范围。导入界面使用独立的分段控件并记住上次选择，任务详情展示安全的冻结模式；在线 OCR 任务另展示 Provider 与状态。首步仅支持手动分别创建任务做对照，不自动双跑、并排 diff 或质量评分。
+
 ---
+
+**D-007 本地图结构归一化（2026-08-17 已确认）。** 本地结构化的规范输入是带 provenance 的 DocumentGraph，不是 PaddleOCR 原始 JSON，也不是先生成的 Markdown。PaddleOCR 页面 JSON 只在 adapter/私有证据层解析；随后以版本化、零出网的确定性规则修复可信标题、几何阅读顺序、连续列表、图注、断行段落和可确认的重复页边噪音。不能机械确认的内容保留原文并记录稳定问题，不使用 LLM 补全或改写正文。合并、拆分和类型变更的块保留全部原始 block identity、locator 与 evidence ref；规则版本随 PDF 任务/图谱冻结，历史任务不因代码升级自动改变。缺少代表性脱敏真实页面时，只能以 fixture 验证协议保真，不能据此宣称语义质量提升。
 
 ## 附：证据强度说明
 

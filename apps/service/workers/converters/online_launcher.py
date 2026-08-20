@@ -7,6 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from domain.evidence import ConversionAttempt, ConversionEvidence
+from domain.local_markdown_structure import normalize_local_pdf_graph
 from ports.credential_store import CredentialStore
 from ports.online_document_parser import OnlineDocumentParser, OnlineDocumentParserError
 from workers.converters.artifact_store import PrivateArtifactStore
@@ -44,14 +45,6 @@ class OnlinePdfConversionLauncher:
         if request.online_parse_selection is None:
             return self.convert(request)
         return self._convert_online(request, record_online_job)
-
-    def convert_after_primary_persisted(self, request: ConversionRequest, record_rejected_attempt):
-        if request.online_parse_selection is None:
-            staged = getattr(self._local_launcher, "convert_after_primary_persisted", None)
-            if callable(staged):
-                return staged(request, record_rejected_attempt)
-            return self._local_launcher.convert(request)
-        return self._convert_online(request)
 
     def _convert_online(self, request: ConversionRequest, record_online_job=None) -> ConversionOutcome:
         selection = request.online_parse_selection
@@ -101,6 +94,7 @@ class OnlinePdfConversionLauncher:
                     blocks.extend(page_blocks)
                     issues.extend(page_issues)
                 graph = _paddleocr_vl_graph(request, attempt_id, blocks, [], issues)
+            graph = normalize_local_pdf_graph(graph, request.local_structure_profile)
             config_hash = sha256(
                 json.dumps(
                     {
@@ -108,6 +102,7 @@ class OnlinePdfConversionLauncher:
                         "endpoint": selection.endpoint,
                         "model": selection.model,
                         "policy_revision": selection.policy_revision,
+                        "local_structure_profile": request.local_structure_profile,
                     },
                     sort_keys=True,
                 ).encode("utf-8")
@@ -124,7 +119,6 @@ class OnlinePdfConversionLauncher:
                 status="selected",
                 output_artifact_refs=artifacts,
                 graph_id=graph.graph_id,
-                quality_gate_decision_id="online-pending-quality-gate",
             )
             return ConversionOutcome(
                 evidence=ConversionEvidence("pdf", graph, attempt),

@@ -46,19 +46,8 @@ from application.embedding_service import EmbeddingExecutionError, EmbeddingServ
 from application.import_selections import ImportSelectionError, ImportSelectionStore
 from application.ingest import ImportTaskError, ImportTaskService
 from application.indexing import IndexingService
-from application.knowledge_graph import EmptyGraphCandidateRepository, KnowledgeGraphService
 from application.local_session import LocalSession, create_local_session
-from application.metadata_batches import (
-    MetadataBatchService,
-    MetadataBatchValidationError,
-)
-from application.metadata_service import MetadataExtractionError, MetadataExtractionService
 from application.provider_reranker import ProviderReranker
-from application.unit_card_batches import (
-    UnitCardBatchService,
-    UnitCardBatchValidationError,
-)
-from application.unit_card_service import UnitCardExecutionError, UnitCardService
 from application.policies import PolicyService, PolicyValidationError
 from application.providers import (
     ProviderService,
@@ -84,17 +73,6 @@ from api.runtime import RuntimeState, initialize_runtime
 from domain.policies import ExclusionRule, PolicyEvaluation, VaultPolicy, normalize_vault_relative_path
 from domain.embedding_batches import EmbeddingBatchScope
 from domain.embeddings import EmbeddingExecutionReport
-from domain.metadata_extraction import (
-    MetadataAuditReport,
-    MetadataBatchScope,
-    MetadataCandidate,
-    MetadataExtractionReport,
-    metadata_audit_report,
-)
-from domain.unit_card_batches import (
-    UnitCardBatchScope,
-    UnitCardExecutionReport,
-)
 from domain.providers import ModelSelection, ProbeResult, Provider, ProviderModel
 from domain.derived_notes import (
     DerivedMarkdownProposal,
@@ -102,8 +80,6 @@ from domain.derived_notes import (
     safe_split_after_unit_indexes,
 )
 from domain.classification import ClassificationSuggestion
-from domain.candidate_links import CandidateLinkProposal
-from domain.metadata_tags import MetadataTagProposal, TagChangePreview, TagDefinition
 from domain.evidence import DocxOoxmlLocator, EvidenceLocator, ParseEvidence, PdfRegionLocator
 from domain.indexing import IndexBlock, IndexHealth
 from domain.review_commits import CommitJournal, ReviewSnapshot
@@ -188,13 +164,6 @@ IMPORT_TASK_SSE_EVENT_NAMES = frozenset(
         "classification-revised",
         "classification-accepted",
         "classification-excluded",
-        "metadata-tags-generated",
-        "metadata-tags-accepted",
-        "metadata-tags-excluded",
-        "metadata-tags-tag-change",
-        "candidate-links-generated",
-        "candidate-links-accepted",
-        "candidate-links-excluded",
         "review-snapshot-created",
         "review-snapshot-stale",
         "review-item-decided",
@@ -217,15 +186,6 @@ class VaultPathCommand(BaseModel):
 
     selection_id: str
     managed_root: str = "platform"
-
-
-class KnowledgeGraphQuery(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    directory: str | None = None
-    tag: str | None = None
-    source: Literal["native", "derived"] | None = None
-    relationship_state: Literal["all", "confirmed", "candidate"] | None = None
 
 
 class SessionListQuery(BaseModel):
@@ -359,20 +319,6 @@ class ClassificationBatchDecisionCommand(BaseModel):
     reason: str
 
 
-class MetadataTagDecisionCommand(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    decision: str
-    reason: str
-
-
-class CandidateLinkDecisionCommand(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    decision: Literal["accepted", "excluded"]
-    reason: str = Field(pattern=r".*\S.*")
-
-
 class ReviewCommitCommand(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -397,25 +343,6 @@ class ConversionBlockCorrectionCommand(BaseModel):
     reason: str = Field(pattern=r".*\S.*")
 
 
-class VaultTagCommand(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    name: str
-
-
-class VaultTagChangeCommand(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    operation: str
-    source_tag: str
-    target_tag: str | None = None
-
-
-class VaultTagChangeApplyCommand(VaultTagChangeCommand):
-    catalog_revision: int
-    proposal_versions: list[list[int]]
-
-
 class ExclusionRuleCommand(BaseModel):
     kind: str
     relative_path: str
@@ -437,26 +364,13 @@ class EmbeddingBatchScopeCommand(BaseModel):
     relative_path: str | None = None
 
 
-class UnitCardBatchScopeCommand(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    scope_kind: Literal["vault", "directory"]
-    relative_path: str | None = None
-
-
-class MetadataCandidateDecisionCommand(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    decision: Literal["accepted", "excluded"]
-    reason: str = Field(pattern=r".*\S.*")
-
-
 class ProviderCommand(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str
     endpoint: str
     secret: str | None = None
+    api_mode: Literal["chat-completions", "responses"] = "chat-completions"
 
 
 class ProviderUpdateCommand(BaseModel):
@@ -465,6 +379,7 @@ class ProviderUpdateCommand(BaseModel):
     name: str
     endpoint: str
     secret: str | None = None
+    api_mode: Literal["chat-completions", "responses"] | None = None
 
 
 class ModelDefaultCommand(BaseModel):
@@ -508,6 +423,7 @@ class ImportTaskCommand(BaseModel):
     selection_id: str
     online_parse_enabled: bool = False
     online_parse_provider_id: str | None = None
+    markdown_pipeline: Literal["ai", "local"] | None = None
 
 
 class OnlineParseProviderCommand(BaseModel):
@@ -708,61 +624,6 @@ def embedding_execution_payload(report: EmbeddingExecutionReport) -> dict[str, o
     }
 
 
-def unit_card_execution_payload(report: UnitCardExecutionReport) -> dict[str, object]:
-    return {
-        "vault_id": report.vault_id,
-        "status": report.status,
-        "file_count": report.file_count,
-        "block_count": report.block_count,
-        "card_count": report.card_count,
-        "chat_network_request_count": report.chat_network_request_count,
-        "embedding_network_request_count": report.embedding_network_request_count,
-    }
-
-
-def metadata_execution_payload(report: MetadataExtractionReport) -> dict[str, object]:
-    return {
-        "vault_id": report.vault_id,
-        "status": report.status,
-        "file_count": report.file_count,
-        "block_count": report.block_count,
-        "candidate_count": report.candidate_count,
-        "required_review_count": report.required_review_count,
-        "network_batch_count": report.network_batch_count,
-    }
-
-
-def metadata_candidate_payload(candidate: MetadataCandidate) -> dict[str, object]:
-    return {
-        "candidate_id": candidate.candidate_id,
-        "vault_id": candidate.vault_id,
-        "relative_path": candidate.relative_path,
-        "sequence": candidate.sequence,
-        "knowledge_kind": candidate.knowledge_kind,
-        "concept_keys": list(candidate.concept_keys),
-        "confidence": candidate.confidence,
-        "provider_id": candidate.provider_id,
-        "model_id": candidate.model_id,
-        "status": candidate.status,
-        "review_reason": candidate.review_reason,
-        "decision_reason": candidate.decision_reason,
-        "created_at": candidate.created_at,
-        "updated_at": candidate.updated_at,
-    }
-
-
-def metadata_audit_payload(report: MetadataAuditReport) -> dict[str, object]:
-    return {
-        "candidate_count": report.candidate_count,
-        "required_review_count": report.required_review_count,
-        "pending_count": report.pending_count,
-        "reviewed_count": report.reviewed_count,
-        "accepted_count": report.accepted_count,
-        "excluded_count": report.excluded_count,
-        "acceptance_rate": report.acceptance_rate,
-    }
-
-
 def probe_payload(probe: ProbeResult) -> dict[str, object]:
     return {"ok": probe.ok, "reason": probe.reason}
 
@@ -783,6 +644,7 @@ def provider_payload(provider: Provider) -> dict[str, object]:
         "name": provider.name,
         "endpoint": provider.endpoint,
         "transport": provider.transport,
+        "api_mode": provider.api_mode,
         "credential_configured": provider.credential_configured,
         "verification": {
             "discovery": probe_payload(provider.verification.discovery),
@@ -1000,14 +862,6 @@ def query_scope_selection(command: SessionQueryScopeCommand | None) -> QueryScop
 
 def embedding_batch_scope(command: EmbeddingBatchScopeCommand) -> EmbeddingBatchScope:
     return EmbeddingBatchScope(command.scope_kind, command.relative_path)
-
-
-def metadata_batch_scope(command: EmbeddingBatchScopeCommand) -> MetadataBatchScope:
-    return MetadataBatchScope(command.scope_kind, command.relative_path)
-
-
-def unit_card_batch_scope(command: UnitCardBatchScopeCommand) -> UnitCardBatchScope:
-    return UnitCardBatchScope(command.scope_kind, command.relative_path)
 
 
 def session_citation_payload(citation: SessionCitation) -> dict[str, object]:
@@ -1538,50 +1392,6 @@ def graph_projection_summary_payload(summary) -> dict[str, object]:
     }
 
 
-def knowledge_graph_payload(graph) -> dict[str, object]:
-    def edge_payload(edge) -> dict[str, object]:
-        payload = {
-            "source_path": edge.source_path,
-            "target_path": edge.target_path,
-            "kind": edge.kind,
-            "status": edge.status,
-        }
-        if edge.kind == "candidate":
-            payload.update(
-                {
-                    "review_item_id": edge.review_item_id,
-                    "reason": edge.reason,
-                    "evidence": [
-                        {
-                            "relative_path": evidence.relative_path,
-                            "location": evidence.location,
-                            "source_locations": list(evidence.source_locations),
-                        }
-                        for evidence in edge.evidence
-                    ],
-                }
-            )
-        return payload
-
-    return {
-        "vault_id": graph.vault_id,
-        "nodes": [
-            {
-                "relative_path": node.relative_path,
-                "title": node.title,
-                "directory": node.directory,
-                "tags": list(node.tags),
-                "source": node.source,
-            }
-            for node in graph.nodes
-        ],
-        "edges": [edge_payload(edge) for edge in graph.edges],
-        "directories": list(graph.directories),
-        "tags": list(graph.tags),
-        "index": index_health_payload(graph.health),
-    }
-
-
 def import_task_payload(task: ImportTask) -> dict[str, object]:
     return {
         "task_id": task.task_id,
@@ -1624,6 +1434,11 @@ def import_task_payload(task: ImportTask) -> dict[str, object]:
             }
             if task.online_parse_selection is not None
             else {"enabled": False}
+        ),
+        "markdown_pipeline": (
+            task.resolved_markdown_pipeline()
+            if task.source_paths and all(path.suffix.casefold() == ".pdf" for path in task.source_paths)
+            else None
         ),
     }
 
@@ -1847,48 +1662,6 @@ def classification_suggestion_payload(suggestion: ClassificationSuggestion) -> d
     }
 
 
-def metadata_tag_proposal_payload(proposal: MetadataTagProposal) -> dict[str, object]:
-    return {
-        "item_id": proposal.item_id,
-        "revision": proposal.revision,
-        "vault_id": proposal.vault_id,
-        "proposal_revision": proposal.proposal_revision,
-        "content_sha256": proposal.content_sha256,
-        "source_type": proposal.source_type,
-        "source_file": proposal.source_file,
-        "ingested_at": proposal.ingested_at,
-        "processing_status": proposal.processing_status,
-        "domain": proposal.domain,
-        "domain_confidence": proposal.domain_confidence,
-        "requires_review": proposal.requires_review,
-        "decision": proposal.decision,
-        "decision_reason": proposal.decision_reason,
-        "tags": [tag.to_dict() for tag in proposal.tags],
-    }
-
-
-def candidate_link_proposal_payload(proposal: CandidateLinkProposal) -> dict[str, object]:
-    return {
-        "review_item_id": proposal.review_item_id,
-        "revision": proposal.revision,
-        "vault_id": proposal.vault_id,
-        "source_item_id": proposal.source_item_id,
-        "source_path": proposal.source_path,
-        "target_item_id": proposal.target_item_id,
-        "target_path": proposal.target_path,
-        "reason": proposal.reason,
-        "confidence": proposal.confidence,
-        "source_evidence": proposal.source_evidence.to_dict(),
-        "target_evidence": proposal.target_evidence.to_dict(),
-        "is_existing_note_change": proposal.is_existing_note_change,
-        "requires_review": proposal.requires_review,
-        "status": proposal.status,
-        "decision": proposal.decision,
-        "decision_reason": proposal.decision_reason,
-        "stale_reason": proposal.stale_reason,
-    }
-
-
 def review_snapshot_payload(snapshot: ReviewSnapshot) -> dict[str, object]:
     return {
         "vault_id": snapshot.vault_id,
@@ -1942,14 +1715,6 @@ def commit_journal_payload(journal: CommitJournal) -> dict[str, object]:
             for file in journal.unit.files
         ],
     }
-
-
-def vault_tag_payload(tag: TagDefinition) -> dict[str, object]:
-    return tag.to_dict()
-
-
-def tag_change_preview_payload(preview: TagChangePreview) -> dict[str, object]:
-    return preview.to_dict()
 
 
 def import_task_event_payload(event: ImportTaskEvent) -> dict[str, object]:
@@ -2022,46 +1787,6 @@ def vault_error(error: Exception) -> HTTPException:
             status_code=409,
             detail={
                 "code": "embedding_execution_blocked",
-                "message": str(error),
-                "details": {},
-                "retryable": True,
-            },
-        )
-    if isinstance(error, MetadataBatchValidationError):
-        return HTTPException(
-            status_code=400,
-            detail={
-                "code": "metadata_batch_invalid",
-                "message": str(error),
-                "details": {},
-                "retryable": True,
-            },
-        )
-    if isinstance(error, MetadataExtractionError):
-        return HTTPException(
-            status_code=409,
-            detail={
-                "code": "metadata_extraction_blocked",
-                "message": str(error),
-                "details": {},
-                "retryable": True,
-            },
-        )
-    if isinstance(error, UnitCardBatchValidationError):
-        return HTTPException(
-            status_code=400,
-            detail={
-                "code": "unit_card_batch_invalid",
-                "message": str(error),
-                "details": {},
-                "retryable": True,
-            },
-        )
-    if isinstance(error, UnitCardExecutionError):
-        return HTTPException(
-            status_code=409,
-            detail={
-                "code": "unit_card_execution_blocked",
                 "message": str(error),
                 "details": {},
                 "retryable": True,
@@ -2247,13 +1972,6 @@ def require_retrieval_chunking_lab_local_request(request: Request) -> None:
         raise HTTPException(status_code=404)
 
 
-def publish_graph_refresh(app: FastAPI, vault_id: str) -> None:
-    with app.state.graph_subscribers_lock:
-        subscribers = tuple(app.state.graph_subscribers.get(vault_id, ()))
-    for loop, queue in subscribers:
-        loop.call_soon_threadsafe(queue.put_nowait, "refresh")
-
-
 def vault_with_policy_payload(app: FastAPI, vault: Vault) -> dict[str, object]:
     policy = app.state.policy_service.get(vault.vault_id)
     payload = vault_payload(
@@ -2347,7 +2065,6 @@ def create_app(
     directory_selections: DirectorySelectionStore | None = None,
     import_task_service: ImportTaskService | None = None,
     indexing_service: IndexingService | None = None,
-    knowledge_graph_service: KnowledgeGraphService | None = None,
     import_picker: WindowsImportPicker | None = None,
     import_selections: ImportSelectionStore | None = None,
     import_upload_store: ImportUploadStore | None = None,
@@ -2371,8 +2088,6 @@ def create_app(
     def require_current_local_session(request: Request) -> None:
         require_local_session(app, request)
 
-    app.state.graph_subscribers = {}
-    app.state.graph_subscribers_lock = threading.Lock()
     if vault_service is None:
         repository = SqliteVaultRepository(runtime.data_directory / "vaults.sqlite3")
         vault_service = VaultService(
@@ -2397,7 +2112,6 @@ def create_app(
         repository=SqliteProviderRepository(runtime.data_directory / "vaults.sqlite3"),
         credentials=WindowsCredentialManager(),
         client=OpenAiCompatibleProviderClient(),
-        unit_card_invalidator=app.state.indexing_service.repository,
     )
     online_parse_credentials = WindowsCredentialManager()
     online_parser = OfficialOnlineDocumentParser()
@@ -2418,28 +2132,6 @@ def create_app(
         app.state.provider_service,
         app.state.indexing_service.repository,
     )
-    app.state.metadata_batch_service = MetadataBatchService(
-        app.state.vault_service,
-        app.state.policy_service,
-        app.state.provider_service,
-        app.state.indexing_service.repository,
-    )
-    app.state.metadata_service = MetadataExtractionService(
-        app.state.metadata_batch_service,
-        app.state.provider_service,
-        app.state.indexing_service.repository,
-    )
-    app.state.unit_card_batch_service = UnitCardBatchService(
-        app.state.vault_service,
-        app.state.policy_service,
-        app.state.provider_service,
-        app.state.indexing_service.repository,
-    )
-    app.state.unit_card_service = UnitCardService(
-        app.state.unit_card_batch_service,
-        app.state.provider_service,
-        app.state.indexing_service.repository,
-    )
     app.state.reranker = ProviderReranker(app.state.provider_service)
     app.state.session_service = session_service or SessionService(
         SqliteSessionRepository(runtime.data_directory / "sessions.sqlite3"),
@@ -2449,7 +2141,6 @@ def create_app(
         index_repository=app.state.indexing_service.repository,
         lexical_retrieval_enabled=runtime.lexical_retrieval_enabled,
         hybrid_retrieval_enabled=runtime.hybrid_retrieval_enabled,
-        unit_card_retrieval_enabled=runtime.unit_card_retrieval_enabled,
         reranker=app.state.reranker,
         rerank_retrieval_enabled=runtime.rerank_retrieval_enabled,
     )
@@ -2494,11 +2185,6 @@ def create_app(
         import_task_service.recover_interrupted_commits(recovered_tasks)
         import_task_service.start_queued_tasks()
     app.state.import_task_service = import_task_service
-    app.state.knowledge_graph_service = knowledge_graph_service or KnowledgeGraphService(
-        app.state.vault_service,
-        app.state.indexing_service.repository,
-        getattr(app.state.import_task_service, "repository", EmptyGraphCandidateRepository()),
-    )
     app.state.workbench_overview_service = workbench_overview_service or WorkbenchOverviewService(
         app.state.vault_service,
         app.state.indexing_service,
@@ -2838,6 +2524,72 @@ def create_app(
             raise session_error(error) from error
 
     @app.post(
+        "/api/sessions/{session_id}/run/stream",
+        dependencies=[Depends(require_current_local_session)],
+    )
+    def stream_persistent_session_run(
+        request: Request, session_id: str, command: SessionRunCommand
+    ) -> StreamingResponse:
+        events: Queue[tuple[str, dict[str, object] | None]] = Queue()
+
+        def run_execution() -> None:
+            try:
+                result = app.state.session_service.run_task(
+                    session_id,
+                    command.content,
+                    vault_id=command.vault_id,
+                    scope_kind=command.scope_kind,
+                    scope_path=command.scope_path,
+                    provider_id=command.provider_id,
+                    model_id=command.model_id,
+                    intent=command.intent,
+                    query_scope=query_scope_selection(command.query_scope),
+                    on_stream_chunk=lambda ordinal, content: events.put(
+                        ("chunk", {"ordinal": ordinal, "content": content})
+                    ),
+                )
+                detail = app.state.session_service.detail(session_id)
+                snapshot = next(
+                    (item for item in detail.task_snapshots if item.snapshot_id == result.snapshot_id),
+                    None,
+                )
+                payload = (
+                    session_completeness_result_payload(result, snapshot)
+                    if isinstance(result, SessionCompletenessResult)
+                    else session_knowledge_organization_result_payload(result, snapshot)
+                    if isinstance(result, SessionKnowledgeOrganizationResult)
+                    else session_deep_creation_result_payload(result, snapshot)
+                    if isinstance(result, SessionDeepCreationResult)
+                    else session_retrieval_result_payload(result, snapshot)
+                )
+                events.put(("result", {"result": payload}))
+            except Exception as error:
+                message = (
+                    str(error)
+                    if isinstance(error, (SessionNotFoundError, SessionValidationError))
+                    else "The session task could not be completed."
+                )
+                events.put(("error", {"message": message}))
+            finally:
+                events.put(("done", None))
+
+        threading.Thread(target=run_execution, daemon=True).start()
+
+        def event_stream():
+            while True:
+                event, payload = events.get()
+                if event == "done":
+                    return
+                encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                yield f"event: {event}\ndata: {encoded}\n\n"
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @app.post(
         "/api/sessions/{session_id}/tasks/{task_id}/execute",
         dependencies=[Depends(require_current_local_session)],
     )
@@ -3101,7 +2853,7 @@ def create_app(
         require_local_session(app, request)
         try:
             provider = app.state.provider_service.create(
-                command.name, command.endpoint, command.secret
+                command.name, command.endpoint, command.secret, command.api_mode
             )
             return {"provider": provider_payload(provider)}
         except Exception as error:
@@ -3122,7 +2874,7 @@ def create_app(
         require_local_session(app, request)
         try:
             provider = app.state.provider_service.update(
-                provider_id, command.name, command.endpoint, command.secret
+                provider_id, command.name, command.endpoint, command.secret, command.api_mode
             )
             return {"provider": provider_payload(provider)}
         except Exception as error:
@@ -3156,6 +2908,18 @@ def create_app(
         try:
             return {"provider": provider_payload(app.state.provider_service.test_model(
                 provider_id, command.model_id
+            ))}
+        except Exception as error:
+            raise provider_error(error) from error
+
+    @app.delete("/api/providers/{provider_id}/models")
+    def remove_provider_model(
+        request: Request, provider_id: str, model_id: str
+    ) -> dict[str, object]:
+        require_local_session(app, request)
+        try:
+            return {"provider": provider_payload(app.state.provider_service.remove_model(
+                provider_id, model_id
             ))}
         except Exception as error:
             raise provider_error(error) from error
@@ -3274,6 +3038,7 @@ def create_app(
                 command.vault_id,
                 selection,
                 command.online_parse_provider_id if command.online_parse_enabled else None,
+                command.markdown_pipeline,
             )
             return {
                 "task": import_task_payload(tasks[0]),
@@ -3315,14 +3080,6 @@ def create_app(
                 app.state.import_task_service, "list_classification_suggestions", None
             )
             classifications = list_classifications(task_id) if list_classifications is not None else []
-            list_metadata_tags = getattr(
-                app.state.import_task_service, "list_metadata_tag_proposals", None
-            )
-            metadata_tags = list_metadata_tags(task_id) if list_metadata_tags is not None else []
-            list_candidate_links = getattr(
-                app.state.import_task_service, "list_candidate_link_proposals", None
-            )
-            candidate_links = list_candidate_links(task_id) if list_candidate_links is not None else []
             list_commit_journals = getattr(app.state.import_task_service, "list_commit_journals", None)
             commit_journals = list_commit_journals(task_id) if list_commit_journals is not None else []
             return {
@@ -3338,12 +3095,6 @@ def create_app(
                 ],
                 "classification_suggestions": [
                     classification_suggestion_payload(suggestion) for suggestion in classifications
-                ],
-                "metadata_tag_proposals": [
-                    metadata_tag_proposal_payload(proposal) for proposal in metadata_tags
-                ],
-                "candidate_link_proposals": [
-                    candidate_link_proposal_payload(proposal) for proposal in candidate_links
                 ],
                 "commit_journals": [commit_journal_payload(journal) for journal in commit_journals],
                 "index": None,
@@ -3400,68 +3151,6 @@ def create_app(
                     for suggestion in app.state.import_task_service.list_classification_suggestions(task_id)
                 ]
             }
-        except Exception as error:
-            raise import_task_error(error) from error
-
-    @app.get("/api/import-tasks/{task_id}/metadata-tags")
-    def get_import_metadata_tags(request: Request, task_id: str) -> dict[str, object]:
-        require_local_session(app, request)
-        try:
-            return {
-                "metadata_tag_proposals": [
-                    metadata_tag_proposal_payload(proposal)
-                    for proposal in app.state.import_task_service.list_metadata_tag_proposals(task_id)
-                ]
-            }
-        except Exception as error:
-            raise import_task_error(error) from error
-
-    @app.post("/api/import-tasks/{task_id}/metadata-tags/{item_id}/decision")
-    def decide_import_metadata_tags(
-        request: Request,
-        task_id: str,
-        item_id: int,
-        command: MetadataTagDecisionCommand,
-    ) -> dict[str, object]:
-        require_local_session(app, request)
-        try:
-            return {
-                "task": import_task_payload(
-                    app.state.import_task_service.decide_metadata_tag_proposal(
-                        task_id, item_id, command.decision, command.reason
-                    )
-                )
-            }
-        except Exception as error:
-            raise import_task_error(error) from error
-
-    @app.get("/api/import-tasks/{task_id}/candidate-links")
-    def get_import_candidate_links(request: Request, task_id: str) -> dict[str, object]:
-        require_local_session(app, request)
-        try:
-            return {
-                "candidate_link_proposals": [
-                    candidate_link_proposal_payload(proposal)
-                    for proposal in app.state.import_task_service.list_candidate_link_proposals(task_id)
-                ]
-            }
-        except Exception as error:
-            raise import_task_error(error) from error
-
-    @app.post("/api/import-tasks/{task_id}/candidate-links/{review_item_id}/decision")
-    def decide_import_candidate_link(
-        request: Request,
-        task_id: str,
-        review_item_id: str,
-        command: CandidateLinkDecisionCommand,
-    ) -> dict[str, object]:
-        require_local_session(app, request)
-        try:
-            task = app.state.import_task_service.decide_candidate_link_proposal(
-                task_id, review_item_id, command.decision, command.reason
-            )
-            publish_graph_refresh(app, task.vault_id)
-            return {"task": import_task_payload(task)}
         except Exception as error:
             raise import_task_error(error) from error
 
@@ -3546,70 +3235,9 @@ def create_app(
                 task_id, tuple(command.unit_ids) if command.unit_ids is not None else None
             )
             journals = app.state.import_task_service.list_commit_journals(task_id)
-            publish_graph_refresh(app, task.vault_id)
             return {
                 "task": import_task_payload(task),
                 "commit_journals": [commit_journal_payload(journal) for journal in journals],
-            }
-        except Exception as error:
-            raise import_task_error(error) from error
-
-    @app.get("/api/vaults/{vault_id}/tags")
-    def get_vault_tags(request: Request, vault_id: str, search: str = "") -> dict[str, object]:
-        require_local_session(app, request)
-        try:
-            return {
-                "tags": [
-                    vault_tag_payload(tag)
-                    for tag in app.state.import_task_service.list_vault_tags(vault_id, search)
-                ]
-            }
-        except Exception as error:
-            raise import_task_error(error) from error
-
-    @app.post("/api/vaults/{vault_id}/tags")
-    def create_vault_tag(
-        request: Request, vault_id: str, command: VaultTagCommand
-    ) -> dict[str, object]:
-        require_local_session(app, request)
-        try:
-            return {"tag": vault_tag_payload(app.state.import_task_service.create_vault_tag(vault_id, command.name))}
-        except Exception as error:
-            raise import_task_error(error) from error
-
-    @app.post("/api/vaults/{vault_id}/tags/change-preview")
-    def preview_vault_tag_change(
-        request: Request, vault_id: str, command: VaultTagChangeCommand
-    ) -> dict[str, object]:
-        require_local_session(app, request)
-        try:
-            return {
-                "preview": tag_change_preview_payload(
-                    app.state.import_task_service.preview_vault_tag_change(
-                        vault_id, command.operation, command.source_tag, command.target_tag
-                    )
-                )
-            }
-        except Exception as error:
-            raise import_task_error(error) from error
-
-    @app.post("/api/vaults/{vault_id}/tags/change")
-    def apply_vault_tag_change(
-        request: Request, vault_id: str, command: VaultTagChangeApplyCommand
-    ) -> dict[str, object]:
-        require_local_session(app, request)
-        try:
-            return {
-                "preview": tag_change_preview_payload(
-                    app.state.import_task_service.apply_vault_tag_change(
-                        vault_id,
-                        command.operation,
-                        command.source_tag,
-                        command.target_tag,
-                        command.catalog_revision,
-                        tuple((int(version[0]), int(version[1])) for version in command.proposal_versions),
-                    )
-                )
             }
         except Exception as error:
             raise import_task_error(error) from error
@@ -3911,67 +3539,12 @@ def create_app(
             )
         return {"projection": graph_projection_summary_payload(summary)}
 
-    @app.get("/api/vaults/{vault_id}/graph/events")
-    async def stream_vault_graph_events(request: Request, vault_id: str):
-        require_local_session(app, request)
-        try:
-            app.state.vault_service.get(vault_id)
-        except Exception as error:
-            raise vault_error(error) from error
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[str] = asyncio.Queue()
-        subscriber = (loop, queue)
-        with app.state.graph_subscribers_lock:
-            app.state.graph_subscribers.setdefault(vault_id, set()).add(subscriber)
-
-        async def events():
-            try:
-                yield ": connected\n\n"
-                while True:
-                    try:
-                        await asyncio.wait_for(queue.get(), timeout=15)
-                        yield 'event: graph-refresh\ndata: {"reason":"changed"}\n\n'
-                    except TimeoutError:
-                        yield ": keep-alive\n\n"
-            finally:
-                with app.state.graph_subscribers_lock:
-                    app.state.graph_subscribers.get(vault_id, set()).discard(subscriber)
-
-        return StreamingResponse(
-            events(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
-
-    @app.get("/api/vaults/{vault_id}/graph")
-    def get_vault_graph(
-        request: Request,
-        vault_id: str,
-        filters: Annotated[KnowledgeGraphQuery, Query()],
-    ) -> dict[str, object]:
-        require_local_session(app, request)
-        try:
-            return {
-                "graph": knowledge_graph_payload(
-                    app.state.knowledge_graph_service.read(
-                        vault_id,
-                        directory=filters.directory,
-                        tag=filters.tag,
-                        source=filters.source,
-                        relationship_state=filters.relationship_state,
-                    )
-                )
-            }
-        except Exception as error:
-            raise vault_error(error) from error
-
     @app.post("/api/vaults/{vault_id}/index/reconcile")
     def reconcile_vault_index(request: Request, vault_id: str) -> dict[str, object]:
         require_local_session(app, request)
         try:
             health = app.state.indexing_service.reconcile(vault_id)
             vault = app.state.vault_service.get(vault_id)
-            publish_graph_refresh(app, vault_id)
             return {"vault": vault_with_policy_payload(app, vault), "index": index_health_payload(health)}
         except Exception as error:
             raise vault_error(error) from error
@@ -3982,7 +3555,6 @@ def create_app(
         try:
             health = app.state.indexing_service.retry(vault_id)
             vault = app.state.vault_service.get(vault_id)
-            publish_graph_refresh(app, vault_id)
             return {"vault": vault_with_policy_payload(app, vault), "index": index_health_payload(health)}
         except Exception as error:
             raise vault_error(error) from error
@@ -3993,7 +3565,6 @@ def create_app(
         try:
             health = app.state.indexing_service.rebuild(vault_id)
             vault = app.state.vault_service.get(vault_id)
-            publish_graph_refresh(app, vault_id)
             return {"vault": vault_with_policy_payload(app, vault), "index": index_health_payload(health)}
         except Exception as error:
             raise vault_error(error) from error
@@ -4008,7 +3579,6 @@ def create_app(
                 vault_id, command.relative_path, command.resolution
             )
             vault = app.state.vault_service.get(vault_id)
-            publish_graph_refresh(app, vault_id)
             return {"vault": vault_with_policy_payload(app, vault), "index": index_health_payload(health)}
         except Exception as error:
             raise vault_error(error) from error
@@ -4163,66 +3733,6 @@ def create_app(
         except Exception as error:
             raise vault_error(error) from error
 
-    @app.post("/api/vaults/{vault_id}/metadata/extract")
-    def extract_metadata(
-        request: Request, vault_id: str, command: EmbeddingBatchScopeCommand
-    ) -> dict[str, object]:
-        require_local_session(app, request)
-        try:
-            report = app.state.metadata_service.execute(vault_id, metadata_batch_scope(command))
-            return {"report": metadata_execution_payload(report)}
-        except Exception as error:
-            raise vault_error(error) from error
-
-    @app.post("/api/vaults/{vault_id}/unit-cards/build")
-    def build_unit_cards(
-        request: Request, vault_id: str, command: UnitCardBatchScopeCommand
-    ) -> dict[str, object]:
-        require_local_session(app, request)
-        try:
-            report = app.state.unit_card_service.execute(vault_id, unit_card_batch_scope(command))
-            return {"report": unit_card_execution_payload(report)}
-        except Exception as error:
-            raise vault_error(error) from error
-
-    @app.get("/api/vaults/{vault_id}/metadata-candidates")
-    def list_metadata_candidates(
-        request: Request, vault_id: str, status: str | None = Query(default=None)
-    ) -> dict[str, object]:
-        require_local_session(app, request)
-        try:
-            statuses = (status,) if status is not None else ()
-            candidates = app.state.indexing_service.repository.list_metadata_candidates(
-                vault_id, statuses
-            )
-            all_candidates = (
-                candidates
-                if not statuses
-                else app.state.indexing_service.repository.list_metadata_candidates(vault_id, ())
-            )
-            return {
-                "candidates": [metadata_candidate_payload(candidate) for candidate in candidates],
-                "audit": metadata_audit_payload(metadata_audit_report(vault_id, all_candidates)),
-            }
-        except Exception as error:
-            raise vault_error(error) from error
-
-    @app.post("/api/vaults/{vault_id}/metadata-candidates/{candidate_id}/decision")
-    def decide_metadata_candidate(
-        request: Request,
-        vault_id: str,
-        candidate_id: str,
-        command: MetadataCandidateDecisionCommand,
-    ) -> dict[str, object]:
-        require_local_session(app, request)
-        try:
-            candidate = app.state.indexing_service.repository.decide_metadata_candidate(
-                vault_id, candidate_id, command.decision, command.reason
-            )
-            return {"candidate": metadata_candidate_payload(candidate)}
-        except Exception as error:
-            raise vault_error(error) from error
-
     @app.get("/", include_in_schema=False)
     def workbench() -> FileResponse:
         return workbench_response(app.state.local_session)
@@ -4231,8 +3741,6 @@ def create_app(
     # Remove the former human-review commands from the public route table while
     # retaining their SQLite records for backward-compatible database opening.
     disabled_import_routes = {
-        "/api/import-tasks/{task_id}/metadata-tags/{item_id}/decision",
-        "/api/import-tasks/{task_id}/candidate-links/{review_item_id}/decision",
         "/api/import-tasks/{task_id}/review-snapshot",
         "/api/import-tasks/{task_id}/review-items/{review_item_id}/decision",
         "/api/import-tasks/{task_id}/conversion-items/{item_id}/blocks/{block_id}/correct",

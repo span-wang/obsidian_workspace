@@ -41,6 +41,11 @@ from domain.evidence import (
     StructuredContentUnit,
     read_evidence,
 )
+from domain.local_markdown_structure import (
+    LOCAL_MARKDOWN_STRUCTURE_PROFILE_V1,
+    LOCAL_MARKDOWN_STRUCTURE_PROFILE_V2,
+    normalize_local_pdf_graph,
+)
 from workers.converters.adapters import (
     ConverterOutput,
     ConverterUnavailable,
@@ -48,19 +53,17 @@ from workers.converters.adapters import (
     MockConverterAdapter,
 )
 from workers.converters.profiles import ConverterProfile
-from workers.converters.quality_gate import StructuralQualityGate
 from workers.converters.artifact_store import PrivateArtifactStore
 from workers.converters.launcher import (
     ProvisionedConversionLauncher,
     _paddleocr_vl_blocks,
+    _paddleocr_vl_graph,
     _stage_paddleocr_vl_input,
 )
 from workers.converters.runner import (
     ConversionArtifactDraft,
-    ConversionCandidate,
     ConversionRequest,
     ConversionOutcome,
-    RejectedConversionCandidate,
     conversion_items,
     run_conversion_worker,
 )
@@ -144,20 +147,7 @@ def _attempt(graph: DocumentGraph, status: str = "selected") -> ConversionAttemp
         status=status,
         output_artifact_refs=(_artifact(),),
         graph_id=graph.graph_id,
-        quality_gate_decision_id="gate-1" if status == "selected" else None,
     )
-
-
-def _accepted_quality_decision(attempt: ConversionAttempt) -> dict[str, object]:
-    return {
-        "decision_id": attempt.quality_gate_decision_id,
-        "policy_id": "document-structure",
-        "policy_version": 1,
-        "action": "accepted",
-        "fallback_eligible": False,
-        "rule_ids": [],
-        "issues": [],
-    }
 
 
 def _paddleocr_vl_artifact(artifact_id: str, digest: str, producer: str, *, role: str = "converter-json") -> ArtifactRef:
@@ -210,6 +200,57 @@ def test_paddleocr_vl_maps_structured_page_blocks_and_verified_image_artifacts()
     ]
 
 
+def test_paddleocr_vl_excludes_an_image_without_a_verified_artifact() -> None:
+    raw = _paddleocr_vl_artifact("paddle-page", "c" * 64, "paddleocr-vl/book_res.json")
+
+    blocks, issues = _paddleocr_vl_blocks(
+        {
+            "res": {
+                "page_index": 0,
+                "parsing_res_list": [
+                    {
+                        "block_label": "image",
+                        "block_content": '<img src="images/missing.png" alt="图示" />',
+                        "block_bbox": [1, 2, 30, 12],
+                    }
+                ],
+            }
+        },
+        "attempt-paddleocr-vl",
+        raw,
+    )
+
+    assert blocks == []
+    assert [(issue.code, issue.severity, issue.state) for issue in issues] == [
+        ("paddleocr-vl-image-artifact-missing", "warning", "accepted")
+    ]
+
+
+def test_paddleocr_vl_keeps_figure_title_text_when_the_image_is_excluded() -> None:
+    raw = _paddleocr_vl_artifact("paddle-page", "c" * 64, "paddleocr-vl/book_res.json")
+
+    blocks, issues = _paddleocr_vl_blocks(
+        {
+            "res": {
+                "page_index": 0,
+                "parsing_res_list": [
+                    {
+                        "block_label": "figure_title",
+                        "block_content": "图 1 施工示意图",
+                        "block_bbox": [1, 2, 30, 12],
+                    }
+                ],
+            }
+        },
+        "attempt-paddleocr-vl",
+        raw,
+    )
+
+    assert [block.kind for block in blocks] == ["paragraph"]
+    assert blocks[0].retrieval_projection == "图 1 施工示意图"
+    assert issues == []
+
+
 def test_paddleocr_vl_maps_saved_page_result_without_a_res_wrapper() -> None:
     raw = _paddleocr_vl_artifact("paddle-page", "c" * 64, "paddleocr-vl/book_0_res.json")
     fixture_path = Path(__file__).parents[1] / "fixtures" / "paddleocr-vl-1.6-page-result.json"
@@ -229,6 +270,265 @@ def test_paddleocr_vl_maps_saved_page_result_without_a_res_wrapper() -> None:
     assert [(issue.code, issue.state) for issue in issues] == [
         ("paddleocr-vl-empty-text", "accepted")
     ]
+
+
+def test_local_structure_profile_promotes_fixture_title_and_preserves_origins() -> None:
+    raw = _paddleocr_vl_artifact("paddle-page", "c" * 64, "paddleocr-vl/book_0_res.json")
+    fixture_path = Path(__file__).parents[1] / "fixtures" / "paddleocr-vl-1.6-page-result.json"
+    blocks, issues = _paddleocr_vl_blocks(
+        json.loads(fixture_path.read_text(encoding="utf-8")),
+        "attempt-paddleocr-vl",
+        raw,
+    )
+    request = ConversionRequest(
+        "task-paddleocr-vl",
+        1,
+        "pdf",
+        _HASH,
+        _HASH,
+        "private/source.pdf",
+        local_structure_profile=LOCAL_MARKDOWN_STRUCTURE_PROFILE_V1,
+    )
+    graph = normalize_local_pdf_graph(
+        _paddleocr_vl_graph(request, "attempt-paddleocr-vl", blocks, [], issues),
+        LOCAL_MARKDOWN_STRUCTURE_PROFILE_V1,
+    )
+
+    assert graph.normalization_profile == LOCAL_MARKDOWN_STRUCTURE_PROFILE_V1
+    assert [block.kind for block in graph.blocks] == ["heading", "table"]
+    assert all(block.origin_block_ids == (block.block_id,) for block in graph.blocks)
+    assert render_document_graph(graph).markdown.startswith("# 本机 PDF 解析")
+
+
+def test_local_structure_profile_turns_continuous_text_lists_into_typed_lists() -> None:
+    source = replace(
+        _block(text="- 第一项\n- 第二项"),
+        block_id="list-source",
+        locators=(PdfRegionLocator(1, (10.0, 20.0, 100.0, 80.0)),),
+    )
+    graph = normalize_local_pdf_graph(_graph(source), LOCAL_MARKDOWN_STRUCTURE_PROFILE_V1)
+
+    assert graph.blocks[0].kind == "list"
+    assert graph.blocks[0].payload.to_dict()["items"] == [
+        {"text": "第一项"},
+        {"text": "第二项"},
+    ]
+    assert render_document_graph(graph).markdown == "- 第一项\n- 第二项"
+
+
+def test_local_structure_profile_recovers_numbered_second_and_third_level_headings() -> None:
+    level_two = replace(
+        _block(text="1.1 适用范围"),
+        block_id="heading-level-two",
+        locators=(PdfRegionLocator(1, (100.0, 200.0, 700.0, 230.0)),),
+    )
+    level_three = replace(
+        _block(text="1.1.1 术语定义"),
+        block_id="heading-level-three",
+        locators=(PdfRegionLocator(1, (100.0, 240.0, 700.0, 270.0)),),
+    )
+    single_list_item = replace(
+        _block(text="1. 普通列表项"),
+        block_id="single-list-item",
+        locators=(PdfRegionLocator(1, (100.0, 300.0, 700.0, 330.0)),),
+    )
+    graph = normalize_local_pdf_graph(
+        _graph(level_two, level_three, single_list_item),
+        LOCAL_MARKDOWN_STRUCTURE_PROFILE_V1,
+    )
+
+    assert [block.kind for block in graph.blocks] == ["heading", "heading", "paragraph"]
+    assert [block.payload.to_dict().get("level") for block in graph.blocks[:2]] == [2, 3]
+    assert render_document_graph(graph).markdown == (
+        "## 1.1 适用范围\n\n### 1.1.1 术语定义\n\n1\\. 普通列表项"
+    )
+
+
+def test_local_structure_profile_golden_pages_merges_text_and_hides_repeated_header() -> None:
+    fixture_path = Path(__file__).parents[1] / "fixtures" / "paddleocr-vl-1.6-local-structure-pages.json"
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    blocks: list[DocumentBlock] = []
+    issues: list[DocumentGraphIssue] = []
+    for page in fixture["pages"]:
+        raw = _paddleocr_vl_artifact(
+            f"paddle-page-{page['page_index']}",
+            "c" * 64,
+            f"paddleocr-vl/page-{page['page_index']}_res.json",
+        )
+        page_blocks, page_issues = _paddleocr_vl_blocks(
+            page,
+            "attempt-paddleocr-vl",
+            raw,
+        )
+        blocks.extend(page_blocks)
+        issues.extend(page_issues)
+    request = ConversionRequest(
+        "task-paddleocr-vl",
+        1,
+        "pdf",
+        _HASH,
+        _HASH,
+        "private/source.pdf",
+        local_structure_profile=LOCAL_MARKDOWN_STRUCTURE_PROFILE_V1,
+    )
+    graph = normalize_local_pdf_graph(
+        _paddleocr_vl_graph(request, "attempt-paddleocr-vl", blocks, [], issues),
+        LOCAL_MARKDOWN_STRUCTURE_PROFILE_V1,
+    )
+    rendered = render_document_graph(graph).markdown
+
+    assert [block.kind for block in graph.blocks] == [
+        "noise",
+        "heading",
+        "paragraph",
+        "list",
+        "paragraph",
+        "noise",
+        "paragraph",
+        "paragraph",
+    ]
+    assert graph.blocks[2].retrieval_projection == "这是跨块段落。"
+    assert graph.blocks[3].payload.to_dict()["items"] == [{"text": "word"}, {"text": "phrase"}]
+    assert "课程页眉" not in rendered
+    assert "这是跨块段落。" in rendered
+
+
+def test_local_structure_profile_v2_hides_repeated_same_position_content_outside_page_margins() -> None:
+    repeated_first = replace(
+        _block("heading", text="限时课程推广"),
+        block_id="promotion-first",
+        locators=(PdfRegionLocator(1, (100.0, 430.0, 360.0, 470.0)),),
+    )
+    repeated_second = replace(
+        _block("heading", text="限时课程推广"),
+        block_id="promotion-second",
+        locators=(PdfRegionLocator(2, (102.0, 432.0, 362.0, 472.0)),),
+    )
+    first_body = replace(
+        _block(text="第一页正文。"),
+        block_id="body-first",
+        locators=(PdfRegionLocator(1, (100.0, 800.0, 900.0, 950.0)),),
+    )
+    second_body = replace(
+        _block(text="第二页正文。"),
+        block_id="body-second",
+        locators=(PdfRegionLocator(2, (100.0, 800.0, 900.0, 950.0)),),
+    )
+    source = _graph(repeated_first, first_body, repeated_second, second_body)
+
+    v1 = normalize_local_pdf_graph(source, LOCAL_MARKDOWN_STRUCTURE_PROFILE_V1)
+    v2 = normalize_local_pdf_graph(source, LOCAL_MARKDOWN_STRUCTURE_PROFILE_V2)
+
+    assert [block.kind for block in v1.blocks] == ["heading", "paragraph", "heading", "paragraph"]
+    assert [block.kind for block in v2.blocks] == ["noise", "paragraph", "noise", "paragraph"]
+    assert "限时课程推广" not in render_document_graph(v2).markdown
+    assert all(block.origin_block_ids == (block.block_id,) for block in v2.blocks)
+    assert [issue.code for issue in v2.issues] == [
+        "paddleocr-vl-repeated-page-content",
+        "paddleocr-vl-repeated-page-content",
+    ]
+
+
+def test_local_structure_profile_v2_keeps_same_content_at_different_page_positions() -> None:
+    first = replace(
+        _block(text="同一段示例文字"),
+        block_id="content-first",
+        locators=(PdfRegionLocator(1, (100.0, 200.0, 500.0, 240.0)),),
+    )
+    second = replace(
+        _block(text="同一段示例文字"),
+        block_id="content-second",
+        locators=(PdfRegionLocator(2, (100.0, 600.0, 500.0, 640.0)),),
+    )
+    first_anchor = replace(
+        _block(text="第一页其他正文。"),
+        block_id="content-first-anchor",
+        locators=(PdfRegionLocator(1, (100.0, 800.0, 900.0, 950.0)),),
+    )
+    second_anchor = replace(
+        _block(text="第二页其他正文。"),
+        block_id="content-second-anchor",
+        locators=(PdfRegionLocator(2, (100.0, 800.0, 900.0, 950.0)),),
+    )
+
+    graph = normalize_local_pdf_graph(
+        _graph(first, first_anchor, second, second_anchor),
+        LOCAL_MARKDOWN_STRUCTURE_PROFILE_V2,
+    )
+
+    assert [block.kind for block in graph.blocks] == ["paragraph"] * 4
+    assert render_document_graph(graph).markdown.count("同一段示例文字") == 2
+
+
+def test_local_structure_profile_marks_a_figure_title_as_a_caption() -> None:
+    raw = _paddleocr_vl_artifact("paddle-page", "c" * 64, "paddleocr-vl/book_0_res.json")
+    image = _paddleocr_vl_artifact(
+        "paddle-image", "d" * 64, "paddleocr-vl/images/figure.png", role="image"
+    )
+    assets: list[DocumentAsset] = []
+    blocks, issues = _paddleocr_vl_blocks(
+        {
+            "res": {
+                "page_index": 0,
+                "parsing_res_list": [
+                    {
+                        "block_label": "image",
+                        "block_content": '<img src="images/figure.png" alt="图示" />',
+                        "block_bbox": [100, 200, 700, 500],
+                        "block_id": "figure",
+                        "block_order": 1,
+                    },
+                    {
+                        "block_label": "figure_title",
+                        "block_content": "图 1 施工示意图",
+                        "block_bbox": [100, 510, 700, 540],
+                        "block_id": "caption",
+                        "block_order": 2,
+                    },
+                ],
+            }
+        },
+        "attempt-paddleocr-vl",
+        raw,
+        {"paddleocr-vl/images/figure.png": image},
+        assets,
+    )
+    request = ConversionRequest(
+        "task-paddleocr-vl",
+        1,
+        "pdf",
+        _HASH,
+        _HASH,
+        "private/source.pdf",
+        local_structure_profile=LOCAL_MARKDOWN_STRUCTURE_PROFILE_V1,
+    )
+    graph = normalize_local_pdf_graph(
+        _paddleocr_vl_graph(request, "attempt-paddleocr-vl", blocks, assets, issues),
+        LOCAL_MARKDOWN_STRUCTURE_PROFILE_V1,
+    )
+
+    assert [block.kind for block in graph.blocks] == ["image", "caption"]
+    assert graph.blocks[1].payload.to_dict()["target_block_id"] == graph.blocks[0].block_id
+    assert render_document_graph(graph).markdown == (
+        f"![[assets/{'d' * 64}.png|图示]]\n\n_图 1 施工示意图_"
+    )
+
+
+def test_graph_proposal_does_not_duplicate_its_group_heading() -> None:
+    graph = _graph(_block("heading", text="Unit One"), _block(text="Body"))
+    proposal = derive_graph_markdown_proposal(
+        item_id=1,
+        vault_id="vault-1",
+        source_id="source-1",
+        processing_task_id="task-1",
+        source_sha256=_HASH,
+        managed_root="platform",
+        source_suffix=".pdf",
+        source_label="Book",
+        graph=graph,
+    )
+
+    assert proposal.notes[0].markdown.count("# Unit One") == 1
 
 
 def test_paddleocr_vl_stages_an_extension_named_private_input(tmp_path: Path) -> None:
@@ -402,52 +702,6 @@ def test_typed_renderer_keeps_legacy_docx_single_item_list_graphs_renderable() -
     assert render_document_graph(_graph(legacy_list)).markdown == "1. legacy item"
 
 
-def test_quality_gate_selects_one_complete_fallback_graph_without_merging() -> None:
-    primary = _graph(
-        _block(),
-        issues=(DocumentGraphIssue("coverage", "Coverage is unknown.", SourceScopeLocator("page:1", "missing inventory")),),
-    )
-    fallback_block = replace(_block(text="Fallback text"), block_id="fallback-block")
-    fallback = replace(_graph(fallback_block), graph_id="graph-fallback", selected_attempt_id="attempt-2")
-    gate = StructuralQualityGate()
-
-    selected, decision = gate.select_complete_graph(
-        (primary, gate.evaluate(primary)), (fallback, gate.evaluate(fallback))
-    )
-
-    assert selected == fallback
-    assert selected.blocks == fallback.blocks
-    assert decision.action == "accepted"
-
-
-def test_quality_gate_falls_back_for_unknown_pdf_coverage_and_ambiguous_docx_anchor() -> None:
-    pdf_gate = StructuralQualityGate()
-    pdf_decision = pdf_gate.evaluate(
-        _graph(_block()),
-        {"document_kind": "pdf", "page_count": 2, "layout_inventory_known": False},
-    )
-
-    assert pdf_decision.action == "fallback"
-    assert {issue.code for issue in pdf_decision.issues} >= {
-        "pdf-coverage-unknown",
-        "pdf-page-uncovered",
-    }
-
-    anchor = "body/p[1]"
-    first = replace(_block(), locators=(DocxOoxmlLocator("/word/document.xml", anchor),))
-    second = replace(
-        _block(text="duplicate"),
-        block_id="docx-duplicate",
-        locators=(DocxOoxmlLocator("/word/document.xml", anchor),),
-    )
-    docx_decision = StructuralQualityGate().evaluate(
-        _graph(first, second), {"document_kind": "docx", "required_anchors": [anchor]}
-    )
-
-    assert docx_decision.action == "fallback"
-    assert any(issue.code == "manifest-anchor-ambiguous" for issue in docx_decision.issues)
-
-
 def test_injected_launcher_can_select_a_snapshot_matched_graph_while_default_stays_fail_closed() -> None:
     graph = _graph(_block())
     evidence = ConversionEvidence("pdf", graph, _attempt(graph))
@@ -590,9 +844,6 @@ def test_sqlite_keeps_v1_evidence_and_persists_selected_v2_graph_in_additive_tab
     attempt = replace(_attempt(graph), task_id=task.task_id, item_id=stored_item.item_id)
     envelope = ConversionEvidence("pdf", graph, attempt)
 
-    repository.record_conversion_quality_gate_decision(
-        attempt, graph.graph_id, _accepted_quality_decision(attempt)
-    )
     repository.record_conversion_evidence(stored_item.item_id, envelope)
 
     assert repository.get_parse_evidence(stored_item.item_id) == legacy
@@ -601,73 +852,6 @@ def test_sqlite_keeps_v1_evidence_and_persists_selected_v2_graph_in_additive_tab
     with sqlite3.connect(repository.database_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM import_parse_evidence").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM import_conversion_graph_revisions").fetchone()[0] == 1
-
-
-def test_sqlite_persists_a_rejected_graph_and_gate_before_fallback_selection(tmp_path: Path) -> None:
-    repository = SqliteImportTaskRepository(tmp_path / "tasks.sqlite3")
-    task = new_import_task(
-        vault_id="vault-1", vault_label="Vault", source_paths=(tmp_path / "book.pdf",), scope_label="book.pdf"
-    )
-    repository.create(task, "created")
-    repository.append_item(
-        task.task_id,
-        ImportTaskItem(
-            item_id=0,
-            task_id=task.task_id,
-            source_path=tmp_path / "book.pdf",
-            label="book.pdf",
-            category="supported",
-            document_kind="pdf",
-            reason=None,
-            source_id="source-1",
-            content_sha256=_HASH,
-            identity_status="new",
-        ),
-    )
-    item = repository.list_items(task.task_id)[0]
-    graph = replace(_graph(_block()), graph_id="graph-rejected")
-    attempt = replace(
-        _attempt(graph, status="rejected"),
-        task_id=task.task_id,
-        item_id=item.item_id,
-        quality_gate_decision_id="gate-rejected",
-        failure_code="pdf-inventory-coverage",
-    )
-    decision = {
-        "decision_id": "gate-rejected",
-        "policy_id": "document-structure",
-        "policy_version": 1,
-        "action": "fallback",
-        "fallback_eligible": True,
-        "rule_ids": ["pdf-inventory-coverage"],
-        "issues": [],
-    }
-
-    repository.save(replace(task, lifecycle="running", phase="converting"), "conversion-started")
-    service = ImportTaskService(None, repository, _ServiceDerivationWorker())
-
-    assert service._handle_worker_event(
-        task.task_id,
-        {
-            "type": "conversion-attempted",
-            "item_id": item.item_id,
-            "attempt": attempt.to_dict(),
-            "graph": graph.to_dict(),
-            "quality_gate_decision": decision,
-        },
-    ) is True
-
-    assert repository.get_conversion_evidence(item.item_id) is None
-    assert repository.list_conversion_attempts(item.item_id) == (attempt,)
-    assert repository.list_items(task.task_id)[0].conversion_status == "rejected"
-    with sqlite3.connect(repository.database_path) as connection:
-        assert connection.execute(
-            "SELECT selected FROM import_conversion_graph_revisions WHERE graph_id = ?", (graph.graph_id,)
-        ).fetchone()[0] == 0
-        assert connection.execute(
-            "SELECT decision_json FROM import_conversion_quality_gate_decisions WHERE decision_id = ?",
-            ("gate-rejected",),
-        ).fetchone()[0]
 
 
 def test_deriver_consumes_only_selected_v2_graph_and_refuses_unresolved_content() -> None:
@@ -739,6 +923,17 @@ def test_selected_conversion_graph_stays_local_and_automatically_reaches_commit(
         vault_label="Vault",
         source_paths=(source,),
         scope_label=source.name,
+        online_parse_selection=OnlineParseSelection(
+            provider_id="paddleocr-official",
+            provider_kind="paddleocr-official",
+            provider_name="PaddleOCR-VL 1.6",
+            endpoint=None,
+            model="PaddleOCR-VL-1.6",
+            credential_reference="online-credential",
+            policy_revision=1,
+            policy_path=source.name,
+        ),
+        markdown_pipeline="local",
     )
     repository.create(task, "created")
     repository.append_item(
@@ -791,7 +986,6 @@ def test_selected_conversion_graph_stays_local_and_automatically_reaches_commit(
                 "item_id": item.item_id,
                 "content_sha256": source_hash,
                 "evidence": envelope.to_dict(),
-                "quality_gate_decision": _accepted_quality_decision(attempt),
             },
     )
     service._handle_worker_event(task.task_id, {"type": "conversion-completed"})
@@ -806,6 +1000,7 @@ def test_selected_conversion_graph_stays_local_and_automatically_reaches_commit(
     assert proposal.graph_block_locators[0][0].document_locator == graph.blocks[0].locators[0].to_dict()
     assert not structurer.called
     assert not policy.called
+    assert completed.resolved_markdown_pipeline() == "local"
     assert proposal.provider_markdown is None
     assert proposal.structured_blocks == ()
     assert completed.lifecycle == "recoverable"
@@ -868,6 +1063,7 @@ def test_selected_online_graph_is_structured_before_projection_indexing_and_embe
             policy_revision=1,
             policy_path=source.name,
         ),
+        markdown_pipeline="ai",
     )
     repository.create(task, "created")
     repository.append_item(
@@ -930,7 +1126,6 @@ def test_selected_online_graph_is_structured_before_projection_indexing_and_embe
             "item_id": item.item_id,
             "content_sha256": source_hash,
             "evidence": ConversionEvidence("pdf", graph, attempt).to_dict(),
-            "quality_gate_decision": _accepted_quality_decision(attempt),
         },
     )
     service._handle_worker_event(task.task_id, {"type": "conversion-completed"})
@@ -1050,7 +1245,6 @@ def test_selected_graph_assets_and_source_snapshot_are_staged_in_one_commit_unit
                 "item_id": item.item_id,
                 "content_sha256": source_hash,
                 "evidence": envelope.to_dict(),
-                "quality_gate_decision": _accepted_quality_decision(attempt),
             },
     )
     service._handle_worker_event(task.task_id, {"type": "conversion-completed"})
@@ -1121,7 +1315,6 @@ def test_conversion_graph_issues_do_not_create_an_interactive_review_checkpoint(
                 "item_id": item.item_id,
                 "content_sha256": source_hash,
                 "evidence": envelope.to_dict(),
-                "quality_gate_decision": _accepted_quality_decision(attempt),
             },
     )
     service._handle_worker_event(task.task_id, {"type": "conversion-completed"})
@@ -1161,7 +1354,7 @@ def test_private_artifact_store_uses_verified_snapshot_and_service_owned_promoti
     assert not temporary.exists()
 
 
-def test_conversion_runner_selects_an_entire_fallback_graph_without_merging() -> None:
+def test_conversion_runner_keeps_primary_graph_when_it_has_structural_issues() -> None:
     primary_graph = replace(
         _graph(_block()),
         issues=(
@@ -1171,33 +1364,9 @@ def test_conversion_runner_selects_an_entire_fallback_graph_without_merging() ->
         ),
     )
     primary = ConversionEvidence("pdf", primary_graph, _attempt(primary_graph))
-    fallback_graph = replace(
-        _graph(replace(_block(text="Fallback"), block_id="fallback-block")),
-        graph_id="graph-fallback",
-        selected_attempt_id="attempt-2",
-    )
-    fallback_attempt = ConversionAttempt(
-        attempt_id="attempt-2",
-        task_id="task-1",
-        item_id=1,
-        engine="mock-fallback",
-        engine_version="1",
-        config_hash=_CONFIG_HASH,
-        converter_profile_id="profile-1",
-        input_snapshot_hash=_HASH,
-        status="selected",
-        output_artifact_refs=(_artifact("attempt-2"),),
-        graph_id=fallback_graph.graph_id,
-        quality_gate_decision_id="gate-fallback",
-    )
-    fallback = ConversionEvidence("pdf", fallback_graph, fallback_attempt)
-
     class OutcomeLauncher:
         def convert(self, request) -> ConversionOutcome:
-            return ConversionOutcome(
-                evidence=primary,
-                fallback_candidates=(ConversionCandidate(fallback, "", ()),),
-            )
+            return ConversionOutcome(evidence=primary)
 
     events = list(
         conversion_items(
@@ -1216,11 +1385,12 @@ def test_conversion_runner_selects_an_entire_fallback_graph_without_merging() ->
     )
 
     selected = ConversionEvidence.from_dict(dict(events[1]["evidence"]))
-    assert selected.graph.graph_id == fallback_graph.graph_id
-    assert selected.graph.blocks == fallback_graph.blocks
+    assert selected.graph.graph_id == primary_graph.graph_id
+    assert selected.graph.blocks == primary_graph.blocks
+    assert selected.graph.issues == primary_graph.issues
 
 
-def test_runner_gates_and_promotes_only_a_verified_snapshot_matched_graph(tmp_path: Path) -> None:
+def test_runner_promotes_only_a_verified_snapshot_matched_graph(tmp_path: Path) -> None:
     source = tmp_path / "source.docx"
     document = WordDocument()
     document.add_paragraph("Source paragraph")
@@ -1289,13 +1459,14 @@ def test_runner_gates_and_promotes_only_a_verified_snapshot_matched_graph(tmp_pa
         status="selected",
         output_artifact_refs=(artifact,),
         graph_id=graph.graph_id,
-        quality_gate_decision_id="untrusted-gate-id",
     )
+    untrusted_evidence = ConversionEvidence("docx", graph, attempt).to_dict()
+    untrusted_evidence["attempt"]["retired_quality_gate_id"] = "untrusted-gate-id"
     event = {
         "type": "conversion-item",
         "item_id": item.item_id,
         "content_sha256": source_hash,
-        "evidence": ConversionEvidence("docx", graph, attempt).to_dict(),
+        "evidence": untrusted_evidence,
         "temporary_directory": str(temporary),
         "artifact_drafts": [
             ConversionArtifactDraft(
@@ -1307,147 +1478,32 @@ def test_runner_gates_and_promotes_only_a_verified_snapshot_matched_graph(tmp_pa
     trusted = runner._prepare_conversion_event(event, {item.item_id: request})
     selected = ConversionEvidence.from_dict(dict(trusted["evidence"]))
 
-    assert trusted["quality_gate_decision"]["action"] == "accepted"
-    assert selected.attempt.quality_gate_decision_id != "untrusted-gate-id"
+    assert "retired_quality_gate_id" not in trusted
+    assert "retired_quality_gate_id" not in selected.attempt.to_dict()
     assert selected.attempt.output_artifact_refs[0].private_relative_path.startswith(
         f"{task.task_id}/{item.item_id}/attempt-managed/"
     )
     assert not temporary.exists()
 
 
-def test_runner_promotes_a_rejected_attempt_before_the_fallback_can_start(tmp_path: Path) -> None:
-    store = PrivateArtifactStore(tmp_path / "private")
-    runner = LocalImportTaskRunner(artifact_store=store)
-    temporary = store.create_attempt_directory("attempt-rejected")
-    raw = temporary / "content-list.json"
-    raw_content = b'{"primary":"rejected"}'
-    raw.write_bytes(raw_content)
-    raw_hash = sha256(raw_content).hexdigest()
-    artifact = ArtifactRef(
-        artifact_id="artifact-rejected",
-        attempt_id="attempt-rejected",
-        sha256=raw_hash,
-        media_type="application/json",
-        role="converter-json",
-        private_relative_path="pending/artifact-rejected",
-        producer_object_id="content-list.json",
-    )
-    block = replace(
-        _block(),
-        evidence_refs=(EvidenceRef(artifact.artifact_id, raw_hash, producer_object_id="content-list.json"),),
-    )
-    graph = DocumentGraph(
-        graph_id="graph-rejected-managed",
-        source_sha256=_HASH,
-        input_snapshot_hash=_HASH,
-        selected_attempt_id="attempt-rejected",
-        blocks=(block,),
-        assets=(),
-        issues=(),
-    )
-    attempt = ConversionAttempt(
-        attempt_id="attempt-rejected",
-        task_id="task-rejected",
-        item_id=1,
-        engine="mineru",
-        engine_version="3.4.4",
-        config_hash=_CONFIG_HASH,
-        converter_profile_id="mineru-local",
-        input_snapshot_hash=_HASH,
-        status="rejected",
-        output_artifact_refs=(artifact,),
-        graph_id=graph.graph_id,
-        quality_gate_decision_id="gate-rejected-managed",
-        failure_code="pdf-inventory-coverage",
-    )
-    candidate = RejectedConversionCandidate(
-        attempt,
-        graph,
-        str(temporary),
-        (ConversionArtifactDraft(artifact.artifact_id, "content-list.json", "application/json", "converter-json", "content-list.json"),),
-        {
-            "decision_id": "gate-rejected-managed",
-            "policy_id": "document-structure",
-            "policy_version": 1,
-            "action": "fallback",
-            "fallback_eligible": True,
-            "rule_ids": ["pdf-inventory-coverage"],
-            "issues": [],
-        },
-    )
-
-    prepared = runner._prepare_rejected_conversion_event(
-        {"type": "conversion-attempted", "item_id": 1, "candidate": candidate.to_dict()},
-        {
-            1: {
-                "task_id": "task-rejected",
-                "item_id": 1,
-                "content_sha256": _HASH,
-                "input_snapshot_hash": _HASH,
-            }
-        },
-    )
-
-    persisted = ConversionAttempt.from_dict(dict(prepared["attempt"]))
-    assert persisted.status == "rejected"
-    assert persisted.output_artifact_refs[0].private_relative_path.startswith(
-        "task-rejected/1/attempt-rejected/"
-    )
-    assert prepared["quality_gate_decision"]["action"] == "fallback"
-    assert not temporary.exists()
-
-
-def test_conversion_worker_waits_for_rejected_attempt_persistence_before_starting_fallback() -> None:
+def test_conversion_worker_continues_without_rejected_attempt_persistence() -> None:
     primary_graph = replace(
-        _graph(_block()), graph_id="graph-primary", selected_attempt_id="attempt-primary"
+        _graph(_block()),
+        graph_id="graph-primary",
+        issues=(
+            DocumentGraphIssue(
+                "coverage", "Primary coverage is unknown.", SourceScopeLocator("page:1", "missing")
+            ),
+        ),
     )
-    primary_attempt = ConversionAttempt(
-        attempt_id="attempt-primary",
-        task_id="task-1",
-        item_id=1,
-        engine="mineru",
-        engine_version="3.4.4",
-        config_hash=_CONFIG_HASH,
-        converter_profile_id="mineru-local",
-        input_snapshot_hash=_HASH,
-        status="rejected",
-        output_artifact_refs=(_artifact("attempt-primary"),),
-        graph_id=primary_graph.graph_id,
-        quality_gate_decision_id="gate-primary",
-        failure_code="pdf-inventory-coverage",
-    )
-    candidate = RejectedConversionCandidate(
-        primary_attempt,
-        primary_graph,
-        "temporary-primary",
-        (ConversionArtifactDraft("artifact-1", "primary.json", "application/json", "converter-json"),),
-        {
-            "decision_id": "gate-primary",
-            "policy_id": "document-structure",
-            "policy_version": 1,
-            "action": "fallback",
-            "fallback_eligible": True,
-            "rule_ids": ["pdf-inventory-coverage"],
-            "issues": [],
-        },
-    )
-    fallback_graph = replace(_graph(_block(text="Fallback")), graph_id="graph-fallback")
-    fallback_evidence = ConversionEvidence("pdf", fallback_graph, _attempt(fallback_graph))
+    primary_evidence = ConversionEvidence("pdf", primary_graph, _attempt(primary_graph))
 
-    class StagedLauncher:
-        fallback_started = False
-
+    class PrimaryLauncher:
         def convert(self, request):
-            raise AssertionError("The staged conversion path must be used.")
+            return ConversionOutcome(evidence=primary_evidence)
 
-        def convert_after_primary_persisted(self, request, record_rejected_attempt):
-            assert record_rejected_attempt(candidate) is True
-            self.fallback_started = True
-            return ConversionOutcome(evidence=fallback_evidence)
-
-    launcher = StagedLauncher()
+    launcher = PrimaryLauncher()
     events: queue.Queue = queue.Queue()
-    confirmations: queue.Queue = queue.Queue()
     cancelled = threading.Event()
     worker = threading.Thread(
         target=run_conversion_worker,
@@ -1465,19 +1521,14 @@ def test_conversion_worker_waits_for_rejected_attempt_persistence_before_startin
             events,
             cancelled,
         ),
-        kwargs={"launcher": launcher, "rejected_attempt_confirmations": confirmations},
+        kwargs={"launcher": launcher},
     )
 
     worker.start()
     assert events.get(timeout=1)["type"] == "conversion-started"
-    rejected_event = events.get(timeout=1)
-    assert rejected_event["type"] == "conversion-attempted"
-    assert launcher.fallback_started is False
-    confirmations.put({"attempt_id": "attempt-primary", "persisted": True})
     worker.join(timeout=1)
 
     assert not worker.is_alive()
-    assert launcher.fallback_started is True
     assert [events.get(timeout=1)["type"] for _ in range(2)] == [
         "conversion-item",
         "conversion-completed",

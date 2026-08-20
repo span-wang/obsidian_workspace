@@ -12,8 +12,19 @@ from application.import_selections import ImportSelection
 from application.ingest import ImportTaskService
 from application.markdown_structuring import MarkdownStructuringError
 from application.vaults import VaultService
-from domain.evidence import EvidenceLocator, ParseEvidence, StructuredContentUnit
+from domain.evidence import (
+    ArtifactRef,
+    ConversionAttempt,
+    ConversionEvidence,
+    DocumentGraph,
+    DocumentGraphIssue,
+    EvidenceLocator,
+    ParseEvidence,
+    SourceScopeLocator,
+    StructuredContentUnit,
+)
 from domain.online_document_parser import OnlineParseJob
+from domain.local_markdown_structure import DEFAULT_LOCAL_MARKDOWN_STRUCTURE_PROFILE
 from domain.tasks import ImportTaskItem, new_import_task
 from workers.markdown_deriver import derive_items
 
@@ -213,11 +224,19 @@ def test_multiple_files_and_folders_create_one_task_per_file(tmp_path: Path) -> 
 
     assert [task.source_paths for task in file_tasks] == [(source_file.absolute(),), (second_file.absolute(),)]
     assert [task.scope_label for task in file_tasks] == ["book.pdf", "second.pdf"]
+    assert [task.local_structure_profile for task in file_tasks] == [
+        DEFAULT_LOCAL_MARKDOWN_STRUCTURE_PROFILE,
+        DEFAULT_LOCAL_MARKDOWN_STRUCTURE_PROFILE,
+    ]
     assert [task.source_paths for task in folder_tasks] == [
         (nested_file.absolute(),),
         (top_level_file.absolute(),),
     ]
     assert [task.scope_label for task in folder_tasks] == ["nested.pdf", "overview.md"]
+    assert [task.local_structure_profile for task in folder_tasks] == [
+        DEFAULT_LOCAL_MARKDOWN_STRUCTURE_PROFILE,
+        None,
+    ]
 
 
 def test_multiple_file_imports_run_one_task_at_a_time(tmp_path: Path) -> None:
@@ -307,6 +326,106 @@ def test_markdown_structuring_failure_does_not_mark_the_document_as_parse_failed
     assert failed.recovery_actions == ("restart-derivation",)
     assert failed.counts.parse_failed == 0
     assert structurer.attempts == 1
+
+
+def test_resume_reconverts_a_selected_graph_with_pending_issues(tmp_path: Path, monkeypatch) -> None:
+    service, vault, source_file = _service(tmp_path, WaitingWorker())
+    source_hash = sha256(source_file.read_bytes()).hexdigest()
+    task = replace(
+        new_import_task(
+            vault_id=vault.vault_id,
+            vault_label=vault.path.name,
+            source_paths=(source_file,),
+            scope_label=source_file.name,
+        ),
+        lifecycle="recoverable",
+        phase="failed",
+        recovery_actions=("restart-derivation",),
+        failure_reason="A supported document has no verified Markdown proposal.",
+    )
+    service.repository.create(task, "automatic-pipeline-blocked")
+    service.repository.append_item(
+        task.task_id,
+        ImportTaskItem(
+            item_id=0,
+            task_id=task.task_id,
+            source_path=source_file,
+            label=source_file.name,
+            category="supported",
+            document_kind="pdf",
+            reason="",
+            source_id="source-1",
+            content_sha256=source_hash,
+            identity_status="new",
+        ),
+    )
+    item = service.repository.list_items(task.task_id)[0]
+    attempt_id = "blocked-attempt"
+    artifact = ArtifactRef(
+        artifact_id="blocked-artifact",
+        attempt_id=attempt_id,
+        sha256="c" * 64,
+        media_type="application/json",
+        role="converter-json",
+        private_relative_path="pending/blocked-artifact",
+        producer_object_id="page.json",
+    )
+    graph = DocumentGraph(
+        source_sha256=source_hash,
+        input_snapshot_hash=source_hash,
+        selected_attempt_id=attempt_id,
+        blocks=(),
+        assets=(),
+        issues=(
+            DocumentGraphIssue(
+                "paddleocr-vl-unsupported-block",
+                "Unsupported PaddleOCR-VL block type: figure_title.",
+                SourceScopeLocator("page:1", "converter block needs review"),
+            ),
+        ),
+        graph_id="blocked-graph",
+    )
+    service.repository.record_conversion_evidence(
+        item.item_id,
+        ConversionEvidence(
+            "pdf",
+            graph,
+            ConversionAttempt(
+                attempt_id=attempt_id,
+                task_id=task.task_id,
+                item_id=item.item_id,
+                engine="paddleocr-vl-1.6",
+                engine_version="1.6",
+                config_hash="b" * 64,
+                converter_profile_id="online:paddleocr-official",
+                input_snapshot_hash=source_hash,
+                status="selected",
+                output_artifact_refs=(artifact,),
+                graph_id=graph.graph_id,
+            ),
+        ),
+    )
+    service.repository.save(
+        replace(
+            service.get(task.task_id),
+            lifecycle="recoverable",
+            phase="failed",
+            recovery_actions=("restart-derivation",),
+            failure_reason="A supported document has no verified Markdown proposal.",
+        ),
+        "automatic-pipeline-blocked",
+    )
+    monkeypatch.setattr(service, "_start_conversion", lambda current: current)
+
+    resumed = service.resume(task.task_id)
+
+    assert resumed.lifecycle == "running"
+    assert resumed.phase == "converting"
+    assert service.repository.list_items(task.task_id)[0].conversion_status == "rejected"
+    assert any(
+        event.event_type == "conversion-requeued"
+        for event in service.repository.events_after(task.task_id, 0)
+    )
 
 
 def test_successful_markdown_proposal_clears_a_legacy_provider_parse_failure(tmp_path: Path) -> None:
@@ -475,7 +594,7 @@ def test_rejected_conversion_does_not_also_report_a_missing_markdown_proposal(tm
     service.repository.append_item(task.task_id, item)
     persisted_item = service.repository.list_items(task.task_id)[0]
     service.repository.record_conversion_rejection(
-        persisted_item.item_id, "Conversion failed: structural-quality-gate."
+        persisted_item.item_id, "Conversion failed: converter-runtime."
     )
 
     blockers, recovery_actions = service._automatic_blockers(task)

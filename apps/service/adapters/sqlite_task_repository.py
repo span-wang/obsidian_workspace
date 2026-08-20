@@ -6,19 +6,16 @@ from dataclasses import replace
 from pathlib import Path
 
 from domain.derived_notes import NoteProposal, private_index_candidates, proposal_from_dict
-from domain.candidate_links import CandidateLinkProposal, LEGACY_CANDIDATE_LINK_ISOLATION_REASON
 from domain.classification import ClassificationSuggestion
 from domain.evidence import (
     ConversionAttempt,
     ConversionEvidence,
-    DocumentGraph,
     EvidenceLocator,
     OcrEvidence,
     OcrTarget,
     ParseEvidence,
     ParseIssue,
 )
-from domain.metadata_tags import MetadataTagProposal, TagChangePreview, TagDefinition
 from domain.online_document_parser import OnlineParseJob, OnlineParseSelection
 from domain.review_commits import CommitJournal, ReviewDecision, ReviewSnapshot
 from domain.sources import VersionSuggestion
@@ -32,10 +29,11 @@ from domain.tasks import (
 )
 
 
-_LEGACY_CANDIDATE_LINK_ISOLATION_MIGRATION = "legacy-candidate-link-isolation-2026-07-22"
 _DOCUMENT_CONVERSION_V2_MIGRATION = "document-conversion-v2-2026-07-22"
 _ONLINE_PARSE_SELECTION_MIGRATION = "online-parse-selection-2026-08-11"
 _ONLINE_PARSE_JOB_MIGRATION = "online-parse-job-2026-08-11"
+_MARKDOWN_PIPELINE_MIGRATION = "markdown-pipeline-2026-08-17"
+_LOCAL_MARKDOWN_STRUCTURE_PROFILE_MIGRATION = "local-markdown-structure-profile-2026-08-17"
 
 
 class SqliteImportTaskRepository:
@@ -82,6 +80,8 @@ class SqliteImportTaskRepository:
                     failure_reason TEXT,
                     parent_task_id TEXT,
                     online_parse_selection_json TEXT,
+                    markdown_pipeline TEXT,
+                    local_structure_profile TEXT,
                     online_parse_job_json TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -150,6 +150,8 @@ class SqliteImportTaskRepository:
             self._ensure_column(connection, "import_tasks", "confirmed_gap_count INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(connection, "import_tasks", "derived_note_count INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(connection, "import_tasks", "online_parse_selection_json TEXT")
+            self._ensure_column(connection, "import_tasks", "markdown_pipeline TEXT")
+            self._ensure_column(connection, "import_tasks", "local_structure_profile TEXT")
             self._ensure_column(connection, "import_tasks", "online_parse_job_json TEXT")
             self._ensure_column(
                 connection, "import_task_items", "parse_status TEXT NOT NULL DEFAULT 'not-applicable'"
@@ -334,81 +336,6 @@ class SqliteImportTaskRepository:
             )
             connection.execute(
                 """
-                CREATE TABLE IF NOT EXISTS import_metadata_tag_proposals (
-                    proposal_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    task_id TEXT NOT NULL,
-                    item_id INTEGER NOT NULL,
-                    revision INTEGER NOT NULL,
-                    proposal_json TEXT NOT NULL,
-                    requires_review INTEGER NOT NULL,
-                    decision TEXT,
-                    created_at TEXT NOT NULL,
-                    invalidated_at TEXT,
-                    UNIQUE(task_id, item_id, revision)
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS vault_tag_definitions (
-                    tag_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    vault_id TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    revision INTEGER NOT NULL,
-                    tag_json TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    UNIQUE(vault_id, name, revision)
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS vault_tag_change_previews (
-                    preview_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    vault_id TEXT NOT NULL,
-                    preview_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS import_metadata_tag_proposals_latest "
-                "ON import_metadata_tag_proposals(task_id, item_id, revision DESC)"
-            )
-            self._ensure_column(connection, "import_metadata_tag_proposals", "invalidated_at TEXT")
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS import_candidate_link_proposals (
-                    candidate_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    task_id TEXT NOT NULL,
-                    review_item_id TEXT NOT NULL,
-                    revision INTEGER NOT NULL,
-                    vault_id TEXT NOT NULL,
-                    source_item_id INTEGER NOT NULL,
-                    target_item_id INTEGER NOT NULL,
-                    proposal_json TEXT NOT NULL,
-                    requires_review INTEGER NOT NULL,
-                    decision TEXT,
-                    created_at TEXT NOT NULL,
-                    invalidated_at TEXT,
-                    invalidation_reason TEXT,
-                    UNIQUE(task_id, review_item_id, revision)
-                )
-                """
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS import_candidate_link_proposals_latest "
-                "ON import_candidate_link_proposals(task_id, review_item_id, revision DESC)"
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS import_candidate_link_proposals_items "
-                "ON import_candidate_link_proposals(task_id, source_item_id, target_item_id)"
-            )
-            self._ensure_column(
-                connection, "import_candidate_link_proposals", "invalidation_reason TEXT"
-            )
-            connection.execute(
-                """
                 CREATE TABLE IF NOT EXISTS import_repository_migrations (
                     migration_id TEXT PRIMARY KEY,
                     applied_at TEXT NOT NULL
@@ -424,10 +351,13 @@ class SqliteImportTaskRepository:
                 "INSERT OR IGNORE INTO import_repository_migrations(migration_id, applied_at) VALUES (?, ?)",
                 (_ONLINE_PARSE_JOB_MIGRATION, utc_now()),
             )
-            self._isolate_legacy_candidate_links(connection)
             connection.execute(
-                "CREATE INDEX IF NOT EXISTS vault_tag_definitions_latest "
-                "ON vault_tag_definitions(vault_id, name, revision DESC)"
+                "INSERT OR IGNORE INTO import_repository_migrations(migration_id, applied_at) VALUES (?, ?)",
+                (_MARKDOWN_PIPELINE_MIGRATION, utc_now()),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO import_repository_migrations(migration_id, applied_at) VALUES (?, ?)",
+                (_LOCAL_MARKDOWN_STRUCTURE_PROFILE_MIGRATION, utc_now()),
             )
             connection.execute(
                 """
@@ -512,17 +442,6 @@ class SqliteImportTaskRepository:
         )
         connection.execute(
             """
-            CREATE TABLE IF NOT EXISTS import_conversion_quality_gate_decisions (
-                decision_id TEXT PRIMARY KEY,
-                attempt_id TEXT NOT NULL,
-                graph_id TEXT NOT NULL,
-                decision_json TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        connection.execute(
-            """
             CREATE TABLE IF NOT EXISTS import_conversion_graph_revisions (
                 graph_id TEXT PRIMARY KEY,
                 item_id INTEGER NOT NULL,
@@ -560,21 +479,6 @@ class SqliteImportTaskRepository:
         connection.execute(
             "INSERT OR IGNORE INTO import_repository_migrations(migration_id, applied_at) VALUES (?, ?)",
             (_DOCUMENT_CONVERSION_V2_MIGRATION, utc_now()),
-        )
-
-    @staticmethod
-    def _isolate_legacy_candidate_links(connection: sqlite3.Connection) -> None:
-        timestamp = utc_now()
-        migration = connection.execute(
-            "INSERT OR IGNORE INTO import_repository_migrations (migration_id, applied_at) VALUES (?, ?)",
-            (_LEGACY_CANDIDATE_LINK_ISOLATION_MIGRATION, timestamp),
-        )
-        if migration.rowcount == 0:
-            return
-        connection.execute(
-            "UPDATE import_candidate_link_proposals "
-            "SET invalidated_at = ?, invalidation_reason = ? WHERE invalidated_at IS NULL",
-            (timestamp, LEGACY_CANDIDATE_LINK_ISOLATION_REASON),
         )
 
     def create(self, task: ImportTask, event_type: str) -> None:
@@ -640,18 +544,11 @@ class SqliteImportTaskRepository:
                 "(SELECT attempt_id FROM import_conversion_attempts WHERE task_id = ?)",
                 (task_id,),
             )
-            connection.execute(
-                "DELETE FROM import_conversion_quality_gate_decisions WHERE attempt_id IN "
-                "(SELECT attempt_id FROM import_conversion_attempts WHERE task_id = ?)",
-                (task_id,),
-            )
             connection.execute("DELETE FROM import_conversion_review_links WHERE task_id = ?", (task_id,))
             connection.execute("DELETE FROM import_conversion_attempts WHERE task_id = ?", (task_id,))
             connection.execute("DELETE FROM import_private_index_candidates WHERE task_id = ?", (task_id,))
             connection.execute("DELETE FROM import_note_proposals WHERE task_id = ?", (task_id,))
             connection.execute("DELETE FROM import_classification_suggestions WHERE task_id = ?", (task_id,))
-            connection.execute("DELETE FROM import_metadata_tag_proposals WHERE task_id = ?", (task_id,))
-            connection.execute("DELETE FROM import_candidate_link_proposals WHERE task_id = ?", (task_id,))
             connection.execute("DELETE FROM import_review_decisions WHERE task_id = ?", (task_id,))
             connection.execute("DELETE FROM import_review_snapshots WHERE task_id = ?", (task_id,))
             connection.execute("DELETE FROM import_commit_journals WHERE task_id = ?", (task_id,))
@@ -735,11 +632,6 @@ class SqliteImportTaskRepository:
                 "UPDATE import_classification_suggestions SET invalidated_at = ? "
                 "WHERE task_id = ? AND invalidated_at IS NULL",
                 (timestamp, task.task_id),
-            )
-            connection.execute(
-                "UPDATE import_candidate_link_proposals SET invalidated_at = ?, invalidation_reason = ? "
-                "WHERE task_id = ? AND invalidated_at IS NULL",
-                (timestamp, "Import task items were replaced.", task.task_id),
             )
             connection.execute("DELETE FROM import_task_items WHERE task_id = ?", (task.task_id,))
             self._write_task(connection, task)
@@ -857,175 +749,6 @@ class SqliteImportTaskRepository:
             )
         return attempt
 
-    def record_rejected_conversion_attempt(
-        self,
-        item_id: int,
-        attempt: ConversionAttempt,
-        graph: DocumentGraph,
-        decision: dict[str, object],
-    ) -> None:
-        decision_id = decision.get("decision_id")
-        if (
-            attempt.status != "rejected"
-            or attempt.item_id != item_id
-            or attempt.graph_id != graph.graph_id
-            or graph.selected_attempt_id != attempt.attempt_id
-            or not isinstance(decision_id, str)
-            or decision_id != attempt.quality_gate_decision_id
-            or decision.get("action") not in {"fallback", "waiting-for-review"}
-        ):
-            raise ValueError("Rejected conversion attempts need a matching persisted quality gate decision.")
-        attempt_json = json.dumps(attempt.to_dict())
-        graph_json = json.dumps(graph.to_dict())
-        decision_json = json.dumps(decision, sort_keys=True)
-        with self._connect() as connection:
-            item = connection.execute(
-                "SELECT task_id, content_sha256 FROM import_task_items WHERE item_id = ?", (item_id,)
-            ).fetchone()
-            if item is None:
-                raise KeyError(item_id)
-            if (
-                item["task_id"] != attempt.task_id
-                or item["content_sha256"] != graph.source_sha256
-                or graph.input_snapshot_hash != attempt.input_snapshot_hash
-            ):
-                raise ValueError("Rejected conversion evidence does not match its task item snapshot.")
-            existing_attempt = connection.execute(
-                "SELECT attempt_json FROM import_conversion_attempts WHERE attempt_id = ?",
-                (attempt.attempt_id,),
-            ).fetchone()
-            if existing_attempt is None:
-                connection.execute(
-                    """
-                    INSERT INTO import_conversion_attempts(
-                        attempt_id, task_id, item_id, idempotency_key, engine, status,
-                        input_snapshot_hash, attempt_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        attempt.attempt_id,
-                        attempt.task_id,
-                        item_id,
-                        attempt.idempotency_key,
-                        attempt.engine,
-                        attempt.status,
-                        attempt.input_snapshot_hash,
-                        attempt_json,
-                        utc_now(),
-                    ),
-                )
-            elif existing_attempt["attempt_json"] != attempt_json:
-                raise ValueError("Immutable conversion attempts cannot be rewritten.")
-            for artifact in attempt.output_artifact_refs:
-                connection.execute(
-                    """
-                    INSERT OR IGNORE INTO import_conversion_artifacts(
-                        artifact_id, attempt_id, sha256, media_type, role, private_relative_path, artifact_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        artifact.artifact_id,
-                        artifact.attempt_id,
-                        artifact.sha256,
-                        artifact.media_type,
-                        artifact.role,
-                        artifact.private_relative_path,
-                        json.dumps(artifact.to_dict()),
-                    ),
-                )
-            existing_graph = connection.execute(
-                "SELECT graph_json, selected FROM import_conversion_graph_revisions WHERE graph_id = ?",
-                (graph.graph_id,),
-            ).fetchone()
-            if existing_graph is None:
-                connection.execute(
-                    """
-                    INSERT INTO import_conversion_graph_revisions(
-                        graph_id, item_id, attempt_id, graph_revision, source_sha256, graph_json, selected, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 0, ?)
-                    """,
-                    (
-                        graph.graph_id,
-                        item_id,
-                        attempt.attempt_id,
-                        graph.graph_revision,
-                        graph.source_sha256,
-                        graph_json,
-                        utc_now(),
-                    ),
-                )
-            elif existing_graph["graph_json"] != graph_json or existing_graph["selected"]:
-                raise ValueError("Rejected conversion graphs are immutable and cannot be selected.")
-            existing_decision = connection.execute(
-                "SELECT attempt_id, graph_id, decision_json FROM import_conversion_quality_gate_decisions "
-                "WHERE decision_id = ?",
-                (decision_id,),
-            ).fetchone()
-            if existing_decision is None:
-                connection.execute(
-                    """
-                    INSERT INTO import_conversion_quality_gate_decisions(
-                        decision_id, attempt_id, graph_id, decision_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (decision_id, attempt.attempt_id, graph.graph_id, decision_json, utc_now()),
-                )
-            elif (
-                existing_decision["attempt_id"] != attempt.attempt_id
-                or existing_decision["graph_id"] != graph.graph_id
-                or existing_decision["decision_json"] != decision_json
-            ):
-                raise ValueError("Quality gate decisions are immutable.")
-            connection.execute(
-                """
-                UPDATE import_task_items
-                SET conversion_status = 'rejected', conversion_fallback_reason = ?
-                WHERE item_id = ?
-                """,
-                (",".join(str(rule) for rule in decision.get("rule_ids", [])) or decision["action"], item_id),
-            )
-            self._append_event(connection, item["task_id"], "conversion-attempt-rejected", utc_now())
-
-    def record_conversion_quality_gate_decision(
-        self, attempt: ConversionAttempt, graph_id: str, decision: dict[str, object]
-    ) -> None:
-        decision_id = decision.get("decision_id")
-        valid_action = (
-            attempt.status == "selected" and decision.get("action") == "accepted"
-        ) or (
-            attempt.status == "rejected"
-            and decision.get("action") in {"fallback", "waiting-for-review"}
-        )
-        if (
-            not isinstance(decision_id, str)
-            or decision_id != attempt.quality_gate_decision_id
-            or not valid_action
-            or not graph_id
-        ):
-            raise ValueError("Conversion attempts need their matching immutable quality gate decision.")
-        decision_json = json.dumps(decision, sort_keys=True)
-        with self._connect() as connection:
-            existing = connection.execute(
-                "SELECT attempt_id, graph_id, decision_json FROM import_conversion_quality_gate_decisions "
-                "WHERE decision_id = ?",
-                (decision_id,),
-            ).fetchone()
-            if existing is None:
-                connection.execute(
-                    """
-                    INSERT INTO import_conversion_quality_gate_decisions(
-                        decision_id, attempt_id, graph_id, decision_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (decision_id, attempt.attempt_id, graph_id, decision_json, utc_now()),
-                )
-            elif (
-                existing["attempt_id"] != attempt.attempt_id
-                or existing["graph_id"] != graph_id
-                or existing["decision_json"] != decision_json
-            ):
-                raise ValueError("Quality gate decisions are immutable.")
-
     def list_conversion_attempts(self, item_id: int) -> tuple[ConversionAttempt, ...]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -1050,18 +773,6 @@ class SqliteImportTaskRepository:
                 raise KeyError(item_id)
             if row["content_sha256"] != evidence.graph.source_sha256:
                 raise ValueError("The conversion graph does not match the scanned source hash.")
-            gate = connection.execute(
-                """
-                SELECT 1 FROM import_conversion_quality_gate_decisions
-                WHERE decision_id = ? AND attempt_id = ?
-                """,
-                (
-                    evidence.attempt.quality_gate_decision_id,
-                    evidence.attempt.attempt_id,
-                ),
-            ).fetchone()
-            if gate is None:
-                raise ValueError("The selected conversion graph has no persisted quality gate decision.")
             existing = connection.execute(
                 "SELECT attempt_json FROM import_conversion_attempts WHERE attempt_id = ?",
                 (evidence.attempt.attempt_id,),
@@ -1468,18 +1179,6 @@ class SqliteImportTaskRepository:
         proposal: NoteProposal,
         created_at: str,
     ) -> None:
-        connection.execute(
-            "UPDATE import_candidate_link_proposals SET invalidated_at = ?, invalidation_reason = ? "
-            "WHERE task_id = ? AND (source_item_id = ? OR target_item_id = ?) "
-            "AND invalidated_at IS NULL",
-            (
-                created_at,
-                "A related note proposal changed; regenerate candidate links.",
-                item["task_id"],
-                item_id,
-                item_id,
-            ),
-        )
         proposal_id = connection.execute(
             """
             INSERT INTO import_note_proposals (task_id, item_id, proposal_kind, proposal_json, created_at)
@@ -1557,19 +1256,6 @@ class SqliteImportTaskRepository:
                 "WHERE task_id = ? AND item_id = ? AND invalidated_at IS NULL",
                 (timestamp, task_id, item_id),
             )
-            connection.execute(
-                "UPDATE import_candidate_link_proposals SET invalidated_at = ?, invalidation_reason = ? "
-                "WHERE task_id = ? AND (source_item_id = ? OR target_item_id = ?) "
-                "AND invalidated_at IS NULL",
-                (
-                    timestamp,
-                    "A related note proposal changed; regenerate candidate links.",
-                    task_id,
-                    item_id,
-                    item_id,
-                ),
-            )
-
     def record_classification_suggestion(
         self, item_id: int, suggestion: ClassificationSuggestion, event_type: str
     ) -> ImportTask:
@@ -1677,312 +1363,6 @@ class SqliteImportTaskRepository:
                 (task_id, task_id),
             ).fetchall()
         return [ClassificationSuggestion.from_dict(json.loads(row["suggestion_json"])) for row in rows]
-
-    def record_metadata_tag_proposal(
-        self, item_id: int, proposal: MetadataTagProposal, event_type: str
-    ) -> ImportTask:
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT task_id, label FROM import_task_items WHERE item_id = ?", (item_id,)
-            ).fetchone()
-            if row is None:
-                raise KeyError(item_id)
-            if proposal.item_id != item_id or proposal.task_id != row["task_id"]:
-                raise ValueError("Metadata proposal does not belong to this import item.")
-            connection.execute(
-                """
-                INSERT INTO import_metadata_tag_proposals (
-                    task_id, item_id, revision, proposal_json, requires_review, decision, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    proposal.task_id,
-                    item_id,
-                    proposal.revision,
-                    json.dumps(proposal.to_dict()),
-                    int(proposal.requires_review),
-                    proposal.decision,
-                    proposal.created_at,
-                ),
-            )
-            task = self._task_from_connection(connection, row["task_id"])
-            updated = replace(
-                task,
-                current_item_label=row["label"],
-                counts=self._counts_from_connection(connection, row["task_id"]),
-                updated_at=utc_now(),
-            )
-            self._write_task(connection, updated)
-            self._append_event(connection, row["task_id"], event_type, updated.updated_at)
-        return updated
-
-    def record_vault_metadata_tag_proposal(self, proposal: MetadataTagProposal) -> None:
-        """Persist a completed task's accepted tag reference after its task row is deleted."""
-
-        with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT proposal_json FROM import_metadata_tag_proposals
-                WHERE task_id = ? AND item_id = ? AND invalidated_at IS NULL
-                ORDER BY revision DESC LIMIT 1
-                """,
-                (proposal.task_id, proposal.item_id),
-            ).fetchone()
-            if row is None:
-                raise KeyError(proposal.item_id)
-            existing = MetadataTagProposal.from_dict(json.loads(row["proposal_json"]))
-            if existing.vault_id != proposal.vault_id or proposal.revision <= existing.revision:
-                raise ValueError("Vault tag reference is not a valid revision.")
-            connection.execute(
-                """
-                INSERT INTO import_metadata_tag_proposals (
-                    task_id, item_id, revision, proposal_json, requires_review, decision, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    proposal.task_id,
-                    proposal.item_id,
-                    proposal.revision,
-                    json.dumps(proposal.to_dict(), ensure_ascii=True, sort_keys=True),
-                    int(proposal.requires_review),
-                    proposal.decision,
-                    proposal.created_at,
-                ),
-            )
-
-    def get_metadata_tag_proposal(self, item_id: int) -> MetadataTagProposal | None:
-        with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT proposal_json FROM import_metadata_tag_proposals
-                WHERE item_id = ? AND invalidated_at IS NULL ORDER BY revision DESC LIMIT 1
-                """,
-                (item_id,),
-            ).fetchone()
-        return MetadataTagProposal.from_dict(json.loads(row["proposal_json"])) if row else None
-
-    def list_metadata_tag_proposals(self, task_id: str) -> list[MetadataTagProposal]:
-        with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT proposal.proposal_json
-                FROM import_metadata_tag_proposals AS proposal
-                JOIN (
-                    SELECT item_id, MAX(revision) AS revision
-                    FROM import_metadata_tag_proposals
-                    WHERE task_id = ? AND invalidated_at IS NULL GROUP BY item_id
-                ) AS latest
-                  ON latest.item_id = proposal.item_id AND latest.revision = proposal.revision
-                WHERE proposal.task_id = ?
-                ORDER BY proposal.item_id
-                """,
-                (task_id, task_id),
-            ).fetchall()
-        return [MetadataTagProposal.from_dict(json.loads(row["proposal_json"])) for row in rows]
-
-    def invalidate_metadata_tag_proposals(self, task_id: str, item_id: int) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                "UPDATE import_metadata_tag_proposals SET invalidated_at = ? "
-                "WHERE task_id = ? AND item_id = ? AND invalidated_at IS NULL",
-                (utc_now(), task_id, item_id),
-            )
-
-    def record_candidate_link_proposal(
-        self, proposal: CandidateLinkProposal, event_type: str
-    ) -> ImportTask:
-        with self._connect() as connection:
-            source = connection.execute(
-                "SELECT task_id, label FROM import_task_items WHERE item_id = ?",
-                (proposal.source_item_id,),
-            ).fetchone()
-            target = connection.execute(
-                "SELECT task_id FROM import_task_items WHERE item_id = ?",
-                (proposal.target_item_id,),
-            ).fetchone()
-            if source is None or target is None:
-                raise KeyError("Candidate link item was not found.")
-            if source["task_id"] != proposal.task_id or target["task_id"] != proposal.task_id:
-                raise ValueError("Candidate link does not belong to this import task.")
-            task = self._task_from_connection(connection, proposal.task_id)
-            if task.vault_id != proposal.vault_id:
-                raise ValueError("Candidate link cannot cross vault boundaries.")
-            connection.execute(
-                """
-                INSERT INTO import_candidate_link_proposals (
-                    task_id, review_item_id, revision, vault_id, source_item_id, target_item_id,
-                    proposal_json, requires_review, decision, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    proposal.task_id,
-                    proposal.review_item_id,
-                    proposal.revision,
-                    proposal.vault_id,
-                    proposal.source_item_id,
-                    proposal.target_item_id,
-                    json.dumps(proposal.to_dict()),
-                    int(proposal.requires_review),
-                    proposal.decision,
-                    proposal.created_at,
-                ),
-            )
-            updated = replace(
-                task,
-                current_item_label=source["label"],
-                counts=self._counts_from_connection(connection, proposal.task_id),
-                updated_at=utc_now(),
-            )
-            self._write_task(connection, updated)
-            self._append_event(connection, proposal.task_id, event_type, updated.updated_at)
-        return updated
-
-    def get_candidate_link_proposal(
-        self, task_id: str, review_item_id: str
-    ) -> CandidateLinkProposal | None:
-        with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT proposal_json, invalidated_at, invalidation_reason
-                FROM import_candidate_link_proposals
-                WHERE task_id = ? AND review_item_id = ?
-                ORDER BY revision DESC LIMIT 1
-                """,
-                (task_id, review_item_id),
-            ).fetchone()
-        return self._candidate_link_from_row(row) if row else None
-
-    def list_candidate_link_proposals(self, task_id: str) -> list[CandidateLinkProposal]:
-        with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT proposal.proposal_json, proposal.invalidated_at, proposal.invalidation_reason
-                FROM import_candidate_link_proposals AS proposal
-                JOIN (
-                    SELECT review_item_id, MAX(revision) AS revision
-                    FROM import_candidate_link_proposals
-                    WHERE task_id = ?
-                    GROUP BY review_item_id
-                ) AS latest
-                  ON latest.review_item_id = proposal.review_item_id
-                    AND latest.revision = proposal.revision
-                WHERE proposal.task_id = ?
-                ORDER BY proposal.source_item_id, proposal.target_item_id, proposal.review_item_id
-                """,
-                (task_id, task_id),
-            ).fetchall()
-        return [self._candidate_link_from_row(row) for row in rows]
-
-    def list_candidate_link_proposals_for_vault(self, vault_id: str) -> list[CandidateLinkProposal]:
-        with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT proposal.proposal_json, proposal.invalidated_at, proposal.invalidation_reason
-                FROM import_candidate_link_proposals AS proposal
-                JOIN (
-                    SELECT task_id, review_item_id, MAX(revision) AS revision
-                    FROM import_candidate_link_proposals
-                    WHERE vault_id = ?
-                    GROUP BY task_id, review_item_id
-                ) AS latest
-                  ON latest.task_id = proposal.task_id
-                    AND latest.review_item_id = proposal.review_item_id
-                    AND latest.revision = proposal.revision
-                WHERE proposal.vault_id = ?
-                ORDER BY proposal.source_item_id, proposal.target_item_id, proposal.review_item_id
-                """,
-                (vault_id, vault_id),
-            ).fetchall()
-        return [self._candidate_link_from_row(row) for row in rows]
-
-    @staticmethod
-    def _candidate_link_from_row(row: sqlite3.Row) -> CandidateLinkProposal:
-        proposal = CandidateLinkProposal.from_dict(json.loads(row["proposal_json"]))
-        if row["invalidated_at"] is None:
-            return proposal
-        return replace(
-            proposal,
-            status="stale",
-            stale_reason=str(row["invalidation_reason"] or "A related review input changed."),
-        )
-
-    def invalidate_candidate_link_proposals(self, task_id: str, item_id: int, reason: str) -> None:
-        if not reason.strip():
-            raise ValueError("Candidate link invalidation needs a reason.")
-        with self._connect() as connection:
-            connection.execute(
-                "UPDATE import_candidate_link_proposals SET invalidated_at = ?, invalidation_reason = ? "
-                "WHERE task_id = ? AND (source_item_id = ? OR target_item_id = ?) "
-                "AND invalidated_at IS NULL",
-                (utc_now(), reason.strip(), task_id, item_id, item_id),
-            )
-
-    def list_metadata_tag_proposals_for_vault(self, vault_id: str) -> list[MetadataTagProposal]:
-        with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT proposal.proposal_json
-                FROM import_metadata_tag_proposals AS proposal
-                JOIN (
-                    SELECT task_id, item_id, MAX(revision) AS revision
-                    FROM import_metadata_tag_proposals WHERE invalidated_at IS NULL GROUP BY task_id, item_id
-                ) AS latest
-                  ON latest.task_id = proposal.task_id AND latest.item_id = proposal.item_id
-                    AND latest.revision = proposal.revision
-                """
-            ).fetchall()
-        return [
-            proposal
-            for row in rows
-            if (proposal := MetadataTagProposal.from_dict(json.loads(row["proposal_json"]))).vault_id == vault_id
-        ]
-
-    def list_vault_tags(
-        self, vault_id: str, search: str = "", include_deleted: bool = False
-    ) -> list[TagDefinition]:
-        with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT definition.tag_json
-                FROM vault_tag_definitions AS definition
-                JOIN (
-                    SELECT name, MAX(revision) AS revision
-                    FROM vault_tag_definitions WHERE vault_id = ? GROUP BY name
-                ) AS latest ON latest.name = definition.name AND latest.revision = definition.revision
-                WHERE definition.vault_id = ?
-                ORDER BY definition.name
-                """,
-                (vault_id, vault_id),
-            ).fetchall()
-        tags = [TagDefinition.from_dict(json.loads(row["tag_json"])) for row in rows]
-        needle = search.strip().lower()
-        return [
-            tag
-            for tag in tags
-            if (include_deleted or tag.status != "deleted") and (not needle or needle in tag.name)
-        ]
-
-    def record_vault_tag(self, tag: TagDefinition) -> TagDefinition:
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO vault_tag_definitions (vault_id, name, revision, tag_json, updated_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (tag.vault_id, tag.name, tag.revision, json.dumps(tag.to_dict()), tag.updated_at),
-            )
-        return tag
-
-    def record_tag_change_preview(self, preview: TagChangePreview, created_at: str) -> TagChangePreview:
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO vault_tag_change_previews (vault_id, preview_json, created_at)
-                VALUES (?, ?, ?)
-                """,
-                (preview.vault_id, json.dumps(preview.to_dict()), created_at),
-            )
-        return preview
 
     def get_ocr_corrections(self, item_id: int) -> tuple[tuple[EvidenceLocator, str], ...]:
         with self._connect() as connection:
@@ -2401,8 +1781,8 @@ class SqliteImportTaskRepository:
                 parsed_count, parse_failed_count, required_check_count, ocr_completed_count,
                 ocr_failed_count, confirmed_gap_count, derived_note_count,
                 recovery_actions_json, failure_reason, parent_task_id, online_parse_selection_json,
-                online_parse_job_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                markdown_pipeline, local_structure_profile, online_parse_job_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(task_id) DO UPDATE SET
                 vault_id = excluded.vault_id,
                 vault_label = excluded.vault_label,
@@ -2431,6 +1811,8 @@ class SqliteImportTaskRepository:
                 failure_reason = excluded.failure_reason,
                 parent_task_id = excluded.parent_task_id,
                 online_parse_selection_json = excluded.online_parse_selection_json,
+                markdown_pipeline = excluded.markdown_pipeline,
+                local_structure_profile = excluded.local_structure_profile,
                 online_parse_job_json = excluded.online_parse_job_json,
                 updated_at = excluded.updated_at
             """,
@@ -2465,6 +1847,8 @@ class SqliteImportTaskRepository:
                 json.dumps(task.online_parse_selection.to_dict())
                 if task.online_parse_selection is not None
                 else None,
+                task.markdown_pipeline,
+                task.local_structure_profile,
                 json.dumps(task.online_parse_job.to_dict()) if task.online_parse_job is not None else None,
                 task.created_at,
                 task.updated_at,
@@ -2542,51 +1926,10 @@ class SqliteImportTaskRepository:
                       ON latest.item_id = suggestion.item_id AND latest.revision = suggestion.revision
                     WHERE suggestion.task_id = ? AND suggestion.invalidated_at IS NULL
                   ), 0) AS classification_required_check_count
-                , COALESCE((
-                    SELECT SUM(
-                        proposal.requires_review = 1 AND proposal.decision IS NULL
-                        AND NOT EXISTS (
-                            SELECT 1 FROM import_classification_suggestions AS classification
-                            WHERE classification.task_id = proposal.task_id
-                              AND classification.item_id = proposal.item_id
-                              AND classification.invalidated_at IS NULL
-                              AND classification.revision = (
-                                  SELECT MAX(revision) FROM import_classification_suggestions
-                                  WHERE task_id = proposal.task_id
-                                    AND item_id = proposal.item_id
-                                    AND invalidated_at IS NULL
-                              )
-                              AND classification.confidence < 0.75
-                              AND classification.decision IS NULL
-                        )
-                    )
-                    FROM import_metadata_tag_proposals AS proposal
-                    JOIN (
-                        SELECT item_id, MAX(revision) AS revision
-                        FROM import_metadata_tag_proposals
-                        WHERE task_id = ? GROUP BY item_id
-                    ) AS latest
-                      ON latest.item_id = proposal.item_id AND latest.revision = proposal.revision
-                    WHERE proposal.task_id = ? AND proposal.invalidated_at IS NULL
-                  ), 0) AS metadata_tag_required_check_count
-                , COALESCE((
-                    SELECT SUM(proposal.requires_review = 1 AND proposal.decision IS NULL)
-                    FROM import_candidate_link_proposals AS proposal
-                    JOIN (
-                        SELECT review_item_id, MAX(revision) AS revision
-                        FROM import_candidate_link_proposals
-                        WHERE task_id = ? AND invalidated_at IS NULL
-                        GROUP BY review_item_id
-                    ) AS latest
-                      ON latest.review_item_id = proposal.review_item_id
-                        AND latest.revision = proposal.revision
-                    WHERE proposal.task_id = ? AND proposal.invalidated_at IS NULL
-                  ), 0) AS candidate_link_required_check_count
             FROM import_task_items WHERE task_id = ?
             """,
             (
-                task_id, task_id, task_id, task_id, task_id, task_id, task_id,
-                task_id, task_id, task_id, task_id, task_id,
+                task_id, task_id, task_id, task_id, task_id, task_id, task_id, task_id,
             ),
         ).fetchone()
         return ImportTaskCounts(
@@ -2602,10 +1945,7 @@ class SqliteImportTaskRepository:
             parsed=row["parsed_count"],
             parse_failed=row["parse_failed_count"],
             required_check=(
-                row["required_check_count"]
-                + row["classification_required_check_count"]
-                + row["metadata_tag_required_check_count"]
-                + row["candidate_link_required_check_count"]
+                row["required_check_count"] + row["classification_required_check_count"]
             ),
             ocr_completed=row["ocr_completed_count"],
             ocr_failed=row["ocr_failed_count"],
@@ -2701,6 +2041,10 @@ class SqliteImportTaskRepository:
                 OnlineParseJob.from_dict(json.loads(row["online_parse_job_json"]))
                 if row["online_parse_job_json"]
                 else None
+            ),
+            markdown_pipeline=str(row["markdown_pipeline"]) if row["markdown_pipeline"] else None,
+            local_structure_profile=(
+                str(row["local_structure_profile"]) if row["local_structure_profile"] else None
             ),
         )
 

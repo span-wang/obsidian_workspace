@@ -1,6 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from hashlib import sha256
 import sqlite3
 from threading import Barrier, Event, Thread
 import pytest
@@ -44,7 +43,6 @@ from domain.providers import Provider, ProviderModel, ProviderProbeResults, Prob
 from domain.retrieval_metadata import RetrievalMetadata
 from domain.retrieval_query import QueryScopeSelection
 from domain.retrieval_rerank import RerankResponse, RerankScore
-from domain.unit_cards import UnitCard, UnitCardHit, UnitCardScope, UnitCardSource
 from domain.vaults import Vault
 from ports.reranker import RerankerExecutionError
 
@@ -142,9 +140,6 @@ def task_service_fixture(
             self.lexical_results = None
             self.heading_results = None
             self.vector_results = None
-            self.unit_card_lexical_results = None
-            self.unit_card_vector_results = None
-            self.unit_card_source_refs = []
             self.semantic_status = "unavailable"
 
         def health(self, vault_id):
@@ -180,24 +175,6 @@ def task_service_fixture(
             assert isinstance(query, VectorQuery)
             self.vector_queries.append(query)
             return self.vector_results or []
-
-        def search_unit_cards_lexical(self, vault_id, query):
-            assert vault_id == vault.vault_id
-            assert isinstance(query, LexicalQuery)
-            return self.unit_card_lexical_results or []
-
-        def search_unit_cards_vector(self, vault_id, query):
-            assert vault_id == vault.vault_id
-            assert isinstance(query, VectorQuery)
-            return self.unit_card_vector_results or []
-
-        def resolve_unit_card_sources(self, vault_id, _card_id, allowed_relative_paths):
-            assert vault_id == vault.vault_id
-            return [
-                reference
-                for reference in self.unit_card_source_refs
-                if reference.relative_path in allowed_relative_paths
-            ]
 
         def filter_blocks(self, vault_id, filters):
             assert vault_id == vault.vault_id
@@ -1179,6 +1156,7 @@ def test_run_task_sends_only_outbound_allowed_evidence_to_the_selected_model(tmp
     policies.preview = lambda _vault_id, _source_path, derived_path, stage: PolicyEvaluation(
         stage != "outbound" or derived_path != "notes/private.md", stage, (), (), "fixture"
     )
+    chunks: list[tuple[int, str]] = []
 
     result = service.run_task(
         session.session_id,
@@ -1189,11 +1167,13 @@ def test_run_task_sends_only_outbound_allowed_evidence_to_the_selected_model(tmp
         provider_id="provider-1",
         model_id="chat-1",
         intent="source-lookup",
+        on_stream_chunk=lambda ordinal, content: chunks.append((ordinal, content)),
     )
     detail = repository.get_detail(session.session_id)
 
     assert result.status == "completed"
     assert result.generation_duration_ms >= 0
+    assert chunks == [(1, "整理后的"), (1, "可直接使用内容。")]
     assert len(providers.generated_prompts) == 1
     prompt = providers.generated_prompts[0]
     assert "visible evidence for the answer" in prompt
@@ -1236,79 +1216,6 @@ def test_source_lookup_limits_lexical_hits_to_snapshot_scope_and_policy(tmp_path
     assert result.status == "completed"
     assert [evidence.relative_path for evidence in result.evidences] == ["notes/visible.md"]
     assert indexes.lexical_queries[-1].allowed_relative_paths == ("notes/visible.md",)
-
-
-def test_unit_card_retrieval_expands_only_original_card_sources_as_evidence(tmp_path) -> None:
-    first = IndexBlock(1, "heading: Unit 1", "Grammar source evidence")
-    second = IndexBlock(2, "heading: Unit 1", "Vocabulary source evidence")
-    metadata = (
-        IndexBlockMetadata(1, "english", "7a", 1, "textbook", "human", 1.0, "accepted"),
-        IndexBlockMetadata(2, "english", "7a", 1, "textbook", "human", 1.0, "accepted"),
-    )
-    document = IndexedDocument(
-        "native-1",
-        "vault-1",
-        "notes/unit-01.md",
-        "a" * 64,
-        "native",
-        (),
-        (),
-        (),
-        (first, second),
-        "now",
-        block_metadata=metadata,
-    )
-    service, _, session, _, _, _, indexes = task_service_fixture(tmp_path, (document,))
-    source = UnitCardSource(
-        "native-1",
-        document.relative_path,
-        1,
-        first.block_content_sha256,
-        "candidate-a",
-        "grammar",
-        ("subject verb agreement",),
-    )
-    second_source = UnitCardSource(
-        "native-1",
-        document.relative_path,
-        2,
-        second.block_content_sha256,
-        "candidate-b",
-        "vocabulary",
-        ("friendship words",),
-    )
-    card_text = "english 7a Unit 1\ngrammar: subject verb agreement"
-    card = UnitCard(
-        "unit-card:fixture",
-        "vault-1",
-        UnitCardScope("english", "7a", 1),
-        "a" * 64,
-        sha256(card_text.encode("utf-8")).hexdigest(),
-        card_text,
-        (source, second_source),
-        "chat-provider",
-        "chat-model",
-        "revision-a",
-        "now",
-    )
-    indexes.lexical_results = []
-    indexes.unit_card_lexical_results = [UnitCardHit(card, 1.0, "unit-card-lexical")]
-    indexes.unit_card_source_refs = [
-        IndexBlockRef(document.document_id, document.relative_path, first, metadata[0]),
-        IndexBlockRef(document.document_id, document.relative_path, second, metadata[1]),
-    ]
-    service.unit_card_retrieval_enabled = True
-    snapshot = service.create_task(session.session_id, "第一单元讲了什么", intent="source-lookup")
-
-    result = service.execute_task(session.session_id, snapshot.task_id)
-
-    assert result.status == "completed"
-    assert [evidence.excerpt for evidence in result.evidences] == [
-        "Grammar source evidence",
-        "Vocabulary source evidence",
-    ]
-    assert {evidence.matched_channels for evidence in result.evidences} == {("unit-card",)}
-    assert all(evidence.relative_path == document.relative_path for evidence in result.evidences)
 
 
 def test_source_lookup_fails_closed_when_lexical_retrieval_is_disabled(tmp_path) -> None:
@@ -1777,11 +1684,10 @@ def test_concurrent_rerank_execution_sends_only_one_provider_request(tmp_path) -
         rerank_retrieval_enabled=True,
     )
     snapshot = service.create_task(session.session_id, "local candidate", intent="source-lookup")
-    fused, _unit_cards, _semantic_sent, _semantic_unavailable = service._hybrid_fused_candidates(
+    fused, _semantic_sent, _semantic_unavailable = service._hybrid_fused_candidates(
         snapshot.vault_id,
         "local candidate",
         (document.relative_path,),
-        include_unit_cards=False,
         limit=20,
     )
     first_result: dict[str, tuple] = {}

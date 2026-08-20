@@ -99,6 +99,29 @@ class OpenAiCompatibleProviderClient:
             raise self._request_error(error) from error
         raise ProviderClientError("Streaming generation returned no usable events.")
 
+    def probe_responses_generation(
+        self,
+        endpoint: str,
+        secret: str,
+        model_id: str,
+        cancel_event: Event | None = None,
+    ) -> None:
+        request = self._request(
+            endpoint,
+            "/responses",
+            secret,
+            self._responses_payload(model_id, "ping", max_output_tokens=1),
+        )
+        deadline = self._deadline()
+        try:
+            with self._open(request, cancel_event, deadline) as response:
+                for payload in self._stream_json_events(response, cancel_event, deadline):
+                    if self._response_text_delta(payload):
+                        return
+        except (HTTPError, URLError, TimeoutError, ProviderClientError) as error:
+            raise self._request_error(error) from error
+        raise ProviderClientError("Responses generation returned no usable events.")
+
     def probe_embedding(
         self,
         endpoint: str,
@@ -177,6 +200,16 @@ class OpenAiCompatibleProviderClient:
     ) -> str:
         return "".join(self.stream_chat(endpoint, secret, model_id, prompt, cancel_event)).strip()
 
+    def generate_responses(
+        self,
+        endpoint: str,
+        secret: str,
+        model_id: str,
+        prompt: str,
+        cancel_event: Event | None = None,
+    ) -> str:
+        return "".join(self.stream_responses(endpoint, secret, model_id, prompt, cancel_event)).strip()
+
     def generate_chat_with_usage(
         self,
         endpoint: str,
@@ -236,6 +269,46 @@ class OpenAiCompatibleProviderClient:
             raise ProviderClientError("Generation returned no usable content.")
         return ChatGeneration(final_content, usage)
 
+    def generate_responses_with_usage(
+        self,
+        endpoint: str,
+        secret: str,
+        model_id: str,
+        prompt: str,
+        max_output_tokens: int,
+        cancel_event: Event | None = None,
+    ) -> ChatGeneration:
+        normalized_prompt = prompt.strip()
+        if not normalized_prompt or len(normalized_prompt) > 200_000:
+            raise ProviderClientError("Generation prompt is invalid.")
+        if (
+            type(max_output_tokens) is not int
+            or not 1 <= max_output_tokens <= self._MAX_GENERATION_OUTPUT_TOKENS
+        ):
+            raise ProviderClientError("Generation output token limit is invalid.")
+        request = self._request(
+            endpoint,
+            "/responses",
+            secret,
+            self._responses_payload(model_id, normalized_prompt, max_output_tokens=max_output_tokens),
+        )
+        deadline = self._deadline()
+        content: list[str] = []
+        usage: ChatUsage | None = None
+        try:
+            with self._open(request, cancel_event, deadline) as response:
+                for payload in self._stream_json_events(response, cancel_event, deadline):
+                    delta = self._response_text_delta(payload)
+                    if delta is not None:
+                        content.append(delta)
+                    usage = self._responses_usage(payload) or usage
+        except (HTTPError, URLError, TimeoutError, ProviderClientError) as error:
+            raise self._request_error(error) from error
+        final_content = "".join(content).strip()
+        if not final_content:
+            raise ProviderClientError("Responses generation returned no usable content.")
+        return ChatGeneration(final_content, usage)
+
     def stream_chat(
         self,
         endpoint: str,
@@ -275,6 +348,37 @@ class OpenAiCompatibleProviderClient:
             raise self._request_error(error) from error
         if not saw_chunk:
             raise ProviderClientError("Generation returned no usable content.")
+
+    def stream_responses(
+        self,
+        endpoint: str,
+        secret: str,
+        model_id: str,
+        prompt: str,
+        cancel_event: Event | None = None,
+    ):
+        normalized_prompt = prompt.strip()
+        if not normalized_prompt or len(normalized_prompt) > 200_000:
+            raise ProviderClientError("Generation prompt is invalid.")
+        request = self._request(
+            endpoint,
+            "/responses",
+            secret,
+            self._responses_payload(model_id, normalized_prompt),
+        )
+        deadline = self._deadline()
+        saw_chunk = False
+        try:
+            with self._open(request, cancel_event, deadline) as response:
+                for payload in self._stream_json_events(response, cancel_event, deadline):
+                    delta = self._response_text_delta(payload)
+                    if delta is not None:
+                        saw_chunk = True
+                        yield delta
+        except (HTTPError, URLError, TimeoutError, ProviderClientError) as error:
+            raise self._request_error(error) from error
+        if not saw_chunk:
+            raise ProviderClientError("Responses generation returned no usable content.")
 
     def _json_request(
         self,
@@ -324,6 +428,17 @@ class OpenAiCompatibleProviderClient:
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if line.startswith("data:"):
                     yield line[5:].strip()
+
+    def _stream_json_events(self, response, cancel_event: Event | None, deadline: float):  # noqa: ANN001
+        for event in self._stream_events(response, cancel_event, deadline):
+            if event == "[DONE]":
+                continue
+            try:
+                payload = json.loads(event)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                yield payload
 
     def _deadline(self) -> float:
         return time.monotonic() + self.timeout_seconds
@@ -513,6 +628,45 @@ class OpenAiCompatibleProviderClient:
         if urlparse(endpoint).hostname == "api.deepseek.com":
             payload["thinking"] = {"type": "disabled"}
         return payload
+
+    @classmethod
+    def _responses_payload(
+        cls, model_id: str, prompt: str, *, max_output_tokens: int | None = None
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "model": model_id,
+            "instructions": cls._FINAL_RESPONSE_ONLY_INSTRUCTION,
+            "input": prompt,
+            "stream": True,
+        }
+        if max_output_tokens is not None:
+            payload["max_output_tokens"] = max_output_tokens
+        return payload
+
+    @staticmethod
+    def _response_text_delta(payload: dict[str, object]) -> str | None:
+        if payload.get("type") != "response.output_text.delta":
+            return None
+        delta = payload.get("delta")
+        return delta if isinstance(delta, str) and delta else None
+
+    @staticmethod
+    def _responses_usage(payload: dict[str, object]) -> ChatUsage | None:
+        if payload.get("type") != "response.completed":
+            return None
+        response = payload.get("response")
+        usage = response.get("usage") if isinstance(response, dict) else None
+        if not isinstance(usage, dict):
+            return None
+        input_tokens = usage.get("input_tokens")
+        output_tokens = usage.get("output_tokens")
+        total_tokens = usage.get("total_tokens")
+        if any(type(value) is not int for value in (input_tokens, output_tokens, total_tokens)):
+            return None
+        try:
+            return ChatUsage(input_tokens, output_tokens, total_tokens)
+        except ValueError:
+            return None
 
     @staticmethod
     def _request(

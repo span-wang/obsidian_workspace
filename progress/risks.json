@@ -1,5 +1,5 @@
 {
-  "updatedOn": "2026-08-12",
+  "updatedOn": "2026-08-17",
   "risks": [
     {
       "id": "RET-R001",
@@ -40,7 +40,7 @@
     {
       "id": "RET-R005",
       "severity": "中",
-      "status": "开放",
+      "status": "已关闭",
       "title": "固定阈值导致误去重或漏召回",
       "impact": "0.92 相似度、top-k、RRF 参数和批预算若未经评测会直接固化样本偏差。",
       "mitigation": "RET-00-03 已建立脱敏合成 golden set，RET-00-04 已记录当前手写检索、Windows FTS5/BM25 与 float32 KNN 的原始基线。用户确认 RET-04-02 的词法最低门槛为 macro recall 0.6569、macro precision 0.2813；实现结果为 0.6875、0.302083。RET-04-03 已在同一 fixture 完成版本化 A/B：相对旧手写评分，FTS macro recall +0.030555555555555558、macro precision +0.020833333333333315，passesGate=true；生产 source-lookup 已仅使用 FTS，关闭本机开关时失败关闭，不回退旧打分。RET-05-04 只会按 block_content_sha256 做精确自动合并；标题词归一仅产生候选簇，duplicate precision/recall 已进入 golden 评测，模型窗口与批次数必须由调用方显式传入。RET-06-04 增加版本化脱敏语义改写 fixture：RRF k=20、60、100 的 macro recall@8 均为 1.0，保留 k=60；该小样本不校准真实 vault 的 top-k、RRF 或向量候选参数。RET-07-02 增加脱敏 unit-card fixture，冻结最低 card coverage=1.0、original citation recall=1.0、card-on 相对 card-off macro recall@8 gain=0.5；实际结果为 1.0、1.0、0.5。RET-07-03 新增 top-20 到 top-8 的脱敏 rerank A/B：脚本化 adapter 的 macro recall@8 +1.0、precision@8 +0.25、MRR@8 +1.0，但真实 Provider 延迟和费用尚未测量，passesGate=false，生产开关保持关闭。RET-09-01 将真实 Provider 测量限制为内容哈希校验通过的 synthetic-deidentified fixture，强制完整候选响应并只记录不含正文的质量与端到端延迟。2026-07-27 使用独立 BAAI/bge-reranker-v2-m3 执行两条 fixture：macro recall@8 +1.0、precision@8 +0.25、MRR@8 +1.0；p50=1014.314 ms、p95=1699.467 ms；质量门槛通过。用户明确不做价格或费用预算，费用明确未计算；该小样本仍不足以启用默认 rerank。仍须扩展已审阅、不可逆脱敏真实样本并由人工复核后决定是否改变默认。",
@@ -239,9 +239,9 @@
       "id": "RET-R027",
       "severity": "高",
       "status": "开放",
-      "title": "在线解析外发扩大原件与文件名暴露范围",
-      "impact": "在线 OCR 需要将任务原件和文件名上传至 PaddleOCR 官方云 API 或 MinerU；若没有逐任务选择、策略门禁或稳定的失败语义，可能在用户未知或配置变化后扩大外发范围。",
-      "mitigation": "RET-27-01 以创建任务时默认关闭的显式 Switch 冻结 Provider、模型和策略版本；提交前重验 Vault outbound policy、已验证 Provider 和凭据，不满足即零上传。仅 PDF 在用户选择后外发；不保存 token、绝对路径、签名 URL、远端 job ID 或原始响应到 UI；失败不静默回退，取消仅停止本机等待。用户已于 2026-08-11 明确确认该任务级外发范围，并明确限制为 PDF。",
+      "title": "PDF 在线 OCR 与 AI 结构化扩大外发范围",
+      "impact": "在线 OCR 需要将任务原件和文件名上传至 PaddleOCR 官方云 API 或 MinerU；统一 PDF AI 结构化后，本机或在线 OCR 的派生 Markdown 也可能发送到既有 Markdown Provider。若没有任务级选择、策略门禁、历史兼容或稳定失败语义，可能在用户未知或重试时扩大外发范围。",
+      "mitigation": "RET-27-01 将在线 OCR 选择与 PDF Markdown 模式分别冻结：在线 OCR 仅在用户打开开关、选择已验证 Provider 且原件上传策略允许时上传 PDF；AI 结构化仅在 Markdown outbound policy 允许时发送选定 DocumentGraph 的派生 Markdown；本地结构化零 Provider 调用。历史任务缺少模式字段时按原有行为推断，失败不静默回退。仅 PDF 受此模式影响；不保存 token、绝对路径、签名 URL、远端 job ID、原始 HTTP 响应或完整 Provider 日志。用户已于 2026-08-17 明确确认本机 OCR + AI 结构化的 Markdown 外发范围与四种 OCR/结构化组合。",
       "ownerTaskId": "RET-27-01"
     },
     {
@@ -252,6 +252,51 @@
       "impact": "来源文件与哈希均未变化的派生笔记会因一级标题后的英文副标题而被标记 source-link-broken，导致 CME 索引错误 stale 并从检索范围排除。",
       "mitigation": "RET-28-01 已将来源链接核验改为允许一级标题后的单行副标题，再接受精确来源链接；既有 source-link-broken 文档会在下一次 reconcile 自动重新核验。回归覆盖中文标题、英文副标题、有效来源链接、恢复路径，并确认正文内容之后的链接仍会被拒绝。",
       "ownerTaskId": "RET-28-01"
+    },
+    {
+      "id": "RET-R029",
+      "severity": "高",
+      "status": "已关闭",
+      "title": "退役知识图谱与治理代码误伤导入结构投影或检索标签",
+      "impact": "若将用户知识图谱与解析使用的 graph projection 混同，PDF/DOCX 索引重建和来源定位会失效；若同时删除 Markdown 原生 tags 或确定性块级元数据，BM25、图谱之外的标签词项和范围枚举会退化。",
+      "mitigation": "RET-30-01 已将删除边界限定为用户知识图谱、候选链接、私有标签提案、LLM 元数据候选和单元卡片；明确保留 DocumentGraph、graph_projection、Markdown 原生 tags、FTS tag_text 与 subject/grade_volume/unit_no/material_type。新库不创建退役治理表，旧库历史表和行保持不变且运行时不读写。完整 unit 651 passed/2 skipped，结构投影与索引重建 20 passed，确定性元数据与 FTS 20 passed，导入索引 68 passed，integration 13 passed/2 skipped，受影响浏览器场景 3 passed。",
+      "ownerTaskId": "RET-30-01"
+    },
+    {
+      "id": "RET-R030",
+      "severity": "高",
+      "status": "开放",
+      "title": "本地 OCR 归一化误删正文或让历史重试产生不同 Markdown",
+      "impact": "过度使用版面或文本启发式可能把正文误判为页眉页脚、错误合并跨列内容，或在规则升级后使历史任务重试产生不可核验的不同派生 Markdown。",
+      "mitigation": "RET-31-01 已只在确定性高的几何和跨页重复条件下变换；不确定结构保留原始内容并记录稳定问题。每个归一化块保留全部原始 block ID、locator 与 evidence ref；任务持久化规则版本，历史任务默认使用旧版本。脱敏 JSON golden fixture 已覆盖页眉 OCR 顺序先于标题、跨块段落、列表、图注关联和 1.1/1.1.1 二级三级标题。local-v2 仅对新任务启用跨页相同内容的同位置检测，且有不同位置同文本保留回归；转换、任务、导入、API 与 provisioning 定向回归共 102 项通过。仍需更多已审阅、不可逆脱敏教材样本量化误删率和标题准确率。",
+      "ownerTaskId": "RET-31-01"
+    },
+    {
+      "id": "RET-R031",
+      "severity": "中",
+      "status": "已关闭",
+      "title": "Provider 模型验证失败被静默隐藏",
+      "impact": "用户无法区分地址、网络、TLS、超时、权限或 Provider 响应问题，失败模型还会从设置页消失，导致无法在原上下文中修复或重试。",
+      "mitigation": "RET-32-01 仅保留 ProviderClientError 已归一化的 HTTP 与网络类别，不返回密钥、正文、完整地址、响应体或堆栈；设置页读取 FastAPI detail.message，并持续显示已配置模型的失败状态、中文原因和重试入口。application、API、前端和独立端口浏览器回归均通过。",
+      "ownerTaskId": "RET-32-01"
+    },
+    {
+      "id": "RET-R032",
+      "severity": "中",
+      "status": "已关闭",
+      "title": "Responses Provider 被误用为 Chat Completions 协议",
+      "impact": "仅支持 /responses 的 Provider 可能收到 /chat/completions 请求，导致网关 502、HTML/非 SSE 响应或模型验证失败；反向切换也可能让既有 Provider 失效。",
+      "mitigation": "RET-33-01 为 Provider 持久化显式 api_mode，旧库默认 chat-completions。Responses 模式的 chat/markdown 验证与生成只使用 /responses、instructions、input、stream 和 max_output_tokens，并仅接受 response.output_text.delta 与一致的 response.completed usage；无有效文本失败关闭。Embedding、Rerank、模型发现和健康检查不受此模式影响；设置页持续显示当前模式，用户必须显式编辑 Provider 才会切换。",
+      "ownerTaskId": "RET-33-01"
+    },
+    {
+      "id": "RET-R033",
+      "severity": "高",
+      "status": "开放",
+      "title": "原生 Obsidian 图片资源丢失或误发到 Embedding Provider",
+      "impact": "Markdown 导入若只保存文本会使本地图片引用失效；若将图片链接、路径或二进制误纳入 embedding，会造成不完整检索、无意义向量和超出用户预期的出网范围。",
+      "mitigation": "RET-34-01 将本地图片引用解析、内容哈希资产提交和 Markdown 重写放入同一可回滚导入单元；远程、越界、缺失和符号链接引用失败关闭；Embedding 只消费去除图片引用的文本块；删除任务按共享引用保护资产。",
+      "ownerTaskId": "RET-34-01"
     }
   ]
 }

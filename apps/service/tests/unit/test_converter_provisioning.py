@@ -25,7 +25,6 @@ from workers.converters.provisioning import (
     default_converter_root,
     load_provisioned_profiles,
 )
-from workers.converters.quality_gate import StructuralQualityGate
 from workers.document_parser import preflight_document
 
 
@@ -356,7 +355,7 @@ def test_pandoc_adapter_skips_layout_only_docx_paragraphs_and_supports_quotes(
     ]
     assert [block.locators[0].element_path for block in blocks] == inventory["required_anchors"]
 
-    graph = DocumentGraph(
+    _ = DocumentGraph(
         graph_id="graph-pandoc",
         source_sha256="a" * 64,
         input_snapshot_hash="a" * 64,
@@ -366,9 +365,6 @@ def test_pandoc_adapter_skips_layout_only_docx_paragraphs_and_supports_quotes(
         issues=(),
     )
 
-    assert StructuralQualityGate().evaluate(
-        graph, {"document_kind": "docx", **inventory}
-    ).action == "accepted"
 
 
 def test_pandoc_adapter_expands_numbered_docx_content_and_restores_style_headings(
@@ -428,7 +424,7 @@ def test_pandoc_adapter_expands_numbered_docx_content_and_restores_style_heading
     assert [block.kind for block in blocks] == ["heading", "list", "heading", "list", "table"]
     assert [block.payload.to_dict().get("level") for block in blocks[:3]] == [1, None, 2]
     assert [block.locators[0].element_path for block in blocks] == inventory["required_anchors"]
-    graph = DocumentGraph(
+    _ = DocumentGraph(
         graph_id="graph-pandoc-numbered",
         source_sha256="a" * 64,
         input_snapshot_hash="a" * 64,
@@ -437,9 +433,6 @@ def test_pandoc_adapter_expands_numbered_docx_content_and_restores_style_heading
         assets=(),
         issues=(),
     )
-    assert StructuralQualityGate().evaluate(
-        graph, {"document_kind": "docx", **inventory}
-    ).action == "accepted"
 
 
 def test_pandoc_adapter_maps_standalone_docx_images_to_verified_obsidian_assets(
@@ -654,7 +647,7 @@ def test_mineru_adapter_preserves_formula_and_table_while_classifying_furniture_
     assert len(issues) == 1
     assert issues[0].severity == "warning"
 
-    graph = DocumentGraph(
+    _ = DocumentGraph(
         graph_id="graph-1",
         source_sha256="a" * 64,
         input_snapshot_hash="a" * 64,
@@ -664,7 +657,6 @@ def test_mineru_adapter_preserves_formula_and_table_while_classifying_furniture_
         issues=tuple(issues),
     )
 
-    assert StructuralQualityGate().evaluate(graph, {"document_kind": "pdf", "page_count": 1}).action == "accepted"
 
 
 def test_mineru_adapter_maps_lists_and_algorithms_and_keeps_images_non_blocking() -> None:
@@ -718,7 +710,7 @@ def test_mineru_adapter_maps_lists_and_algorithms_and_keeps_images_non_blocking(
         {"inline_runs": [{"kind": "text", "text": "Second"}]},
     ]
     assert [issue.code for issue in issues] == ["mineru-image-preserved-as-artifact"]
-    graph = DocumentGraph(
+    _ = DocumentGraph(
         graph_id="graph-mineru-extended",
         source_sha256="a" * 64,
         input_snapshot_hash="a" * 64,
@@ -727,7 +719,6 @@ def test_mineru_adapter_maps_lists_and_algorithms_and_keeps_images_non_blocking(
         assets=(),
         issues=tuple(issues),
     )
-    assert StructuralQualityGate().evaluate(graph, {"document_kind": "pdf", "page_count": 1}).action == "accepted"
 
 
 def test_mineru_image_blocks_bind_verified_artifacts_and_render_obsidian_embeds() -> None:

@@ -2,17 +2,17 @@
 
 > 此文件由 `progress/` 下的结构化数据生成，请勿手工修改。
 
-- 数据日期：2026-08-12
+- 数据日期：2026-08-17
 - 方案文档：`docs/retrieval-redesign.md`
-- 任务总数：56
-- 已完成：54
+- 任务总数：61
+- 已完成：59
 - 进行中：2
 - 阻塞：0
 
 ## 当前焦点
 
 - `RET-25-01` iOS 设计语言统一前端 UI 重构（进行中）：五个生产入口均遵循 DESIGN.md 的 iOS 设计语言、中文简洁文案、状态连续和无障碍标准；桌面三栏与移动端逐层路径完整可操作；刷新不闪白或丢失阅读位置；关键单测、构建、浏览器和视觉检查通过。
-- `RET-27-01` 任务级在线 OCR Provider 与显式授权（进行中）：用户只有在创建 PDF 导入任务时显式打开在线解析且选择已验证 Provider 后，原件与文件名才会发送到 PaddleOCR 官方 API 或 MinerU；其他格式始终本地解析。默认和策略拒绝时零上传。任务可显示安全状态、可在服务重启后继续轮询，Provider 失败不会静默回退；两个 Provider 的连接测试、服务测试、前端测试和关键浏览器流程通过。
+- `RET-34-01` 原生 Obsidian 图片资源保留与 Embedding 排除（进行中）：原生 Obsidian Markdown 导入后，存在的本地图片可在 Vault 中随 Markdown 使用且引用有效；缺失或不安全引用不会产生部分完成态；图片正文、路径和二进制内容不进入 Embedding Provider；删除任务不会删除仍被其他 Markdown 或用户文件引用的共享图片。
 
 ## 阶段概览
 
@@ -45,9 +45,14 @@
 | `RET-24` 导入任务队列与本地 Word 提案 | 让批量导入按可见队列逐项推进，并确保 Word/PDF 的本地 DocumentGraph 不会发送给 Markdown Provider。 | 已完成 | 2/2 |
 | `RET-25` iOS 设计语言统一 | 以 DESIGN.md 定义的原生感、扁平、状态连续和全端可操作标准，统一生产工作台的视觉与交互。 | 进行中 | 0/1 |
 | `RET-26` 可读导入文件命名 | 让导入原件、解析笔记及目录以导入文件名和解析标题命名，同时保留可核验身份并防止同名覆盖。 | 已完成 | 1/1 |
-| `RET-27` 受控在线文档解析 | 以任务级显式授权和 Vault 出网策略门禁接入 PaddleOCR-VL 1.6 与 MinerU 官方在线解析。 | 进行中 | 0/1 |
+| `RET-27` 受控在线文档解析 | 以任务级显式授权和 Vault 出网策略门禁接入 PaddleOCR-VL 1.6 与 MinerU 官方在线解析。 | 已完成 | 1/1 |
 | `RET-28` 来源链接核验修复 | 修复双语标题导致已存在来源链接被错误标记为 stale 的索引核验缺陷。 | 已完成 | 1/1 |
 | `RET-29` 当前页任务批量删除 | 让当前页导入任务可多选或全选，并在既有安全删除语义下逐项删除。 | 已完成 | 1/1 |
+| `RET-30` 无效治理与知识图谱退役 | 删除未形成生产闭环的标签、LLM 元数据、单元卡片和用户知识图谱能力，同时保留导入结构投影与检索主链。 | 已完成 | 1/1 |
+| `RET-31` 本地 OCR 图结构归一化 | 以可追溯、版本化的确定性规则将 PaddleOCR-VL 页面图块归一化为保真 Markdown，改善标题、阅读顺序、列表、图注与页边噪音。 | 已完成 | 1/1 |
+| `RET-32` Provider 验证反馈 | 让模型验证保留安全、可操作的失败原因，并在设置页连续展示验证状态和重试入口。 | 已完成 | 1/1 |
+| `RET-33` Responses API Provider 模式 | 让 OpenAI-compatible Provider 可显式选择 Responses API，并以稳定的流式合同完成模型验证和生成。 | 已完成 | 1/1 |
+| `RET-34` Obsidian 图片资源保留 | 解析和入库原生 Obsidian Markdown 时保留本地图片资源，同时确保图片不进入 embedding 出网输入。 | 进行中 | 0/1 |
 
 ## RET-00 决策与基线
 
@@ -241,7 +246,7 @@
 
 | 任务 | 优先级 | 状态 | 依赖 | 验收 | 验证 |
 | --- | --- | --- | --- | --- | --- |
-| `RET-27-01` 任务级在线 OCR Provider 与显式授权 | P0 | 进行中 | `RET-24-01`、`RET-25-01` | 用户只有在创建 PDF 导入任务时显式打开在线解析且选择已验证 Provider 后，原件与文件名才会发送到 PaddleOCR 官方 API 或 MinerU；其他格式始终本地解析。默认和策略拒绝时零上传。任务可显示安全状态、可在服务重启后继续轮询，Provider 失败不会静默回退；两个 Provider 的连接测试、服务测试、前端测试和关键浏览器流程通过。 | - |
+| `RET-27-01` 任务级在线 OCR 与 PDF Markdown 双管线 | P0 | 已完成 | `RET-24-01`、`RET-25-01` | 所有 PDF 任务均冻结 AI 结构化或本地结构化模式，且可独立组合本机或在线 OCR。AI 模式仅在 Markdown outbound policy 允许时将选定 DocumentGraph 的 Markdown 发送给既有 Provider；本地模式零 Markdown Provider 调用；任何 Provider 或策略失败均不静默回退。用户只有在显式打开在线解析并选择已验证 Provider 后，原件与文件名才会发送到 PaddleOCR 官方 API 或 MinerU；其他格式保持既有处理。历史任务兼容原有外发行为，任务详情仅展示安全的模式、Provider 与状态；两个 Provider 的连接测试、服务测试、前端测试和关键浏览器流程通过。 | - |
 
 ## RET-28 来源链接核验修复
 
@@ -255,6 +260,36 @@
 | --- | --- | --- | --- | --- | --- |
 | `RET-29-01` 当前页导入任务多选删除 | P1 | 已完成 | `RET-18-02`、`RET-25-01` | 当前 Vault 的任务列表可单选或全选当前页中所有非运行任务；确认后只通过既有单任务删除路径逐项处理。成功项即时从列表移除，失败项保持选中并显示原因；分页、切换 Vault 或改变页大小不会把选择范围扩展到当前页以外。 | `npm --prefix apps/web run test（38 passed）`、`npm --prefix apps/web run lint（通过）`、`npm --prefix apps/web run build（通过）`、`OBSIDIAN_PLATFORM_TEST_PORT=6431 npm run browser-test：新增当前页多选、运行中任务排除、部分失败保留用例通过；完整 24 项中 16 项通过，另有 8 项在既有工作台、设置和会话 UI 场景失败，未归因于本任务。`、`单独重跑新增浏览器用例时隔离服务未在 10 秒健康检查窗口内启动；此前完整套件中该用例已通过，因此不记为功能失败。`、`npm run progress:build && npm run progress:check（通过）`、`git diff --check（通过；仅既有 Windows 行尾提示）` |
 
+## RET-30 无效治理与知识图谱退役
+
+| 任务 | 优先级 | 状态 | 依赖 | 验收 | 验证 |
+| --- | --- | --- | --- | --- | --- |
+| `RET-30-01` 删除无效标签元数据治理与用户知识图谱 | P0 | 已完成 | `RET-18-01`、`RET-25-01` | 生产 UI 和公开路由不再出现标签治理、元数据审核、单元卡片或知识图谱；导入不再生成私有标签或候选链接，运行时不再构造 LLM 元数据和单元卡片服务；旧数据库可继续打开且历史表不被改写；DocumentGraph/graph projection、Markdown 原生标签、确定性范围元数据、导入、Embedding 和普通检索保持可用。 | `uv run --directory apps/service pytest -p no:cacheprovider tests/unit -q（651 passed，2 skipped）`、`uv run --directory apps/service ruff check .（All checks passed）`、`npm --prefix apps/web run test（35 passed）、npm --prefix apps/web run lint（通过）、npm --prefix apps/web run build（通过）`、`OBSIDIAN_PLATFORM_TEST_PORT=6427 npm run integration（13 passed，2 skipped）`、`OBSIDIAN_PLATFORM_TEST_PORT=6429 npx playwright test --config browser-tests/playwright.config.mjs browser-tests/loopback.spec.mjs --grep "without a user graph drawer\|without a user graph\|runs import tasks automatically\|does not expose a manual commit request"（3 passed）`、`完整 browser-test 24 场景为 13 passed、11 failed；其中本任务相关场景已改合同并通过，余下失败为既有工作台、设置、会话 UI 基线漂移，未纳入本任务`、`npm run progress:build && npm run progress:check（待本次进度同步后执行）`、`git diff --check（通过；仅既有 Windows 行尾提示）` |
+
+## RET-31 本地 OCR 图结构归一化
+
+| 任务 | 优先级 | 状态 | 依赖 | 验收 | 验证 |
+| --- | --- | --- | --- | --- | --- |
+| `RET-31-01` OCR 后本地 Markdown 图结构归一化 | P0 | 已完成 | `RET-22-01`、`RET-27-01` | 本机 PDF 的 local 模式仅消费有 provenance 的 DocumentGraph 并保持零 Markdown Provider 调用；可信标题、列表、图注和可验证表格/公式/图片能以 Markdown 结构表达，跨页重复页边噪音不进入正文，异常或无法确认的结构不静默丢失。每个归一化图块可回链全部原始 block identity、locator 与 evidence，任务冻结规则版本，历史任务不会因代码升级自动改变。定向 golden 回归、Ruff、进度检查和差异检查通过。 | `OCR 图结构、二级/三级编号标题、跨页同位置重复内容、任务 profile 持久化、导入/API 与转换器 provisioning 定向回归（102 passed）`、`受影响应用、领域、适配器、转换器与测试 Ruff（All checks passed）`、`uv run --directory apps/service python -m compileall -q application adapters api domain ports workers（通过）`、`OBSIDIAN_PLATFORM_TEST_PORT=6443 npm run integration（13 passed，2 skipped）`、`npm run progress:build && npm run progress:check（通过）`、`git diff --check（通过；仅既有 Windows 行尾提示）` |
+
+## RET-32 Provider 验证反馈
+
+| 任务 | 优先级 | 状态 | 依赖 | 验收 | 验证 |
+| --- | --- | --- | --- | --- | --- |
+| `RET-32-01` 模型验证失败原因与状态反馈 | P0 | 已完成 | `RET-25-01` | 模型验证失败时，设置页保留对应模型和已选类型，展示中文的失败状态、已脱敏原因与可重试操作；本机 API 前置拒绝也展示具体可修复原因。成功和失败均有稳定状态，失败不会被误报为成功或静默隐藏。 | `uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_providers.py -q（24 passed）`、`uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_vault_api.py -q（12 passed）`、`uv run --directory apps/service ruff check application/providers.py tests/unit/test_providers.py（All checks passed）`、`npm --prefix apps/web run test（38 passed）、lint 与 build（通过）`、`OBSIDIAN_PLATFORM_TEST_PORT=6445 npx playwright test --config browser-tests/playwright.config.mjs browser-tests/loopback.spec.mjs --grep "configures independent chat and Rerank models"（1 passed）`、`npm run progress:build && npm run progress:check（通过）`、`git diff --check（通过；仅既有 Windows 行尾提示）` |
+
+## RET-33 Responses API Provider 模式
+
+| 任务 | 优先级 | 状态 | 依赖 | 验收 | 验证 |
+| --- | --- | --- | --- | --- | --- |
+| `RET-33-01` Provider Responses API 模式 | P0 | 已完成 | `RET-32-01` | 用户可在添加或编辑 Provider 时选择 Chat Completions 或 Responses API；旧 Provider 迁移后继续使用 Chat Completions。Responses Provider 的 chat/markdown 模型验证和生成只请求 /responses，并仅从流式 response.output_text.delta 读取最终文本、从 response.completed 读取一致的 usage；无有效文本或 usage 时失败关闭。Embedding、Rerank、模型发现、健康检查、凭据和出网边界保持既有行为。 | `Provider client、服务和 SQLite 迁移定向回归（74 passed）`、`Provider API 单测（12 passed）`、`Loopback integration（15 passed）`、`Provider 相关 Ruff（All checks passed）`、`前端单测（39 passed）、lint 与 build（通过）`、`独立 Provider 设置 Playwright 回归（1 passed）`、`Playwright CLI 真实工作台设置页检查（Responses API 选项可见；桌面截图 output/playwright/responses-api-mode.png）`、`npm run progress:build && npm run progress:check（通过）`、`git diff --check（通过；仅既有 Windows 行尾提示）` |
+
+## RET-34 Obsidian 图片资源保留
+
+| 任务 | 优先级 | 状态 | 依赖 | 验收 | 验证 |
+| --- | --- | --- | --- | --- | --- |
+| `RET-34-01` 原生 Obsidian 图片资源保留与 Embedding 排除 | P0 | 进行中 | `RET-18-02`、`RET-26-01` | 原生 Obsidian Markdown 导入后，存在的本地图片可在 Vault 中随 Markdown 使用且引用有效；缺失或不安全引用不会产生部分完成态；图片正文、路径和二进制内容不进入 Embedding Provider；删除任务不会删除仍被其他 Markdown 或用户文件引用的共享图片。 | - |
+
 ## 风险
 
 | 风险 | 严重度 | 状态 | 影响 | 缓解措施 | 归属任务 |
@@ -263,7 +298,7 @@
 | `RET-R002` 索引正文批量出网扩大隐私边界 | 高 | 已关闭 | 教材和个人笔记正文可能按 vault 或目录批量发送给云端 Provider。 | 2026-07-27 用户明确确认默认允许出网，2026-08-05 再次明确确认可将 PDF/DOCX 解析得到的、格式保留的 Markdown 正文发送给 Markdown Provider 做结构化。RET-12-01 已删除运行时的逐任务授权、确认和执行前授权核验；会话 /run 在同一请求中保存选择、检索并仅将 outbound policy 允许的证据提交给所选 Model。never-send-cloud 证据不进入提示词；do-not-index、completely-ignore、HTTPS、已验证 Provider/model、内容哈希、响应和向量校验保持失败关闭。旧 SQLite 授权历史保留但运行时不读取或写入。默认出网的隐私范围已由用户接受。 | `RET-12-01` |
 | `RET-R003` SQLite 新旧 schema 与派生索引不同步 | 高 | 已关闭 | 升级失败、stale FTS 行或向量孤儿会造成错误召回和难以恢复的索引状态。 | RET-02-01 已为富 IndexBlock 建立显式、可重试的结构列 migration，旧行以兼容默认值读取，失败注入会回滚富列且可在同一旧库重试；graph migration 也已独立事务化，避免后续 migration 失败留下无标记表。RET-02-02 已保持旧三字段与富字段同事务写入，并以 current-only、可重试回填补全哈希及可精确核验的 durable graph 结构；原始行的 legacy/rich 报告会拒绝静默覆盖不匹配或损坏投影。RET-02-03 已以 `OBSIDIAN_PLATFORM_RICH_BLOCK_READS` 保留 legacy 默认和显式 rich 切换；rich 模式遇到一致性问题会失败关闭，健康状态仅返回模式、状态和问题码。RET-03-03 已为块级规则元数据增加独立、可回滚的 migration，并将 document、block 与 metadata 写入保持在同一事务；filter_blocks 显式排除 stale、非 current、pending 与不允许路径。RET-04-01 已为 FTS5 与 map 完成可回滚 migration、eligible current 回填，以及 save、invalidate、rebuild 与失败回滚的同事务同步。RET-04-02 已以独立、可回滚内容回填 migration 将中英文词法文本同步到同一 FTS/map 生命周期；search_lexical 只读取 vault 内 current、verifiable、非 stale、非 pending 且由调用方允许的路径。RET-06-02 已为 embedding_cache 增加独立、可回滚 migration 与 float32 BLOB 校验；同一 profile locator 的多维度或损坏向量均失败关闭。RET-06-03 已以独立、可回滚的 current block vector migration 绑定完整 profile、块正文哈希、授权输入哈希和 float32 BLOB；文档保存、失效、回填、重建和关联状态转换均与向量删除和提交后矩阵 generation 失效同步。KNN、health 和写入均按 vault/current/可核验状态/profile/允许路径失败关闭，并拒绝损坏、零范数或输入哈希不匹配的向量。 | `RET-06-03` |
 | `RET-R004` 目录规则只覆盖示例命名 | 中 | 已关闭 | 真实资料无法解析册次和单元，枚举型检索会返回 recoverable 或错误 scope。 | RET-00-02 已收集不可逆脱敏真实结构样本；RET-03-02 已以同一 fixture 固定严格的路径/标题归一化，并对根级、仅资料信号和仅位置标题分别返回 unknown 或 recoverable，绝不伪造 scope。RET-05-01 已让 QueryUnderstanding 直接消费同一合同，并将不完整或冲突范围保持为 recoverable，避免查询侧猜测。RET-05-02 已提供可编辑范围预览，显示文件、块、资料类型和缺口；用户确认的规范化范围已随私有快照保存。RET-05-03 已在范围快照完整时以 BlockFilter 全量枚举，不受点查 top-k 影响，并把标题规则分类与超预算项作为持久化的覆盖信息和明确缺口；仍须在更多已审阅、不可逆脱敏样本上扩展规则。 | `RET-05-03` |
-| `RET-R005` 固定阈值导致误去重或漏召回 | 中 | 开放 | 0.92 相似度、top-k、RRF 参数和批预算若未经评测会直接固化样本偏差。 | RET-00-03 已建立脱敏合成 golden set，RET-00-04 已记录当前手写检索、Windows FTS5/BM25 与 float32 KNN 的原始基线。用户确认 RET-04-02 的词法最低门槛为 macro recall 0.6569、macro precision 0.2813；实现结果为 0.6875、0.302083。RET-04-03 已在同一 fixture 完成版本化 A/B：相对旧手写评分，FTS macro recall +0.030555555555555558、macro precision +0.020833333333333315，passesGate=true；生产 source-lookup 已仅使用 FTS，关闭本机开关时失败关闭，不回退旧打分。RET-05-04 只会按 block_content_sha256 做精确自动合并；标题词归一仅产生候选簇，duplicate precision/recall 已进入 golden 评测，模型窗口与批次数必须由调用方显式传入。RET-06-04 增加版本化脱敏语义改写 fixture：RRF k=20、60、100 的 macro recall@8 均为 1.0，保留 k=60；该小样本不校准真实 vault 的 top-k、RRF 或向量候选参数。RET-07-02 增加脱敏 unit-card fixture，冻结最低 card coverage=1.0、original citation recall=1.0、card-on 相对 card-off macro recall@8 gain=0.5；实际结果为 1.0、1.0、0.5。RET-07-03 新增 top-20 到 top-8 的脱敏 rerank A/B：脚本化 adapter 的 macro recall@8 +1.0、precision@8 +0.25、MRR@8 +1.0，但真实 Provider 延迟和费用尚未测量，passesGate=false，生产开关保持关闭。RET-09-01 将真实 Provider 测量限制为内容哈希校验通过的 synthetic-deidentified fixture，强制完整候选响应并只记录不含正文的质量与端到端延迟。2026-07-27 使用独立 BAAI/bge-reranker-v2-m3 执行两条 fixture：macro recall@8 +1.0、precision@8 +0.25、MRR@8 +1.0；p50=1014.314 ms、p95=1699.467 ms；质量门槛通过。用户明确不做价格或费用预算，费用明确未计算；该小样本仍不足以启用默认 rerank。仍须扩展已审阅、不可逆脱敏真实样本并由人工复核后决定是否改变默认。 | `RET-09-01` |
+| `RET-R005` 固定阈值导致误去重或漏召回 | 中 | 已关闭 | 0.92 相似度、top-k、RRF 参数和批预算若未经评测会直接固化样本偏差。 | RET-00-03 已建立脱敏合成 golden set，RET-00-04 已记录当前手写检索、Windows FTS5/BM25 与 float32 KNN 的原始基线。用户确认 RET-04-02 的词法最低门槛为 macro recall 0.6569、macro precision 0.2813；实现结果为 0.6875、0.302083。RET-04-03 已在同一 fixture 完成版本化 A/B：相对旧手写评分，FTS macro recall +0.030555555555555558、macro precision +0.020833333333333315，passesGate=true；生产 source-lookup 已仅使用 FTS，关闭本机开关时失败关闭，不回退旧打分。RET-05-04 只会按 block_content_sha256 做精确自动合并；标题词归一仅产生候选簇，duplicate precision/recall 已进入 golden 评测，模型窗口与批次数必须由调用方显式传入。RET-06-04 增加版本化脱敏语义改写 fixture：RRF k=20、60、100 的 macro recall@8 均为 1.0，保留 k=60；该小样本不校准真实 vault 的 top-k、RRF 或向量候选参数。RET-07-02 增加脱敏 unit-card fixture，冻结最低 card coverage=1.0、original citation recall=1.0、card-on 相对 card-off macro recall@8 gain=0.5；实际结果为 1.0、1.0、0.5。RET-07-03 新增 top-20 到 top-8 的脱敏 rerank A/B：脚本化 adapter 的 macro recall@8 +1.0、precision@8 +0.25、MRR@8 +1.0，但真实 Provider 延迟和费用尚未测量，passesGate=false，生产开关保持关闭。RET-09-01 将真实 Provider 测量限制为内容哈希校验通过的 synthetic-deidentified fixture，强制完整候选响应并只记录不含正文的质量与端到端延迟。2026-07-27 使用独立 BAAI/bge-reranker-v2-m3 执行两条 fixture：macro recall@8 +1.0、precision@8 +0.25、MRR@8 +1.0；p50=1014.314 ms、p95=1699.467 ms；质量门槛通过。用户明确不做价格或费用预算，费用明确未计算；该小样本仍不足以启用默认 rerank。仍须扩展已审阅、不可逆脱敏真实样本并由人工复核后决定是否改变默认。 | `RET-09-01` |
 | `RET-R006` 同名 Embedding 模型错误复用缓存 | 中 | 开放 | 不同 Provider endpoint 或配置 revision 产生的不可比较向量可能被混用。 | RET-06-02 已实现 embedding_profile_fingerprint，固定绑定 provider ID、规范 endpoint、Provider.updated_at 配置 revision、model ID 和返回维度。缓存查询先以 locator 查找，再验证最终 profile 指纹；endpoint、revision、model 或 dimension 任一变化均不复用，且同一 locator 出现多维度时失败关闭。 | `RET-06-02` |
 | `RET-R007` 向量常驻缓存失效不完整 | 中 | 已关闭 | 索引更新、模型切换或 policy revision 后仍可能搜索旧矩阵。 | RET-06-03 已按 vault/profile 维护本地 float32 矩阵与 vault generation；save_document、save_committed_unit、invalidate_current_path、backfill_current_blocks、pending association 解析和 save_block_vectors 仅在 SQLite 提交成功后递增 generation 并清除受影响矩阵。profile fingerprint 是缓存键的一部分，模型或 Provider 配置变化会加载独立矩阵；定向测试覆盖保存、失效、重建等价路径、新 profile、当前状态和跨 vault 隔离。 | `RET-06-03` |
 | `RET-R008` LLM 元数据候选被错误采纳或驱动不可逆动作 | 高 | 开放 | 不可靠或恶意的 Provider 输出可能给索引块附加错误概念，进而误导后续知识卡片或人工决策。 | RET-07-01 已将模型输出限制为经过领域校验的 knowledge_kind 与 concept_key 候选，绑定 vault、块内容哈希、Provider/model 和置信度；低置信度或新概念一律标记为 required-check。候选不会自动合并、写回原文或改变范围、当前检索排序；只有带原因的本地人工接受决定才能改变审核状态。RET-07-02 只消费 accepted 且仍与当前块哈希匹配的候选；卡片 Provider 输出必须是 JSON，且只可完整复述已接受的 knowledge_kind/concept_key。源块、scope、审核决定或 Provider/profile 变化会使卡片失效；检索只将卡片命中展开为原始块证据，不把卡片正文作为 evidence。人工审核质量仍需持续监测。 | `RET-07-02` |
@@ -285,8 +320,13 @@
 | `RET-R024` 任务详情正文展示扩大本地浏览器可见范围 | 中 | 已关闭 | 将解析正文返回到任务详情可能意外泄漏绝对路径、哈希、转换工件或解析器内部原始输出，也可能把尚未选择的资料项内容混入当前任务。 | RET-24-02 仅从当前任务已选 DocumentGraph 的 retrieval_projection 或兼容 ParseEvidence.units 构造显示合同，按 item_id 归属并过滤为块类型、用户可理解定位和文本；不返回 raw extraction、artifact、bbox、哈希、内部 block ID 或绝对路径。接口继续要求本机会话；服务定向回归、前端单测/lint/build 和独立端口浏览器回归均通过，并断言敏感字段缺失。 | `RET-24-02` |
 | `RET-R025` 全局 UI 重构降低高频操作可发现性或引入动效性能回归 | 中 | 开放 | 重排导航、收敛说明和迁移移动端层级可能让用户找不到既有操作；不受约束的动画或组件重挂载也可能造成闪白、滚动位置丢失、掉帧或无障碍退化。 | RET-25-01 保留五个入口和全部现有业务能力，只重构呈现层；主要操作保持文字标签，工具图标带 aria-label 和 Tooltip；刷新保留旧内容与位置；动画限定 transform/opacity 并支持 prefers-reduced-motion。2026-08-11 会话首次进入已改为直接定位最新消息，不继承默认平滑下滚，问答定位保留用户触发的平滑滚动。以桌面、紧凑桌面、390px、键盘和关键点击流程的 Playwright 回归及截图复核作为验收闸门。 | `RET-25-01` |
 | `RET-R026` 可读导入文件名发生同名覆盖或目录页重复索引 | 中 | 已关闭 | 移除内部 ID 与哈希后，同名不同内容可能覆盖既有原件或笔记；目录页若被当作正文索引，会形成重复检索结果。 | RET-26-01 已在派生前检查 managed sources 目录：同内容复用已有名称，不同内容使用常规‘（2）’后缀。目录页改为‘文件名 - 目录.md’，索引层同时识别该格式与遗留 index.md。自动导入、同名、中文命名、标签和索引定向回归共 59 项通过。 | `RET-26-01` |
-| `RET-R027` 在线解析外发扩大原件与文件名暴露范围 | 高 | 开放 | 在线 OCR 需要将任务原件和文件名上传至 PaddleOCR 官方云 API 或 MinerU；若没有逐任务选择、策略门禁或稳定的失败语义，可能在用户未知或配置变化后扩大外发范围。 | RET-27-01 以创建任务时默认关闭的显式 Switch 冻结 Provider、模型和策略版本；提交前重验 Vault outbound policy、已验证 Provider 和凭据，不满足即零上传。仅 PDF 在用户选择后外发；不保存 token、绝对路径、签名 URL、远端 job ID 或原始响应到 UI；失败不静默回退，取消仅停止本机等待。用户已于 2026-08-11 明确确认该任务级外发范围，并明确限制为 PDF。 | `RET-27-01` |
+| `RET-R027` PDF 在线 OCR 与 AI 结构化扩大外发范围 | 高 | 开放 | 在线 OCR 需要将任务原件和文件名上传至 PaddleOCR 官方云 API 或 MinerU；统一 PDF AI 结构化后，本机或在线 OCR 的派生 Markdown 也可能发送到既有 Markdown Provider。若没有任务级选择、策略门禁、历史兼容或稳定失败语义，可能在用户未知或重试时扩大外发范围。 | RET-27-01 将在线 OCR 选择与 PDF Markdown 模式分别冻结：在线 OCR 仅在用户打开开关、选择已验证 Provider 且原件上传策略允许时上传 PDF；AI 结构化仅在 Markdown outbound policy 允许时发送选定 DocumentGraph 的派生 Markdown；本地结构化零 Provider 调用。历史任务缺少模式字段时按原有行为推断，失败不静默回退。仅 PDF 受此模式影响；不保存 token、绝对路径、签名 URL、远端 job ID、原始 HTTP 响应或完整 Provider 日志。用户已于 2026-08-17 明确确认本机 OCR + AI 结构化的 Markdown 外发范围与四种 OCR/结构化组合。 | `RET-27-01` |
 | `RET-R028` 双语标题误判来源链接失效 | 高 | 已关闭 | 来源文件与哈希均未变化的派生笔记会因一级标题后的英文副标题而被标记 source-link-broken，导致 CME 索引错误 stale 并从检索范围排除。 | RET-28-01 已将来源链接核验改为允许一级标题后的单行副标题，再接受精确来源链接；既有 source-link-broken 文档会在下一次 reconcile 自动重新核验。回归覆盖中文标题、英文副标题、有效来源链接、恢复路径，并确认正文内容之后的链接仍会被拒绝。 | `RET-28-01` |
+| `RET-R029` 退役知识图谱与治理代码误伤导入结构投影或检索标签 | 高 | 已关闭 | 若将用户知识图谱与解析使用的 graph projection 混同，PDF/DOCX 索引重建和来源定位会失效；若同时删除 Markdown 原生 tags 或确定性块级元数据，BM25、图谱之外的标签词项和范围枚举会退化。 | RET-30-01 已将删除边界限定为用户知识图谱、候选链接、私有标签提案、LLM 元数据候选和单元卡片；明确保留 DocumentGraph、graph_projection、Markdown 原生 tags、FTS tag_text 与 subject/grade_volume/unit_no/material_type。新库不创建退役治理表，旧库历史表和行保持不变且运行时不读写。完整 unit 651 passed/2 skipped，结构投影与索引重建 20 passed，确定性元数据与 FTS 20 passed，导入索引 68 passed，integration 13 passed/2 skipped，受影响浏览器场景 3 passed。 | `RET-30-01` |
+| `RET-R030` 本地 OCR 归一化误删正文或让历史重试产生不同 Markdown | 高 | 开放 | 过度使用版面或文本启发式可能把正文误判为页眉页脚、错误合并跨列内容，或在规则升级后使历史任务重试产生不可核验的不同派生 Markdown。 | RET-31-01 已只在确定性高的几何和跨页重复条件下变换；不确定结构保留原始内容并记录稳定问题。每个归一化块保留全部原始 block ID、locator 与 evidence ref；任务持久化规则版本，历史任务默认使用旧版本。脱敏 JSON golden fixture 已覆盖页眉 OCR 顺序先于标题、跨块段落、列表、图注关联和 1.1/1.1.1 二级三级标题。local-v2 仅对新任务启用跨页相同内容的同位置检测，且有不同位置同文本保留回归；转换、任务、导入、API 与 provisioning 定向回归共 102 项通过。仍需更多已审阅、不可逆脱敏教材样本量化误删率和标题准确率。 | `RET-31-01` |
+| `RET-R031` Provider 模型验证失败被静默隐藏 | 中 | 已关闭 | 用户无法区分地址、网络、TLS、超时、权限或 Provider 响应问题，失败模型还会从设置页消失，导致无法在原上下文中修复或重试。 | RET-32-01 仅保留 ProviderClientError 已归一化的 HTTP 与网络类别，不返回密钥、正文、完整地址、响应体或堆栈；设置页读取 FastAPI detail.message，并持续显示已配置模型的失败状态、中文原因和重试入口。application、API、前端和独立端口浏览器回归均通过。 | `RET-32-01` |
+| `RET-R032` Responses Provider 被误用为 Chat Completions 协议 | 中 | 已关闭 | 仅支持 /responses 的 Provider 可能收到 /chat/completions 请求，导致网关 502、HTML/非 SSE 响应或模型验证失败；反向切换也可能让既有 Provider 失效。 | RET-33-01 为 Provider 持久化显式 api_mode，旧库默认 chat-completions。Responses 模式的 chat/markdown 验证与生成只使用 /responses、instructions、input、stream 和 max_output_tokens，并仅接受 response.output_text.delta 与一致的 response.completed usage；无有效文本失败关闭。Embedding、Rerank、模型发现和健康检查不受此模式影响；设置页持续显示当前模式，用户必须显式编辑 Provider 才会切换。 | `RET-33-01` |
+| `RET-R033` 原生 Obsidian 图片资源丢失或误发到 Embedding Provider | 高 | 开放 | Markdown 导入若只保存文本会使本地图片引用失效；若将图片链接、路径或二进制误纳入 embedding，会造成不完整检索、无意义向量和超出用户预期的出网范围。 | RET-34-01 将本地图片引用解析、内容哈希资产提交和 Markdown 重写放入同一可回滚导入单元；远程、越界、缺失和符号链接引用失败关闭；Embedding 只消费去除图片引用的文本块；删除任务按共享引用保护资产。 | `RET-34-01` |
 
 ## 技术债
 
@@ -294,13 +334,13 @@
 
 ## 最近日志
 
-- 2026-08-12 `RET-29-01`：完成当前页导入任务多选删除。结果：当前 Vault 的导入任务列表现支持逐项选择、全选当前页中的非运行任务和删除所选。删除确认明确说明影响范围，并逐项复用既有单任务删除请求，因此仍受 Vault 提交文件 SHA-256 校验、受限回退和索引清理保护。成功项立即移出列表；失败项保留选中状态并显示任务名和错误。切换页大小、页码或 Vault 会清空选择，不会形成跨页删除范围。RET-R019 的安全删除风险保持已关闭；本步未新增技术债。 下一步：如需跨页选择、服务端批量事务或撤销删除，应先建立并发、原子性和恢复语义的独立任务。
-- 2026-08-12 `RET-18-02`：完成任务删除全链路清理。结果：从任务列表删除已提交任务时，服务先校验提交哈希并恢复或删除该任务拥有的 Vault 原始资料、派生笔记和附件；随后物理清理索引文档、块、FTS、向量、无引用 Embedding 缓存、元数据候选、依赖单元卡、索引任务路径和无引用 graph projection。任务、来源身份和解析证据只在没有其他任务引用时删除；共享来源会保留并转交存活任务。 下一步：重启本机工作台后，任务列表中的新删除操作会使用全链路清理。
-- 2026-08-12 `RET-28-01`：完成双语标题来源链接核验修复。结果：来源链接校验器不再把中英文两行标题中的英文副标题误认为正文。它允许一级标题后的单行副标题，再核验精确来源链接；来源链接缺失或仅位于后续正文时仍保持 source-link-broken。既有同原因 stale 文档会在下一次 reconcile 自动重新核验，因此 CME 的两份笔记无需变更哈希或来源路径即可恢复可核验状态。 下一步：在受影响 Vault 的下一次 reconcile 或重建中重新核验既有派生笔记；不需要修改笔记的来源链接、哈希或路径。
-- 2026-08-12 `RET-28-01`：开始修复双语标题来源链接误判。结果：用户确认：CME 索引 stale 的直接原因是来源链接校验器把英文副标题当作一级标题后的唯一允许内容，提前标记 source-link-broken；本步只修复顶部来源链接核验并保留正文链接不作为来源凭据的边界。 下一步：先加入双语标题失败回归，再完成最小核验修复并运行定向验证。
-- 2026-08-11 `RET-27-01`：开始设计任务级在线 OCR Provider。结果：用户明确确认：仅在创建导入任务时打开在线解析开关后，可将该任务原始 PDF/DOCX 与文件名上传至所选 PaddleOCR 官方云 API 或 MinerU。默认关闭；Provider 失败不静默回退；取消仅停止本机等待。已基于官方 API 文档冻结 PaddleOCR-VL 1.6 的异步文档解析与 MinerU v4 本地上传、批次轮询方案。 下一步：先以 fake SDK/HTTP 响应建立 PaddleOCR 与 MinerU Provider 合同测试，再接入任务状态、出网门禁、设置和任务创建界面。
-- 2026-08-11 `RET-27-01`：收窄在线解析文件范围。结果：用户明确将在线解析限制为 PDF；DOCX、Markdown 和其他格式不显示在线解析选择且始终使用现有本地路径。 下一步：在 PDF 转换分支接入在线 Provider，并为非 PDF 的零外发路径增加回归。
-- 2026-08-11 `RET-25-01`：完成会话首次进入的即时最新消息定位。结果：会话正文容器不再继承默认 scroll-behavior: smooth，因此首次进入时既有的底部定位直接完成，不再从首条消息动画下滚；问答定位按钮继续通过显式 smooth 行为平滑定位。 下一步：继续收敛 RET-25-01 的其他 UI 变更后，修复并重跑完整浏览器回归；本任务仍保持进行中。
-- 2026-08-11 `RET-25-01`：开始修复会话首次进入的下滚动画。结果：用户确认会话首次进入应直接展示最新消息，不从首条消息平滑下滚；本步仅移除会话正文容器的默认平滑滚动，保留问答定位按钮显式触发的平滑定位。 下一步：运行前端单测、lint、构建和独立端口浏览器回归，确认首次定位即时完成且问答定位仍可用。
-- 2026-08-11 `RET-25-01`：开始 iOS 设计语言统一前端 UI 重构。结果：用户已确认借用 Apple 原生设计语言而不模拟放大 iPhone，覆盖工作台、资料、会话、任务和设置五个入口；保持桌面三栏、移动端逐层操作、浅色主题、蓝色交互色和极限顺滑但可减少动态的连续反馈。DESIGN.md 已成为生产 UI 的强制规范。 下一步：先建立共享 tokens、图标、控件和全局应用外壳，再迁移工作台与会话页并进行桌面和移动端截图检查。
-- 2026-08-11 `RET-26-01`：开始解析产物可读命名与同名保护。结果：用户确认新导入的解析产物应以导入文件名表达语义，不再暴露成组的内部 ID、哈希和章节序号。实施范围为新导入路径、同名保护及目录页索引排除；历史 Vault 不迁移。 下一步：完成完整服务端回归、进度构建和差异检查后记录实际结果。
+- 2026-08-20 `RET-34-01`：开始原生 Obsidian 图片资源保留与 Embedding 排除。结果：用户确认：解析和入库 Obsidian 时保留本地图片资源，Embedding 不处理图片。本步冻结为原生 Markdown 本地图片引用的安全解析、资产入库、引用重写、共享删除保护和 embedding 排除；远程图片、历史批量迁移和图像理解不纳入。 下一步：先补充图片资源与 embedding 排除失败回归，再实现最小导入链路。
+- 2026-08-19 `RET-31-01`：忽略跨页同位置的重复 OCR 内容。结果：新增 local-v2。新 PDF 任务默认冻结 v2：跨至少两页出现、文本相同且 bbox 相对或绝对位置及尺寸接近的内容，标记为不可渲染 noise，可覆盖页眉、页脚和页面中部的重复广告。不同页面位置的同文内容保留，避免把重复正文静默删除。legacy-v0 与已冻结的 local-v1 行为不变。 下一步：以更多已审阅、不可逆脱敏 PDF 检验不同纸张尺寸、双栏与重复练习内容；任何阈值调整以新的冻结 profile 发布。
+- 2026-08-17 `RET-33-01`：完成 Provider Responses API 模式。结果：Provider 现可在设置页显式选择 Chat Completions 或 Responses API；旧 SQLite 记录自动迁移为 Chat Completions。Responses 模式的 chat/markdown 验证与生成调用 /responses，发送 instructions、input、stream 与 max_output_tokens，只消费 response.output_text.delta 的最终文本和 response.completed 的一致 usage。模型发现、健康检查、Embedding、Rerank、凭据与 Vault 出网策略未改变；不自动切换任何已有 Provider。真实工作台页面确认选项和桌面布局可用；未发起真实 Provider 请求，未新增技术债。 下一步：用户可编辑“极速按量”，将 API 模式切换为 Responses API 后重新测试模型；若仍收到服务商 502，则继续按 API Key 或上游模型权限处理。
+- 2026-08-17 `RET-27-01`：确认 PDF OCR 后 Markdown 双管线开发方案。结果：用户确认所有 PDF 均可独立组合本机或在线 OCR 与 AI 结构化或本地结构化。AI 模式将选定 DocumentGraph 的 Markdown 发送到既有 Markdown Provider，本地模式使用确定性渲染且零 Provider 调用；PDF 原件上传仍只由在线解析开关控制。两类外发均使用既有 Vault outbound policy，失败不自动回退。模式按任务冻结，新任务默认 AI；历史任务按既有在线 OCR 选择推断模式以避免重试扩大外发。非 PDF 保持原处理；本步仅提供手动任务对照，不新增自动双跑、差异或评分。 下一步：实施任务级 PDF Markdown 模式合同、四种 OCR/结构化执行分支、API 与前端分段控件；完成定向服务端、前端和浏览器验证后记录真实结果。
+- 2026-08-17 `RET-31-01`：开始 OCR 后本地 Markdown 图结构归一化。结果：用户确认以 DocumentGraph 为本地结构化规范输入，原始 PaddleOCR 页面 JSON 保持在 adapter 与私有证据层。范围限定为零出网的确定性归一化：标题、阅读顺序、列表、图注、段落断行、可确认的重复页边噪音与异常 bbox，并要求变换后的图块可回链全部原始定位与证据。历史任务不得因规则升级自动改变。 下一步：实现版本化归一化器与最小持久化合同，补齐脱敏 golden fixtures 后运行定向回归、进度检查和差异检查。
+- 2026-08-17 `RET-31-01`：完成 OCR 后本地 Markdown 图结构归一化。结果：PDF 的本地 Markdown 结构化现以初步 DocumentGraph 为唯一规范输入，原始 PaddleOCR 页面 JSON 仍留在转换 adapter 与私有证据层。local-v1 以零出网确定性规则保守提升首页标题、合并 CJK 断行和同列连续段落、转换连续列表、关联图片图注、隐藏跨页重复页边文字，并为异常 bbox 保留正文和 warning。转换结果保留全部原始 block identity、locator 与 evidence；新 PDF 任务冻结 local-v1，缺失字段的历史任务继续使用 legacy-v0。未新增技术债；误删率和标题准确率仍由 RET-R030 跟踪。 下一步：以更多已审阅、不可逆脱敏教材页量化正文保留、标题准确率和误删率；如需扩展规则，新增版本而非改写既有任务的冻结 profile。
+- 2026-08-17 `RET-32-01`：完成 Provider 模型验证失败反馈。结果：模型探测现保留适配器已归一化的 HTTP、超时、DNS、连接拒绝和 TLS 原因；意外异常仍保持通用失败。设置页正确读取 FastAPI detail.message，失败模型不会从原位置消失，并显示中文原因、验证中状态和重试入口。未记录或暴露 Provider 凭据、请求正文、完整地址、响应体或异常堆栈。 下一步：如需保留跨重启的 Provider 请求诊断或用量历史，先定义最小脱敏字段、保留期与用户可见的隐私边界。
+- 2026-08-17 `RET-31-01`：修复 OCR 后二级与三级标题无法识别。结果：补充 local-v1 的显式标题识别：普通 OCR text 块中的 1.1、1.1.1 和全角编号按编号深度转换为 H2/H3，已有标题块按编号修正层级，Markdown 标题前缀和第...节/条/款也可映射；单行有序列表不被误判。 下一步：继续以更多已审阅、不可逆脱敏教材样本验证无编号语义标题；无法从 OCR 标签或版面确定的标题保持正文，不用启发式强行升级。
+- 2026-08-13 `RET-30-01`：完成无效治理与用户知识图谱退役。结果：已删除私有标签治理、LLM 元数据候选、单元卡片、候选链接和用户知识图谱的生产 UI/API/运行时/领域/端口/仓储链路；新库不创建退役表，旧库历史表和行保持不变且运行时不读写。保留 DocumentGraph、graph projection、Markdown 原生 tags、FTS tag_text、确定性范围元数据、导入、Embedding 和普通检索。 下一步：若重新引入治理能力，另立任务并先定义唯一耐久身份、可回滚写入和真实数据质量门槛。
+- 2026-08-12 `RET-30-01`：开始退役无效治理与用户知识图谱。结果：用户确认直接删除私有标签治理、LLM 元数据候选、单元卡片和知识图谱。执行边界明确保留 PDF/DOCX 解析依赖的 DocumentGraph 与 graph projection、Markdown 原生 tags、FTS tag_text 和确定性范围元数据；旧 SQLite 历史表不做破坏性迁移，只停止生产运行时读写。 下一步：删除生产入口与运行时依赖后，重点回归导入结构投影、Markdown 标签检索、范围过滤和普通会话检索。

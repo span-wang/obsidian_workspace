@@ -1,6 +1,6 @@
 {
   "initiativeId": "RET",
-  "updatedOn": "2026-08-12",
+  "updatedOn": "2026-08-17",
   "tasks": [
     {
       "id": "RET-00-01",
@@ -2656,9 +2656,9 @@
       "id": "RET-27-01",
       "phaseId": "RET-27",
       "order": 1,
-      "title": "任务级在线 OCR Provider 与显式授权",
+      "title": "任务级在线 OCR 与 PDF Markdown 双管线",
       "priority": "P0",
-      "status": "进行中",
+      "status": "已完成",
       "dependsOn": [
         "RET-24-01",
         "RET-25-01"
@@ -2667,36 +2667,40 @@
         "inScope": [
           "定义 PaddleOCR 官方 API 与 MinerU 官方 API 的在线文档解析 Provider 合同，接入受控凭据、连接测试、提交、轮询和结果归一化。",
           "将在线解析选择冻结到导入任务，并在 Vault outbound policy、Provider 验证与凭据可用性通过后才上传 PDF 原件与文件名。",
-          "在创建导入任务界面增加默认关闭的在线解析 Switch 和已验证 Provider 选择；任务详情仅展示安全的 Provider 与状态摘要。",
-          "持久化远端作业身份以支持重启后继续轮询；覆盖失败、取消、策略拒绝及不静默回退。"
+          "为所有 PDF 冻结独立的 Markdown 结构化模式：AI 结构化将本机或在线 OCR 生成的 DocumentGraph Markdown 发送到既有 Markdown Provider，本地结构化始终确定性渲染且不调用 Provider。",
+          "在创建导入任务界面保留独立的在线解析 Switch 和已验证 Provider 选择，并增加 PDF Markdown 结构化分段控件及本地持久化；任务详情仅展示安全的 OCR Provider、状态和冻结的结构化模式。",
+          "在 Markdown Provider 调用前统一执行 Vault outbound policy；本机 OCR + AI 模式只外发派生 Markdown，在线 OCR + AI 模式同时校验原件上传与 Markdown 外发。",
+          "持久化远端作业身份以支持重启后继续轮询；兼容没有模式字段的历史任务；覆盖失败、取消、策略拒绝及不静默回退。"
         ],
         "outOfScope": [
           "不将 DOCX、原生 Markdown、其他文件类型、Vault 全量内容或已提交历史资料发送到在线 Provider。",
           "不暴露 Provider token、绝对路径、远端 job ID、签名 URL、原始 HTTP 响应或完整 Provider 日志。",
           "不把在线 Provider 失败自动改为本地或另一在线 Provider；不承诺取消已在云端提交的作业。",
+          "不自动双跑两条 Markdown 管线、不提供并排 diff、质量评分或成本统计。",
           "不修改公开网络入口、Cloudflare Tunnel、安全会话边界或检索排序。"
         ],
         "followup": [
           "需要在线 Provider 的费用预算、配额告警或用量结算时，另立费用与配额治理任务。",
+          "需要自动双跑、并排差异、结构保真评分或脱敏 A/B 质量报告时，另立 PDF 结构化评测任务。",
           "需要其他云端 OCR Provider、图片/演示文稿/表格支持或远端作业取消时，另立兼容性与隐私审查任务。"
         ],
         "verification": [
-          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_online_document_parser.py tests/unit/test_import_service.py tests/unit/test_import_api.py",
-          "uv run --directory apps/service ruff check domain application adapters api tests/unit",
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_online_document_parser.py tests/unit/test_document_conversion_v2.py tests/unit/test_import_service.py tests/unit/test_import_api.py tests/unit/test_import_tasks.py",
+          "uv run --directory apps/service ruff check domain/online_document_parser.py domain/tasks.py application/online_parse_providers.py application/ingest.py api/main.py tests/unit/test_online_document_parser.py tests/unit/test_document_conversion_v2.py tests/unit/test_import_api.py",
           "npm --prefix apps/web run test && npm --prefix apps/web run lint && npm --prefix apps/web run build",
           "以独立端口运行 npm run browser-test",
-          "Playwright CLI 检查 1440x900、1024x768、390x844 的在线解析开关、Provider 选择与错误恢复",
+          "Playwright CLI 检查 1440x900、1024x768、390x844 的在线解析开关、Provider 选择、PDF 结构化分段控件、任务详情模式与错误恢复",
           "npm run progress:build && npm run progress:check",
           "git diff --check"
         ]
       },
       "deliverables": [
         "PaddleOCR-VL 1.6 与 MinerU 官方在线解析 Provider",
-        "任务级显式在线解析选择、出网门禁和可恢复轮询",
-        "设置页 Provider 配置与导入任务在线解析开关",
+        "任务级在线 OCR 选择、PDF Markdown 模式冻结、出网门禁和可恢复轮询",
+        "设置页 Provider 配置与导入任务在线解析 / PDF 结构化控件",
         "服务、前端与浏览器回归证据"
       ],
-      "acceptance": "用户只有在创建 PDF 导入任务时显式打开在线解析且选择已验证 Provider 后，原件与文件名才会发送到 PaddleOCR 官方 API 或 MinerU；其他格式始终本地解析。默认和策略拒绝时零上传。任务可显示安全状态、可在服务重启后继续轮询，Provider 失败不会静默回退；两个 Provider 的连接测试、服务测试、前端测试和关键浏览器流程通过。",
+      "acceptance": "所有 PDF 任务均冻结 AI 结构化或本地结构化模式，且可独立组合本机或在线 OCR。AI 模式仅在 Markdown outbound policy 允许时将选定 DocumentGraph 的 Markdown 发送给既有 Provider；本地模式零 Markdown Provider 调用；任何 Provider 或策略失败均不静默回退。用户只有在显式打开在线解析并选择已验证 Provider 后，原件与文件名才会发送到 PaddleOCR 官方 API 或 MinerU；其他格式保持既有处理。历史任务兼容原有外发行为，任务详情仅展示安全的模式、Provider 与状态；两个 Provider 的连接测试、服务测试、前端测试和关键浏览器流程通过。",
       "verification": []
     },
     {
@@ -2794,6 +2798,260 @@
         "npm run progress:build && npm run progress:check（通过）",
         "git diff --check（通过；仅既有 Windows 行尾提示）"
       ]
+    },
+    {
+      "id": "RET-30-01",
+      "phaseId": "RET-30",
+      "order": 1,
+      "title": "删除无效标签元数据治理与用户知识图谱",
+      "priority": "P0",
+      "status": "已完成",
+      "dependsOn": [
+        "RET-18-01",
+        "RET-25-01"
+      ],
+      "executionBoundary": {
+        "inScope": [
+          "删除导入任务私有标签提案、Vault 私有标签目录、LLM 元数据抽取与候选审核、单元卡片生成与可选检索的生产 UI、API、运行时服务和自动生成入口。",
+          "删除用户知识图谱、候选链接治理、图谱筛选与相关生产 UI、API、领域和应用代码。",
+          "清理任务摘要、Provider 失效、会话检索、端口、仓储和测试中的相关依赖；新库不再创建对应治理表，旧库历史表和行保持原样且运行时不再读取或写入。",
+          "同步更新进度任务、风险和日志，并运行导入、索引、检索、Provider、前端和 loopback 回归。"
+        ],
+        "outOfScope": [
+          "不删除 DocumentGraph、graph_projection、graph_projection_blocks 或解析定位信息；这些仍用于 PDF/DOCX 结构化、索引重建和来源溯源。",
+          "不删除 Markdown 原生 tags 的读取、FTS tag_text、查询词典或其他索引能力。",
+          "不删除 subject、grade_volume、unit_no、material_type 等确定性块级范围元数据或 SQL 范围过滤。",
+          "不物理删除旧 SQLite 表或历史治理数据，不修改 Vault Markdown，不进行破坏性数据迁移。"
+        ],
+        "followup": [
+          "若未来重新引入标签或概念治理，必须先定义唯一耐久身份、明确生效目标、可回滚写入和真实数据质量门槛，不复用本次退役的并行模型。",
+          "若需要面向用户的资料浏览能力，应基于文件与索引状态另立任务，不恢复知识图谱或候选链接作为默认入口。"
+        ],
+        "verification": [
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit",
+          "uv run --directory apps/service ruff check .",
+          "npm --prefix apps/web run test && npm --prefix apps/web run lint && npm --prefix apps/web run build",
+          "以独立端口运行 npm run integration 和 npm run browser-test",
+          "npm run progress:build && npm run progress:check",
+          "git diff --check"
+        ]
+      },
+      "deliverables": [
+        "退役标签治理、LLM 元数据候选和单元卡片的生产链路",
+        "退役用户知识图谱与候选链接治理的生产链路",
+        "保留结构投影、Markdown 原生标签和确定性范围过滤的回归证据"
+      ],
+      "acceptance": "生产 UI 和公开路由不再出现标签治理、元数据审核、单元卡片或知识图谱；导入不再生成私有标签或候选链接，运行时不再构造 LLM 元数据和单元卡片服务；旧数据库可继续打开且历史表不被改写；DocumentGraph/graph projection、Markdown 原生标签、确定性范围元数据、导入、Embedding 和普通检索保持可用。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit -q（651 passed，2 skipped）",
+        "uv run --directory apps/service ruff check .（All checks passed）",
+        "npm --prefix apps/web run test（35 passed）、npm --prefix apps/web run lint（通过）、npm --prefix apps/web run build（通过）",
+        "OBSIDIAN_PLATFORM_TEST_PORT=6427 npm run integration（13 passed，2 skipped）",
+        "OBSIDIAN_PLATFORM_TEST_PORT=6429 npx playwright test --config browser-tests/playwright.config.mjs browser-tests/loopback.spec.mjs --grep \"without a user graph drawer|without a user graph|runs import tasks automatically|does not expose a manual commit request\"（3 passed）",
+        "完整 browser-test 24 场景为 13 passed、11 failed；其中本任务相关场景已改合同并通过，余下失败为既有工作台、设置、会话 UI 基线漂移，未纳入本任务",
+        "npm run progress:build && npm run progress:check（待本次进度同步后执行）",
+        "git diff --check（通过；仅既有 Windows 行尾提示）"
+      ]
+    },
+    {
+      "id": "RET-31-01",
+      "phaseId": "RET-31",
+      "order": 1,
+      "title": "OCR 后本地 Markdown 图结构归一化",
+      "priority": "P0",
+      "status": "已完成",
+      "dependsOn": [
+        "RET-22-01",
+        "RET-27-01"
+      ],
+      "executionBoundary": {
+        "inScope": [
+          "为本机 PaddleOCR-VL 页面 JSON 到 DocumentGraph 的转换增加纯本地、确定性、版本化的归一化规则；规范输入是带 provenance 的初步 DocumentGraph，不向 Markdown 层泄漏原始 OCR JSON。",
+          "保守修复可信标题、阅读顺序、连续列表、图注、断行段落、跨页重复页边噪音和异常 bbox；不能机械确认的内容保留原文并输出稳定问题，而非猜测或静默删除。",
+          "让合并、拆分或类型变更的输出块保留全部原始 block ID、locator 与 evidence ref，并将本地结构规则版本冻结到 PDF 导入任务；历史任务保持旧规则，除非显式重处理。",
+          "以现有 PaddleOCR 页面 fixture 为基线，补充脱敏 JSON golden fixtures 和 Markdown/Graph 断言，覆盖标题误标、列表、图注、页眉页脚、异常坐标、表格、公式与缺失图片 artifact。"
+        ],
+        "outOfScope": [
+          "不修改 PaddleOCR-VL 模型、在线 OCR Provider、PDF 原件上传、Vault outbound policy、Markdown Provider 或公开网络边界。",
+          "不使用 LLM 重写、总结、补全 OCR 正文或推断无法由图块和版面规则验证的章节语义。",
+          "不批量重处理或改写已提交 Vault Markdown，不修改 DOCX、原生 Markdown、检索排序或前端 UI。"
+        ],
+        "followup": [
+          "需要以更多真实脱敏教材页量化结构保真率、标题准确率或与 AI 结构化对照时，另立版本化质量评测任务。",
+          "需要用户查看原始页面图像、bbox 覆盖层或逐块人工修复时，另立受控媒体读取与编辑合同任务。"
+        ],
+        "verification": [
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_document_conversion_v2.py",
+          "uv run --directory apps/service ruff check domain/evidence.py domain/derived_notes.py workers/converters/launcher.py tests/unit/test_document_conversion_v2.py",
+          "npm run progress:build && npm run progress:check",
+          "git diff --check"
+        ]
+      },
+      "deliverables": [
+        "版本化、零出网的 OCR 图结构归一化器与不可变 provenance 合同",
+        "标题、列表、图注、阅读顺序、页边噪音和异常 bbox 的保守确定性规则",
+        "脱敏 PaddleOCR-VL JSON golden fixtures 及 Graph/Markdown 保真回归"
+      ],
+      "acceptance": "本机 PDF 的 local 模式仅消费有 provenance 的 DocumentGraph 并保持零 Markdown Provider 调用；可信标题、列表、图注和可验证表格/公式/图片能以 Markdown 结构表达，跨页重复页边噪音不进入正文，异常或无法确认的结构不静默丢失。每个归一化图块可回链全部原始 block identity、locator 与 evidence，任务冻结规则版本，历史任务不会因代码升级自动改变。定向 golden 回归、Ruff、进度检查和差异检查通过。",
+      "verification": [
+        "OCR 图结构、二级/三级编号标题、跨页同位置重复内容、任务 profile 持久化、导入/API 与转换器 provisioning 定向回归（102 passed）",
+        "受影响应用、领域、适配器、转换器与测试 Ruff（All checks passed）",
+        "uv run --directory apps/service python -m compileall -q application adapters api domain ports workers（通过）",
+        "OBSIDIAN_PLATFORM_TEST_PORT=6443 npm run integration（13 passed，2 skipped）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过；仅既有 Windows 行尾提示）"
+      ]
+    },
+    {
+      "id": "RET-32-01",
+      "phaseId": "RET-32",
+      "order": 1,
+      "title": "模型验证失败原因与状态反馈",
+      "priority": "P0",
+      "status": "已完成",
+      "dependsOn": [
+        "RET-25-01"
+      ],
+      "executionBoundary": {
+        "inScope": [
+          "保留模型探测中已脱敏的 ProviderClientError 原因，区分 HTTP、超时、DNS、连接拒绝与 TLS 等可恢复失败。",
+          "让设置页正确读取本机 API 错误，并持续显示已配置模型的验证中、成功或失败状态、原因与重试操作。",
+          "补充 application、前端和浏览器回归，覆盖 Provider 不可达时无外部成功响应的可操作反馈。"
+        ],
+        "outOfScope": [
+          "不修改 Provider endpoint、模型请求格式、凭据存储、外发授权、SQLite schema 或默认模型选择语义。",
+          "不记录或返回 Provider 密钥、请求正文、完整 URL、绝对路径、原始 HTTP 响应或异常堆栈。",
+          "不重新发起真实 Provider 请求，验证仅使用 fake client 和浏览器路由。"
+        ],
+        "followup": [
+          "如需跨重启的 Provider 诊断历史、请求追踪或用量统计，另立隐私审查与存储保留策略任务。"
+        ],
+        "verification": [
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_providers.py tests/unit/test_vault_api.py",
+          "uv run --directory apps/service ruff check application/providers.py tests/unit/test_providers.py",
+          "npm --prefix apps/web run test && npm --prefix apps/web run lint && npm --prefix apps/web run build",
+          "以独立端口运行相关 Playwright Provider 设置场景",
+          "npm run progress:build && npm run progress:check",
+          "git diff --check"
+        ]
+      },
+      "deliverables": [
+        "安全的模型验证失败原因合同",
+        "连续展示的模型失败状态、原因与重试入口",
+        "应用、前端和浏览器回归证据"
+      ],
+      "acceptance": "模型验证失败时，设置页保留对应模型和已选类型，展示中文的失败状态、已脱敏原因与可重试操作；本机 API 前置拒绝也展示具体可修复原因。成功和失败均有稳定状态，失败不会被误报为成功或静默隐藏。",
+      "verification": [
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_providers.py -q（24 passed）",
+        "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_vault_api.py -q（12 passed）",
+        "uv run --directory apps/service ruff check application/providers.py tests/unit/test_providers.py（All checks passed）",
+        "npm --prefix apps/web run test（38 passed）、lint 与 build（通过）",
+        "OBSIDIAN_PLATFORM_TEST_PORT=6445 npx playwright test --config browser-tests/playwright.config.mjs browser-tests/loopback.spec.mjs --grep \"configures independent chat and Rerank models\"（1 passed）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过；仅既有 Windows 行尾提示）"
+      ]
+    },
+    {
+      "id": "RET-33-01",
+      "phaseId": "RET-33",
+      "order": 1,
+      "title": "Provider Responses API 模式",
+      "priority": "P0",
+      "status": "已完成",
+      "dependsOn": [
+        "RET-32-01"
+      ],
+      "executionBoundary": {
+        "inScope": [
+          "为 Provider 增加可持久化的 API 模式，旧记录默认 Chat Completions，新记录可显式选择 Responses API。",
+          "为 Responses 模式实现 /responses 的 instructions、input、stream 与 max_output_tokens 请求合同，并解析 response.output_text.delta 和 response.completed usage。",
+          "让对话和 Markdown 模型的验证与生成按所选 API 模式执行；模型发现、健康检查、Embedding 和 Rerank 继续使用既有 OpenAI-compatible 路径。",
+          "在设置页提供可访问的 API 模式选择、当前模式展示以及 Provider、SQLite、API、前端和浏览器回归。"
+        ],
+        "outOfScope": [
+          "不改变 Provider 凭据存储、Vault outbound policy、默认出网规则、Embedding、Rerank 或模型发现协议。",
+          "不自动修改现有 Provider 的 API 模式，不发起真实 Provider 调用，不保存 Provider 响应正文、完整 URL、密钥或堆栈。",
+          "不支持非 OpenAI-compatible 的 Anthropic、Gemini 原生或其他专有 Provider 协议。"
+        ],
+        "followup": [
+          "如需按模型或 capability 而非 Provider 选择 API 模式，需另立迁移、默认模型与配置一致性任务。",
+          "如需支持 Responses 的工具调用、图像/文件输入、后台 response 或非流式兼容网关，需先定义独立的隐私与响应合同。"
+        ],
+        "verification": [
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_openai_compatible_provider.py tests/unit/test_providers.py tests/unit/test_sqlite_provider_repository_rerank.py",
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_vault_api.py",
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/integration/test_loopback_server.py",
+          "uv run --directory apps/service ruff check domain/providers.py ports/provider_client.py adapters/openai_compatible_provider.py adapters/sqlite_provider_repository.py application/providers.py api/main.py tests/unit/test_openai_compatible_provider.py tests/unit/test_providers.py tests/unit/test_sqlite_provider_repository_rerank.py tests/unit/test_vault_api.py",
+          "npm --prefix apps/web run test && npm --prefix apps/web run lint && npm --prefix apps/web run build",
+          "npx playwright test --config browser-tests/playwright.config.mjs --grep \"configures independent chat and Rerank models\"",
+          "Playwright CLI 在本机设置页检查 Responses API 选择项与桌面布局",
+          "npm run progress:build && npm run progress:check",
+          "git diff --check"
+        ]
+      },
+      "deliverables": [
+        "向后兼容的 Provider API 模式字段和 SQLite 迁移",
+        "Responses API 对话/Markdown 验证、流式文本和 usage 适配",
+        "设置页 API 模式选择与回归证据"
+      ],
+      "acceptance": "用户可在添加或编辑 Provider 时选择 Chat Completions 或 Responses API；旧 Provider 迁移后继续使用 Chat Completions。Responses Provider 的 chat/markdown 模型验证和生成只请求 /responses，并仅从流式 response.output_text.delta 读取最终文本、从 response.completed 读取一致的 usage；无有效文本或 usage 时失败关闭。Embedding、Rerank、模型发现、健康检查、凭据和出网边界保持既有行为。",
+      "verification": [
+        "Provider client、服务和 SQLite 迁移定向回归（74 passed）",
+        "Provider API 单测（12 passed）",
+        "Loopback integration（15 passed）",
+        "Provider 相关 Ruff（All checks passed）",
+        "前端单测（39 passed）、lint 与 build（通过）",
+        "独立 Provider 设置 Playwright 回归（1 passed）",
+        "Playwright CLI 真实工作台设置页检查（Responses API 选项可见；桌面截图 output/playwright/responses-api-mode.png）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过；仅既有 Windows 行尾提示）"
+      ]
+    },
+    {
+      "id": "RET-34-01",
+      "phaseId": "RET-34",
+      "order": 1,
+      "title": "原生 Obsidian 图片资源保留与 Embedding 排除",
+      "priority": "P0",
+      "status": "进行中",
+      "dependsOn": [
+        "RET-18-02",
+        "RET-26-01"
+      ],
+      "executionBoundary": {
+        "inScope": [
+          "解析原生 .md 中的本地 Obsidian ![[...]] 与 Markdown ![](...) 图片引用，并按 vault 相对路径安全解析。",
+          "将存在且未越界的本地图片以内容哈希去重写入 platform/assets/，同步重写 Markdown 引用并保持可读文件名。",
+          "图片缺失、越界、符号链接或读取失败时保持任务可恢复失败，不提交不完整 Markdown 或部分资产。",
+          "让图片引用和图片资源不进入 Embedding 输入、缓存、向量覆盖率或 Provider 请求。",
+          "删除导入任务时仅删除该任务独占的图片资源，共享资源与用户原有图片保持不变。",
+          "补充原生 Markdown 导入、索引、Embedding、任务删除和共享资源回归测试。"
+        ],
+        "outOfScope": [
+          "不下载远程 http(s) 图片，不解析或复制 data URI、HTML 原始标签或外部网络资源。",
+          "不改变 PDF/DOCX DocumentGraph 资产合同、原始图片 artifact 或已有转换资产路径。",
+          "不把图片 OCR、图像理解、图片向量化或图片内容发送给任何 Provider。",
+          "不批量重写历史 Vault Markdown；仅在本次导入或显式重试时处理。"
+        ],
+        "followup": [
+          "如需历史 Vault 图片迁移、图片预览 API 或图片引用修复工具，另立任务。",
+          "如需图像理解或跨模态检索，先定义独立的隐私、授权和向量合同。"
+        ],
+        "verification": [
+          "uv run --directory apps/service pytest -p no:cacheprovider tests/unit/test_obsidian_image_assets.py tests/unit/test_import_tasks.py tests/unit/test_embedding_service.py tests/unit/test_index_chunking.py",
+          "uv run --directory apps/service ruff check domain/derived_notes.py domain/indexing.py application/ingest.py application/embedding_batches.py adapters/sqlite_index_repository.py tests/unit/test_obsidian_image_assets.py",
+          "npm run progress:build",
+          "npm run progress:check",
+          "git diff --check"
+        ]
+      },
+      "deliverables": [
+        "原生 Markdown 本地图片引用解析与安全资产提交",
+        "Embedding 输入图片排除与共享资源删除保护",
+        "导入、索引、向量和删除链路回归测试"
+      ],
+      "acceptance": "原生 Obsidian Markdown 导入后，存在的本地图片可在 Vault 中随 Markdown 使用且引用有效；缺失或不安全引用不会产生部分完成态；图片正文、路径和二进制内容不进入 Embedding Provider；删除任务不会删除仍被其他 Markdown 或用户文件引用的共享图片。",
+      "verification": []
     }
   ]
 }

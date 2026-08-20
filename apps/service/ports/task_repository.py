@@ -4,18 +4,15 @@ from typing import Protocol
 
 from domain.tasks import ImportTask, ImportTaskEvent, ImportTaskItem
 from domain.classification import ClassificationSuggestion
-from domain.candidate_links import CandidateLinkProposal
 from domain.derived_notes import NoteProposal
 from domain.evidence import (
     ConversionAttempt,
     ConversionEvidence,
-    DocumentGraph,
     EvidenceLocator,
     OcrEvidence,
     OcrTarget,
     ParseEvidence,
 )
-from domain.metadata_tags import MetadataTagProposal, TagChangePreview, TagDefinition
 from domain.review_commits import CommitJournal, ReviewDecision, ReviewSnapshot
 
 
@@ -51,14 +48,6 @@ class TaskRepository(Protocol):
     ) -> ParseEvidence | None: ...
 
     def record_conversion_attempt(self, attempt: ConversionAttempt) -> ConversionAttempt: ...
-
-    def record_rejected_conversion_attempt(
-        self, item_id: int, attempt: ConversionAttempt, graph: DocumentGraph, decision: dict[str, object]
-    ) -> None: ...
-
-    def record_conversion_quality_gate_decision(
-        self, attempt: ConversionAttempt, graph_id: str, decision: dict[str, object]
-    ) -> None: ...
 
     def record_conversion_evidence(self, item_id: int, evidence: ConversionEvidence) -> ImportTask: ...
 
@@ -114,42 +103,6 @@ class TaskRepository(Protocol):
     def get_classification_suggestion(self, item_id: int) -> ClassificationSuggestion | None: ...
 
     def list_classification_suggestions(self, task_id: str) -> list[ClassificationSuggestion]: ...
-
-    def record_metadata_tag_proposal(
-        self, item_id: int, proposal: MetadataTagProposal, event_type: str
-    ) -> ImportTask: ...
-
-    def record_vault_metadata_tag_proposal(self, proposal: MetadataTagProposal) -> None: ...
-
-    def get_metadata_tag_proposal(self, item_id: int) -> MetadataTagProposal | None: ...
-
-    def list_metadata_tag_proposals(self, task_id: str) -> list[MetadataTagProposal]: ...
-
-    def invalidate_metadata_tag_proposals(self, task_id: str, item_id: int) -> None: ...
-
-    def record_candidate_link_proposal(
-        self, proposal: CandidateLinkProposal, event_type: str
-    ) -> ImportTask: ...
-
-    def get_candidate_link_proposal(
-        self, task_id: str, review_item_id: str
-    ) -> CandidateLinkProposal | None: ...
-
-    def list_candidate_link_proposals(self, task_id: str) -> list[CandidateLinkProposal]: ...
-
-    def list_candidate_link_proposals_for_vault(self, vault_id: str) -> list[CandidateLinkProposal]: ...
-
-    def invalidate_candidate_link_proposals(self, task_id: str, item_id: int, reason: str) -> None: ...
-
-    def list_metadata_tag_proposals_for_vault(self, vault_id: str) -> list[MetadataTagProposal]: ...
-
-    def list_vault_tags(
-        self, vault_id: str, search: str = "", include_deleted: bool = False
-    ) -> list[TagDefinition]: ...
-
-    def record_vault_tag(self, tag: TagDefinition) -> TagDefinition: ...
-
-    def record_tag_change_preview(self, preview: TagChangePreview, created_at: str) -> TagChangePreview: ...
 
     def get_ocr_corrections(self, item_id: int) -> tuple[tuple[EvidenceLocator, str], ...]: ...
 

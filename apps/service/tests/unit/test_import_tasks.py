@@ -18,7 +18,8 @@ from domain.classification import ClassificationSuggestion
 from domain.evidence import EvidenceLocator, ParseEvidence, ParseIssue, PdfRegionLocator, StructuredContentUnit
 from domain.graph_projection import DurableGraphProjection, GraphProjectionBlock
 from domain.indexing import IndexBlock, IndexedDocument
-from domain.metadata_tags import MetadataTagProposal, TagSuggestion
+from domain.online_document_parser import OnlineParseSelection
+from domain.local_markdown_structure import LOCAL_MARKDOWN_STRUCTURE_PROFILE_V1
 from domain.review_commits import CommitFile, CommitJournal, CommitUnit, build_review_snapshot
 from ports.vault_committer import VaultWrite
 from domain.sources import VersionSuggestion
@@ -182,6 +183,48 @@ def test_import_task_persists_scope_counts_and_recovers_interrupted_scans(tmp_pa
     assert recovered.counts.discovered == 3
     assert recovered.recovery_actions == ("restart-scan",)
     assert repository.latest_event_id(running.task_id) > 0
+
+
+def test_import_task_freezes_markdown_pipeline_and_infers_legacy_online_tasks(tmp_path: Path) -> None:
+    repository = SqliteImportTaskRepository(tmp_path / "tasks.sqlite3")
+    selection = OnlineParseSelection(
+        provider_id="paddleocr-official",
+        provider_kind="paddleocr-official",
+        provider_name="PaddleOCR-VL 1.6",
+        endpoint=None,
+        model="PaddleOCR-VL-1.6",
+        credential_reference="online-parse:paddleocr-official",
+        policy_revision=3,
+        policy_path="book.pdf",
+    )
+    frozen = new_import_task(
+        vault_id="vault-1",
+        vault_label="Vault",
+        source_paths=(tmp_path / "book.pdf",),
+        scope_label="book.pdf",
+        online_parse_selection=selection,
+        markdown_pipeline="local",
+        local_structure_profile=LOCAL_MARKDOWN_STRUCTURE_PROFILE_V1,
+    )
+    legacy = new_import_task(
+        vault_id="vault-1",
+        vault_label="Vault",
+        source_paths=(tmp_path / "legacy.pdf",),
+        scope_label="legacy.pdf",
+        online_parse_selection=selection,
+    )
+    repository.create(frozen, "created")
+    repository.create(legacy, "created")
+
+    reopened = SqliteImportTaskRepository(tmp_path / "tasks.sqlite3")
+
+    assert reopened.get(frozen.task_id).markdown_pipeline == "local"
+    assert reopened.get(frozen.task_id).local_structure_profile == LOCAL_MARKDOWN_STRUCTURE_PROFILE_V1
+    assert reopened.get(frozen.task_id).resolved_local_structure_profile() == LOCAL_MARKDOWN_STRUCTURE_PROFILE_V1
+    assert reopened.get(frozen.task_id).resolved_markdown_pipeline() == "local"
+    assert reopened.get(legacy.task_id).markdown_pipeline is None
+    assert reopened.get(legacy.task_id).resolved_markdown_pipeline() == "ai"
+    assert reopened.get(legacy.task_id).resolved_local_structure_profile() == "legacy-v0"
 
 
 def test_recovery_marks_an_interrupted_prepared_commit_as_retryable(tmp_path: Path) -> None:
@@ -590,10 +633,6 @@ def test_delete_import_task_removes_only_task_scoped_records(tmp_path: Path) -> 
             ("vault-1", "shared-source", "a" * 64, "pdf", "{}", "2026-07-22T00:00:00+00:00"),
         )
         connection.execute(
-            "INSERT INTO vault_tag_definitions(vault_id, name, revision, tag_json, updated_at) VALUES (?, ?, ?, ?, ?)",
-            ("vault-1", "shared", 1, "{}", "2026-07-22T00:00:00+00:00"),
-        )
-        connection.execute(
             "INSERT INTO import_ocr_targets(item_id, target_id, locator_json, label, status, locator_summary, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (deleted_item.item_id, "target-1", "{}", "Page 1", "completed", "page 1", "now", "now"),
         )
@@ -635,14 +674,6 @@ def test_delete_import_task_removes_only_task_scoped_records(tmp_path: Path) -> 
             (deleted_task.task_id, deleted_item.item_id, 1, "{}", 0.5, "now"),
         )
         connection.execute(
-            "INSERT INTO import_metadata_tag_proposals(task_id, item_id, revision, proposal_json, requires_review, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (deleted_task.task_id, deleted_item.item_id, 1, "{}", 1, "now"),
-        )
-        connection.execute(
-            "INSERT INTO import_candidate_link_proposals(task_id, review_item_id, revision, vault_id, source_item_id, target_item_id, proposal_json, requires_review, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (deleted_task.task_id, "link-1", 1, "vault-1", deleted_item.item_id, deleted_item.item_id, "{}", 1, "now"),
-        )
-        connection.execute(
             "INSERT INTO import_review_snapshots(task_id, vault_id, digest, snapshot_json, created_at) VALUES (?, ?, ?, ?, ?)",
             (deleted_task.task_id, "vault-1", "digest", "{}", "now"),
         )
@@ -664,7 +695,6 @@ def test_delete_import_task_removes_only_task_scoped_records(tmp_path: Path) -> 
             "import_conversion_artifacts", "import_conversion_graph_revisions",
             "import_conversion_review_links", "import_note_proposals",
             "import_private_index_candidates", "import_classification_suggestions",
-            "import_metadata_tag_proposals", "import_candidate_link_proposals",
             "import_review_snapshots", "import_review_decisions", "import_commit_journals",
         ):
             if table in {"import_tasks", "import_task_items", "import_task_events"}:
@@ -676,7 +706,6 @@ def test_delete_import_task_removes_only_task_scoped_records(tmp_path: Path) -> 
         assert connection.execute("SELECT COUNT(*) FROM import_tasks WHERE task_id = ?", (retained_task.task_id,)).fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM import_task_items WHERE item_id = ?", (retained_item.item_id,)).fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM import_parse_evidence").fetchone()[0] == 1
-        assert connection.execute("SELECT COUNT(*) FROM vault_tag_definitions").fetchone()[0] == 1
 
 
 def test_import_task_service_rejects_running_task_deletion() -> None:
@@ -850,54 +879,3 @@ def test_delete_import_task_removes_its_private_artifact_namespace(tmp_path: Pat
     assert not (store.root / task.task_id).exists()
     assert retained_file.read_bytes() == b"other private source"
     assert repository.deleted_task_id == task.task_id
-
-
-def test_delete_completed_task_removes_accepted_tag_proposal_but_keeps_vault_tag(tmp_path: Path) -> None:
-    repository = SqliteImportTaskRepository(tmp_path / "tasks.sqlite3")
-    task = replace(
-        new_import_task(
-            vault_id="vault-1", vault_label="Vault", source_paths=(tmp_path / "book.pdf",), scope_label="book.pdf"
-        ),
-        lifecycle="complete",
-        phase="complete",
-    )
-    repository.create(task, "completed")
-    repository.append_item(
-        task.task_id,
-        ImportTaskItem(
-            item_id=0,
-            task_id=task.task_id,
-            source_path=tmp_path / "book.pdf",
-            label="book.pdf",
-            category="supported",
-            document_kind="pdf",
-            reason=None,
-            content_sha256="a" * 64,
-            source_id="source-1",
-            identity_status="new",
-        ),
-    )
-    item = repository.list_items(task.task_id)[0]
-    proposal = MetadataTagProposal(
-        task_id=task.task_id,
-        item_id=item.item_id,
-        revision=1,
-        vault_id="vault-1",
-        proposal_revision=1,
-        content_sha256="a" * 64,
-        source_type="pdf",
-        source_file="book.pdf",
-        ingested_at="2026-07-22T00:00:00+00:00",
-        processing_status="complete",
-        domain="mathematics",
-        domain_confidence=0.9,
-        tags=(TagSuggestion("mathematics", 0.9, "accepted", False, (), ("platform/notes/book.md",), "Reviewed."),),
-        created_at="2026-07-22T00:00:00+00:00",
-        decision="accepted",
-        decision_reason="Reviewed.",
-    )
-    repository.record_metadata_tag_proposal(item.item_id, proposal, "metadata-tags-accepted")
-
-    repository.delete(task.task_id)
-
-    assert repository.list_metadata_tag_proposals_for_vault("vault-1") == []

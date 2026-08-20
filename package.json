@@ -23,7 +23,6 @@
     "retrieval:baseline": "uv run --directory apps/service python -m application.retrieval_baseline --fixture tests/fixtures/retrieval-golden-v1.json --output ../../docs/ret-00-04-baseline-v1.json",
     "retrieval:lexical-ab": "uv run --directory apps/service python -m application.retrieval_lexical_ab --fixture tests/fixtures/retrieval-golden-v1.json --output ../../docs/ret-04-03-lexical-ab-v1.json",
     "retrieval:hybrid-eval": "uv run --directory apps/service python -m application.retrieval_hybrid_eval --fixture tests/fixtures/retrieval-hybrid-golden-v1.json --output ../../docs/ret-06-04-hybrid-eval-v1.json",
-    "retrieval:unit-card-eval": "uv run --directory apps/service python -m application.unit_card_evaluation --fixture tests/fixtures/unit-card-golden-v1.json --output ../../docs/ret-07-02-unit-card-eval-v1.json",
     "retrieval:rerank-ab": "uv run --directory apps/service python -m application.retrieval_rerank_eval --fixture tests/fixtures/retrieval-rerank-golden-v1.json --output ../../docs/ret-07-03-rerank-ab-v1.json",
     "retrieval:rerank-live": "uv run --directory apps/service python -m api.retrieval_live_rerank_eval",
     "progress:build": "node scripts/generate-progress.mjs",

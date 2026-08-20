@@ -12,6 +12,7 @@ import {
   Search,
   Settings,
   SlidersHorizontal,
+  Trash2,
   X
 } from "lucide-react";
 
@@ -30,6 +31,8 @@ export const IMPORT_FILES_SELECTION_ENDPOINT = "/api/import-selections/files";
 export const IMPORT_UPLOAD_ENDPOINT = "/api/import-selections/uploads";
 export const IMPORT_DIRECTORY_SELECTION_ENDPOINT = "/api/import-selections/directory";
 export const ONLINE_PARSE_SELECTION_STORAGE_KEY = "obsidian-platform.online-parse-selection.v1";
+export const ONLINE_PARSE_ENABLED_STORAGE_KEY = "obsidian-platform.online-parse-enabled.v1";
+export const MARKDOWN_PIPELINE_STORAGE_KEY = "obsidian-platform.markdown-pipeline.v1";
 export const IMPORT_TASK_EVENT_NAMES = [
   "task-update",
   "scan-started",
@@ -67,12 +70,6 @@ export const IMPORT_TASK_EVENT_NAMES = [
   "classification-revised",
   "classification-accepted",
   "classification-excluded",
-  "metadata-tags-generated",
-  "metadata-tags-accepted",
-  "metadata-tags-excluded",
-  "candidate-links-generated",
-  "candidate-links-accepted",
-  "candidate-links-excluded",
   "review-snapshot-created",
   "review-snapshot-stale",
   "review-item-decided",
@@ -135,6 +132,46 @@ export function saveOnlineParseProviderId(providerId, storage) {
     target.setItem(ONLINE_PARSE_SELECTION_STORAGE_KEY, JSON.stringify({ providerId: selectedProviderId }));
   } catch {
     // Browser storage can be unavailable or blocked; selection remains usable for this page.
+  }
+}
+
+export function loadOnlineParseEnabled(storage) {
+  try {
+    const saved = browserStorage(storage)?.getItem(ONLINE_PARSE_ENABLED_STORAGE_KEY);
+    if (saved === "true") return true;
+    if (saved === "false") return false;
+    return true;
+  } catch {
+    return true;
+  }
+}
+
+export function saveOnlineParseEnabled(enabled, storage) {
+  try {
+    const target = browserStorage(storage);
+    if (!target) return;
+    target.setItem(ONLINE_PARSE_ENABLED_STORAGE_KEY, enabled ? "true" : "false");
+  } catch {
+    // Browser storage can be unavailable or blocked; the choice remains usable for this page.
+  }
+}
+
+export function loadMarkdownPipeline(storage) {
+  try {
+    const saved = browserStorage(storage)?.getItem(MARKDOWN_PIPELINE_STORAGE_KEY);
+    return saved === "local" ? "local" : "ai";
+  } catch {
+    return "ai";
+  }
+}
+
+export function saveMarkdownPipeline(pipeline, storage) {
+  try {
+    const target = browserStorage(storage);
+    if (!target) return;
+    target.setItem(MARKDOWN_PIPELINE_STORAGE_KEY, pipeline === "local" ? "local" : "ai");
+  } catch {
+    // Browser storage can be unavailable or blocked; the choice remains usable for this page.
   }
 }
 
@@ -561,9 +598,52 @@ function requestJson(endpoint, options = {}) {
     }
   }).then(async (response) => {
     const payload = response.status === 204 ? {} : await response.json();
-    if (!response.ok) throw new Error(payload.message || "请求未完成。");
+    if (!response.ok) {
+      const message = nonEmptyText(payload?.message) || nonEmptyText(payload?.detail?.message);
+      throw new Error(message || "请求未完成。");
+    }
     return payload;
   });
+}
+
+export async function readServerSentEvents(response, handlers = {}) {
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    const message = nonEmptyText(payload?.message) || nonEmptyText(payload?.detail?.message);
+    throw new Error(message || "请求未完成。");
+  }
+  if (!response.body?.getReader) throw new Error("流式响应不可用。");
+
+  const reader = response.body.getReader();
+  const decoder = new globalThis.TextDecoder();
+  let buffer = "";
+  const dispatch = (frame) => {
+    const event = frame.split(/\r?\n/).find((line) => line.startsWith("event:"))?.slice(6).trim() || "message";
+    const data = frame.split(/\r?\n/)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart())
+      .join("\n");
+    if (!data) return;
+    let payload;
+    try {
+      payload = JSON.parse(data);
+    } catch {
+      return;
+    }
+    if (event === "chunk") handlers.onChunk?.(payload);
+    else if (event === "result") handlers.onResult?.(payload);
+    else if (event === "error") handlers.onError?.(payload);
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    const frames = buffer.split(/\r?\n\r?\n/);
+    buffer = frames.pop() || "";
+    frames.forEach(dispatch);
+    if (done) break;
+  }
+  if (buffer.trim()) dispatch(buffer);
 }
 
 function vaultName(vault) {
@@ -581,20 +661,55 @@ function statusText(vault) {
   return "已授权";
 }
 
-function providerStatus(provider) {
-  if (provider.verification.is_verified) return "已验证";
-  const failed = Object.values(provider.verification).find(
-    (probe) => probe && typeof probe === "object" && probe.ok === false && probe.reason !== "Not yet verified."
-  );
-  return failed?.reason || "等待验证";
+function apiModeLabel(provider) {
+  return provider.api_mode === "responses" ? "Responses API" : "Chat Completions";
 }
 
 function verifiedProviderModels(provider) {
   return (provider.models || []).filter((model) => model.is_discovered && model.verification?.ok);
 }
 
-function unverifiedProviderModels(provider) {
-  return (provider.models || []).filter((model) => model.is_discovered && !model.verification?.ok);
+function configuredProviderModels(provider) {
+  return (provider.models || []).filter((model) => model.is_discovered && model.model_type);
+}
+
+function unconfiguredProviderModels(provider) {
+  return (provider.models || []).filter((model) => model.is_discovered && !model.model_type);
+}
+
+function userFacingProviderReason(reason) {
+  const normalized = nonEmptyText(reason);
+  const exact = {
+    "Not yet verified.": "尚未验证。",
+    "Credential is unavailable.": "未能读取 API Key。请重新保存 Provider 凭据后重试。",
+    "Model discovery could not be completed.": "模型发现失败。请检查服务地址、网络和 API Key。",
+    "Provider health check could not be completed.": "服务健康检查失败。请检查服务地址、网络和 API Key。",
+    "Provider request timed out.": "Provider 请求超时。请检查网络或稍后重试。",
+    "Provider hostname could not be resolved.": "无法解析 Provider 域名。请检查服务地址和网络。",
+    "Provider connection was refused.": "Provider 拒绝连接。请检查服务地址和服务状态。",
+    "Provider TLS connection failed.": "Provider TLS 连接失败。请检查服务地址或证书后重试。",
+    "Provider request could not be completed.": "Provider 请求未完成。请检查网络后重试。",
+    "Choose a model type before testing the model.": "请先选择模型类型，再进行验证。",
+    "Run Provider discovery before testing this model.": "请先测试 Provider，完成模型发现后再验证模型。",
+    "The model must appear in the latest successful Provider discovery.": "该模型不在最近一次发现结果中。请先重新测试 Provider。"
+  };
+  if (exact[normalized]) return exact[normalized];
+  const verification = /^(?:Chat|Embedding|Rerank) model verification could not be completed\.\s*(.*)$/.exec(normalized);
+  if (verification) {
+    const detail = nonEmptyText(verification[1]);
+    return detail ? `模型验证失败：${userFacingProviderReason(detail)}` : "模型验证失败。请重试。";
+  }
+  const http = /^Provider request failed with HTTP (\d{3})\.$/.exec(normalized);
+  if (http) {
+    const status = http[1];
+    const action = status === "401" || status === "403"
+      ? "请检查 API Key 和模型权限。"
+      : status === "404"
+        ? "请检查服务地址和模型是否可用。"
+        : "请稍后重试，或检查 Provider 服务状态。";
+    return `Provider 返回 HTTP ${status}。${action}`;
+  }
+  return normalized || "未返回失败原因。";
 }
 
 function modelOptions(providers, modelType) {
@@ -824,11 +939,14 @@ function ConfirmationPanel({ request, error, isSubmitting, onClose, onConfirm })
   }
 
   const isProviderRemoval = request.kind === "provider-remove";
+  const isModelRemoval = request.kind === "provider-model-remove";
   const isSessionRemoval = request.kind === "session-remove";
   const isRemoval = request.kind === "remove" || isProviderRemoval;
   const targetName = isSessionRemoval
     ? request.target.title
-    : isProviderRemoval ? request.target.name : vaultName(request.target);
+    : isProviderRemoval ? request.target.name
+      : isModelRemoval ? request.target.model_id
+        : vaultName(request.target);
   return React.createElement(
     "div",
     { className: "confirmation-overlay" },
@@ -845,7 +963,7 @@ function ConfirmationPanel({ request, error, isSubmitting, onClose, onConfirm })
       React.createElement(
         "h2",
         { id: "confirmation-title" },
-        isSessionRemoval ? `删除会话“${targetName}”？` : isProviderRemoval ? "删除 Provider" : isRemoval ? "移除 vault 授权" : "停用 vault"
+        isSessionRemoval ? `删除会话“${targetName}”？` : isProviderRemoval ? "删除 Provider" : isModelRemoval ? "删除模型" : isRemoval ? "移除 vault 授权" : "停用 vault"
       ),
       React.createElement(
         "p",
@@ -854,6 +972,8 @@ function ConfirmationPanel({ request, error, isSubmitting, onClose, onConfirm })
           ? "这会删除该会话的私有消息、范围、模型记录、任务状态、引用和结果。不会删除、移动或改写已审核写入 vault 的资料、笔记或标签。"
           : isProviderRemoval
           ? `将删除“${targetName}”的应用内配置、模型缓存和 Windows 凭据，并使关联外发记录失效。`
+          : isModelRemoval
+            ? `将删除“${targetName}”的模型类型、验证结果和本地缓存。若它是默认模型，对应默认设置也会被清除。`
           : isRemoval
             ? `将移除“${targetName}”的应用内授权与私有状态。不会删除、移动或改写 vault 中的文件。`
             : `将停止“${targetName}”的新写入依赖操作。现有 vault 文件、应用记录和本地结果会保留。`
@@ -870,7 +990,7 @@ function ConfirmationPanel({ request, error, isSubmitting, onClose, onConfirm })
         React.createElement(
           "button",
           { className: "danger-button", type: "button", disabled: isSubmitting, onClick: onConfirm },
-          isSessionRemoval ? "删除会话" : isProviderRemoval ? "删除 Provider" : isRemoval ? "移除授权" : "停用"
+          isSessionRemoval ? "删除会话" : isProviderRemoval ? "删除 Provider" : isModelRemoval ? "删除模型" : isRemoval ? "移除授权" : "停用"
         )
       )
     )
@@ -910,6 +1030,8 @@ export function SessionManagement({
   const [status, setStatus] = React.useState("");
   const [retrievalModeError, setRetrievalModeError] = React.useState("");
   const [isSubmitting, setIsSubmitting] = React.useState(false);
+  const [isStreaming, setIsStreaming] = React.useState(false);
+  const [streamingContent, setStreamingContent] = React.useState("");
   const [context, setContext] = React.useState({ vault_id: "", scope_kind: "vault", scope_path: "", provider_id: "", model_id: "" });
   const [message, setMessage] = React.useState("");
   const [taskIntent, setTaskIntent] = React.useState("auto");
@@ -924,6 +1046,7 @@ export function SessionManagement({
   const evidenceSheetCloseButtonRef = React.useRef(null);
   const renderedSessionIdRef = React.useRef(null);
   const conversationSignatureRef = React.useRef("");
+  const streamingOrdinalRef = React.useRef(null);
   const shouldStickToLatestRef = React.useRef(true);
   const [activeConversationTurnId, setActiveConversationTurnId] = React.useState(null);
   const page = sessionPage?.page || 1;
@@ -963,6 +1086,9 @@ export function SessionManagement({
     setContext(sessionComposerContext(selectedSession));
     setMessage("");
     setTaskIntent("auto");
+    setIsStreaming(false);
+    setStreamingContent("");
+    streamingOrdinalRef.current = null;
   }, [selectedSession?.session_id]);
 
   React.useEffect(() => {
@@ -992,6 +1118,12 @@ export function SessionManagement({
     renderedSessionIdRef.current = sessionId;
     conversationSignatureRef.current = conversationSignature;
   }, [activeDetail?.session?.session_id, conversationSignature, conversationTurnItems.length]);
+
+  React.useLayoutEffect(() => {
+    const messageList = messageListRef.current;
+    if (!messageList || !isStreaming || !shouldStickToLatestRef.current) return;
+    messageList.scrollTop = messageList.scrollHeight;
+  }, [isStreaming, streamingContent]);
 
   React.useEffect(() => {
     const messageList = messageListRef.current;
@@ -1574,12 +1706,21 @@ export function SessionManagement({
     if (!canSend || !selectedSession || !onRun) return;
     setStatus("");
     setIsSubmitting(true);
+    setIsStreaming(true);
+    setStreamingContent("");
+    streamingOrdinalRef.current = null;
     try {
       const execution = await onRun(selectedSession.session_id, {
         ...context,
         scope_path: context.scope_kind === "directory" ? context.scope_path : null,
         content: message,
         intent: taskIntent
+      }, (chunk, ordinal) => {
+        setStreamingContent((current) => {
+          const separator = current && streamingOrdinalRef.current !== ordinal ? "\n\n" : "";
+          streamingOrdinalRef.current = ordinal;
+          return current + separator + chunk;
+        });
       });
       if (execution?.isCurrent === false) return;
       const result = execution?.result || execution;
@@ -1588,6 +1729,9 @@ export function SessionManagement({
     } catch (requestError) {
       setStatus(requestError.message);
     } finally {
+      setIsStreaming(false);
+      setStreamingContent("");
+      streamingOrdinalRef.current = null;
       setIsSubmitting(false);
     }
   }
@@ -2143,7 +2287,19 @@ export function SessionManagement({
                 ? React.createElement("p", { className: "form-error", role: "alert" }, detailError)
                 : selectedSession
                   ? React.createElement("p", { className: "empty-state" }, "该会话尚无已保存的消息。")
-                  : React.createElement("p", { className: "empty-state" }, "从左侧选择一个会话以查看内容。")
+                  : React.createElement("p", { className: "empty-state" }, "从左侧选择一个会话以查看内容。"),
+          isStreaming
+            ? React.createElement(
+                "article",
+                { className: "session-message session-message-streaming", "aria-live": "polite" },
+                React.createElement("p", { className: "session-message-role" }, "助手 · 正在生成"),
+                React.createElement(
+                  "p",
+                  { className: "session-message-content" },
+                  streamingContent || "正在生成回答……"
+                )
+              )
+            : null
         ),
         conversationTurnItems.length
           ? React.createElement(
@@ -2564,204 +2720,6 @@ function VaultPolicyControls({ vault, onUpdate }) {
   );
 }
 
-export function TagManagement({ vault }) {
-  const [tags, setTags] = React.useState([]);
-  const [search, setSearch] = React.useState("");
-  const [newTag, setNewTag] = React.useState("");
-  const [operation, setOperation] = React.useState("rename");
-  const [sourceTag, setSourceTag] = React.useState("");
-  const [targetTag, setTargetTag] = React.useState("");
-  const [preview, setPreview] = React.useState(null);
-  const [status, setStatus] = React.useState("");
-  const [isActing, setIsActing] = React.useState(false);
-
-  const loadTags = React.useCallback(async (term = search) => {
-    setIsActing(true);
-    try {
-      const response = await requestJson(`${VAULTS_ENDPOINT}/${vault.vault_id}/tags?search=${encodeURIComponent(term)}`);
-      setTags(response.tags);
-      setStatus("");
-    } catch (error) {
-      setStatus(error.message);
-    } finally {
-      setIsActing(false);
-    }
-  }, [search, vault.vault_id]);
-
-  React.useEffect(() => {
-    void loadTags("");
-  }, [loadTags]);
-
-  async function createTag() {
-    if (!newTag.trim() || isActing) return;
-    setIsActing(true);
-    try {
-      const response = await requestJson(`${VAULTS_ENDPOINT}/${vault.vault_id}/tags`, {
-        method: "POST",
-        body: JSON.stringify({ name: newTag })
-      });
-      setTags((current) => [...current, response.tag].sort((left, right) => left.name.localeCompare(right.name)));
-      setNewTag("");
-      setStatus("标签已加入应用私有目录；尚未写入任何 Markdown。 ");
-    } catch (error) {
-      setStatus(error.message);
-    } finally {
-      setIsActing(false);
-    }
-  }
-
-  async function previewChange() {
-    if (!sourceTag.trim() || ((operation === "rename" || operation === "merge") && !targetTag.trim()) || isActing) return;
-    setIsActing(true);
-    try {
-      const response = await requestJson(`${VAULTS_ENDPOINT}/${vault.vault_id}/tags/change-preview`, {
-        method: "POST",
-        body: JSON.stringify({
-          operation,
-          source_tag: sourceTag,
-          target_tag: operation === "deactivate" || operation === "delete" ? null : targetTag
-        })
-      });
-      setPreview(response.preview);
-      setStatus(response.preview.conflicts.length ? "预览包含冲突；请先修正后再进入后续审核。" : "已生成私有影响预览；不会写入 vault。 ");
-    } catch (error) {
-      setStatus(error.message);
-    } finally {
-      setIsActing(false);
-    }
-  }
-
-  async function applyChange() {
-    if (!preview || preview.is_stale || preview.conflicts.length || isActing) return;
-    setIsActing(true);
-    try {
-      await requestJson(`${VAULTS_ENDPOINT}/${vault.vault_id}/tags/change`, {
-        method: "POST",
-        body: JSON.stringify({
-          operation: preview.operation,
-          source_tag: preview.source_tag,
-          target_tag: preview.target_tag,
-          catalog_revision: preview.catalog_revision,
-          proposal_versions: preview.proposal_versions
-        })
-      });
-      await loadTags("");
-      setPreview(null);
-      setStatus(
-        preview.operation === "delete"
-          ? "标签及其私有提案引用已移除；不会修改 vault Markdown。"
-          : "已更新应用私有标签提案；所有受影响 Markdown 仍需后续审核提交。 "
-      );
-    } catch (error) {
-      setStatus(error.message);
-    } finally {
-      setIsActing(false);
-    }
-  }
-
-  return React.createElement(
-    "section",
-    { className: "tag-management", "aria-labelledby": `tag-management-${vault.vault_id}` },
-    React.createElement("h3", { id: `tag-management-${vault.vault_id}` }, "标签管理"),
-    React.createElement("p", { className: "row-note" }, "标签变更先生成私有影响预览；实际 Markdown 写入仍需后续审核提交。"),
-    React.createElement(
-      "div",
-      { className: "tag-controls" },
-      React.createElement("input", {
-        type: "search",
-        value: search,
-        onChange: (event) => setSearch(event.target.value),
-        placeholder: "搜索标签",
-        "aria-label": "搜索 vault 标签"
-      }),
-      React.createElement("button", { className: "secondary-button", type: "button", disabled: isActing, onClick: () => loadTags() }, "搜索"),
-      React.createElement("input", {
-        type: "text",
-        value: newTag,
-        onChange: (event) => setNewTag(event.target.value),
-        placeholder: "新标签",
-        "aria-label": "新建 vault 标签"
-      }),
-      React.createElement("button", { className: "secondary-button", type: "button", disabled: isActing || !newTag.trim(), onClick: createTag }, "新建标签")
-    ),
-    React.createElement(
-      "div",
-      { className: "tag-controls tag-change-controls" },
-      React.createElement(
-        "select",
-        {
-          value: operation,
-          onChange: (event) => {
-            setOperation(event.target.value);
-            setPreview(null);
-            setStatus("");
-          },
-          "aria-label": "标签变更类型"
-        },
-        React.createElement("option", { value: "rename" }, "重命名"),
-        React.createElement("option", { value: "merge" }, "合并"),
-        React.createElement("option", { value: "deactivate" }, "停用"),
-        React.createElement("option", { value: "delete" }, "删除")
-      ),
-      React.createElement("input", {
-        type: "text",
-        value: sourceTag,
-        onChange: (event) => {
-          setSourceTag(event.target.value);
-          setPreview(null);
-          setStatus("");
-        },
-        placeholder: "当前标签",
-        "aria-label": "当前标签"
-      }),
-      operation !== "deactivate" && operation !== "delete"
-        ? React.createElement("input", {
-            type: "text",
-            value: targetTag,
-            onChange: (event) => {
-              setTargetTag(event.target.value);
-              setPreview(null);
-              setStatus("");
-            },
-            placeholder: "目标标签",
-            "aria-label": "目标标签"
-          })
-        : null,
-      React.createElement("button", { className: "secondary-button", type: "button", disabled: isActing, onClick: previewChange }, "检查标签影响")
-    ),
-    status ? React.createElement("p", { className: "status-line", role: "status" }, status) : null,
-    tags.length === 0
-      ? React.createElement("p", { className: "empty-state" }, "当前没有匹配的私有标签目录记录。")
-      : React.createElement(
-          "div",
-          { className: "tag-list", "aria-label": "vault 标签目录" },
-          tags.map((tag) => React.createElement(
-            "div",
-            { className: "section-row tag-row", key: tag.name },
-            React.createElement("span", { className: "row-title" }, tag.name),
-            React.createElement("span", { className: "row-note" }, `使用数：${tag.usage_count}`),
-            React.createElement("span", { className: "row-status" }, tag.status === "active" ? "可用" : "已停用")
-          ))
-        ),
-    preview
-      ? React.createElement(
-          "div",
-          { className: "tag-impact-preview", "aria-label": "标签变更影响预览" },
-          React.createElement("p", { className: preview.is_stale || preview.conflicts.length ? "row-status status-danger" : "row-status" }, preview.is_stale ? `预览已陈旧：${preview.stale_reason}` : `受影响 Markdown：${preview.affected_paths.length}`),
-          preview.conflicts.map((conflict) => React.createElement("p", { className: "row-note", key: conflict }, conflict)),
-          preview.affected_paths.map((path) => React.createElement("p", { className: "row-note", key: path }, path)),
-          React.createElement("button", {
-            className: "secondary-button",
-            type: "button",
-            disabled: isActing || preview.is_stale || preview.conflicts.length > 0,
-            title: preview.is_stale ? preview.stale_reason : preview.conflicts[0],
-            onClick: applyChange
-          }, preview.operation === "delete" ? "确认删除标签" : "确认标签变更")
-        )
-      : null
-  );
-}
-
 export function VaultIndexStatus({ vault, onUpdate }) {
   const [status, setStatus] = React.useState("");
   const [isActing, setIsActing] = React.useState(false);
@@ -2864,312 +2822,7 @@ export function VaultIndexStatus({ vault, onUpdate }) {
         onClick: () => runIndexAction("rebuild")
       }, "重建索引")
     ),
-    React.createElement(MetadataExtractionPanel, { vault }),
     status ? React.createElement("p", { className: "status-line", role: "status" }, status) : null
-  );
-}
-
-export function MetadataExtractionPanel({ vault }) {
-  const [candidates, setCandidates] = React.useState([]);
-  const [audit, setAudit] = React.useState(null);
-  const [status, setStatus] = React.useState("");
-  const [isActing, setIsActing] = React.useState(false);
-
-  const loadCandidates = React.useCallback(async () => {
-    const response = await requestJson(`${VAULTS_ENDPOINT}/${vault.vault_id}/metadata-candidates`);
-    setCandidates(response.candidates || []);
-    setAudit(response.audit || null);
-  }, [vault.vault_id]);
-
-  React.useEffect(() => {
-    let active = true;
-    loadCandidates().catch((error) => {
-      if (active) setStatus(error.message);
-    });
-    return () => { active = false; };
-  }, [loadCandidates]);
-
-  async function extractMetadata() {
-    setIsActing(true);
-    setStatus("");
-    try {
-      const executed = await requestJson(`${VAULTS_ENDPOINT}/${vault.vault_id}/metadata/extract`, {
-        method: "POST",
-        body: JSON.stringify({ scope_kind: "vault" })
-      });
-      await loadCandidates();
-      setStatus(`已抽取 ${executed.report.candidate_count} 项元数据候选；${executed.report.required_review_count} 项待审核。`);
-    } catch (error) {
-      setStatus(error.message);
-    } finally {
-      setIsActing(false);
-    }
-  }
-
-  async function decideCandidate(candidateId, decision) {
-    setIsActing(true);
-    setStatus("");
-    try {
-      const response = await requestJson(
-        `${VAULTS_ENDPOINT}/${vault.vault_id}/metadata-candidates/${candidateId}/decision`,
-        {
-          method: "POST",
-          body: JSON.stringify({
-            decision,
-            reason: decision === "accepted" ? "已审核索引块元数据候选。" : "已排除索引块元数据候选。"
-          })
-        }
-      );
-      setCandidates((current) => current.map((candidate) => (
-        candidate.candidate_id === candidateId ? response.candidate : candidate
-      )));
-    } catch (error) {
-      setStatus(error.message);
-    } finally {
-      setIsActing(false);
-    }
-  }
-
-  const requiredCandidates = candidates.filter((candidate) => candidate.status === "required-check");
-  return React.createElement(
-    "section",
-    { className: "metadata-extraction", "aria-label": "元数据审核" },
-    React.createElement("h4", null, "元数据审核"),
-    React.createElement(
-      "div",
-      { className: "detail-actions" },
-      React.createElement(
-        "button",
-        { className: "secondary-button", type: "button", disabled: isActing, onClick: extractMetadata },
-        "抽取元数据"
-      )
-    ),
-    requiredCandidates.length
-      ? requiredCandidates.map((candidate) => React.createElement(
-        "div",
-        { className: "metadata-candidate-row", key: candidate.candidate_id },
-        React.createElement("strong", null, candidate.relative_path),
-        React.createElement(
-          "span",
-          { className: "row-note" },
-          `${candidate.knowledge_kind}；${candidate.concept_keys.join("、")}；置信度 ${candidate.confidence}`
-        ),
-        React.createElement("span", { className: "row-note" }, candidate.review_reason),
-        React.createElement(
-          "div",
-          { className: "detail-actions" },
-          React.createElement(
-            "button",
-            {
-              className: "secondary-button",
-              type: "button",
-              disabled: isActing,
-              onClick: () => decideCandidate(candidate.candidate_id, "accepted")
-            },
-            "接受"
-          ),
-          React.createElement(
-            "button",
-            {
-              className: "danger-button",
-              type: "button",
-              disabled: isActing,
-              onClick: () => decideCandidate(candidate.candidate_id, "excluded")
-            },
-            "排除"
-          )
-        )
-      ))
-      : React.createElement("p", { className: "row-note" }, "没有待审核的元数据候选。"),
-    audit?.reviewed_count
-      ? React.createElement(
-        "p",
-        { className: "row-note" },
-        `已审核 ${audit.reviewed_count} 项；接受 ${audit.accepted_count} 项；通过率 ${(audit.acceptance_rate * 100).toFixed(1)}%。`
-      )
-      : null,
-    status ? React.createElement("p", { className: "status-line", role: "status" }, status) : null
-  );
-}
-
-export function KnowledgeGraphWorkbench({ vaults, currentVault, isLoading, onAddVault, onUpdateVault }) {
-  const [graph, setGraph] = React.useState(null);
-  const [status, setStatus] = React.useState("");
-  const [directory, setDirectory] = React.useState("");
-  const [tag, setTag] = React.useState("");
-  const [source, setSource] = React.useState("");
-  const [relationshipState, setRelationshipState] = React.useState("");
-  const [selected, setSelected] = React.useState(null);
-  const [refreshRevision, setRefreshRevision] = React.useState(0);
-  const graphRequestRevision = React.useRef(0);
-  const vaultSwitchRevision = React.useRef(0);
-
-  React.useEffect(() => {
-    const requestRevision = ++graphRequestRevision.current;
-    if (!currentVault) {
-      setGraph(null);
-      setSelected(null);
-      return undefined;
-    }
-    const parameters = new window.URLSearchParams();
-    if (directory) parameters.set("directory", directory);
-    if (tag) parameters.set("tag", tag);
-    if (source) parameters.set("source", source);
-    if (relationshipState) parameters.set("relationship_state", relationshipState);
-    let active = true;
-    setGraph(null);
-    setSelected(null);
-    setStatus("正在读取当前 vault 图谱。");
-    requestJson(`${VAULTS_ENDPOINT}/${currentVault.vault_id}/graph?${parameters}`)
-      .then((response) => {
-        if (
-          !active
-          || requestRevision !== graphRequestRevision.current
-          || response.graph.vault_id !== currentVault.vault_id
-        ) return;
-        setGraph(response.graph);
-        setStatus(response.graph.index.status === "healthy" ? "图谱已更新。" : "图谱包含不完整的索引状态。");
-      })
-      .catch((error) => {
-        if (!active || requestRevision !== graphRequestRevision.current) return;
-        setGraph(null);
-        setStatus(error.message);
-      });
-    return () => { active = false; };
-  }, [currentVault?.vault_id, directory, tag, source, relationshipState, refreshRevision]);
-
-  React.useEffect(() => {
-    if (!currentVault) return undefined;
-    const eventSource = new window.EventSource(`${VAULTS_ENDPOINT}/${currentVault.vault_id}/graph/events`);
-    eventSource.addEventListener("graph-refresh", () => {
-      setStatus("图谱状态已变化，正在刷新。");
-      setRefreshRevision((current) => current + 1);
-    });
-    return () => eventSource.close();
-  }, [currentVault?.vault_id]);
-
-  if (isLoading) {
-    return React.createElement("p", { className: "empty-state", role: "status" }, "正在加载 vault 授权。");
-  }
-  if (!currentVault) {
-    return React.createElement(
-      "section",
-      { className: "workspace-section graph-empty", "aria-label": "知识图谱" },
-      React.createElement("p", { className: "section-label" }, "当前 vault 图谱"),
-      React.createElement("p", { className: "empty-state" }, "添加 vault 后即可浏览已提交的知识图谱。"),
-      React.createElement("button", { className: "primary-button", type: "button", onClick: onAddVault }, "添加 vault")
-    );
-  }
-
-  async function selectVault(event) {
-    const vaultId = event.target.value;
-    if (!vaultId || vaultId === currentVault.vault_id) return;
-    const switchRevision = ++vaultSwitchRevision.current;
-    setGraph(null);
-    setSelected(null);
-    setStatus("正在切换当前 vault 并替换图谱。");
-    try {
-      const response = await requestJson(`${VAULTS_ENDPOINT}/${vaultId}/current`, { method: "POST" });
-      if (switchRevision !== vaultSwitchRevision.current) return;
-      setDirectory("");
-      setTag("");
-      setSource("");
-      setRelationshipState("");
-      onUpdateVault(response.vault);
-    } catch (error) {
-      if (switchRevision !== vaultSwitchRevision.current) return;
-      setStatus(error.message);
-    }
-  }
-
-  function clearFilters() {
-    setDirectory("");
-    setTag("");
-    setSource("");
-    setRelationshipState("");
-  }
-
-  function updateIndexVault(vault) {
-    onUpdateVault(vault);
-    setStatus("索引状态已更新，正在刷新图谱。");
-    setRefreshRevision((current) => current + 1);
-  }
-
-  const currentGraph = graph?.vault_id === currentVault.vault_id ? graph : null;
-  const index = currentGraph?.index || currentVault.index || { status: "not-initialized" };
-  const indexSummary = index.status === "healthy"
-    ? "索引健康，图谱只显示当前可验证的已提交知识。"
-    : `索引状态：${index.status}；此图谱不是当前完整知识视图。`;
-  const selectedNode = selected?.type === "node" ? currentGraph?.nodes.find((node) => node.relative_path === selected.path) : null;
-  const selectedEdge = selected?.type === "edge" ? currentGraph?.edges[selected.index] : null;
-
-  return React.createElement(
-    "section",
-    { className: "knowledge-graph-workbench", "aria-label": "知识图谱" },
-    React.createElement("p", { className: "scope-summary" }, `当前 vault：${vaultName(currentVault)}；图谱筛选不会改变会话、任务或检索范围。`),
-    React.createElement(
-      "div",
-      { className: "graph-filter-bar" },
-      React.createElement(
-        "label",
-        null,
-        "当前 vault",
-        React.createElement("select", { "aria-label": "当前 vault", value: currentVault.vault_id, onChange: selectVault }, vaults.map((vault) => React.createElement("option", { key: vault.vault_id, value: vault.vault_id }, vaultName(vault))))
-      ),
-      React.createElement(
-        "label",
-        null,
-        "目录",
-        React.createElement("select", { "aria-label": "按目录筛选图谱", value: directory, onChange: (event) => setDirectory(event.target.value) }, [React.createElement("option", { key: "all", value: "" }, "全部目录"), ...(currentGraph?.directories || []).map((value) => React.createElement("option", { key: value, value }, value))])
-      ),
-      React.createElement(
-        "label",
-        null,
-        "标签",
-        React.createElement("select", { "aria-label": "按标签筛选图谱", value: tag, onChange: (event) => setTag(event.target.value) }, [React.createElement("option", { key: "all", value: "" }, "全部标签"), ...(currentGraph?.tags || []).map((value) => React.createElement("option", { key: value, value }, value))])
-      ),
-      React.createElement(
-        "label",
-        null,
-        "来源",
-        React.createElement("select", { "aria-label": "按来源筛选图谱", value: source, onChange: (event) => setSource(event.target.value) }, React.createElement("option", { value: "" }, "全部来源"), React.createElement("option", { value: "native" }, "原生 Markdown"), React.createElement("option", { value: "derived" }, "派生资料"))
-      ),
-      React.createElement(
-        "label",
-        null,
-        "关系状态",
-        React.createElement("select", { "aria-label": "按关系状态筛选图谱", value: relationshipState, onChange: (event) => setRelationshipState(event.target.value) }, React.createElement("option", { value: "" }, "全部关系"), React.createElement("option", { value: "confirmed" }, "已确认"), React.createElement("option", { value: "candidate" }, "候选"))
-      ),
-      React.createElement("button", { className: "secondary-button", type: "button", onClick: clearFilters }, "清除筛选")
-    ),
-    React.createElement("p", { className: "graph-status", role: "status", "aria-live": "polite" }, status),
-    React.createElement("p", { className: `status-marker graph-index-${index.status}` }, indexSummary),
-    React.createElement(VaultIndexStatus, { vault: { ...currentVault, index }, onUpdate: updateIndexVault }),
-    currentGraph && !currentGraph.nodes.length
-      ? React.createElement("p", { className: "empty-state" }, "没有符合当前筛选的图谱节点。")
-      : null,
-    currentGraph
-      ? React.createElement(
-        "div",
-        { className: "knowledge-graph" },
-        React.createElement(
-          "section",
-          { "aria-label": "图谱节点" },
-          React.createElement("h2", null, "节点"),
-          React.createElement("p", { className: "row-note" }, "节点均为当前 vault 中已提交、可验证的 Markdown。"),
-          React.createElement("ul", { className: "graph-node-list" }, currentGraph.nodes.map((node) => React.createElement("li", { key: node.relative_path }, React.createElement("button", { className: "graph-node", type: "button", "aria-expanded": selectedNode?.relative_path === node.relative_path, onClick: () => setSelected({ type: "node", path: node.relative_path }) }, node.title, React.createElement("span", null, `目录：${node.directory}；来源：${node.source === "native" ? "原生" : "派生"}`))))),
-        ),
-        React.createElement(
-          "section",
-          { "aria-label": "图谱关系" },
-          React.createElement("h2", null, "关系"),
-          React.createElement("p", { className: "row-note" }, "已确认：实线；候选：虚线。候选关系尚未写入 vault。"),
-          React.createElement("ul", { className: "graph-edge-list" }, currentGraph.edges.map((edge, indexValue) => React.createElement("li", { key: `${edge.kind}:${edge.source_path}:${edge.target_path}:${edge.review_item_id || ""}` }, React.createElement("button", { className: `graph-edge graph-edge-${edge.kind}`, type: "button", "aria-expanded": selectedEdge === edge, onClick: () => setSelected({ type: "edge", index: indexValue }) }, `${edge.kind === "confirmed" ? "已确认（实线）" : "候选（虚线）"}：${edge.source_path} -> ${edge.target_path}`))))
-        )
-      )
-      : null,
-    selectedNode ? React.createElement("section", { className: "graph-detail", "aria-label": "节点详情", tabIndex: -1 }, React.createElement("h2", null, selectedNode.title), React.createElement("p", null, `路径：${selectedNode.relative_path}`), React.createElement("p", null, `标签：${selectedNode.tags.join("、") || "无"}`)) : null,
-    selectedEdge ? React.createElement("section", { className: "graph-detail", "aria-label": "关系详情", tabIndex: -1 }, React.createElement("h2", null, selectedEdge.kind === "confirmed" ? "已确认关系" : "候选关系"), React.createElement("p", null, `${selectedEdge.source_path} -> ${selectedEdge.target_path}`), selectedEdge.kind === "candidate" ? React.createElement(React.Fragment, null, React.createElement("p", null, `状态：${selectedEdge.status}`), React.createElement("p", null, `理由：${selectedEdge.reason}`), React.createElement("p", null, `证据来源：${selectedEdge.evidence.map((evidence) => evidence.relative_path).join("；")}`)) : null) : null
   );
 }
 
@@ -3225,7 +2878,6 @@ function VaultOverviewDrawer({ vault, onClose, onNavigate, onRefresh }) {
     ["overview", "概况"],
     ["index", "索引"],
     ["tasks", "资料任务"],
-    ["graph", "图谱"],
     ["sessions", "会话"],
     ["policy", "策略"]
   ];
@@ -3241,15 +2893,13 @@ function VaultOverviewDrawer({ vault, onClose, onNavigate, onRefresh }) {
   }, [onClose]);
 
   React.useEffect(() => {
-    if (!["graph", "sessions", "policy"].includes(activeTab) || tabData[activeTab]) return undefined;
+    if (!["sessions", "policy"].includes(activeTab) || tabData[activeTab]) return undefined;
     let active = true;
     setLoadingTab(true);
     setTabError("");
-    const endpoint = activeTab === "graph"
-      ? `${VAULTS_ENDPOINT}/${vault.vault_id}/graph?relationship_state=all`
-      : activeTab === "sessions"
-        ? `${SESSIONS_ENDPOINT}?vault_id=${encodeURIComponent(vault.vault_id)}&page=1&page_size=8&sort=updated_at&order=desc`
-        : `${VAULTS_ENDPOINT}/${vault.vault_id}/policy`;
+    const endpoint = activeTab === "sessions"
+      ? `${SESSIONS_ENDPOINT}?vault_id=${encodeURIComponent(vault.vault_id)}&page=1&page_size=8&sort=updated_at&order=desc`
+      : `${VAULTS_ENDPOINT}/${vault.vault_id}/policy`;
     requestJson(endpoint)
       .then((response) => {
         if (active) setTabData((current) => ({ ...current, [activeTab]: response }));
@@ -3269,7 +2919,6 @@ function VaultOverviewDrawer({ vault, onClose, onNavigate, onRefresh }) {
     onRefresh();
   }
 
-  const graph = tabData.graph?.graph;
   const sessions = tabData.sessions?.sessions || [];
   const policy = tabData.policy?.policy;
 
@@ -3320,7 +2969,7 @@ function VaultOverviewDrawer({ vault, onClose, onNavigate, onRefresh }) {
           ? React.createElement(
             React.Fragment,
             null,
-            React.createElement("div", { className: "workbench-drawer-lead" }, "这是一个只读运营摘要。正文与跨 Vault 关系仍保持在各自的工作区内。"),
+            React.createElement("div", { className: "workbench-drawer-lead" }, "这是一个只读运营摘要。正文仍保持在各自的工作区内。"),
             React.createElement("div", { className: "workbench-drawer-metrics" },
               React.createElement(WorkbenchMetric, { label: "可检索块", value: index?.current_count ?? "—", note: index ? `失效 ${index.stale_count}` : "索引不可用", tone: index?.stale_count ? "warning" : "neutral", onClick: () => setActiveTab("index") }),
               React.createElement(WorkbenchMetric, { label: "语义覆盖", value: index?.semantic_eligible_block_count ? `${Math.round(index.semantic_covered_block_count / index.semantic_eligible_block_count * 100)}%` : "—", note: index ? `${index.semantic_covered_block_count} / ${index.semantic_eligible_block_count}` : "尚无数据", tone: "accent", onClick: () => setActiveTab("index") }),
@@ -3367,27 +3016,7 @@ function VaultOverviewDrawer({ vault, onClose, onNavigate, onRefresh }) {
                 React.createElement("p", { className: "workbench-note" }, vault.tasks.latest_at ? `最近任务更新：${workbenchTimeText(vault.tasks.latest_at)}` : "当前没有导入任务。"),
                 React.createElement("button", { className: "primary-button", type: "button", onClick: () => onNavigate("tasks") }, "打开任务中心")
               )
-              : activeTab === "graph"
-                ? React.createElement(
-                  "section",
-                  { className: "workbench-tab-section", "aria-label": "知识图谱摘要" },
-                  React.createElement("h3", null, "知识图谱"),
-                  graph
-                    ? React.createElement(
-                      React.Fragment,
-                      null,
-                      React.createElement("div", { className: "workbench-stat-list" },
-                        React.createElement("div", null, React.createElement("span", null, "节点"), React.createElement("strong", null, graph.nodes?.length || 0)),
-                        React.createElement("div", null, React.createElement("span", null, "关系"), React.createElement("strong", null, graph.edges?.length || 0)),
-                        React.createElement("div", null, React.createElement("span", null, "目录"), React.createElement("strong", null, graph.directories?.length || 0)),
-                        React.createElement("div", null, React.createElement("span", null, "标签"), React.createElement("strong", null, graph.tags?.length || 0))
-                      ),
-                      React.createElement("ul", { className: "workbench-mini-list" }, (graph.nodes || []).slice(0, 6).map((node) => React.createElement("li", { key: node.relative_path }, React.createElement("strong", null, node.title), React.createElement("span", null, node.source === "native" ? "原生 Markdown" : "派生资料")))),
-                      React.createElement("button", { className: "secondary-button", type: "button", onClick: () => onNavigate("materials") }, "打开图谱工作区")
-                    )
-                    : React.createElement("p", { className: "workbench-empty" }, "切换到此标签后读取当前 Vault 图谱摘要。")
-                )
-                : activeTab === "sessions"
+              : activeTab === "sessions"
                   ? React.createElement(
                     "section",
                     { className: "workbench-tab-section", "aria-label": "会话摘要" },
@@ -3569,11 +3198,10 @@ function VaultDetail({ vault, onBack, onUpdate, onRelink, onConfirm }) {
       React.createElement("dt", null, "受管根目录"),
       React.createElement("dd", null, vault.managed_root),
       React.createElement("dt", null, "隔离边界"),
-      React.createElement("dd", null, "文件、标签、候选链接、索引和操作状态仅属于此 vault。")
+      React.createElement("dd", null, "文件、索引和操作状态仅属于此 vault。")
     ),
     React.createElement(VaultIndexStatus, { vault, onUpdate }),
     React.createElement(VaultPolicyControls, { vault, onUpdate }),
-    React.createElement(TagManagement, { vault }),
     status ? React.createElement("p", { className: "status-line", role: "status" }, status) : null,
     React.createElement(
       "div",
@@ -3625,6 +3253,7 @@ function VaultDetail({ vault, onBack, onUpdate, onRelink, onConfirm }) {
 function ProviderForm({ provider, onCancel, onComplete }) {
   const [name, setName] = React.useState(provider?.name || "");
   const [endpoint, setEndpoint] = React.useState(provider?.endpoint || "");
+  const [apiMode, setApiMode] = React.useState(provider?.api_mode || "chat-completions");
   const [status, setStatus] = React.useState("");
   const [isSubmitting, setIsSubmitting] = React.useState(false);
   const secretRef = React.useRef(null);
@@ -3636,7 +3265,7 @@ function ProviderForm({ provider, onCancel, onComplete }) {
     setStatus("");
     setIsSubmitting(true);
     try {
-      const payload = { name, endpoint };
+      const payload = { name, endpoint, api_mode: apiMode };
       if (secret) payload.secret = secret;
       const response = await requestJson(
         isEditing ? `${PROVIDERS_ENDPOINT}/${provider.provider_id}` : PROVIDERS_ENDPOINT,
@@ -3655,7 +3284,7 @@ function ProviderForm({ provider, onCancel, onComplete }) {
     "form",
     { className: "provider-form", onSubmit: submit, "aria-label": isEditing ? "编辑 Provider" : "添加 Provider" },
     React.createElement("h2", null, isEditing ? "编辑 Provider" : "添加 Provider"),
-    React.createElement("p", { className: "form-description" }, "仅支持 OpenAI-compatible 服务。API Key 可选；本地服务留空时不会发送鉴权头。"),
+    React.createElement("p", { className: "form-description" }, "支持 Chat Completions 和 Responses API。API Key 可选；本地服务留空时不会发送鉴权头。"),
     React.createElement(
       "label",
       { className: "form-row", htmlFor: "provider-name" },
@@ -3668,6 +3297,18 @@ function ProviderForm({ provider, onCancel, onComplete }) {
       React.createElement("span", { className: "form-label" }, "服务地址"),
       React.createElement("input", { id: "provider-endpoint", type: "url", value: endpoint, required: true, disabled: isSubmitting, onChange: (event) => setEndpoint(event.target.value) }),
       React.createElement("span", { className: "form-help" }, "例如 https://service.example/v1")
+    ),
+    React.createElement(
+      "label",
+      { className: "form-row", htmlFor: "provider-api-mode" },
+      React.createElement("span", { className: "form-label" }, "API 模式"),
+      React.createElement(
+        "select",
+        { id: "provider-api-mode", value: apiMode, disabled: isSubmitting, onChange: (event) => setApiMode(event.target.value) },
+        React.createElement("option", { value: "chat-completions" }, "Chat Completions"),
+        React.createElement("option", { value: "responses" }, "Responses API")
+      ),
+      React.createElement("span", { className: "form-help" }, "Responses API 使用 /responses；Chat Completions 使用 /chat/completions。")
     ),
     React.createElement(
       "label",
@@ -3686,20 +3327,27 @@ function ProviderForm({ provider, onCancel, onComplete }) {
   );
 }
 
-function ProviderVerification({ provider }) {
+function ProviderStatusLights({ provider }) {
   const labels = {
     discovery: "模型发现",
     health: "服务健康"
   };
   return React.createElement(
     "div",
-    { className: "provider-verification", "aria-live": "polite" },
+    { className: "provider-status-lights", "aria-live": "polite" },
     Object.entries(labels).map(([key, label]) => {
       const probe = provider.verification[key];
+      const status = probe.ok ? "通过" : userFacingProviderReason(probe.reason);
       return React.createElement(
-        "p",
-        { key, className: probe.ok ? "provider-check provider-check-ok" : "provider-check provider-check-failed" },
-        `${label}：${probe.ok ? "通过" : probe.reason || "未验证"}`
+        "span",
+        {
+          key,
+          className: probe.ok ? "provider-status-light is-ok" : "provider-status-light is-failed",
+          role: "img",
+          "aria-label": `${label}：${status}`,
+          title: `${label}：${status}`
+        },
+        React.createElement("span", { className: "visually-hidden" }, `${label}：${status}`)
       );
     })
   );
@@ -3946,21 +3594,22 @@ export function ProviderManagement({ providers, isLoading, modelDefaults, onOpen
   const [addModelId, setAddModelId] = React.useState("");
   const [addModelType, setAddModelType] = React.useState("");
   const [isAddingModel, setIsAddingModel] = React.useState(false);
+  const [verifyingModelKey, setVerifyingModelKey] = React.useState(null);
 
   async function testProvider(provider) {
-    setStatus("");
+    setStatus("正在测试 Provider。");
     try {
       const response = await requestJson(`${PROVIDERS_ENDPOINT}/${provider.provider_id}/test`, { method: "POST" });
       onUpdate(response.provider);
       onDefaultsChange();
       setStatus(response.provider.verification.is_verified ? "Provider 发现和健康验证通过。" : "Provider 验证未通过；请查看各项原因。");
     } catch (error) {
-      setStatus(error.message);
+      setStatus(userFacingProviderReason(error.message));
     }
   }
 
   function openModelPicker(provider) {
-    const candidates = unverifiedProviderModels(provider);
+    const candidates = unconfiguredProviderModels(provider);
     const firstCandidate = candidates[0];
     setStatus("");
     setAddingProviderId((current) => current === provider.provider_id ? null : provider.provider_id);
@@ -3969,7 +3618,7 @@ export function ProviderManagement({ providers, isLoading, modelDefaults, onOpen
   }
 
   function selectAddModel(modelId, provider) {
-    const model = unverifiedProviderModels(provider).find((candidate) => candidate.model_id === modelId);
+    const model = unconfiguredProviderModels(provider).find((candidate) => candidate.model_id === modelId);
     setAddModelId(modelId);
     setAddModelType(model?.model_type || "");
   }
@@ -3990,19 +3639,25 @@ export function ProviderManagement({ providers, isLoading, modelDefaults, onOpen
   }
 
   async function reconfigureModel(providerId, modelId, modelType) {
-    setStatus("");
+    const modelKey = `${providerId}:${modelId}`;
+    setStatus("正在验证模型。");
+    setVerifyingModelKey(modelKey);
     try {
       const provider = await configureAndVerifyModel(providerId, modelId, modelType);
       setStatus(provider.models.find((model) => model.model_id === modelId)?.verification.ok
         ? "模型类型已更新并验证。"
-        : "模型类型已更新，但验证未通过；模型已从主列表隐藏。请点击添加模型重试。");
+        : userFacingProviderReason(provider.models.find((model) => model.model_id === modelId)?.verification.reason));
     } catch (error) {
-      setStatus(error.message);
+      setStatus(userFacingProviderReason(error.message));
+    } finally {
+      setVerifyingModelKey(null);
     }
   }
 
   async function verifyModel(providerId, modelId) {
-    setStatus("");
+    const modelKey = `${providerId}:${modelId}`;
+    setStatus("正在验证模型。");
+    setVerifyingModelKey(modelKey);
     try {
       const response = await requestJson(`${PROVIDERS_ENDPOINT}/${providerId}/models/test`, {
         method: "POST",
@@ -4012,9 +3667,11 @@ export function ProviderManagement({ providers, isLoading, modelDefaults, onOpen
       await onDefaultsChange();
       setStatus(response.provider.models.find((model) => model.model_id === modelId)?.verification.ok
         ? "模型验证已完成。"
-        : "模型验证未通过；模型已从主列表隐藏。请点击添加模型重试。");
+        : userFacingProviderReason(response.provider.models.find((model) => model.model_id === modelId)?.verification.reason));
     } catch (error) {
-      setStatus(error.message);
+      setStatus(userFacingProviderReason(error.message));
+    } finally {
+      setVerifyingModelKey(null);
     }
   }
 
@@ -4023,16 +3680,16 @@ export function ProviderManagement({ providers, isLoading, modelDefaults, onOpen
       setStatus("请选择模型和模型类型。");
       return;
     }
-    setStatus("");
+    setStatus("正在验证模型。");
     setIsAddingModel(true);
     try {
       const testedProvider = await configureAndVerifyModel(provider.provider_id, addModelId, addModelType);
       setAddingProviderId(null);
       setStatus(testedProvider.models.find((model) => model.model_id === addModelId)?.verification.ok
         ? "模型已添加并验证。"
-        : "模型添加成功，但验证未通过；可在添加模型中重试。");
+        : userFacingProviderReason(testedProvider.models.find((model) => model.model_id === addModelId)?.verification.reason));
     } catch (error) {
-      setStatus(error.message);
+      setStatus(userFacingProviderReason(error.message));
     } finally {
       setIsAddingModel(false);
     }
@@ -4115,7 +3772,8 @@ export function ProviderManagement({ providers, isLoading, modelDefaults, onOpen
       : null,
     providers.map((provider) => {
       const verifiedModels = verifiedProviderModels(provider);
-      const candidateModels = unverifiedProviderModels(provider);
+      const configuredModels = configuredProviderModels(provider);
+      const candidateModels = unconfiguredProviderModels(provider);
       const isPickerOpen = addingProviderId === provider.provider_id;
       return React.createElement(
         "div",
@@ -4127,14 +3785,9 @@ export function ProviderManagement({ providers, isLoading, modelDefaults, onOpen
             "div",
             { className: "provider-summary-heading" },
             React.createElement("span", { className: "row-title" }, provider.name),
-            React.createElement(
-              "span",
-              { className: provider.verification.is_verified ? "provider-status-badge is-verified" : "provider-status-badge is-pending" },
-              provider.verification.is_verified ? "已验证" : "待验证"
-            )
+            React.createElement(ProviderStatusLights, { provider })
           ),
-          React.createElement("span", { className: "row-meta" }, provider.endpoint),
-          React.createElement("span", { className: "row-note" }, `API Key：${provider.credential_configured ? "已配置" : "未配置"}；${providerStatus(provider)}；${verifiedModels.length} 个已验证模型`)
+          React.createElement("span", { className: "row-note" }, `${apiModeLabel(provider)}；${verifiedModels.length} 个已验证模型`)
         ),
         React.createElement(
           "div",
@@ -4144,31 +3797,67 @@ export function ProviderManagement({ providers, isLoading, modelDefaults, onOpen
           React.createElement(IconButton, { icon: Settings, label: `编辑 ${provider.name}`, type: "button", onClick: () => onOpenForm(provider) }),
           React.createElement(IconButton, { icon: X, label: `删除 ${provider.name}`, className: "icon-button provider-remove-button", type: "button", onClick: (event) => onConfirm("provider-remove", provider, event.currentTarget) })
         ),
-        React.createElement(ProviderVerification, { provider }),
-        verifiedModels.length
-          ? verifiedModels.map((model) => React.createElement(
-            "div",
-            { className: "provider-model-row", key: `${provider.provider_id}-${model.model_id}` },
-            React.createElement("span", { className: "row-title" }, model.model_id),
-            React.createElement(
-              "label",
-              { className: "model-type-selector" },
-              React.createElement("span", { className: "visually-hidden" }, `${model.model_id} 模型类型`),
+        configuredModels.length
+          ? configuredModels.map((model) => {
+            const modelKey = `${provider.provider_id}:${model.model_id}`;
+            const isVerifying = verifyingModelKey === modelKey;
+            const isModelBusy = isAddingModel || Boolean(verifyingModelKey);
+            return React.createElement(
+              "div",
+              { className: "provider-model-row", key: `${provider.provider_id}-${model.model_id}` },
               React.createElement(
-                "select",
-                { value: model.model_type || "", disabled: !provider.verification.is_verified || isAddingModel,
-                  onChange: (event) => reconfigureModel(provider.provider_id, model.model_id, event.target.value) },
-                React.createElement("option", { value: "" }, "选择类型"),
-                React.createElement("option", { value: "chat" }, "对话/文本生成"),
-                React.createElement("option", { value: "embedding" }, "Embedding"),
-                React.createElement("option", { value: "rerank" }, "Rerank（重排）"),
-                React.createElement("option", { value: "markdown" }, "Markdown 结构化")
-              )
-            ),
-            React.createElement("span", { className: "provider-check provider-check-ok" }, "已验证"),
-            React.createElement("button", { className: "text-button", type: "button", disabled: !model.model_type || !provider.verification.is_verified || isAddingModel, onClick: () => verifyModel(provider.provider_id, model.model_id) }, "测试模型")
-          ))
-          : React.createElement("p", { className: "provider-model-empty" }, "暂无已验证模型；点击“添加模型”从已发现模型中选择并验证。"),
+                "div",
+                { className: "provider-model-identity" },
+                React.createElement("span", { className: "row-title" }, model.model_id),
+                React.createElement(IconButton, {
+                  icon: Trash2,
+                  label: `删除模型 ${model.model_id}`,
+                  className: "icon-button provider-model-remove-button",
+                  type: "button",
+                  disabled: isModelBusy,
+                  onClick: (event) => onConfirm(
+                    "provider-model-remove",
+                    { provider_id: provider.provider_id, model_id: model.model_id },
+                    event.currentTarget
+                  )
+                })
+              ),
+              React.createElement(
+                "label",
+                { className: "model-type-selector" },
+                React.createElement("span", { className: "visually-hidden" }, `${model.model_id} 模型类型`),
+                React.createElement(
+                  "select",
+                  { value: model.model_type || "", disabled: !provider.verification.is_verified || isModelBusy,
+                    onChange: (event) => reconfigureModel(provider.provider_id, model.model_id, event.target.value) },
+                  React.createElement("option", { value: "" }, "选择类型"),
+                  React.createElement("option", { value: "chat" }, "对话/文本生成"),
+                  React.createElement("option", { value: "embedding" }, "Embedding"),
+                  React.createElement("option", { value: "rerank" }, "Rerank（重排）"),
+                  React.createElement("option", { value: "markdown" }, "Markdown 结构化")
+                )
+              ),
+              React.createElement(
+                "span",
+                { className: model.verification?.ok ? "provider-check provider-check-ok" : "provider-check provider-check-failed" },
+                model.verification?.ok ? "已验证" : "验证失败"
+              ),
+              React.createElement(
+                "button",
+                {
+                  className: "text-button",
+                  type: "button",
+                  disabled: !model.model_type || !provider.verification.is_verified || isModelBusy,
+                  onClick: () => verifyModel(provider.provider_id, model.model_id)
+                },
+                isVerifying ? "验证中" : model.verification?.ok ? "测试模型" : "重试"
+              ),
+              !model.verification?.ok
+                ? React.createElement("p", { className: "provider-model-reason", role: "status" }, `原因：${userFacingProviderReason(model.verification?.reason)}`)
+                : null
+            );
+          })
+          : React.createElement("p", { className: "provider-model-empty" }, "暂无已配置模型；点击“添加模型”从已发现模型中选择并验证。"),
         isPickerOpen
           ? React.createElement(
             "form",
@@ -4187,7 +3876,7 @@ export function ProviderManagement({ providers, isLoading, modelDefaults, onOpen
                     React.createElement("span", { className: "form-label" }, "模型"),
                     React.createElement(
                       "select",
-                      { id: `${provider.provider_id}-add-model`, value: addModelId, disabled: isAddingModel, onChange: (event) => selectAddModel(event.target.value, provider) },
+                      { id: `${provider.provider_id}-add-model`, value: addModelId, disabled: isAddingModel || Boolean(verifyingModelKey), onChange: (event) => selectAddModel(event.target.value, provider) },
                       candidateModels.map((model) => React.createElement("option", { key: model.model_id, value: model.model_id }, model.model_id))
                     )
                   ),
@@ -4197,7 +3886,7 @@ export function ProviderManagement({ providers, isLoading, modelDefaults, onOpen
                     React.createElement("span", { className: "form-label" }, "类型"),
                     React.createElement(
                       "select",
-                      { id: `${provider.provider_id}-add-model-type`, value: addModelType, required: true, disabled: isAddingModel, onChange: (event) => setAddModelType(event.target.value) },
+                      { id: `${provider.provider_id}-add-model-type`, value: addModelType, required: true, disabled: isAddingModel || Boolean(verifyingModelKey), onChange: (event) => setAddModelType(event.target.value) },
                       React.createElement("option", { value: "" }, "选择类型"),
                       React.createElement("option", { value: "chat" }, "对话/文本生成"),
                       React.createElement("option", { value: "embedding" }, "Embedding"),
@@ -4208,8 +3897,8 @@ export function ProviderManagement({ providers, isLoading, modelDefaults, onOpen
                   React.createElement(
                     "div",
                     { className: "form-actions" },
-                    React.createElement("button", { className: "secondary-button", type: "button", disabled: isAddingModel, onClick: () => setAddingProviderId(null) }, "取消"),
-                    React.createElement("button", { className: "primary-button", type: "submit", disabled: isAddingModel || !addModelId || !addModelType }, isAddingModel ? "验证中" : "添加并验证")
+                    React.createElement("button", { className: "secondary-button", type: "button", disabled: isAddingModel || Boolean(verifyingModelKey), onClick: () => setAddingProviderId(null) }, "取消"),
+                    React.createElement("button", { className: "primary-button", type: "submit", disabled: isAddingModel || Boolean(verifyingModelKey) || !addModelId || !addModelType }, isAddingModel ? "验证中" : "添加并验证")
                   )
                 )
             )
@@ -4269,18 +3958,25 @@ function VaultManagement({ activeDestination, vaults, isLoading, selectedVault, 
 function ImportTaskLauncher({ vault, onCreated }) {
   const [status, setStatus] = React.useState("");
   const [isSelecting, setIsSelecting] = React.useState(false);
-  const [onlineParseEnabled, setOnlineParseEnabled] = React.useState(false);
+  const [onlineParseEnabled, setOnlineParseEnabled] = React.useState(loadOnlineParseEnabled);
   const [onlineParseProviders, setOnlineParseProviders] = React.useState([]);
   const [onlineParseProviderId, setOnlineParseProviderId] = React.useState(loadOnlineParseProviderId);
+  const [markdownPipeline, setMarkdownPipeline] = React.useState(loadMarkdownPipeline);
   const [onlineParseLoadError, setOnlineParseLoadError] = React.useState("");
   const uploadInputRef = React.useRef(null);
   const uploadDirectoryInputRef = React.useRef(null);
   const canImport = vault && vault.authorization_status === "active" && vault.access_status === "available";
   const verifiedOnlineParseProviders = onlineParseProviders.filter((provider) => provider.verified);
+  const onlineParseActive = onlineParseEnabled
+    && verifiedOnlineParseProviders.some((provider) => provider.provider_id === onlineParseProviderId);
 
   React.useEffect(() => {
     saveOnlineParseProviderId(onlineParseProviderId);
   }, [onlineParseProviderId]);
+
+  React.useEffect(() => {
+    saveMarkdownPipeline(markdownPipeline);
+  }, [markdownPipeline]);
 
   React.useEffect(() => {
     let active = true;
@@ -4307,8 +4003,9 @@ function ImportTaskLauncher({ vault, onCreated }) {
       body: JSON.stringify({
         vault_id: vault.vault_id,
         selection_id: selection.selection_id,
-        online_parse_enabled: onlineParseEnabled,
-        online_parse_provider_id: onlineParseEnabled ? onlineParseProviderId : null
+        online_parse_enabled: onlineParseActive,
+        online_parse_provider_id: onlineParseActive ? onlineParseProviderId : null,
+        markdown_pipeline: markdownPipeline
       })
     });
     const tasks = created.tasks || (created.task ? [created.task] : []);
@@ -4324,11 +4021,7 @@ function ImportTaskLauncher({ vault, onCreated }) {
     const files = Array.from(event.target.files || []);
     event.target.value = "";
     if (!canImport || files.length === 0) return;
-    if (onlineParseEnabled && !onlineParseProviderId) {
-      setStatus("请选择在线解析 Provider 后再上传 PDF。");
-      return;
-    }
-    if (onlineParseEnabled && (kind !== "files" || files.some((file) => !file.name.toLowerCase().endsWith(".pdf")))) {
+    if (onlineParseActive && (kind !== "files" || files.some((file) => !file.name.toLowerCase().endsWith(".pdf")))) {
       setStatus("在线解析仅支持 PDF 文件；请关闭在线解析后导入其他格式或文件夹。");
       return;
     }
@@ -4417,7 +4110,11 @@ function ImportTaskLauncher({ vault, onCreated }) {
                   "aria-checked": onlineParseEnabled,
                   "aria-labelledby": "online-parse-label",
                   disabled: verifiedOnlineParseProviders.length === 0 || isSelecting,
-                  onClick: () => setOnlineParseEnabled((current) => !current)
+                  onClick: () => setOnlineParseEnabled((current) => {
+                    const next = !current;
+                    saveOnlineParseEnabled(next);
+                    return next;
+                  })
                 },
                 React.createElement("span", { className: "form-switch-thumb", "aria-hidden": "true" })
               )
@@ -4447,8 +4144,38 @@ function ImportTaskLauncher({ vault, onCreated }) {
                   ))
                 )
               ),
-              React.createElement("p", { className: "form-help" }, "将把所选 PDF 原件与文件名发送至所选 Provider。")
+              onlineParseActive
+                ? React.createElement("p", { className: "form-help" }, "将把所选 PDF 原件与文件名发送至所选 Provider。")
+                : null
             ) : null,
+            React.createElement(
+              "div",
+              { className: "markdown-pipeline-control", role: "group", "aria-labelledby": "markdown-pipeline-label" },
+              React.createElement("span", { className: "form-label", id: "markdown-pipeline-label" }, "Markdown 结构化"),
+              React.createElement(
+                "div",
+                { className: "segmented-control", role: "radiogroup", "aria-label": "PDF Markdown 结构化方式" },
+                [
+                  ["ai", "AI 结构化"],
+                  ["local", "本地结构化"]
+                ].map(([pipeline, label]) => React.createElement(
+                  "button",
+                  {
+                    className: `segmented-control-option${markdownPipeline === pipeline ? " is-selected" : ""}`,
+                    type: "button",
+                    key: pipeline,
+                    role: "radio",
+                    "aria-checked": markdownPipeline === pipeline,
+                    disabled: isSelecting,
+                    onClick: () => setMarkdownPipeline(pipeline)
+                  },
+                  label
+                ))
+              ),
+              markdownPipeline === "ai"
+                ? React.createElement("p", { className: "form-help" }, "AI 结构化会将选定 DocumentGraph 的 Markdown 发送至已配置的 Markdown Provider。")
+                : React.createElement("p", { className: "form-help" }, "本地结构化不调用 Markdown Provider。")
+            ),
             verifiedOnlineParseProviders.length === 0
               ? React.createElement("p", { className: "form-help" }, onlineParseLoadError || "请先在设置中保存凭据并完成在线解析 Provider 的连接测试。")
               : null
@@ -4611,8 +4338,6 @@ export function LegacyReviewImportTaskDetail({ taskId, onBack, onTaskChanged, on
   const [isActing, setIsActing] = React.useState(false);
   const [ocrDrafts, setOcrDrafts] = React.useState({});
   const [classificationDrafts, setClassificationDrafts] = React.useState({});
-  const [metadataTagDrafts, setMetadataTagDrafts] = React.useState({});
-  const [candidateLinkDrafts, setCandidateLinkDrafts] = React.useState({});
   const [reviewItemDrafts, setReviewItemDrafts] = React.useState({});
   const [conversionDrafts, setConversionDrafts] = React.useState({});
   const [splitSelections, setSplitSelections] = React.useState({});
@@ -4695,14 +4420,6 @@ export function LegacyReviewImportTaskDetail({ taskId, onBack, onTaskChanged, on
       ...current,
       [itemId]: { ...(current[itemId] || {}), [field]: value }
     }));
-  }
-
-  function updateMetadataTagDraft(itemId, value) {
-    setMetadataTagDrafts((current) => ({ ...current, [itemId]: value }));
-  }
-
-  function updateCandidateLinkDraft(reviewItemId, value) {
-    setCandidateLinkDrafts((current) => ({ ...current, [reviewItemId]: value }));
   }
 
   function updateReviewItemDraft(reviewItemId, value) {
@@ -4828,65 +4545,6 @@ export function LegacyReviewImportTaskDetail({ taskId, onBack, onTaskChanged, on
       );
       onTaskChanged(response.task);
       await loadDetail();
-    } catch (error) {
-      setStatus(error.message);
-    } finally {
-      setIsActing(false);
-    }
-  }
-
-  async function runMetadataTagAction(proposal, decision) {
-    if (isActing) return;
-    const reason = metadataTagDrafts[proposal.item_id]?.trim();
-    if (decision === "excluded" && !reason) {
-      setStatus("请说明排除元数据与标签提案的理由。 ");
-      return;
-    }
-    setStatus("");
-    setIsActing(true);
-    try {
-      const response = await requestJson(
-        `${IMPORT_TASKS_ENDPOINT}/${taskId}/metadata-tags/${proposal.item_id}/decision`,
-        {
-          method: "POST",
-          body: JSON.stringify({
-            decision,
-            reason: reason || "Accepted from the import task detail."
-          })
-        }
-      );
-      onTaskChanged(response.task);
-      await loadDetail();
-    } catch (error) {
-      setStatus(error.message);
-    } finally {
-      setIsActing(false);
-    }
-  }
-
-  async function runCandidateLinkAction(proposal, decision) {
-    if (isActing) return;
-    const reason = candidateLinkDrafts[proposal.review_item_id]?.trim();
-    if (decision === "excluded" && !reason) {
-      setStatus("请说明排除候选链接的理由。 ");
-      return;
-    }
-    setStatus("");
-    setIsActing(true);
-    try {
-      const response = await requestJson(
-        `${IMPORT_TASKS_ENDPOINT}/${taskId}/candidate-links/${encodeURIComponent(proposal.review_item_id)}/decision`,
-        {
-          method: "POST",
-          body: JSON.stringify({
-            decision,
-            reason: reason || "Accepted from the import task detail."
-          })
-        }
-      );
-      onTaskChanged(response.task);
-      await loadDetail();
-      setStatus(decision === "accepted" ? "候选链接已接受，尚未写入 Markdown。" : "候选链接已排除。");
     } catch (error) {
       setStatus(error.message);
     } finally {
@@ -5026,8 +4684,6 @@ export function LegacyReviewImportTaskDetail({ taskId, onBack, onTaskChanged, on
     items,
     note_proposals: noteProposals = [],
     classification_suggestions: classifications = [],
-    metadata_tag_proposals: metadataTagProposals = [],
-    candidate_link_proposals: candidateLinkProposals = [],
     conversion_graphs: conversionGraphs = [],
     review_snapshot: reviewSnapshot = null,
     commit_journals: commitJournals = [],
@@ -5060,16 +4716,6 @@ export function LegacyReviewImportTaskDetail({ taskId, onBack, onTaskChanged, on
   const classificationBatchReason = classificationControlReason || (
     !hasHighConfidenceSuggestion ? "没有可批量接受的高置信度建议。" : ""
   );
-  const metadataTagControlReason = isActing
-    ? "正在更新元数据与标签提案。"
-    : task.lifecycle !== "waiting-for-review"
-      ? "元数据与标签提案只能在等待审核时处理。"
-      : "";
-  const candidateLinkControlReason = isActing
-    ? "正在更新候选链接提案。"
-    : task.lifecycle !== "waiting-for-review"
-      ? "候选链接只能在等待审核时处理。"
-      : "";
   const reviewItemsByUnit = new Map();
   for (const reviewItem of reviewSnapshot?.review_items || []) {
     const current = reviewItemsByUnit.get(reviewItem.unit_id) || [];
@@ -5111,6 +4757,9 @@ export function LegacyReviewImportTaskDetail({ taskId, onBack, onTaskChanged, on
     React.createElement("button", { className: "back-button", type: "button", onClick: () => onBack(null) }, "返回任务列表"),
     React.createElement("h2", null, "导入任务详情"),
     React.createElement("p", { className: "scope-summary" }, `目标 vault：${task.vault_label}；范围：${task.scope_label}`),
+    task.markdown_pipeline
+      ? React.createElement("p", { className: "row-note" }, `结构化：${task.markdown_pipeline === "ai" ? "AI 结构化" : "本地结构化"}`)
+      : null,
     task.online_parse?.enabled
       ? React.createElement("p", { className: "row-note" }, `在线解析：${task.online_parse.provider_name} / ${task.online_parse.model}`)
       : null,
@@ -5522,155 +5171,6 @@ export function LegacyReviewImportTaskDetail({ taskId, onBack, onTaskChanged, on
     ,
     React.createElement(
       "section",
-      { className: "metadata-tag-list", "aria-label": "元数据与标签" },
-      React.createElement("h3", null, "元数据与标签"),
-      metadataTagProposals.length === 0
-        ? React.createElement("p", { className: "empty-state" }, "正在等待元数据与标签治理提案。")
-        : metadataTagProposals.map((proposal) => {
-            const canDecide = task.lifecycle === "waiting-for-review" && !isActing && !proposal.decision;
-            const decisionText = proposal.decision === "accepted"
-              ? "已接受"
-              : proposal.decision === "excluded"
-                ? "已排除"
-                : proposal.requires_review
-                  ? "标签必须检查"
-                  : "待确认";
-            return React.createElement(
-              "div",
-              { className: "section-row review-diff-row metadata-tag-row", key: proposal.item_id },
-              React.createElement("span", { className: "row-title" }, `资料：${proposal.source_file}`),
-              React.createElement("span", { className: "row-meta" }, `来源类型：${proposal.source_type}；处理状态：${proposal.processing_status}`),
-              React.createElement("span", { className: "row-note" }, `领域：${proposal.domain}；置信度：${proposal.domain_confidence}`),
-              React.createElement(
-                "span",
-                { className: `row-status${proposal.requires_review && !proposal.decision ? " status-danger" : ""}` },
-                decisionText
-              ),
-              proposal.tags.map((tag) => React.createElement(
-                "span",
-                { className: "row-note", key: tag.name },
-                `标签：${tag.name}${tag.is_new ? "（新建，待审核）" : "（复用）"}；文档 ${tag.document_paths.length}，笔记 ${tag.note_paths.length}；置信度：${tag.confidence}`
-              )),
-              proposal.decision_reason
-                ? React.createElement("span", { className: "row-note" }, `决定理由：${proposal.decision_reason}`)
-                : null,
-              !proposal.decision
-                ? React.createElement(
-                    "div",
-                    { className: "classification-controls" },
-                    React.createElement("input", {
-                      type: "text",
-                      value: metadataTagDrafts[proposal.item_id] || "",
-                      onChange: (event) => updateMetadataTagDraft(proposal.item_id, event.target.value),
-                      disabled: !canDecide,
-                      placeholder: "排除理由",
-                        "aria-label": `${proposal.source_file} 的元数据与标签决定理由`
-                    }),
-                    React.createElement("button", {
-                      className: "secondary-button",
-                      type: "button",
-                      disabled: !canDecide,
-                      title: metadataTagControlReason || undefined,
-                      onClick: () => runMetadataTagAction(proposal, "accepted")
-                    }, "接受标签"),
-                    React.createElement("button", {
-                      className: "secondary-button",
-                      type: "button",
-                      disabled: !canDecide,
-                      title: metadataTagControlReason || undefined,
-                      onClick: () => runMetadataTagAction(proposal, "excluded")
-                    }, "排除标签")
-                  )
-                : null
-            );
-          })
-    )
-    ,
-    React.createElement(
-      "section",
-      { className: "candidate-link-list", "aria-label": "候选链接" },
-      React.createElement("h3", null, "候选链接"),
-      React.createElement("p", { className: "row-note" }, "审核决定仅保存在应用私有状态，尚未写入 Markdown。"),
-      candidateLinkProposals.length === 0
-        ? React.createElement("p", { className: "empty-state" }, "尚未发现有充分证据的候选链接。")
-        : candidateLinkProposals.map((proposal) => {
-            const isStale = proposal.status === "stale";
-            const canDecide = task.lifecycle === "waiting-for-review" && !isActing && !proposal.decision && !isStale;
-            const decisionText = isStale
-              ? "已陈旧，需重新生成"
-              : proposal.decision === "accepted"
-              ? "已接受，待后续提交"
-              : proposal.decision === "excluded"
-                ? "已排除"
-                : proposal.requires_review
-                  ? "必须检查"
-                  : "待确认";
-            const decisionControlReason = isStale
-              ? proposal.stale_reason || "候选链接已陈旧，不能再做决定。"
-              : candidateLinkControlReason;
-            const controlReasonId = `candidate-link-control-reason-${proposal.review_item_id}`;
-            return React.createElement(
-              "div",
-              { className: "section-row review-diff-row candidate-link-row", key: proposal.review_item_id },
-              React.createElement("span", { className: "row-title" }, `${proposal.source_path} -> ${proposal.target_path}`),
-              React.createElement("span", { className: "row-note" }, `关系理由：${proposal.reason}`),
-              React.createElement("span", { className: "row-note" }, `来源证据：${proposal.source_evidence.excerpt}`),
-              React.createElement("span", { className: "row-note" }, `目标证据：${proposal.target_evidence.excerpt}`),
-              React.createElement("span", { className: "row-note" }, `置信度：${proposal.confidence}`),
-              proposal.is_existing_note_change
-                ? React.createElement("span", { className: "row-status" }, "既有笔记独立变更")
-                : null,
-              React.createElement(
-                "span",
-                { className: `row-status${proposal.requires_review && !proposal.decision ? " status-danger" : ""}` },
-                decisionText
-              ),
-              proposal.decision_reason
-                ? React.createElement("span", { className: "row-note" }, `决定理由：${proposal.decision_reason}`)
-                : null,
-              isStale
-                ? React.createElement("span", { className: "row-note" }, `陈旧原因：${proposal.stale_reason}`)
-                : null,
-              !proposal.decision
-                ? React.createElement(
-                    "div",
-                    { className: "classification-controls" },
-                    decisionControlReason
-                      ? React.createElement("span", { id: controlReasonId, className: "row-note", role: "status" }, decisionControlReason)
-                      : null,
-                    React.createElement("input", {
-                      type: "text",
-                      value: candidateLinkDrafts[proposal.review_item_id] || "",
-                      onChange: (event) => updateCandidateLinkDraft(proposal.review_item_id, event.target.value),
-                      disabled: !canDecide,
-                      placeholder: "审核理由（排除时必填）",
-                      "aria-label": `${proposal.source_path} 到 ${proposal.target_path} 的候选链接决定理由`,
-                      "aria-describedby": decisionControlReason ? controlReasonId : undefined
-                    }),
-                    React.createElement("button", {
-                      className: "secondary-button",
-                      type: "button",
-                      disabled: !canDecide,
-                      title: decisionControlReason || undefined,
-                      "aria-describedby": decisionControlReason ? controlReasonId : undefined,
-                      onClick: () => runCandidateLinkAction(proposal, "accepted")
-                    }, "接受"),
-                    React.createElement("button", {
-                      className: "secondary-button",
-                      type: "button",
-                      disabled: !canDecide,
-                      title: decisionControlReason || undefined,
-                      "aria-describedby": decisionControlReason ? controlReasonId : undefined,
-                      onClick: () => runCandidateLinkAction(proposal, "excluded")
-                    }, "确认排除")
-                  )
-                : null
-            );
-          })
-    )
-    ,
-    React.createElement(
-      "section",
       { className: "classification-list", "aria-label": "分类建议" },
       React.createElement("h3", null, "分类建议"),
       classificationControlReason || classificationBatchReason
@@ -5968,8 +5468,6 @@ function AutomaticImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskDelete
     note_proposals: noteProposals = [],
     source_parses: sourceParses = [],
     classification_suggestions: classifications = [],
-    metadata_tag_proposals: metadataTagProposals = [],
-    candidate_link_proposals: candidateLinkProposals = [],
     conversion_graphs: conversionGraphs = [],
     commit_journals: commitJournals = [],
     index = null
@@ -5985,6 +5483,9 @@ function AutomaticImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskDelete
     React.createElement("button", { className: "back-button", type: "button", onClick: () => onBack(null) }, "返回任务列表"),
     React.createElement("h2", null, "导入任务详情"),
     React.createElement("p", { className: "scope-summary" }, `目标 vault：${task.vault_label}；范围：${task.scope_label}`),
+    task.markdown_pipeline
+      ? React.createElement("p", { className: "row-note" }, `结构化：${task.markdown_pipeline === "ai" ? "AI 结构化" : "本地结构化"}`)
+      : null,
     task.online_parse?.enabled
       ? React.createElement("p", { className: "row-note" }, `在线解析：${task.online_parse.provider_name} / ${task.online_parse.model}`)
       : null,
@@ -6054,33 +5555,6 @@ function AutomaticImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskDelete
           React.createElement("span", { className: "row-title" }, suggestion.filename || suggestion.domain),
           React.createElement("span", { className: "row-meta" }, suggestion.domain),
           React.createElement("span", { className: "row-note" }, suggestion.reason)
-        ))
-    ),
-    React.createElement(
-      "section",
-      { className: "metadata-tag-list", "aria-label": "元数据与标签" },
-      React.createElement("h3", null, "元数据与标签"),
-      metadataTagProposals.length === 0
-        ? React.createElement("p", { className: "empty-state" }, "暂无元数据与标签。")
-        : metadataTagProposals.map((proposal) => React.createElement(
-          "div",
-          { className: "section-row", key: proposal.item_id },
-          React.createElement("span", { className: "row-title" }, proposal.source_file),
-          React.createElement("span", { className: "row-meta" }, proposal.domain),
-          React.createElement("span", { className: "row-note" }, proposal.tags.map((tag) => tag.name).join("、") || "无标签")
-        ))
-    ),
-    React.createElement(
-      "section",
-      { className: "candidate-link-list", "aria-label": "候选链接" },
-      React.createElement("h3", null, "候选链接"),
-      candidateLinkProposals.length === 0
-        ? React.createElement("p", { className: "empty-state" }, "暂无候选链接。")
-        : candidateLinkProposals.map((proposal) => React.createElement(
-          "div",
-          { className: "section-row", key: proposal.review_item_id },
-          React.createElement("span", { className: "row-title" }, `${proposal.source_path} -> ${proposal.target_path}`),
-          React.createElement("span", { className: "row-note" }, proposal.reason)
         ))
     ),
     commitJournals.length
@@ -6679,15 +6153,29 @@ export function App() {
     await loadSessionDetail(sessionId);
   }
 
-  async function runPersistentSessionTask(sessionId, command) {
-    const response = await requestJson(`${SESSIONS_ENDPOINT}/${sessionId}/run`, {
+  async function runPersistentSessionTask(sessionId, command, onChunk) {
+    const response = await fetch(`${SESSIONS_ENDPOINT}/${sessionId}/run/stream`, {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(command)
     });
+    let result;
+    await readServerSentEvents(response, {
+      onChunk: (payload) => {
+        if (typeof payload?.content === "string") onChunk?.(payload.content, payload.ordinal);
+      },
+      onResult: (payload) => {
+        result = payload?.result;
+      },
+      onError: (payload) => {
+        throw new Error(nonEmptyText(payload?.message) || "会话生成失败。");
+      }
+    });
+    if (!result) throw new Error("流式响应未返回最终结果。");
     const isCurrent = selectedSessionIdRef.current === sessionId;
     if (isCurrent) await loadSessionDetail(sessionId);
     await loadSessions(sessionFilters);
-    return { result: response.result, isCurrent };
+    return { result, isCurrent };
   }
 
   async function editPersistentSessionGenerationResult(sessionId, resultId, content) {
@@ -6761,6 +6249,16 @@ export function App() {
       if (request.kind === "provider-remove") {
         await requestJson(`${PROVIDERS_ENDPOINT}/${request.target.provider_id}`, { method: "DELETE" });
         setProviders((current) => current.filter((item) => item.provider_id !== request.target.provider_id));
+        await loadModelDefaults();
+      } else if (request.kind === "provider-model-remove") {
+        const query = new window.URLSearchParams({ model_id: request.target.model_id });
+        const response = await requestJson(
+          `${PROVIDERS_ENDPOINT}/${request.target.provider_id}/models?${query}`,
+          { method: "DELETE" }
+        );
+        setProviders((current) => current.map((item) => (
+          item.provider_id === request.target.provider_id ? response.provider : item
+        )));
         await loadModelDefaults();
       } else if (request.kind === "session-remove") {
         await requestJson(`${SESSIONS_ENDPOINT}/${request.target.session_id}`, { method: "DELETE" });

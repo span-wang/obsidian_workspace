@@ -1,7 +1,7 @@
 {
   "projectName": "Obsidian Personal Knowledge Platform",
   "initiativeName": "Retrieval Redesign",
-  "updatedOn": "2026-08-12",
+  "updatedOn": "2026-08-17",
   "planDocument": "docs/retrieval-redesign.md",
   "generatedFile": "docs/retrieval-progress.md",
   "sourceFiles": [
@@ -183,6 +183,31 @@
       "id": "RET-29",
       "label": "当前页任务批量删除",
       "goal": "让当前页导入任务可多选或全选，并在既有安全删除语义下逐项删除。"
+    },
+    {
+      "id": "RET-30",
+      "label": "无效治理与知识图谱退役",
+      "goal": "删除未形成生产闭环的标签、LLM 元数据、单元卡片和用户知识图谱能力，同时保留导入结构投影与检索主链。"
+    },
+    {
+      "id": "RET-31",
+      "label": "本地 OCR 图结构归一化",
+      "goal": "以可追溯、版本化的确定性规则将 PaddleOCR-VL 页面图块归一化为保真 Markdown，改善标题、阅读顺序、列表、图注与页边噪音。"
+    },
+    {
+      "id": "RET-32",
+      "label": "Provider 验证反馈",
+      "goal": "让模型验证保留安全、可操作的失败原因，并在设置页连续展示验证状态和重试入口。"
+    },
+    {
+      "id": "RET-33",
+      "label": "Responses API Provider 模式",
+      "goal": "让 OpenAI-compatible Provider 可显式选择 Responses API，并以稳定的流式合同完成模型验证和生成。"
+    },
+    {
+      "id": "RET-34",
+      "label": "Obsidian 图片资源保留",
+      "goal": "解析和入库原生 Obsidian Markdown 时保留本地图片资源，同时确保图片不进入 embedding 出网输入。"
     }
   ],
   "trackingRules": [

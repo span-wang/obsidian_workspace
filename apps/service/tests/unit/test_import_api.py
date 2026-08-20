@@ -11,7 +11,6 @@ from api.main import create_app, import_task_sse_event_name, source_parse_payloa
 from api.runtime import RuntimeState
 from application.ingest import ImportTaskService
 from application.vaults import VaultService
-from domain.candidate_links import CandidateLinkEvidence, CandidateLinkProposal
 from domain.evidence import (
     BlockPayload,
     DocumentBlock,
@@ -23,7 +22,7 @@ from domain.evidence import (
     PdfRegionLocator,
     StructuredContentUnit,
 )
-from domain.tasks import ImportTaskEvent, new_import_task
+from domain.tasks import ImportTaskEvent
 from workers.markdown_deriver import derive_items
 
 
@@ -148,20 +147,6 @@ def test_source_parse_payload_exposes_selected_graph_text_without_private_proven
     assert "body/p[2]" not in serialized
 
 
-class CandidateLinkTaskService:
-    def __init__(self, task, candidate) -> None:
-        self.task = task
-        self.candidate = candidate
-
-    def get(self, task_id: str):
-        assert task_id == self.task.task_id
-        return self.task
-
-    def list_candidate_link_proposals(self, task_id: str):
-        assert task_id == self.task.task_id
-        return [self.candidate]
-
-
 def asgi_request(app, method: str, path: str, *, body=None, cookie: str = ""):
     payload = json.dumps(body).encode() if body is not None else b""
     messages = []
@@ -257,6 +242,7 @@ def test_import_detail_is_session_bound_and_hides_review_snapshot_and_private_pa
     assert denied_status == 403
     assert detail_status == 200
     assert detail["task"]["phase"] == "failed"
+    assert detail["task"]["markdown_pipeline"] == "local"
     assert detail["items"][0]["label"] == "book.pdf"
     assert detail["items"][0]["parse_status"] == "parsed"
     assert detail["note_proposals"][0]["kind"] == "derived"
@@ -319,59 +305,6 @@ def test_import_task_creation_returns_one_task_per_selected_file(tmp_path: Path)
     assert created["task"] == created["tasks"][0]
     assert [task["scope_label"] for task in created["tasks"]] == ["first.pdf", "second.pdf"]
     assert all(len(task_service.get(task["task_id"]).source_paths) == 1 for task in created["tasks"])
-
-
-def test_candidate_links_are_read_only_private_api_records(tmp_path: Path) -> None:
-    task = new_import_task(
-        vault_id="vault-1",
-        vault_label="Vault",
-        source_paths=(tmp_path / "book.pdf",),
-        scope_label="book.pdf",
-    )
-    candidate = CandidateLinkProposal(
-        task_id=task.task_id,
-        review_item_id="candidate-safe",
-        revision=1,
-        vault_id="vault-1",
-        source_item_id=1,
-        source_path="platform/notes/source.md",
-        source_proposal_revision=1,
-        source_proposal_sha256="a" * 64,
-        target_item_id=2,
-        target_path="platform/notes/target.md",
-        target_proposal_revision=1,
-        target_proposal_sha256="b" * 64,
-        reason="Both notes contain an explainable shared term.",
-        confidence=0.6,
-        source_evidence=CandidateLinkEvidence("platform/notes/source.md", "line:2", "Safe source excerpt."),
-        target_evidence=CandidateLinkEvidence("platform/notes/target.md", "line:3", "Safe target excerpt."),
-        is_existing_note_change=True,
-        status="required-check",
-        created_at="2026-07-22T00:00:00+00:00",
-    )
-    app = create_app(
-        runtime=RuntimeState(data_directory=tmp_path / "app-data", sqlite_version="3.45.1"),
-        import_task_service=CandidateLinkTaskService(task, candidate),
-    )
-    _, headers, _ = asgi_request(app, "GET", "/")
-    cookie = headers["set-cookie"].split(";", maxsplit=1)[0]
-    denied_status, _, _ = asgi_request(app, "GET", f"/api/import-tasks/{task.task_id}/candidate-links")
-    status, _, payload = asgi_request(
-        app, "GET", f"/api/import-tasks/{task.task_id}/candidate-links", cookie=cookie
-    )
-    decision_status, _, _ = asgi_request(
-        app,
-        "POST",
-        f"/api/import-tasks/{task.task_id}/candidate-links/{candidate.review_item_id}/decision",
-        body={"decision": "accepted", "reason": "not used"},
-        cookie=cookie,
-    )
-
-    assert denied_status == 403
-    assert status == 200
-    assert payload["candidate_link_proposals"][0]["source_path"] == "platform/notes/source.md"
-    assert "source_proposal_sha256" not in payload["candidate_link_proposals"][0]
-    assert decision_status in {404, 405}
 
 
 def test_import_task_sse_names_distinguish_parse_stages() -> None:

@@ -5,7 +5,7 @@ import sqlite3
 import struct
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
 from threading import RLock
@@ -39,7 +39,6 @@ from domain.indexing import (
     LexicalQuery,
     VectorQuery,
 )
-from domain.metadata_extraction import METADATA_CANDIDATE_STATUSES, MetadataCandidate
 from domain.retrieval_lexical import (
     build_cjk_vocabulary,
     english_fts_text,
@@ -47,7 +46,6 @@ from domain.retrieval_lexical import (
     tokenize_cjk,
 )
 from domain.tasks import utc_now
-from domain.unit_cards import UnitCard, UnitCardHit, UnitCardScope, UnitCardSource, UnitCardVector
 
 
 _GRAPH_PROJECTION_MIGRATION_ID = "ret-01-02-graph-projection-v1"
@@ -58,8 +56,6 @@ _INDEX_BLOCK_FTS_MIGRATION_ID = "ret-04-01-index-block-fts-v1"
 _INDEX_BLOCK_LEXICAL_MIGRATION_ID = "ret-04-02-index-block-lexical-v1"
 _EMBEDDING_CACHE_MIGRATION_ID = "ret-06-02-embedding-cache-v1"
 _INDEX_BLOCK_VECTOR_MIGRATION_ID = "ret-06-03-index-block-vectors-v1"
-_METADATA_CANDIDATE_MIGRATION_ID = "ret-07-01-metadata-candidates-v1"
-_UNIT_CARD_MIGRATION_ID = "ret-07-02-unit-cards-v1"
 _LEXICAL_BM25_ARGUMENTS = "1.0, 1.0, 10.0, 1.0"
 _RICH_INDEX_BLOCK_COLUMNS = (
     ("block_content_sha256", "TEXT NOT NULL DEFAULT ''"),
@@ -204,8 +200,6 @@ class SqliteIndexRepository:
             self._apply_index_block_lexical_migration(connection)
             self._apply_embedding_cache_migration(connection)
             self._apply_index_block_vector_migration(connection)
-            self._apply_metadata_candidate_migration(connection)
-            self._apply_unit_card_migration(connection)
 
     @staticmethod
     def _apply_graph_projection_migration(connection: sqlite3.Connection) -> None:
@@ -594,174 +588,6 @@ class SqliteIndexRepository:
             connection.execute("RELEASE SAVEPOINT index_block_vector_migration")
             raise
         connection.execute("RELEASE SAVEPOINT index_block_vector_migration")
-
-    @staticmethod
-    def _create_metadata_candidate_schema(connection: sqlite3.Connection) -> None:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS index_metadata_candidates (
-                candidate_id TEXT PRIMARY KEY,
-                vault_id TEXT NOT NULL,
-                document_id TEXT NOT NULL,
-                sequence INTEGER NOT NULL,
-                block_content_sha256 TEXT NOT NULL,
-                knowledge_kind TEXT NOT NULL,
-                concept_keys_json TEXT NOT NULL,
-                confidence REAL NOT NULL,
-                provider_id TEXT NOT NULL,
-                model_id TEXT NOT NULL,
-                provider_configuration_revision TEXT NOT NULL,
-                status TEXT NOT NULL,
-                review_reason TEXT,
-                decision_reason TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                FOREIGN KEY (document_id, sequence)
-                    REFERENCES index_blocks(document_id, sequence) ON DELETE CASCADE
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_metadata_candidates_vault_status
-            ON index_metadata_candidates(vault_id, status, document_id, sequence)
-            """
-        )
-
-    @classmethod
-    def _apply_metadata_candidate_migration(cls, connection: sqlite3.Connection) -> None:
-        connection.execute("SAVEPOINT metadata_candidate_migration")
-        try:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS index_repository_migrations (
-                    migration_id TEXT PRIMARY KEY,
-                    applied_at TEXT NOT NULL
-                )
-                """
-            )
-            existing = connection.execute(
-                "SELECT 1 FROM index_repository_migrations WHERE migration_id = ?",
-                (_METADATA_CANDIDATE_MIGRATION_ID,),
-            ).fetchone()
-            if existing is None:
-                cls._create_metadata_candidate_schema(connection)
-                connection.execute(
-                    "INSERT INTO index_repository_migrations (migration_id, applied_at) VALUES (?, ?)",
-                    (_METADATA_CANDIDATE_MIGRATION_ID, utc_now()),
-                )
-        except Exception:
-            connection.execute("ROLLBACK TO SAVEPOINT metadata_candidate_migration")
-            connection.execute("RELEASE SAVEPOINT metadata_candidate_migration")
-            raise
-        connection.execute("RELEASE SAVEPOINT metadata_candidate_migration")
-
-    @staticmethod
-    def _create_unit_card_schema(connection: sqlite3.Connection) -> None:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS unit_cards (
-                card_id TEXT PRIMARY KEY,
-                vault_id TEXT NOT NULL,
-                subject TEXT NOT NULL,
-                grade_volume TEXT NOT NULL,
-                unit_no INTEGER NOT NULL,
-                input_sha256 TEXT NOT NULL,
-                content_sha256 TEXT NOT NULL,
-                text TEXT NOT NULL,
-                provider_id TEXT NOT NULL,
-                model_id TEXT NOT NULL,
-                provider_configuration_revision TEXT NOT NULL,
-                indexed_at TEXT NOT NULL,
-                UNIQUE(vault_id, subject, grade_volume, unit_no)
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS unit_card_sources (
-                card_id TEXT NOT NULL REFERENCES unit_cards(card_id) ON DELETE CASCADE,
-                document_id TEXT NOT NULL,
-                relative_path TEXT NOT NULL,
-                sequence INTEGER NOT NULL,
-                block_content_sha256 TEXT NOT NULL,
-                candidate_id TEXT NOT NULL,
-                knowledge_kind TEXT NOT NULL,
-                concept_keys_json TEXT NOT NULL,
-                PRIMARY KEY (card_id, document_id, sequence, candidate_id),
-                FOREIGN KEY (document_id, sequence)
-                    REFERENCES index_blocks(document_id, sequence) ON DELETE CASCADE
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_unit_card_sources_document
-            ON unit_card_sources(document_id, sequence)
-            """
-        )
-        connection.execute(
-            """
-            CREATE VIRTUAL TABLE IF NOT EXISTS unit_card_fts
-            USING fts5(en_text, cjk_text)
-            """
-        )
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS unit_card_fts_map (
-                rowid INTEGER PRIMARY KEY,
-                card_id TEXT NOT NULL UNIQUE REFERENCES unit_cards(card_id) ON DELETE CASCADE
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS unit_card_vectors (
-                card_id TEXT NOT NULL REFERENCES unit_cards(card_id) ON DELETE CASCADE,
-                embedding_profile_fingerprint TEXT NOT NULL,
-                embedding_model_id TEXT NOT NULL,
-                card_content_sha256 TEXT NOT NULL,
-                dimension INTEGER NOT NULL,
-                vector BLOB NOT NULL,
-                indexed_at TEXT NOT NULL,
-                PRIMARY KEY (card_id, embedding_profile_fingerprint)
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_unit_card_vectors_profile
-            ON unit_card_vectors(embedding_profile_fingerprint, dimension, card_id)
-            """
-        )
-
-    @classmethod
-    def _apply_unit_card_migration(cls, connection: sqlite3.Connection) -> None:
-        connection.execute("SAVEPOINT unit_card_migration")
-        try:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS index_repository_migrations (
-                    migration_id TEXT PRIMARY KEY,
-                    applied_at TEXT NOT NULL
-                )
-                """
-            )
-            existing = connection.execute(
-                "SELECT 1 FROM index_repository_migrations WHERE migration_id = ?",
-                (_UNIT_CARD_MIGRATION_ID,),
-            ).fetchone()
-            if existing is None:
-                cls._create_unit_card_schema(connection)
-                connection.execute(
-                    "INSERT INTO index_repository_migrations (migration_id, applied_at) VALUES (?, ?)",
-                    (_UNIT_CARD_MIGRATION_ID, utc_now()),
-                )
-        except Exception:
-            connection.execute("ROLLBACK TO SAVEPOINT unit_card_migration")
-            connection.execute("RELEASE SAVEPOINT unit_card_migration")
-            raise
-        connection.execute("RELEASE SAVEPOINT unit_card_migration")
 
     def enqueue(self, job: IndexJob) -> None:
         with self._connect() as connection:
@@ -1393,354 +1219,6 @@ class SqliteIndexRepository:
                     ),
                 )
 
-    def save_unit_cards(
-        self,
-        vault_id: str,
-        cards: tuple[UnitCard, ...],
-        vectors: tuple[UnitCardVector, ...],
-    ) -> None:
-        if not isinstance(cards, tuple) or not all(isinstance(card, UnitCard) for card in cards):
-            raise ValueError("Unit cards must be immutable card projections.")
-        if not isinstance(vectors, tuple) or not all(isinstance(vector, UnitCardVector) for vector in vectors):
-            raise ValueError("Unit card vectors must be immutable vector bindings.")
-        if not cards:
-            return
-        if any(card.vault_id != vault_id for card in cards):
-            raise ValueError("Unit cards must belong to the supplied vault.")
-        card_ids = {card.card_id for card in cards}
-        if len(card_ids) != len(cards) or len({card.scope for card in cards}) != len(cards):
-            raise ValueError("Unit card identities and scopes must be unique.")
-        vector_keys = {(vector.card_id, vector.profile.fingerprint) for vector in vectors}
-        if len(vector_keys) != len(vectors) or {vector.card_id for vector in vectors} != card_ids:
-            raise EmbeddingVectorConsistencyError(
-                "Every saved unit card needs one unique vector for the requested profile."
-            )
-        cards_by_id = {card.card_id: card for card in cards}
-        with self._connect() as connection:
-            self._delete_unit_cards(connection, tuple(sorted(card_ids)))
-            for card in cards:
-                connection.execute(
-                    """
-                    INSERT INTO unit_cards (
-                        card_id, vault_id, subject, grade_volume, unit_no, input_sha256,
-                        content_sha256, text, provider_id, model_id,
-                        provider_configuration_revision, indexed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        card.card_id,
-                        card.vault_id,
-                        card.scope.subject,
-                        card.scope.grade_volume,
-                        card.scope.unit_no,
-                        card.input_sha256,
-                        card.content_sha256,
-                        card.text,
-                        card.provider_id,
-                        card.model_id,
-                        card.provider_configuration_revision,
-                        card.indexed_at,
-                    ),
-                )
-                connection.executemany(
-                    """
-                    INSERT INTO unit_card_sources (
-                        card_id, document_id, relative_path, sequence, block_content_sha256, candidate_id,
-                        knowledge_kind, concept_keys_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        (
-                            card.card_id,
-                            source.document_id,
-                            source.relative_path,
-                            source.sequence,
-                            source.block_content_sha256,
-                            source.candidate_id,
-                            source.knowledge_kind,
-                            json.dumps(source.concept_keys, ensure_ascii=False),
-                        )
-                        for source in card.sources
-                    ],
-                )
-                self._insert_unit_card_fts(connection, card)
-            for vector in vectors:
-                card = cards_by_id[vector.card_id]
-                if vector.card_content_sha256 != card.content_sha256:
-                    raise EmbeddingVectorConsistencyError(
-                        "Unit card vector content does not match the persisted card."
-                    )
-                normalized_vector = self._normalized_float32_vector(
-                    vector.vector, vector.profile.dimension
-                )
-                connection.execute(
-                    """
-                    INSERT INTO unit_card_vectors (
-                        card_id, embedding_profile_fingerprint, embedding_model_id,
-                        card_content_sha256, dimension, vector, indexed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        vector.card_id,
-                        vector.profile.fingerprint,
-                        vector.profile.locator.model_id,
-                        vector.card_content_sha256,
-                        vector.profile.dimension,
-                        self._encode_embedding_vector(tuple(float(value) for value in normalized_vector)),
-                        vector.indexed_at,
-                    ),
-                )
-
-    def invalidate_unit_cards_for_provider_change(self, provider_id: str, updated_at: str) -> None:
-        if not isinstance(provider_id, str) or not provider_id.strip():
-            raise ValueError("Provider identity is invalid for unit card invalidation.")
-        if not isinstance(updated_at, str) or not updated_at.strip():
-            raise ValueError("Provider revision is invalid for unit card invalidation.")
-        with self._connect() as connection:
-            rows = connection.execute("SELECT card_id FROM unit_cards ORDER BY card_id").fetchall()
-            # Unit-card vectors retain only an opaque profile fingerprint, so a provider change clears
-            # every card projection rather than risking a stale lexical card from another profile.
-            self._delete_unit_cards(connection, tuple(str(row["card_id"]) for row in rows))
-
-    def search_unit_cards_lexical(self, vault_id: str, query: LexicalQuery) -> list[UnitCardHit]:
-        if not query.allowed_relative_paths:
-            return []
-        with self._connect() as connection:
-            vocabulary = self._unit_card_lexical_vocabulary(connection, vault_id)
-            expression = self._unit_card_match_expression(query.text, vocabulary)
-            if not expression:
-                return []
-            rows = connection.execute(
-                """
-                SELECT cards.*, -bm25(unit_card_fts, 1.0, 1.0) AS score
-                FROM unit_card_fts
-                JOIN unit_card_fts_map AS mappings ON mappings.rowid = unit_card_fts.rowid
-                JOIN unit_cards AS cards ON cards.card_id = mappings.card_id
-                WHERE unit_card_fts MATCH ? AND cards.vault_id = ?
-                ORDER BY score DESC, cards.subject, cards.grade_volume, cards.unit_no
-                LIMIT ?
-                """,
-                (expression, vault_id, query.limit),
-            ).fetchall()
-            hits: list[UnitCardHit] = []
-            for row in rows:
-                card = self._unit_card_from_row(connection, row)
-                if self._resolve_unit_card_sources(connection, vault_id, card.card_id, query.allowed_relative_paths):
-                    hits.append(UnitCardHit(card, float(row["score"]), "unit-card-lexical"))
-            return hits
-
-    def search_unit_cards_vector(self, vault_id: str, query: VectorQuery) -> list[UnitCardHit]:
-        if not query.allowed_relative_paths:
-            return []
-        with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT cards.*, vectors.dimension, vectors.vector
-                FROM unit_card_vectors AS vectors
-                JOIN unit_cards AS cards ON cards.card_id = vectors.card_id
-                WHERE cards.vault_id = ?
-                  AND vectors.embedding_profile_fingerprint = ?
-                  AND vectors.dimension = ?
-                  AND vectors.card_content_sha256 = cards.content_sha256
-                """,
-                (vault_id, query.profile.fingerprint, query.profile.dimension),
-            ).fetchall()
-            query_vector = self._normalized_float32_vector(query.vector, query.profile.dimension)
-            hits: list[UnitCardHit] = []
-            for row in rows:
-                try:
-                    stored = self._normalized_float32_vector(
-                        self._decode_embedding_vector(row["vector"], int(row["dimension"])),
-                        query.profile.dimension,
-                    )
-                except (EmbeddingCacheConsistencyError, EmbeddingVectorConsistencyError, ValueError) as error:
-                    raise EmbeddingVectorConsistencyError(
-                        "Unit card semantic vector is inconsistent."
-                    ) from error
-                card = self._unit_card_from_row(connection, row)
-                if not self._resolve_unit_card_sources(
-                    connection, vault_id, card.card_id, query.allowed_relative_paths
-                ):
-                    continue
-                hits.append(
-                    UnitCardHit(
-                        card,
-                        float(stored @ query_vector),
-                        "unit-card-semantic",
-                    )
-                )
-        return sorted(
-            hits,
-            key=lambda hit: (-hit.score, hit.card.scope.subject, hit.card.scope.grade_volume, hit.card.scope.unit_no),
-        )[: query.limit]
-
-    def resolve_unit_card_sources(
-        self, vault_id: str, card_id: str, allowed_relative_paths: tuple[str, ...]
-    ) -> list[IndexBlockRef]:
-        if not allowed_relative_paths:
-            return []
-        with self._connect() as connection:
-            return self._resolve_unit_card_sources(
-                connection, vault_id, card_id, allowed_relative_paths
-            )
-
-    @staticmethod
-    def _unit_card_lexical_vocabulary(connection: sqlite3.Connection, vault_id: str) -> tuple[str, ...]:
-        rows = connection.execute(
-            "SELECT text FROM unit_cards WHERE vault_id = ? ORDER BY card_id", (vault_id,)
-        ).fetchall()
-        return build_cjk_vocabulary(tuple(str(row["text"]) for row in rows))
-
-    @staticmethod
-    def _unit_card_match_expression(query_text: str, vocabulary: tuple[str, ...]) -> str:
-        english = english_terms(query_text)
-        cjk = tuple(dict.fromkeys(tokenize_cjk(query_text, vocabulary)))
-        clauses = [f'en_text : "{term}"' for term in english]
-        clauses.extend(f'cjk_text : "{term}"' for term in cjk)
-        return " OR ".join(clauses)
-
-    @classmethod
-    def _insert_unit_card_fts(cls, connection: sqlite3.Connection, card: UnitCard) -> None:
-        vocabulary = build_cjk_vocabulary((card.text,))
-        cursor = connection.execute(
-            "INSERT INTO unit_card_fts (en_text, cjk_text) VALUES (?, ?)",
-            (english_fts_text(card.text), " ".join(tokenize_cjk(card.text, vocabulary))),
-        )
-        connection.execute(
-            "INSERT INTO unit_card_fts_map (rowid, card_id) VALUES (?, ?)",
-            (cursor.lastrowid, card.card_id),
-        )
-
-    @classmethod
-    def _delete_unit_cards(cls, connection: sqlite3.Connection, card_ids: tuple[str, ...]) -> None:
-        if not card_ids:
-            return
-        placeholders = ", ".join("?" for _ in card_ids)
-        rows = connection.execute(
-            f"SELECT rowid FROM unit_card_fts_map WHERE card_id IN ({placeholders})", card_ids
-        ).fetchall()
-        connection.executemany(
-            "DELETE FROM unit_card_fts WHERE rowid = ?", ((int(row["rowid"]),) for row in rows)
-        )
-        connection.executemany(
-            "DELETE FROM unit_card_fts_map WHERE rowid = ?", ((int(row["rowid"]),) for row in rows)
-        )
-        connection.execute(f"DELETE FROM unit_cards WHERE card_id IN ({placeholders})", card_ids)
-
-    @classmethod
-    def _invalidate_unit_cards_for_document(
-        cls, connection: sqlite3.Connection, vault_id: str, document_id: str
-    ) -> None:
-        rows = connection.execute(
-            """
-            SELECT DISTINCT sources.card_id
-            FROM unit_card_sources AS sources
-            JOIN unit_cards AS cards ON cards.card_id = sources.card_id
-            WHERE cards.vault_id = ? AND sources.document_id = ?
-            """,
-            (vault_id, document_id),
-        ).fetchall()
-        cls._delete_unit_cards(connection, tuple(str(row["card_id"]) for row in rows))
-
-    @classmethod
-    def _unit_card_from_row(cls, connection: sqlite3.Connection, row: sqlite3.Row) -> UnitCard:
-        sources = connection.execute(
-            """
-            SELECT document_id, relative_path, sequence, block_content_sha256, candidate_id, knowledge_kind,
-                   concept_keys_json
-            FROM unit_card_sources
-            WHERE card_id = ?
-            ORDER BY document_id, sequence, candidate_id
-            """,
-            (row["card_id"],),
-        ).fetchall()
-        return UnitCard(
-            card_id=str(row["card_id"]),
-            vault_id=str(row["vault_id"]),
-            scope=UnitCardScope(
-                str(row["subject"]), str(row["grade_volume"]), int(row["unit_no"])
-            ),
-            input_sha256=str(row["input_sha256"]),
-            content_sha256=str(row["content_sha256"]),
-            text=str(row["text"]),
-            sources=tuple(
-                UnitCardSource(
-                    document_id=str(source["document_id"]),
-                    relative_path=str(source["relative_path"]),
-                    sequence=int(source["sequence"]),
-                    block_content_sha256=str(source["block_content_sha256"]),
-                    candidate_id=str(source["candidate_id"]),
-                    knowledge_kind=str(source["knowledge_kind"]),
-                    concept_keys=tuple(json.loads(str(source["concept_keys_json"]))),
-                )
-                for source in sources
-            ),
-            provider_id=str(row["provider_id"]),
-            model_id=str(row["model_id"]),
-            provider_configuration_revision=str(row["provider_configuration_revision"]),
-            indexed_at=str(row["indexed_at"]),
-        )
-
-    @classmethod
-    def _resolve_unit_card_sources(
-        cls,
-        connection: sqlite3.Connection,
-        vault_id: str,
-        card_id: str,
-        allowed_relative_paths: tuple[str, ...],
-    ) -> list[IndexBlockRef]:
-        expected = int(
-            connection.execute(
-                "SELECT COUNT(*) FROM unit_card_sources WHERE card_id = ?", (card_id,)
-            ).fetchone()[0]
-        )
-        if not expected:
-            return []
-        placeholders = ", ".join("?" for _ in allowed_relative_paths)
-        rows = connection.execute(
-            f"""
-            SELECT documents.document_id, documents.relative_path,
-                   blocks.sequence, blocks.location, blocks.text, blocks.block_content_sha256,
-                   blocks.block_kind, blocks.heading_path_json, blocks.heading_level,
-                   blocks.source_locators_json, blocks.graph_block_id, blocks.reading_order,
-                   blocks.confidence, blocks.retrieval_text, blocks.contextual_prefix,
-                   blocks.token_estimate, metadata.subject, metadata.grade_volume, metadata.unit_no,
-                   metadata.material_type, metadata.meta_origin, metadata.meta_confidence,
-                   metadata.meta_status
-            FROM unit_card_sources AS sources
-            JOIN unit_cards AS cards ON cards.card_id = sources.card_id
-            JOIN index_documents AS documents ON documents.document_id = sources.document_id
-            JOIN index_blocks AS blocks
-              ON blocks.document_id = sources.document_id AND blocks.sequence = sources.sequence
-            JOIN index_block_meta AS metadata
-              ON metadata.document_id = sources.document_id AND metadata.sequence = sources.sequence
-            JOIN index_metadata_candidates AS candidates ON candidates.candidate_id = sources.candidate_id
-            WHERE sources.card_id = ?
-              AND cards.vault_id = ?
-              AND documents.vault_id = ?
-              AND documents.is_current = 1
-              AND documents.verifiable = 1
-              AND documents.stale_reason IS NULL
-              AND documents.pending_association = 0
-              AND documents.relative_path IN ({placeholders})
-              AND blocks.block_content_sha256 = sources.block_content_sha256
-              AND candidates.vault_id = ?
-              AND candidates.document_id = sources.document_id
-              AND candidates.sequence = sources.sequence
-              AND candidates.block_content_sha256 = sources.block_content_sha256
-              AND candidates.status = 'accepted'
-              AND metadata.meta_status = 'accepted'
-              AND metadata.subject = cards.subject
-              AND metadata.grade_volume = cards.grade_volume
-              AND metadata.unit_no = cards.unit_no
-            ORDER BY documents.relative_path, blocks.sequence
-            """,
-            (card_id, vault_id, vault_id, *allowed_relative_paths, vault_id),
-        ).fetchall()
-        if len(rows) != expected:
-            return []
-        return [cls._block_ref_from_row(row) for row in rows]
-
     @staticmethod
     def _encode_embedding_vector(vector: tuple[float, ...]) -> bytes:
         try:
@@ -1879,166 +1357,6 @@ class SqliteIndexRepository:
                 self._document_from_row(connection, row, rich_block_reads_enabled=True)
                 for row in rows
             ]
-
-    def current_metadata_documents(self, vault_id: str) -> list[IndexedDocument]:
-        """Read rich current blocks for outbound metadata regardless of the legacy read flag."""
-
-        return self.current_embedding_documents(vault_id)
-
-    def save_metadata_candidates(
-        self, vault_id: str, candidates: tuple[MetadataCandidate, ...]
-    ) -> None:
-        if not isinstance(candidates, tuple) or not all(
-            isinstance(candidate, MetadataCandidate) for candidate in candidates
-        ):
-            raise ValueError("Metadata candidates must be immutable candidate values.")
-        if not candidates:
-            return
-        if any(candidate.vault_id != vault_id for candidate in candidates):
-            raise ValueError("Metadata candidates must belong to the requested vault.")
-        if len({candidate.candidate_id for candidate in candidates}) != len(candidates):
-            raise ValueError("Metadata candidate identities must not repeat.")
-        with self._connect() as connection:
-            for candidate in candidates:
-                row = connection.execute(
-                    """
-                    SELECT documents.relative_path
-                    FROM index_documents AS documents
-                    JOIN index_blocks AS blocks
-                      ON blocks.document_id = documents.document_id
-                    WHERE documents.vault_id = ?
-                      AND documents.document_id = ?
-                      AND documents.is_current = 1
-                      AND documents.verifiable = 1
-                      AND documents.stale_reason IS NULL
-                      AND documents.pending_association = 0
-                      AND blocks.sequence = ?
-                      AND blocks.block_content_sha256 = ?
-                    """,
-                    (
-                        vault_id,
-                        candidate.document_id,
-                        candidate.sequence,
-                        candidate.block_content_sha256,
-                    ),
-                ).fetchone()
-                if row is None or str(row["relative_path"]) != candidate.relative_path:
-                    raise ValueError("Metadata candidate no longer matches a current indexed block.")
-            connection.executemany(
-                """
-                INSERT INTO index_metadata_candidates (
-                    candidate_id, vault_id, document_id, sequence, block_content_sha256,
-                    knowledge_kind, concept_keys_json, confidence, provider_id, model_id,
-                    provider_configuration_revision, status, review_reason, decision_reason,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(candidate_id) DO NOTHING
-                """,
-                [
-                    (
-                        candidate.candidate_id,
-                        candidate.vault_id,
-                        candidate.document_id,
-                        candidate.sequence,
-                        candidate.block_content_sha256,
-                        candidate.knowledge_kind,
-                        json.dumps(candidate.concept_keys, ensure_ascii=False),
-                        candidate.confidence,
-                        candidate.provider_id,
-                        candidate.model_id,
-                        candidate.provider_configuration_revision,
-                        candidate.status,
-                        candidate.review_reason,
-                        candidate.decision_reason,
-                        candidate.created_at,
-                        candidate.updated_at,
-                    )
-                    for candidate in candidates
-                ],
-            )
-
-    def list_metadata_candidates(
-        self, vault_id: str, statuses: tuple[str, ...]
-    ) -> list[MetadataCandidate]:
-        if not isinstance(statuses, tuple) or any(
-            status not in METADATA_CANDIDATE_STATUSES for status in statuses
-        ):
-            raise ValueError("Metadata candidate status filter is invalid.")
-        conditions = [
-            "candidates.vault_id = ?",
-            "documents.is_current = 1",
-            "documents.verifiable = 1",
-            "documents.stale_reason IS NULL",
-            "documents.pending_association = 0",
-            "blocks.block_content_sha256 = candidates.block_content_sha256",
-        ]
-        parameters: list[object] = [vault_id]
-        if statuses:
-            placeholders = ", ".join("?" for _ in statuses)
-            conditions.append(f"candidates.status IN ({placeholders})")
-            parameters.extend(statuses)
-        with self._connect() as connection:
-            rows = connection.execute(
-                f"""
-                SELECT candidates.*, documents.relative_path
-                FROM index_metadata_candidates AS candidates
-                JOIN index_documents AS documents ON documents.document_id = candidates.document_id
-                JOIN index_blocks AS blocks
-                  ON blocks.document_id = candidates.document_id AND blocks.sequence = candidates.sequence
-                WHERE {' AND '.join(conditions)}
-                ORDER BY candidates.created_at, candidates.candidate_id
-                """,
-                parameters,
-            ).fetchall()
-        return [self._metadata_candidate_from_row(row) for row in rows]
-
-    def accepted_metadata_concept_keys(self, vault_id: str) -> set[str]:
-        return {
-            concept_key
-            for candidate in self.list_metadata_candidates(vault_id, statuses=("accepted",))
-            for concept_key in candidate.concept_keys
-        }
-
-    def decide_metadata_candidate(
-        self, vault_id: str, candidate_id: str, decision: str, reason: str
-    ) -> MetadataCandidate:
-        if decision not in {"accepted", "excluded"} or not isinstance(reason, str) or not reason.strip():
-            raise ValueError("Metadata candidate decision is invalid.")
-        candidates = [
-            candidate
-            for candidate in self.list_metadata_candidates(vault_id, statuses=())
-            if candidate.candidate_id == candidate_id
-        ]
-        if not candidates:
-            raise KeyError(candidate_id)
-        candidate = candidates[0]
-        if candidate.status in {"accepted", "excluded"}:
-            raise ValueError("Metadata candidate already has a review decision.")
-        updated = replace(
-            candidate,
-            status=decision,
-            decision_reason=reason.strip(),
-            updated_at=utc_now(),
-        )
-        with self._connect() as connection:
-            self._invalidate_unit_cards_for_document(connection, vault_id, candidate.document_id)
-            result = connection.execute(
-                """
-                UPDATE index_metadata_candidates
-                SET status = ?, decision_reason = ?, updated_at = ?
-                WHERE candidate_id = ? AND vault_id = ? AND status IN ('pending', 'required-check')
-                """,
-                (
-                    updated.status,
-                    updated.decision_reason,
-                    updated.updated_at,
-                    updated.candidate_id,
-                    vault_id,
-                ),
-            )
-            if result.rowcount != 1:
-                raise ValueError("Metadata candidate is no longer pending review.")
-        return updated
 
     @classmethod
     def _require_current_rich_blocks(cls, connection: sqlite3.Connection, vault_id: str) -> None:
@@ -2354,34 +1672,6 @@ class SqliteIndexRepository:
             if row["meta_confidence"] is not None
             else None,
             meta_status=str(row["meta_status"]),
-        )
-
-    @staticmethod
-    def _metadata_candidate_from_row(row: sqlite3.Row) -> MetadataCandidate:
-        try:
-            concept_keys = tuple(json.loads(str(row["concept_keys_json"])))
-        except (TypeError, json.JSONDecodeError) as error:
-            raise ValueError("Stored metadata candidate concepts are invalid.") from error
-        return MetadataCandidate(
-            candidate_id=str(row["candidate_id"]),
-            vault_id=str(row["vault_id"]),
-            document_id=str(row["document_id"]),
-            relative_path=str(row["relative_path"]),
-            sequence=int(row["sequence"]),
-            block_content_sha256=str(row["block_content_sha256"]),
-            knowledge_kind=str(row["knowledge_kind"]),
-            concept_keys=concept_keys,
-            confidence=float(row["confidence"]),
-            provider_id=str(row["provider_id"]),
-            model_id=str(row["model_id"]),
-            provider_configuration_revision=str(row["provider_configuration_revision"]),
-            status=str(row["status"]),
-            review_reason=str(row["review_reason"]) if row["review_reason"] is not None else None,
-            decision_reason=str(row["decision_reason"])
-            if row["decision_reason"] is not None
-            else None,
-            created_at=str(row["created_at"]),
-            updated_at=str(row["updated_at"]),
         )
 
     @staticmethod
@@ -2785,15 +2075,6 @@ class SqliteIndexRepository:
     def _invalidate_current_path(
         self, connection: sqlite3.Connection, vault_id: str, relative_path: str, reason: str
     ) -> None:
-        document_rows = connection.execute(
-            """
-            SELECT document_id FROM index_documents
-            WHERE vault_id = ? AND relative_path = ? AND is_current = 1
-            """,
-            (vault_id, relative_path),
-        ).fetchall()
-        for row in document_rows:
-            self._invalidate_unit_cards_for_document(connection, vault_id, str(row["document_id"]))
         self._delete_fts_rows_for_current_path(connection, vault_id, relative_path)
         self._delete_block_vectors_for_current_path(connection, vault_id, relative_path)
         connection.execute(
@@ -2986,8 +2267,6 @@ class SqliteIndexRepository:
         if not document_ids:
             return
         placeholders = ", ".join("?" for _ in document_ids)
-        for document_id in document_ids:
-            cls._invalidate_unit_cards_for_document(connection, vault_id, document_id)
         input_rows = connection.execute(
             f"""
             SELECT DISTINCT contextual_prefix, retrieval_text, text
@@ -3028,10 +2307,6 @@ class SqliteIndexRepository:
                 """,
                 input_sha256s,
             )
-        connection.execute(
-            f"DELETE FROM index_metadata_candidates WHERE document_id IN ({placeholders})",
-            document_ids,
-        )
         connection.execute(f"DELETE FROM index_blocks WHERE document_id IN ({placeholders})", document_ids)
         connection.execute(f"DELETE FROM index_documents WHERE document_id IN ({placeholders})", document_ids)
 
@@ -3046,10 +2321,6 @@ class SqliteIndexRepository:
                     """,
                     (vault_id, relative_path),
                 ).fetchall()
-                for row in rows:
-                    self._invalidate_unit_cards_for_document(
-                        connection, vault_id, str(row["document_id"])
-                    )
                 self._delete_fts_rows_for_current_path(
                     connection,
                     vault_id,

@@ -475,7 +475,7 @@ def test_automatic_import_recovers_without_writing_the_vault_when_conversion_is_
     assert detail_status == 200
     assert detail["task"]["lifecycle"] == "recoverable"
     assert detail["task"]["phase"] == "failed"
-    assert detail["task"]["recovery_actions"] == ["restart-conversion", "restart-derivation"]
+    assert detail["task"]["recovery_actions"] == ["restart-conversion"]
     assert "complete document graph" in detail["task"]["failure_reason"]
     assert detail["task"]["counts"]["discovered"] == 1
     assert detail["task"]["counts"]["supported"] == 1

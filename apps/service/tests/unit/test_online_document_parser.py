@@ -25,7 +25,6 @@ from domain.policies import PolicyEvaluation, VaultPolicy
 from workers.converters.artifact_store import PrivateArtifactStore
 from workers.converters.launcher import ProvisionedConversionLauncher
 from workers.converters.online_launcher import OnlinePdfConversionLauncher
-from workers.converters.quality_gate import StructuralQualityGate
 from workers.converters.runner import ConversionRequest
 
 
@@ -287,7 +286,7 @@ def test_online_launcher_persists_then_resumes_the_same_remote_job(tmp_path: Pat
     assert parser.submits == 1
     assert parser.waited == ["job-1", "job-1"]
     assert first.evidence is not None and resumed.evidence is not None
-    assert StructuralQualityGate().evaluate(first.evidence.graph, dict(request.preflight_inventory)).action == "accepted"
+    assert "retired_quality_gate_id" not in first.evidence.attempt.to_dict()
 
 
 def test_online_launcher_stages_an_extensionless_snapshot_with_the_original_pdf_name(tmp_path: Path) -> None:

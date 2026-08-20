@@ -18,8 +18,12 @@ import {
   HEALTH_ENDPOINT,
   IMPORT_DIRECTORY_SELECTION_ENDPOINT,
   IMPORT_FILES_SELECTION_ENDPOINT,
+  loadMarkdownPipeline,
+  loadOnlineParseEnabled,
   loadOnlineParseProviderId,
   MARKDOWN_STRUCTURE_BUDGET_ENDPOINT,
+  MARKDOWN_PIPELINE_STORAGE_KEY,
+  ONLINE_PARSE_ENABLED_STORAGE_KEY,
   ONLINE_PARSE_PROVIDERS_ENDPOINT,
   ONLINE_PARSE_SELECTION_STORAGE_KEY,
   IMPORT_UPLOAD_ENDPOINT,
@@ -28,18 +32,18 @@ import {
   ImportContentComparison,
   IMPORT_TASK_EVENT_NAMES,
   IMPORT_TASKS_ENDPOINT,
-  KnowledgeGraphWorkbench,
   LOCAL_SESSION_ENDPOINT,
-  MetadataExtractionPanel,
   NAVIGATION_DESTINATIONS,
   ProjectionRebuildVerificationPanel,
   ProviderManagement,
   PROVIDERS_ENDPOINT,
+  readServerSentEvents,
   RETRIEVAL_MODE_ENDPOINT,
+  saveOnlineParseEnabled,
+  saveMarkdownPipeline,
   saveOnlineParseProviderId,
   SESSIONS_ENDPOINT,
   SessionManagement,
-  TagManagement,
   WORKBENCH_OVERVIEW_ENDPOINT,
   userFacingEvidenceLocation,
   userFacingEvidenceSource,
@@ -192,6 +196,30 @@ test("copies only direct answer content without application-evidence markers", a
   assert.equal(await copyPlainText("", clipboard), false);
 });
 
+test("consumes fragmented session SSE chunks before the final result", async () => {
+  const encoder = new globalThis.TextEncoder();
+  const received = [];
+  let result;
+  const response = {
+    ok: true,
+    body: new globalThis.ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('event: chunk\ndata: {"ordinal":1,"content":"先到"}\n\n'));
+        controller.enqueue(encoder.encode('event: chunk\ndata: {"ordinal":1,"content":"后到"}\n\nevent: result\ndata: {"result":{"status":"completed"}}\n\n'));
+        controller.close();
+      }
+    })
+  };
+
+  await readServerSentEvents(response, {
+    onChunk: (payload) => received.push(payload.content),
+    onResult: (payload) => { result = payload.result; }
+  });
+
+  assert.deepEqual(received, ["先到", "后到"]);
+  assert.deepEqual(result, { status: "completed" });
+});
+
 test("groups each user question with its following session output for navigation", () => {
   const turns = conversationTurns({
     messages: [
@@ -275,12 +303,6 @@ test("uses relative same-origin endpoints for health and local session checks", 
     "classification-revised",
     "classification-accepted",
     "classification-excluded",
-    "metadata-tags-generated",
-    "metadata-tags-accepted",
-    "metadata-tags-excluded",
-    "candidate-links-generated",
-    "candidate-links-accepted",
-    "candidate-links-excluded",
     "review-snapshot-created",
     "review-snapshot-stale",
     "review-item-decided",
@@ -343,7 +365,7 @@ test("renders a dense all-vault panorama and second-level detail drawer", () => 
   assert.match(markup, /概况/);
   assert.match(markup, /索引/);
   assert.match(markup, /资料任务/);
-  assert.match(markup, /图谱/);
+  assert.doesNotMatch(markup, /图谱/);
   assert.match(markup, /会话/);
   assert.match(markup, /策略/);
   assert.doesNotMatch(markup, /研究资料\/platform/);
@@ -355,6 +377,7 @@ test("groups model defaults and Provider actions into a scannable settings layou
       provider_id: "provider-1",
       name: "Rerank Provider",
       endpoint: "https://rerank.example/v1",
+      api_mode: "responses",
       credential_configured: false,
       verification: { is_verified: true, discovery: { ok: true }, health: { ok: true } },
       models: [{
@@ -362,6 +385,11 @@ test("groups model defaults and Provider actions into a scannable settings layou
         model_type: "rerank",
         is_discovered: true,
         verification: { ok: true }
+      }, {
+        model_id: "failed-model",
+        model_type: "chat",
+        is_discovered: true,
+        verification: { ok: false, reason: "Chat model verification could not be completed. Provider TLS connection failed." }
       }, {
         model_id: "unused-provider-model",
         model_type: null,
@@ -388,6 +416,9 @@ test("groups model defaults and Provider actions into a scannable settings layou
   assert.match(markup, /候选重排默认模型/);
   assert.match(markup, /默认关闭；启用后仅发送允许外发的候选。/);
   assert.match(markup, /Rerank（重排）/);
+  assert.match(markup, /failed-model/);
+  assert.match(markup, /验证失败/);
+  assert.match(markup, /原因：模型验证失败：Provider TLS 连接失败。请检查服务地址或证书后重试。/);
   assert.doesNotMatch(markup, /unused-provider-model/);
   assert.match(markup, /添加模型/);
   assert.match(markup, /Markdown 结构化/);
@@ -398,10 +429,23 @@ test("groups model defaults and Provider actions into a scannable settings layou
   assert.match(markup, /目标 Token/);
   assert.match(markup, /最大 Token/);
   assert.match(markup, /Rerank Provider \/ rerank-1/);
-  assert.match(markup, /API Key：未配置/);
+  assert.match(markup, /aria-label="模型发现：通过"/);
+  assert.match(markup, /aria-label="服务健康：通过"/);
+  assert.doesNotMatch(markup, /https:\/\/rerank\.example\/v1/);
+  assert.doesNotMatch(markup, /API Key：未配置/);
+  assert.match(markup, /Responses API/);
   assert.match(markup, /aria-label="测试 Rerank Provider"/);
   assert.match(markup, /aria-label="编辑 Rerank Provider"/);
   assert.match(markup, /aria-label="删除 Rerank Provider"/);
+  assert.match(markup, /aria-label="删除模型 rerank-1"/);
+  assert.match(markup, /aria-label="删除模型 failed-model"/);
+  assert.match(markup, /class="provider-model-identity">[\s\S]*?rerank-1[\s\S]*?aria-label="删除模型 rerank-1"/);
+});
+
+test("reads FastAPI detail messages for provider validation failures", () => {
+  const source = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "../src/app.js"), "utf8");
+
+  assert.match(source, /payload\?\.detail\?\.message/);
 });
 
 test("renders a bounded three-pane session workspace with a context composer", () => {
@@ -1155,12 +1199,42 @@ test("requires an explicit online parse Provider selection", () => {
   const component = source.slice(componentStart, componentEnd);
 
   assert.ok(componentStart >= 0);
-  assert.match(component, /const \[onlineParseEnabled, setOnlineParseEnabled\] = React\.useState\(false\)/);
+  assert.match(component, /const \[onlineParseEnabled, setOnlineParseEnabled\] = React\.useState\(loadOnlineParseEnabled\)/);
   assert.match(component, /React\.useState\(loadOnlineParseProviderId\)/);
   assert.match(component, /saveOnlineParseProviderId\(onlineParseProviderId\)/);
-  assert.match(component, /onlineParseEnabled && !onlineParseProviderId/);
+  assert.match(component, /saveOnlineParseEnabled\(next\)/);
+  assert.match(component, /React\.useState\(loadMarkdownPipeline\)/);
+  assert.match(component, /markdown_pipeline: markdownPipeline/);
+  assert.match(component, /const onlineParseActive = onlineParseEnabled/);
+  assert.match(component, /online_parse_enabled: onlineParseActive/);
+  assert.match(component, /online_parse_provider_id: onlineParseActive \? onlineParseProviderId : null/);
+  assert.match(component, /AI 结构化/);
+  assert.match(component, /本地结构化/);
+  assert.match(component, /verifiedOnlineParseProviders\.some/);
   assert.match(component, /请选择在线解析 Provider/);
   assert.doesNotMatch(component, /providers\.find\(\(provider\) => provider\.verified\)/);
+});
+
+test("defaults online parsing on and preserves the user's manual switch choice", () => {
+  const values = new Map();
+  const storage = {
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value),
+    removeItem: (key) => values.delete(key)
+  };
+
+  assert.equal(loadOnlineParseEnabled(storage), true);
+
+  saveOnlineParseEnabled(false, storage);
+  assert.equal(values.get(ONLINE_PARSE_ENABLED_STORAGE_KEY), "false");
+  assert.equal(loadOnlineParseEnabled(storage), false);
+
+  saveOnlineParseEnabled(true, storage);
+  assert.equal(values.get(ONLINE_PARSE_ENABLED_STORAGE_KEY), "true");
+  assert.equal(loadOnlineParseEnabled(storage), true);
+
+  values.set(ONLINE_PARSE_ENABLED_STORAGE_KEY, "unexpected");
+  assert.equal(loadOnlineParseEnabled(storage), true);
 });
 
 test("persists the last selected online parse Provider without enabling online parsing", () => {
@@ -1178,6 +1252,21 @@ test("persists the last selected online parse Provider without enabling online p
 
   saveOnlineParseProviderId("", storage);
   assert.equal(loadOnlineParseProviderId(storage), "");
+});
+
+test("defaults PDF Markdown structuring to AI and preserves manual local mode", () => {
+  const values = new Map();
+  const storage = {
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value)
+  };
+
+  assert.equal(loadMarkdownPipeline(storage), "ai");
+  saveMarkdownPipeline("local", storage);
+  assert.equal(values.get(MARKDOWN_PIPELINE_STORAGE_KEY), "local");
+  assert.equal(loadMarkdownPipeline(storage), "local");
+  saveMarkdownPipeline("invalid", storage);
+  assert.equal(loadMarkdownPipeline(storage), "ai");
 });
 
 test("offers an accessible deletion action only for non-running import tasks", () => {
@@ -1324,17 +1413,6 @@ test("renders the projection rebuild verification panel without projection conte
   assert.doesNotMatch(markup, /retrieval_projection/);
 });
 
-test("offers a private tag deletion flow without a target tag field", () => {
-  const markup = renderToStaticMarkup(
-    React.createElement(TagManagement, {
-      vault: { vault_id: "vault-1" }
-    })
-  );
-
-  assert.match(markup, /<option value="delete">删除<\/option>/);
-  assert.match(markup, /标签变更先生成私有影响预览；实际 Markdown 写入仍需后续审核提交。/);
-});
-
 test("renders index health and explicit recovery controls without exposing content", () => {
   const markup = renderToStaticMarkup(
     React.createElement(VaultIndexStatus, {
@@ -1366,18 +1444,6 @@ test("renders index health and explicit recovery controls without exposing conte
   assert.match(markup, /重建索引/);
 });
 
-test("renders the metadata extraction action and local review surface", () => {
-  const markup = renderToStaticMarkup(
-    React.createElement(MetadataExtractionPanel, {
-      vault: { vault_id: "vault-1" }
-    })
-  );
-
-  assert.match(markup, /元数据审核/);
-  assert.match(markup, /抽取元数据/);
-  assert.match(markup, /没有待审核的元数据候选/);
-});
-
 test("renders a partial index summary without unmounting the workspace", () => {
   const markup = renderToStaticMarkup(
     React.createElement(VaultIndexStatus, {
@@ -1391,19 +1457,4 @@ test("renders a partial index summary without unmounting the workspace", () => {
 
   assert.match(markup, /状态：未初始化/);
   assert.match(markup, /已索引 0 项；失效 0 项；待关联 0 项；失败 0 项。/);
-});
-
-test("renders the current-vault graph controls with non-color relationship states", () => {
-  const markup = renderToStaticMarkup(
-    React.createElement(KnowledgeGraphWorkbench, {
-      vaults: [],
-      currentVault: null,
-      isLoading: false,
-      onAddVault: () => {},
-      onUpdateVault: () => {}
-    })
-  );
-
-  assert.match(markup, /添加 vault/);
-  assert.match(markup, /知识图谱/);
 });

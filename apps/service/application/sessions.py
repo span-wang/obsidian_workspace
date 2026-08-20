@@ -297,7 +297,7 @@ class SessionService:
     def __init__(
         self, repository: SessionRepository, *, vault_service=None, provider_service=None,
         policy_service=None, index_repository=None, lexical_retrieval_enabled: bool = True,
-        hybrid_retrieval_enabled: bool = False, unit_card_retrieval_enabled: bool = False,
+        hybrid_retrieval_enabled: bool = False,
         reranker: RerankerPort | None = None, rerank_retrieval_enabled: bool = False,
     ) -> None:
         self.repository = repository
@@ -308,7 +308,6 @@ class SessionService:
         self.lexical_retrieval_enabled = lexical_retrieval_enabled
         self.hybrid_retrieval_enabled = hybrid_retrieval_enabled
         self._retrieval_mode: str | None = None
-        self.unit_card_retrieval_enabled = unit_card_retrieval_enabled
         self.reranker = reranker
         self.rerank_retrieval_enabled = rerank_retrieval_enabled
         self._preparing_snapshot_counts: dict[str, int] = {}
@@ -604,6 +603,7 @@ class SessionService:
         model_id: str,
         intent: str = "auto",
         query_scope: QueryScopeSelection | None = None,
+        on_stream_chunk: Callable[[int, str], None] | None = None,
     ):
         """Persist this turn's selections and execute it without a user-facing staging step."""
 
@@ -616,7 +616,12 @@ class SessionService:
             model_id=model_id,
         )
         snapshot = self.create_task(session_id, content, intent=intent, query_scope=query_scope)
-        return self.execute_task(session_id, snapshot.task_id, generate_answer=True)
+        return self.execute_task(
+            session_id,
+            snapshot.task_id,
+            on_stream_chunk=on_stream_chunk,
+            generate_answer=True,
+        )
 
     def execute_task(
         self,
@@ -767,7 +772,7 @@ class SessionService:
             self._begin_knowledge_organization_preparation(snapshot.snapshot_id)
             try:
                 return self._execute_knowledge_organization(
-                    snapshot, task_state, started, content
+                    snapshot, task_state, started, content, on_stream_chunk=on_stream_chunk
                 )
             finally:
                 self._end_knowledge_organization_preparation(snapshot.snapshot_id)
@@ -855,7 +860,11 @@ class SessionService:
             completed_state = replace(task_state, status=result.status, updated_at=timestamp)
             generation_results, citations, generation_duration_ms, generation_error = (
                 self._evidence_turn_records(
-                    completed_snapshot, detail, result, generate_answer=generate_answer
+                    completed_snapshot,
+                    detail,
+                    result,
+                    generate_answer=generate_answer,
+                    on_stream_chunk=on_stream_chunk,
                 )
             )
             if generate_answer and result.status == "completed":
@@ -1292,6 +1301,8 @@ class SessionService:
         task_state: SessionTaskState,
         started: float,
         content: str,
+        *,
+        on_stream_chunk: Callable[[int, str], None] | None = None,
     ) -> SessionKnowledgeOrganizationResult:
         timestamp = utc_now()
         expected_status = snapshot.status
@@ -1320,11 +1331,21 @@ class SessionService:
                 break
             try:
                 self._prepare_knowledge_organization_section(section)
-                generated = self.provider_service.generate_chat(
-                    snapshot.provider_id,
-                    snapshot.model_id,
-                    self._knowledge_organization_prompt(snapshot, section, content, structure_kind),
-                )
+                prompt = self._knowledge_organization_prompt(snapshot, section, content, structure_kind)
+                if on_stream_chunk is None:
+                    generated = self.provider_service.generate_chat(
+                        snapshot.provider_id, snapshot.model_id, prompt
+                    )
+                else:
+                    chunks = []
+                    for chunk in self.provider_service.stream_chat(
+                        snapshot.provider_id, snapshot.model_id, prompt
+                    ):
+                        chunks.append(chunk)
+                        on_stream_chunk(section.ordinal, chunk)
+                    generated = "".join(chunks).strip()
+                    if not generated:
+                        raise SessionValidationError("The selected Provider returned no generated content.")
                 outcome = SessionKnowledgeOrganizationSectionOutcome(
                     section.ordinal,
                     "completed",
@@ -1876,22 +1897,6 @@ class SessionService:
         ranked: list[tuple[float, object, object, tuple[str, ...]]] = []
         semantic_query_sent = False
         semantic_unavailable = False
-        use_unit_cards = self.unit_card_retrieval_enabled and self._is_coarse_unit_lookup(content)
-        unit_card_lexical_hits = (
-            tuple(
-                self.index_repository.search_unit_cards_lexical(
-                    snapshot.vault_id,
-                    LexicalQuery(
-                        content,
-                        limit=MAX_HYBRID_CANDIDATES,
-                        allowed_relative_paths=allowed_paths,
-                    ),
-                )
-            )
-            if allowed_paths and use_unit_cards and retrieval_mode in {"keyword", "hybrid"}
-            else ()
-        )
-        unit_card_semantic_hits = ()
         if allowed_paths and retrieval_mode == "semantic":
             health = self.index_repository.health(snapshot.vault_id)
             if health.semantic_status not in {"available", "partial"}:
@@ -1903,12 +1908,9 @@ class SessionService:
                 )
             (
                 semantic_hits,
-                unit_card_semantic_hits,
                 semantic_query_sent,
                 semantic_unavailable,
-            ) = self._semantic_candidates(
-                snapshot.vault_id, content, allowed_paths, include_unit_cards=use_unit_cards
-            )
+            ) = self._semantic_candidates(snapshot.vault_id, content, allowed_paths)
             if semantic_unavailable or not semantic_query_sent:
                 return SessionRetrievalResult(
                     str(uuid4()), snapshot.session_id, snapshot.task_id, snapshot.snapshot_id,
@@ -1947,14 +1949,12 @@ class SessionService:
             )
             (
                 fused,
-                unit_card_semantic_hits,
                 semantic_query_sent,
                 semantic_unavailable,
             ) = self._hybrid_fused_candidates(
                 snapshot.vault_id,
                 content,
                 allowed_paths,
-                include_unit_cards=use_unit_cards,
                 limit=candidate_limit,
             )
             primary_hits = fused
@@ -1979,27 +1979,6 @@ class SessionService:
                 document = allowed_documents_by_id.get(hit.document_id)
                 if document is not None and document.relative_path == hit.relative_path:
                     ranked.append((hit.score, document, hit.block, ("lexical",)))
-
-        if use_unit_cards:
-            card_ranked = self._unit_card_ranked(
-                snapshot.vault_id,
-                (*unit_card_lexical_hits, *unit_card_semantic_hits),
-                allowed_paths,
-                allowed_documents_by_id,
-            )
-            if card_ranked:
-                card_keys = {
-                    (document.document_id, block.sequence)
-                    for _score, document, block, _channels in card_ranked
-                }
-                ranked = [
-                    *card_ranked,
-                    *(
-                        item
-                        for item in ranked
-                        if (item[1].document_id, item[2].sequence) not in card_keys
-                    ),
-                ]
 
         evidences: list[SessionRetrievalEvidence] = []
         remaining_characters = MAX_RETRIEVAL_CONTEXT_CHARS
@@ -2117,10 +2096,8 @@ class SessionService:
         vault_id: str,
         content: str,
         allowed_paths: tuple[str, ...],
-        *,
-        include_unit_cards: bool,
         limit: int,
-    ) -> tuple[tuple[HybridBlockHit, ...], tuple, bool, bool]:
+    ) -> tuple[tuple[HybridBlockHit, ...], bool, bool]:
         # Every channel sees the same policy-approved path set, but never another channel's hits.
         lexical_hits = (
             tuple(
@@ -2151,8 +2128,8 @@ class SessionService:
             if heading_prefixes
             else ()
         )
-        semantic_hits, unit_card_hits, semantic_query_sent, semantic_unavailable = self._semantic_candidates(
-            vault_id, content, allowed_paths, include_unit_cards=include_unit_cards
+        semantic_hits, semantic_query_sent, semantic_unavailable = self._semantic_candidates(
+            vault_id, content, allowed_paths
         )
         return (
             fuse_rrf(
@@ -2163,7 +2140,6 @@ class SessionService:
                 },
                 limit=limit,
             ),
-            unit_card_hits,
             semantic_query_sent,
             semantic_unavailable,
         )
@@ -2475,12 +2451,10 @@ class SessionService:
         vault_id: str,
         query_text: str,
         allowed_paths: tuple[str, ...],
-        *,
-        include_unit_cards: bool,
-    ) -> tuple[tuple, tuple, bool, bool]:
+    ) -> tuple[tuple, bool, bool]:
         health = self.index_repository.health(vault_id)
         if health.semantic_status not in {"available", "partial"}:
-            return (), (), False, True
+            return (), False, True
         try:
             resolved = self.provider_service.resolve_model("embedding")
             vectors = self.provider_service.create_embeddings(
@@ -2510,54 +2484,9 @@ class SessionService:
                     allowed_relative_paths=allowed_paths,
                 ),
             )
-            card_hits = (
-                self.index_repository.search_unit_cards_vector(
-                    vault_id,
-                    VectorQuery(
-                        profile=profile,
-                        vector=vector,
-                        limit=MAX_HYBRID_CANDIDATES,
-                        allowed_relative_paths=allowed_paths,
-                    ),
-                )
-                if include_unit_cards
-                else []
-            )
         except (EmbeddingVectorConsistencyError, ProviderUnavailableError, ValueError):
-            return (), (), False, True
-        return tuple(hits), tuple(card_hits), True, False
-
-    @staticmethod
-    def _is_coarse_unit_lookup(content: str) -> bool:
-        normalized = content.casefold()
-        return "unit" in normalized or "单元" in content
-
-    def _unit_card_ranked(
-        self,
-        vault_id: str,
-        hits: tuple,
-        allowed_paths: tuple[str, ...],
-        documents_by_id: dict[str, object],
-    ) -> list[tuple[float, object, object, tuple[str, ...]]]:
-        ranked: list[tuple[float, object, object, tuple[str, ...]]] = []
-        seen_cards: set[str] = set()
-        seen_blocks: set[tuple[str, int]] = set()
-        for card_rank, hit in enumerate(hits, start=1):
-            if hit.card.card_id in seen_cards:
-                continue
-            seen_cards.add(hit.card.card_id)
-            for reference in self.index_repository.resolve_unit_card_sources(
-                vault_id, hit.card.card_id, allowed_paths
-            ):
-                document = documents_by_id.get(reference.document_id)
-                if document is None or document.relative_path != reference.relative_path:
-                    continue
-                key = reference.document_id, reference.block.sequence
-                if key in seen_blocks:
-                    continue
-                seen_blocks.add(key)
-                ranked.append((1.0 / card_rank, document, reference.block, ("unit-card",)))
-        return ranked
+            return (), False, True
+        return tuple(hits), True, False
 
     @staticmethod
     def _expand_retrieval_neighborhoods(
@@ -2597,6 +2526,7 @@ class SessionService:
         retrieval: SessionRetrievalResult,
         *,
         generate_answer: bool,
+        on_stream_chunk: Callable[[int, str], None] | None = None,
     ) -> tuple[
         tuple[SessionGenerationResult, ...], tuple[SessionCitation, ...], int, str | None
     ]:
@@ -2618,21 +2548,31 @@ class SessionService:
                 return (), (), 0, "当前范围内的内容无法用于生成回答。"
             started = perf_counter()
             try:
-                generated = self.provider_service.generate_chat(
-                    snapshot.provider_id,
-                    snapshot.model_id,
-                    self._retrieval_answer_prompt(
-                        next(
-                            (
-                                message.content
-                                for message in detail.messages
-                                if message.message_id == snapshot.message_id
-                            ),
-                            "请直接回答用户问题。",
+                prompt = self._retrieval_answer_prompt(
+                    next(
+                        (
+                            message.content
+                            for message in detail.messages
+                            if message.message_id == snapshot.message_id
                         ),
-                        evidences,
+                        "请直接回答用户问题。",
                     ),
+                    evidences,
                 )
+                if on_stream_chunk is None:
+                    generated = self.provider_service.generate_chat(
+                        snapshot.provider_id, snapshot.model_id, prompt
+                    )
+                else:
+                    chunks = []
+                    for chunk in self.provider_service.stream_chat(
+                        snapshot.provider_id, snapshot.model_id, prompt
+                    ):
+                        chunks.append(chunk)
+                        on_stream_chunk(1, chunk)
+                    generated = "".join(chunks).strip()
+                    if not generated:
+                        raise SessionValidationError("The selected Provider returned no generated content.")
             except Exception:
                 return (), (), int((perf_counter() - started) * 1000), "回答生成失败，请稍后重试。"
             result = SessionGenerationResult.new(

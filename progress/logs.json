@@ -1,6 +1,87 @@
 {
   "logs": [
     {
+      "date": "2026-08-20",
+      "taskId": "RET-34-01",
+      "action": "开始原生 Obsidian 图片资源保留与 Embedding 排除",
+      "result": "用户确认：解析和入库 Obsidian 时保留本地图片资源，Embedding 不处理图片。本步冻结为原生 Markdown 本地图片引用的安全解析、资产入库、引用重写、共享删除保护和 embedding 排除；远程图片、历史批量迁移和图像理解不纳入。",
+      "verification": [],
+      "files": [
+        "progress/config.json",
+        "progress/tasks/retrieval.json",
+        "progress/risks.json",
+        "progress/logs.json"
+      ],
+      "next": "先补充图片资源与 embedding 排除失败回归，再实现最小导入链路。"
+    },
+    {
+      "date": "2026-08-17",
+      "taskId": "RET-33-01",
+      "action": "完成 Provider Responses API 模式",
+      "result": "Provider 现可在设置页显式选择 Chat Completions 或 Responses API；旧 SQLite 记录自动迁移为 Chat Completions。Responses 模式的 chat/markdown 验证与生成调用 /responses，发送 instructions、input、stream 与 max_output_tokens，只消费 response.output_text.delta 的最终文本和 response.completed 的一致 usage。模型发现、健康检查、Embedding、Rerank、凭据与 Vault 出网策略未改变；不自动切换任何已有 Provider。真实工作台页面确认选项和桌面布局可用；未发起真实 Provider 请求，未新增技术债。",
+      "verification": [
+        "Provider client、服务与 SQLite 迁移回归（74 passed）",
+        "Provider API 单测（12 passed）与 loopback integration（15 passed）",
+        "Provider 相关 Ruff（All checks passed）",
+        "前端单测（39 passed）、lint 与 build（通过）",
+        "Provider 设置 Playwright 回归（1 passed）与真实本机设置页 CLI 检查",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过；仅既有 Windows 行尾提示）"
+      ],
+      "files": [
+        "apps/service/domain/providers.py",
+        "apps/service/ports/provider_client.py",
+        "apps/service/adapters/openai_compatible_provider.py",
+        "apps/service/adapters/sqlite_provider_repository.py",
+        "apps/service/application/providers.py",
+        "apps/service/api/main.py",
+        "apps/web/src/app.js",
+        "apps/service/tests/unit/test_openai_compatible_provider.py",
+        "apps/service/tests/unit/test_providers.py",
+        "apps/service/tests/unit/test_sqlite_provider_repository_rerank.py",
+        "apps/service/tests/unit/test_vault_api.py",
+        "apps/web/tests/app.test.js",
+        "browser-tests/loopback.spec.mjs",
+        "progress/"
+      ],
+      "next": "用户可编辑“极速按量”，将 API 模式切换为 Responses API 后重新测试模型；若仍收到服务商 502，则继续按 API Key 或上游模型权限处理。"
+    },
+    {
+      "date": "2026-08-17",
+      "taskId": "RET-27-01",
+      "action": "确认 PDF OCR 后 Markdown 双管线开发方案",
+      "result": "用户确认所有 PDF 均可独立组合本机或在线 OCR 与 AI 结构化或本地结构化。AI 模式将选定 DocumentGraph 的 Markdown 发送到既有 Markdown Provider，本地模式使用确定性渲染且零 Provider 调用；PDF 原件上传仍只由在线解析开关控制。两类外发均使用既有 Vault outbound policy，失败不自动回退。模式按任务冻结，新任务默认 AI；历史任务按既有在线 OCR 选择推断模式以避免重试扩大外发。非 PDF 保持原处理；本步仅提供手动任务对照，不新增自动双跑、差异或评分。",
+      "verification": [
+        "用户逐项确认 OCR/结构化组合、PDF-only 范围、出网门禁、失败语义、历史兼容、界面可见性和手动对照边界",
+        "progress/config.json、progress/tasks/retrieval.json、progress/risks.json 与 progress/logs.json JSON 解析通过",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过；仅既有 Windows 行尾提示）"
+      ],
+      "files": [
+        "docs/retrieval-redesign.md",
+        "docs/online-ocr-providers.md",
+        "progress/config.json",
+        "progress/tasks/retrieval.json",
+        "progress/risks.json",
+        "progress/logs.json"
+      ],
+      "next": "实施任务级 PDF Markdown 模式合同、四种 OCR/结构化执行分支、API 与前端分段控件；完成定向服务端、前端和浏览器验证后记录真实结果。"
+    },
+    {
+      "date": "2026-08-12",
+      "taskId": "RET-30-01",
+      "action": "开始退役无效治理与用户知识图谱",
+      "result": "用户确认直接删除私有标签治理、LLM 元数据候选、单元卡片和知识图谱。执行边界明确保留 PDF/DOCX 解析依赖的 DocumentGraph 与 graph projection、Markdown 原生 tags、FTS tag_text 和确定性范围元数据；旧 SQLite 历史表不做破坏性迁移，只停止生产运行时读写。",
+      "verification": [],
+      "files": [
+        "progress/",
+        "apps/service/",
+        "apps/web/",
+        "browser-tests/"
+      ],
+      "next": "删除生产入口与运行时依赖后，重点回归导入结构投影、Markdown 标签检索、范围过滤和普通会话检索。"
+    },
+    {
       "date": "2026-08-12",
       "taskId": "RET-29-01",
       "action": "完成当前页导入任务多选删除",
@@ -1935,6 +2016,135 @@
         "progress/"
       ],
       "next": "如需迁移历史导入或允许用户批量自定义命名，应先建立可预览、可回滚的 Vault 迁移与冲突确认任务。"
+    },
+    {
+      "date": "2026-08-13",
+      "taskId": "RET-30-01",
+      "action": "完成无效治理与用户知识图谱退役",
+      "result": "已删除私有标签治理、LLM 元数据候选、单元卡片、候选链接和用户知识图谱的生产 UI/API/运行时/领域/端口/仓储链路；新库不创建退役表，旧库历史表和行保持不变且运行时不读写。保留 DocumentGraph、graph projection、Markdown 原生 tags、FTS tag_text、确定性范围元数据、导入、Embedding 和普通检索。",
+      "verification": [
+        "完整服务端 unit（651 passed，2 skipped）",
+        "uv run --directory apps/service ruff check .（All checks passed）",
+        "前端 test（35 passed）、lint 与 build（通过）",
+        "OBSIDIAN_PLATFORM_TEST_PORT=6427 npm run integration（13 passed，2 skipped）",
+        "受影响浏览器场景（用户图谱退役、自动导入治理区移除、无手工提交）（3 passed）",
+        "npm run progress:build && npm run progress:check（通过）与 git diff --check（通过）",
+        "完整 browser-test 24 场景为 13 passed、11 failed；未通过项为既有工作台、设置、会话 UI 基线漂移，未归因于本任务。"
+      ],
+      "files": [
+        "apps/service/",
+        "apps/web/",
+        "browser-tests/loopback.spec.mjs",
+        "docs/retrieval-redesign.md",
+        "DESIGN.md",
+        "progress/"
+      ],
+      "next": "若重新引入治理能力，另立任务并先定义唯一耐久身份、可回滚写入和真实数据质量门槛。"
+    },
+    {
+      "date": "2026-08-17",
+      "taskId": "RET-31-01",
+      "action": "开始 OCR 后本地 Markdown 图结构归一化",
+      "result": "用户确认以 DocumentGraph 为本地结构化规范输入，原始 PaddleOCR 页面 JSON 保持在 adapter 与私有证据层。范围限定为零出网的确定性归一化：标题、阅读顺序、列表、图注、段落断行、可确认的重复页边噪音与异常 bbox，并要求变换后的图块可回链全部原始定位与证据。历史任务不得因规则升级自动改变。",
+      "verification": [],
+      "files": [
+        "progress/",
+        "apps/service/domain/evidence.py",
+        "apps/service/domain/derived_notes.py",
+        "apps/service/workers/converters/launcher.py",
+        "apps/service/tests/fixtures/",
+        "apps/service/tests/unit/test_document_conversion_v2.py"
+      ],
+      "next": "实现版本化归一化器与最小持久化合同，补齐脱敏 golden fixtures 后运行定向回归、进度检查和差异检查。"
+    },
+    {
+      "date": "2026-08-17",
+      "taskId": "RET-31-01",
+      "action": "完成 OCR 后本地 Markdown 图结构归一化",
+      "result": "PDF 的本地 Markdown 结构化现以初步 DocumentGraph 为唯一规范输入，原始 PaddleOCR 页面 JSON 仍留在转换 adapter 与私有证据层。local-v1 以零出网确定性规则保守提升首页标题、合并 CJK 断行和同列连续段落、转换连续列表、关联图片图注、隐藏跨页重复页边文字，并为异常 bbox 保留正文和 warning。转换结果保留全部原始 block identity、locator 与 evidence；新 PDF 任务冻结 local-v1，缺失字段的历史任务继续使用 legacy-v0。未新增技术债；误删率和标题准确率仍由 RET-R030 跟踪。",
+      "verification": [
+        "转换、任务 profile 持久化、导入/API 与 converter provisioning 定向回归（99 passed）",
+        "受影响应用、领域、适配器、转换器与测试 Ruff（All checks passed）",
+        "uv run --directory apps/service python -m compileall -q application adapters api domain ports workers（通过）",
+        "OBSIDIAN_PLATFORM_TEST_PORT=6443 npm run integration（13 passed，2 skipped）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过；仅既有 Windows 行尾提示）"
+      ],
+      "files": [
+        "apps/service/domain/local_markdown_structure.py",
+        "apps/service/domain/evidence.py",
+        "apps/service/domain/derived_notes.py",
+        "apps/service/domain/tasks.py",
+        "apps/service/application/ingest.py",
+        "apps/service/adapters/local_import_task_runner.py",
+        "apps/service/adapters/sqlite_task_repository.py",
+        "apps/service/workers/converters/launcher.py",
+        "apps/service/workers/converters/online_launcher.py",
+        "apps/service/workers/converters/runner.py",
+        "apps/service/tests/fixtures/paddleocr-vl-1.6-local-structure-pages.json",
+        "apps/service/tests/unit/test_document_conversion_v2.py",
+        "apps/service/tests/unit/test_import_service.py",
+        "apps/service/tests/unit/test_import_tasks.py",
+        "progress/"
+      ],
+      "next": "以更多已审阅、不可逆脱敏教材页量化正文保留、标题准确率和误删率；如需扩展规则，新增版本而非改写既有任务的冻结 profile。"
+    },
+    {
+      "date": "2026-08-17",
+      "taskId": "RET-32-01",
+      "action": "完成 Provider 模型验证失败反馈",
+      "result": "模型探测现保留适配器已归一化的 HTTP、超时、DNS、连接拒绝和 TLS 原因；意外异常仍保持通用失败。设置页正确读取 FastAPI detail.message，失败模型不会从原位置消失，并显示中文原因、验证中状态和重试入口。未记录或暴露 Provider 凭据、请求正文、完整地址、响应体或异常堆栈。",
+      "verification": [
+        "服务端 Provider 定向回归（24 passed）与 Provider API 回归（12 passed）",
+        "Provider application Ruff（All checks passed）",
+        "前端单测（38 passed）、lint 与生产构建（通过）",
+        "独立端口 Provider 设置浏览器回归（1 passed）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过；仅既有 Windows 行尾提示）"
+      ],
+      "files": [
+        "apps/service/application/providers.py",
+        "apps/service/tests/unit/test_providers.py",
+        "apps/web/src/app.js",
+        "apps/web/src/style.css",
+        "apps/web/tests/app.test.js",
+        "browser-tests/loopback.spec.mjs",
+        "progress/"
+      ],
+      "next": "如需保留跨重启的 Provider 请求诊断或用量历史，先定义最小脱敏字段、保留期与用户可见的隐私边界。"
+    },
+    {
+      "date": "2026-08-17",
+      "taskId": "RET-31-01",
+      "action": "修复 OCR 后二级与三级标题无法识别",
+      "result": "补充 local-v1 的显式标题识别：普通 OCR text 块中的 1.1、1.1.1 和全角编号按编号深度转换为 H2/H3，已有标题块按编号修正层级，Markdown 标题前缀和第...节/条/款也可映射；单行有序列表不被误判。",
+      "verification": [
+        "转换、任务 profile 持久化、导入/API、在线解析与 converter provisioning 定向回归（100 passed）",
+        "受影响结构化器与转换测试 Ruff（All checks passed）"
+      ],
+      "files": [
+        "apps/service/domain/local_markdown_structure.py",
+        "apps/service/tests/unit/test_document_conversion_v2.py",
+        "progress/"
+      ],
+      "next": "继续以更多已审阅、不可逆脱敏教材样本验证无编号语义标题；无法从 OCR 标签或版面确定的标题保持正文，不用启发式强行升级。"
+    },
+    {
+      "date": "2026-08-19",
+      "taskId": "RET-31-01",
+      "action": "忽略跨页同位置的重复 OCR 内容",
+      "result": "新增 local-v2。新 PDF 任务默认冻结 v2：跨至少两页出现、文本相同且 bbox 相对或绝对位置及尺寸接近的内容，标记为不可渲染 noise，可覆盖页眉、页脚和页面中部的重复广告。不同页面位置的同文内容保留，避免把重复正文静默删除。legacy-v0 与已冻结的 local-v1 行为不变。",
+      "verification": [
+        "OCR 图结构、任务 profile 持久化、导入/API、在线解析与 converter provisioning 定向回归（102 passed）",
+        "受影响应用、领域、适配器、转换器与测试 Ruff（All checks passed）",
+        "uv run --directory apps/service python -m compileall -q application adapters api domain ports workers（通过）"
+      ],
+      "files": [
+        "apps/service/domain/local_markdown_structure.py",
+        "apps/service/tests/unit/test_document_conversion_v2.py",
+        "progress/"
+      ],
+      "next": "以更多已审阅、不可逆脱敏 PDF 检验不同纸张尺寸、双栏与重复练习内容；任何阈值调整以新的冻结 profile 发布。"
     }
   ]
 }

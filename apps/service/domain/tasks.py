@@ -3,10 +3,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 from uuid import uuid4
 
 from domain.sources import VersionSuggestion
 from domain.online_document_parser import OnlineParseJob, OnlineParseSelection
+from domain.local_markdown_structure import (
+    LEGACY_LOCAL_MARKDOWN_STRUCTURE_PROFILE,
+    LOCAL_MARKDOWN_STRUCTURE_PROFILES,
+)
+
+
+MarkdownPipeline = Literal["ai", "local"]
+MARKDOWN_PIPELINES = frozenset({"ai", "local"})
 
 
 @dataclass(frozen=True)
@@ -61,6 +70,26 @@ class ImportTask:
     ignored_paths: tuple[Path, ...] = ()
     online_parse_selection: OnlineParseSelection | None = None
     online_parse_job: OnlineParseJob | None = None
+    markdown_pipeline: MarkdownPipeline | None = None
+    local_structure_profile: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.markdown_pipeline is not None and self.markdown_pipeline not in MARKDOWN_PIPELINES:
+            raise ValueError("Unsupported Markdown pipeline.")
+        if self.local_structure_profile is not None and self.local_structure_profile not in LOCAL_MARKDOWN_STRUCTURE_PROFILES:
+            raise ValueError("Unsupported local Markdown structure profile.")
+
+    def resolved_markdown_pipeline(self) -> MarkdownPipeline:
+        """Infer the pre-migration value without changing the persisted task."""
+
+        if self.markdown_pipeline is not None:
+            return self.markdown_pipeline
+        return "ai" if self.online_parse_selection is not None else "local"
+
+    def resolved_local_structure_profile(self) -> str:
+        """Infer the pre-migration profile without changing the persisted task."""
+
+        return self.local_structure_profile or LEGACY_LOCAL_MARKDOWN_STRUCTURE_PROFILE
 
 
 @dataclass(frozen=True)
@@ -115,6 +144,8 @@ def new_import_task(
     parent_task_id: str | None = None,
     online_parse_selection: OnlineParseSelection | None = None,
     online_parse_job: OnlineParseJob | None = None,
+    markdown_pipeline: MarkdownPipeline | None = None,
+    local_structure_profile: str | None = None,
 ) -> ImportTask:
     timestamp = utc_now()
     return ImportTask(
@@ -134,4 +165,6 @@ def new_import_task(
         updated_at=timestamp,
         online_parse_selection=online_parse_selection,
         online_parse_job=online_parse_job,
+        markdown_pipeline=markdown_pipeline,
+        local_structure_profile=local_structure_profile,
     )
