@@ -14,7 +14,9 @@ from domain.embeddings import (
     EmbeddingProfile,
     EmbeddingProfileLocator,
     EmbeddingVectorConsistencyError,
+    embedding_block_input_text,
     embedding_input_sha256,
+    embedding_input_text,
 )
 from domain.indexing import IndexBlock, IndexedDocument, VectorQuery
 
@@ -59,9 +61,9 @@ def _document(
 
 
 def _input_text(block: IndexBlock) -> str:
-    return "\n\n".join(
-        value for value in (block.contextual_prefix.strip(), block.retrieval_text.strip()) if value
-    )
+    value = embedding_block_input_text(block.contextual_prefix, block.retrieval_text, block.text)
+    assert value is not None
+    return value
 
 
 def _binding(
@@ -128,6 +130,86 @@ def test_vector_migration_is_retriable_and_rolls_back_after_schema_failure(
         assert connection.execute(
             "SELECT COUNT(*) FROM index_repository_migrations WHERE migration_id = ?",
             ("ret-06-03-index-block-vectors-v1",),
+        ).fetchone()[0] == 1
+
+
+def test_image_exclusion_migration_invalidates_legacy_image_inputs_and_allows_reembedding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "pre-image-exclusion.sqlite3"
+    with monkeypatch.context() as skipped:
+        skipped.setattr(
+            SqliteIndexRepository,
+            "_apply_embedding_image_exclusion_migration",
+            classmethod(lambda _cls, _connection: None),
+        )
+        repository = SqliteIndexRepository(database_path)
+        document = _document(
+            "unit",
+            "notes/unit.md",
+            (
+                _block(1, "Text body."),
+                _block(2, "Text with ![[platform/assets/diagram.png|diagram]]."),
+            ),
+        )
+        profile = _profile()
+        repository.save_document(document)
+        legacy_inputs = tuple(
+            embedding_input_text(block.contextual_prefix, block.retrieval_text, block.text)
+            for block in document.blocks
+        )
+        repository.save_embedding_cache(
+            tuple(
+                EmbeddingCacheEntry.from_input(
+                    profile, value, (1.0, 0.0), "2026-08-20T00:00:00Z"
+                )
+                for value in legacy_inputs
+            )
+        )
+        with sqlite3.connect(database_path) as connection:
+            connection.executemany(
+                """
+                INSERT INTO index_block_vectors (
+                    document_id, sequence, embedding_profile_fingerprint, block_content_sha256,
+                    input_sha256, dimension, vector, indexed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        document.document_id,
+                        block.sequence,
+                        profile.fingerprint,
+                        block.block_content_sha256,
+                        embedding_input_sha256(value),
+                        profile.dimension,
+                        bytes.fromhex("0000803f00000000"),
+                        "2026-08-20T00:00:00Z",
+                    )
+                    for block, value in zip(document.blocks, legacy_inputs, strict=True)
+                ],
+            )
+
+    reopened = SqliteIndexRepository(database_path)
+    with sqlite3.connect(database_path) as connection:
+        vectors = connection.execute(
+            "SELECT sequence FROM index_block_vectors ORDER BY sequence"
+        ).fetchall()
+        assert [row[0] for row in vectors] == [1]
+        assert connection.execute("SELECT COUNT(*) FROM embedding_cache").fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM index_repository_migrations WHERE migration_id = ?",
+            ("ret-34-01-embedding-image-exclusion-v1",),
+        ).fetchone()[0] == 1
+
+    image_binding = _binding(document, document.blocks[1], profile, (0.0, 1.0))
+    reopened.save_block_vectors("vault-1", (image_binding,))
+    assert reopened.health("vault-1").semantic_status == "available"
+
+    SqliteIndexRepository(database_path)
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM index_repository_migrations WHERE migration_id = ?",
+            ("ret-34-01-embedding-image-exclusion-v1",),
         ).fetchone()[0] == 1
 
 
@@ -278,6 +360,32 @@ def test_semantic_health_reports_current_profile_coverage_and_blocks_invalid_vec
         repository.search_vector("vault-1", _query(profile, (1.0, 0.0), ("notes/unit.md",)))
 
 
+def test_image_only_blocks_do_not_require_a_semantic_vector(tmp_path: Path) -> None:
+    repository = SqliteIndexRepository(tmp_path / "indexes.sqlite3")
+    document = _document(
+        "unit",
+        "notes/unit.md",
+        (_block(1, "![[platform/assets/diagram.png|diagram]]"), _block(2, "Text body.")),
+    )
+    profile = _profile()
+    repository.save_document(document)
+    repository.save_block_vectors("vault-1", (_binding(document, document.blocks[1], profile, (1.0, 0.0)),))
+
+    health = repository.health("vault-1")
+    assert (health.semantic_status, health.semantic_covered_block_count, health.semantic_eligible_block_count) == (
+        "available",
+        1,
+        1,
+    )
+
+    image_input = embedding_block_input_text(
+        document.blocks[0].contextual_prefix,
+        document.blocks[0].retrieval_text,
+        document.blocks[0].text,
+    )
+    assert image_input is None
+
+
 def test_block_vector_batch_rolls_back_when_one_current_block_changes(tmp_path: Path) -> None:
     repository = SqliteIndexRepository(tmp_path / "indexes.sqlite3")
     document = _document("unit", "notes/unit.md", (_block(1, "One"), _block(2, "Two")))
@@ -299,6 +407,30 @@ def test_block_vector_batch_rolls_back_when_one_current_block_changes(tmp_path: 
     assert repository.search_vector(
         "vault-1", _query(profile, (1.0, 0.0), ("notes/unit.md",))
     ) == []
+
+
+def test_block_vector_identity_rejects_a_different_vector_for_the_same_input(tmp_path: Path) -> None:
+    repository = SqliteIndexRepository(tmp_path / "indexes.sqlite3")
+    document = _document("unit", "notes/unit.md", (_block(1, "One"),))
+    profile = _profile()
+    binding = _binding(document, document.blocks[0], profile, (1.0, 0.0))
+    repository.save_document(document)
+    repository.save_block_vectors("vault-1", (binding,))
+
+    with pytest.raises(EmbeddingVectorConsistencyError, match="identity cannot be reused"):
+        repository.save_block_vectors(
+            "vault-1",
+            (
+                EmbeddingBlockVector(
+                    document_id=binding.document_id,
+                    sequence=binding.sequence,
+                    content_sha256=binding.content_sha256,
+                    input_sha256=binding.input_sha256,
+                    profile=binding.profile,
+                    vector=(0.0, 1.0),
+                ),
+            ),
+        )
 
 
 def test_block_vectors_require_the_current_rich_embedding_input(tmp_path: Path) -> None:

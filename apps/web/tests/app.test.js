@@ -23,6 +23,7 @@ import {
   loadOnlineParseProviderId,
   MARKDOWN_STRUCTURE_BUDGET_ENDPOINT,
   MARKDOWN_PIPELINE_STORAGE_KEY,
+  markdownPreviewHtml,
   ONLINE_PARSE_ENABLED_STORAGE_KEY,
   ONLINE_PARSE_PROVIDERS_ENDPOINT,
   ONLINE_PARSE_SELECTION_STORAGE_KEY,
@@ -105,6 +106,16 @@ test("formats source metadata for readers without exposing internal identity", (
   assert.equal(userFacingImportIssue("paragraph:1: Paragraph needs review."), "Paragraph needs review.");
   assert.equal(userFacingImportIssue("image:1: Image description needs review."), "Image description needs review.");
   assert.equal(userFacingImportIssue("table:1/row:1/cell:1: Table needs review."), "Table needs review.");
+});
+
+test("renders large Markdown previews in safe chunks without interpreting raw HTML", () => {
+  const markup = markdownPreviewHtml("# 标题\n\n- 条目\n\n<script>alert(1)</script>");
+
+  assert.match(markup, /<h1>标题<\/h1>/);
+  assert.match(markup, /<ul><li>条目<\/li><\/ul>/);
+  assert.match(markup, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+  assert.doesNotMatch(markup, /<script>/);
+  assert.match(markup, /file-markdown-chunk/);
 });
 
 test("marks parsed import items with their selected parser", () => {
@@ -244,7 +255,7 @@ test("renders the five-destination local workbench shell", () => {
 
   assert.deepEqual(
     NAVIGATION_DESTINATIONS.map((destination) => destination.label),
-    ["工作台", "资料", "会话", "任务", "设置"]
+    ["工作台", "资料", "文件管理", "会话", "任务", "设置"]
   );
   assert.match(markup, /本机知识工作台/);
   assert.match(markup, /工作台/);
@@ -402,7 +413,11 @@ test("groups model defaults and Provider actions into a scannable settings layou
       chat: { default: null, status: "unconfigured", reason: null },
       embedding: { default: null, status: "unconfigured", reason: null },
       rerank: { default: null, status: "unconfigured", reason: null },
-      markdown: { default: null, status: "unconfigured", reason: null }
+      markdown: {
+        default: { provider_id: "provider-1", model_id: "markdown-1" },
+        status: "unavailable",
+        reason: "The selected markdown Model is unavailable. Choose another model."
+      }
     },
     onOpenForm: () => {},
     onUpdate: () => {},
@@ -423,6 +438,8 @@ test("groups model defaults and Provider actions into a scannable settings layou
   assert.match(markup, /添加模型/);
   assert.match(markup, /Markdown 结构化/);
   assert.match(markup, /Markdown 结构化默认模型/);
+  assert.match(markup, /所选 Markdown 模型不可用。请选择其他模型。/);
+  assert.doesNotMatch(markup, /The selected markdown Model is unavailable/);
   assert.match(markup, /Markdown 分块 Token 预算/);
   assert.match(markup, /在线解析/);
   assert.match(markup, /最小 Token/);
@@ -1124,7 +1141,7 @@ test("keeps conversion correction disabled until its typed payload and reason ar
   assert.match(markup, /disabled=""/);
 });
 
-test("shows all identity counts in task center rows", () => {
+test("shows a compact task summary instead of every identity count", () => {
   const markup = renderToStaticMarkup(
     React.createElement(ImportTaskCenter, {
       tasks: [{
@@ -1158,10 +1175,14 @@ test("shows all identity counts in task center rows", () => {
     })
   );
 
-  assert.match(markup, /可能版本 1/);
-  assert.match(markup, /识别失败 1/);
-  assert.match(markup, /已解析 1/);
-  assert.match(markup, /待审核问题 1/);
+  assert.match(markup, /class="import-task-summary import-task-open-summary"/);
+  assert.match(markup, /排队/);
+  assert.match(markup, /等待后续处理/);
+  assert.match(markup, /3 项资料/);
+  assert.match(markup, /待审核 1/);
+  assert.doesNotMatch(markup, /可能版本 1/);
+  assert.doesNotMatch(markup, /识别失败 1/);
+  assert.doesNotMatch(markup, /已解析 1/);
 });
 
 test("offers browser file and folder uploads for an available vault", () => {
@@ -1184,10 +1205,10 @@ test("offers browser file and folder uploads for an available vault", () => {
     })
   );
 
-  assert.match(markup, /aria-label="上传本机资料文件"/);
-  assert.match(markup, /aria-label="上传本机资料文件夹"/);
+  assert.match(markup, /type="file"[^>]+tabindex="-1"[^>]+aria-hidden="true"/);
   assert.match(markup, /webkitdirectory=""/);
   assert.doesNotMatch(markup, /选择服务机文件/);
+  assert.match(markup, />上传文件<\/button>/);
   assert.match(markup, />上传文件夹<\/button>/);
 });
 

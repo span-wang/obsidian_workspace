@@ -1,12 +1,61 @@
 import os
 import tempfile
+from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 
+from domain.file_management import SourceFile, normalize_source_relative_path
+from domain.vaults import Vault
+from ports.source_file_store import SourceFileStoreError
 from ports.vault_filesystem import VaultAccess, VaultFilesystemError
 
 
 class LocalVaultFilesystem:
+    def list_source_files(self, vault: Vault) -> tuple[SourceFile, ...]:
+        source_directory = self._resolved_source_directory(vault)
+        files: list[SourceFile] = []
+        try:
+            for candidate in source_directory.rglob("*"):
+                if not candidate.is_file() or candidate.is_symlink():
+                    continue
+                resolved = candidate.resolve(strict=True)
+                if source_directory not in resolved.parents:
+                    continue
+                stat = resolved.stat()
+                files.append(
+                    SourceFile(
+                        vault_id=vault.vault_id,
+                        vault_label=vault.display_name,
+                        relative_path=resolved.relative_to(source_directory).as_posix(),
+                        size_bytes=stat.st_size,
+                        modified_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc),
+                    )
+                )
+        except OSError as error:
+            raise SourceFileStoreError("无法读取资料目录。") from error
+        return tuple(files)
+
+    def resolve_source_file(self, vault: Vault, relative_path: str) -> Path:
+        source_directory = self._resolved_source_directory(vault)
+        try:
+            normalized = normalize_source_relative_path(relative_path)
+            candidate = (source_directory / normalized).resolve(strict=True)
+        except (OSError, ValueError) as error:
+            raise SourceFileStoreError("资料文件不存在或不可读取。") from error
+        if not candidate.is_file() or source_directory not in candidate.parents:
+            raise SourceFileStoreError("资料文件不存在或不可读取。")
+        return candidate
+
+    @staticmethod
+    def _resolved_source_directory(vault: Vault) -> Path:
+        try:
+            source_directory = vault.source_directory.resolve(strict=True)
+        except OSError as error:
+            raise SourceFileStoreError("资料目录不可用。") from error
+        if not source_directory.is_dir():
+            raise SourceFileStoreError("资料目录不可用。")
+        return source_directory
+
     def resolve_vault_path(self, candidate: str | Path) -> Path:
         if not str(candidate).strip():
             raise VaultFilesystemError("Vault path is required.")

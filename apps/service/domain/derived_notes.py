@@ -447,6 +447,7 @@ class NativeMarkdownProposal:
     markdown: str
     heading_locations: tuple[str, ...]
     structured_blocks: tuple[MarkdownStructureBlock, ...] = ()
+    assets: tuple["NativeMarkdownAsset", ...] = ()
     revision: int = 1
     kind: str = "native"
 
@@ -456,6 +457,9 @@ class NativeMarkdownProposal:
             if block.end_offset > len(self.markdown) or block.start_offset < previous_offset:
                 raise ValueError("Native Markdown structure blocks must be ordered source slices.")
             previous_offset = block.end_offset
+        target_paths = [asset.target_relative_path for asset in self.assets]
+        if len(target_paths) != len(set(target_paths)):
+            raise ValueError("Native Markdown asset target paths must be unique.")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -467,8 +471,40 @@ class NativeMarkdownProposal:
             "markdown": self.markdown,
             "heading_locations": list(self.heading_locations),
             "structured_blocks": [block.to_dict() for block in self.structured_blocks],
+            "assets": [asset.to_dict() for asset in self.assets],
             "revision": self.revision,
         }
+
+
+@dataclass(frozen=True)
+class NativeMarkdownAsset:
+    """A verified local image reference carried by a native Markdown proposal."""
+
+    source_relative_path: str
+    target_relative_path: str
+    content_sha256: str
+
+    def __post_init__(self) -> None:
+        if not self.source_relative_path or "\\" in self.source_relative_path:
+            raise ValueError("Native Markdown asset source path must be relative POSIX text.")
+        _normalize_relative_path(self.target_relative_path)
+        if not _SHA256_PATTERN.fullmatch(self.content_sha256):
+            raise ValueError("Native Markdown asset SHA-256 must be lowercase 64-hex.")
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "source_relative_path": self.source_relative_path,
+            "target_relative_path": self.target_relative_path,
+            "content_sha256": self.content_sha256,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, object]) -> "NativeMarkdownAsset":
+        return cls(
+            source_relative_path=str(value["source_relative_path"]),
+            target_relative_path=str(value["target_relative_path"]),
+            content_sha256=str(value["content_sha256"]),
+        )
 
 
 NoteProposal = DerivedMarkdownProposal | NativeMarkdownProposal
@@ -841,6 +877,7 @@ def native_markdown_proposal(
     content_sha256: str,
     markdown: str,
     structured_blocks: tuple[MarkdownStructureBlock, ...] = (),
+    assets: tuple[NativeMarkdownAsset, ...] = (),
 ) -> NativeMarkdownProposal:
     content_sha256 = content_sha256.lower()
     if not _SHA256_PATTERN.fullmatch(content_sha256):
@@ -861,6 +898,7 @@ def native_markdown_proposal(
         markdown=markdown,
         heading_locations=headings,
         structured_blocks=tuple(structured_blocks),
+        assets=tuple(assets),
     )
 
 
@@ -951,6 +989,10 @@ def proposal_from_dict(value: dict[str, object]) -> NoteProposal:
             structured_blocks=tuple(
                 MarkdownStructureBlock.from_dict(dict(block))
                 for block in list(value.get("structured_blocks", []))
+            ),
+            assets=tuple(
+                NativeMarkdownAsset.from_dict(dict(asset))
+                for asset in list(value.get("assets", []))
             ),
             revision=int(value.get("revision", 1)),
         )

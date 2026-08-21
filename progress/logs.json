@@ -1,6 +1,108 @@
 {
   "logs": [
     {
+      "date": "2026-08-21",
+      "taskId": "RET-35-01",
+      "action": "完成 Vault 文件管理、检索与安全在线阅读",
+      "result": "文件管理现从各 Vault managed_root/sources 直接枚举原件，支持当前 Vault 与 active/available Vault 全局本地搜索、分页筛选、下载及 PDF/图片/TXT/Markdown/Office 在线阅读；Office 通过受控本机临时 PDF 渲染，不复制原件、不依赖任务记录、不向 Provider 外发正文。文件管理页面改为全屏阅读工作区，文件列表为可收起抽屉；修复阅读器高度链路，使阅读面板和 PDF iframe 从标题栏延伸至工作区底部。",
+      "verification": [
+        "服务完整 unit（678 passed，2 skipped）与文件管理定向测试通过",
+        "前端单元测试（39 passed）、lint 与生产构建通过",
+        "Playwright CLI 真实本机回归：桌面阅读器 1440px 与移动端 390x844 均确认 file-management、file-preview-pane、file-preview-body 和 PDF iframe 满高；抽屉交互、自动收起、在线阅读和下载入口通过",
+        "npm run progress:build && npm run progress:check",
+        "git diff --check（通过；仅 Windows 行尾转换提示）"
+      ],
+      "files": [
+        "apps/web/src/app.js",
+        "apps/web/src/style.css",
+        "apps/web/tests/app.test.js",
+        "apps/service/application/file_management.py",
+        "apps/service/application/file_preview.py",
+        "progress/"
+      ],
+      "next": "如需文件移动、批量重命名、删除、版本控制、AI 整理或精确阅读位置高亮，另立任务并先定义回滚与权限边界。"
+    },
+    {
+      "date": "2026-08-21",
+      "taskId": "RET-35-01",
+      "action": "启动 Vault 文件管理与安全在线阅读",
+      "result": "用户确认文件管理只读取各 Vault managed_root/sources，不复制原件、不依赖导入任务。范围包括全局本地全文检索、安全预览、下载和统一 Office 临时 PDF 渲染；不做 AI 整理，且不向用户展示解析状态。",
+      "verification": [],
+      "files": [
+        "progress/"
+      ],
+      "next": "先定义文件枚举、检索和预览合同，再补实现与回归。"
+    },
+    {
+      "date": "2026-08-20",
+      "taskId": "RET-25-01",
+      "action": "完成工作台界面精简与交互回归",
+      "result": "工作台、Provider 和导入流程已收敛为简洁的中文操作界面，移除了重复说明，同时保留外发、隐私、错误和恢复提示。移动端 Vault 表格转换为两列信息行，上传控件保留可见按钮并从键盘焦点中移除隐藏 input；会话搜索控件名称不再冲突，异步加载中仍显示会话已保存的 Vault 标签。未新增技术债。",
+      "verification": [
+        "前端单元测试（39 passed）",
+        "前端 lint 与生产构建（通过）",
+        "OBSIDIAN_PLATFORM_TEST_PORT=6451 npm run browser-test（24 passed）",
+        "Playwright CLI 复核 1440x900、1024x768、390x844、键盘焦点和 prefers-reduced-motion（通过）"
+      ],
+      "files": [
+        "apps/web/src/app.js",
+        "apps/web/src/style.css",
+        "apps/web/tests/app.test.js",
+        "browser-tests/loopback.spec.mjs",
+        "progress/"
+      ],
+      "next": "如需深色模式或更复杂的跨页动效，按 RET-25-01 executionBoundary 另立任务并先完成独立对比度或性能评审。"
+    },
+    {
+      "date": "2026-08-20",
+      "taskId": "RET-34-01",
+      "action": "修复历史图片 Embedding 向量身份冲突",
+      "result": "根因是图片排除规则上线后，旧向量仍绑定旧输入哈希；同一 document/sequence/profile 写入新向量时触发身份完整性保护。新增统一 embedding_block_input_text 规则与 ret-34-01-embedding-image-exclusion-v1 可回滚迁移：仅删除输入哈希因图片排除而变化或图片-only 的旧向量，并清理无引用缓存；未变化向量保留，真实同身份不同内容仍拒绝写入。",
+      "verification": [
+        "图片资源、Embedding、迁移和导入定向回归（80 passed）",
+        "服务完整 unit 回归（678 passed，2 skipped）",
+        "服务 Ruff 与 compileall（通过）",
+        "npm run build（通过）",
+        "npm run integration（未执行：既有本机服务占用 127.0.0.1:6240）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过；仅既有 Windows 行尾提示）"
+      ],
+      "files": [
+        "apps/service/domain/embeddings.py",
+        "apps/service/application/embedding_batches.py",
+        "apps/service/adapters/sqlite_index_repository.py",
+        "apps/service/tests/unit/test_sqlite_index_vectors.py",
+        "progress/"
+      ],
+      "next": "释放 127.0.0.1:6240 后重新运行 npm run integration；如需历史 Vault 图片迁移或图像理解检索，另立任务。"
+    },
+    {
+      "date": "2026-08-20",
+      "taskId": "RET-34-01",
+      "action": "完成原生 Obsidian 图片资源保留与 Embedding 排除",
+      "result": "原生 Markdown 现解析本地 Obsidian 与 Markdown 图片引用，验证路径与内容哈希后以 platform/assets/<sha256>.<ext> 去重入库并重写为 Vault 内 wikilink；远程图片不下载，缺失、越界或符号链接失败关闭。Embedding 仅发送去除图片引用后的文本，图片-only 块不产生 Provider 输入；删除任务会保留被其他 Markdown 引用或原先已存在的共享资产。",
+      "verification": [
+        "图片资源与 Embedding 定向回归（11 passed）",
+        "导入、删除、索引、向量回归（60 passed）",
+        "服务完整 unit 回归（674 passed，2 skipped）",
+        "服务 Ruff 与 compileall（通过）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过；仅既有 Windows 行尾提示）"
+      ],
+      "files": [
+        "apps/service/domain/obsidian_assets.py",
+        "apps/service/domain/derived_notes.py",
+        "apps/service/domain/retrieval_chunking.py",
+        "apps/service/application/ingest.py",
+        "apps/service/application/embedding_batches.py",
+        "apps/service/adapters/sqlite_index_repository.py",
+        "apps/service/tests/unit/test_obsidian_image_assets.py",
+        "apps/service/tests/unit/test_embedding_service.py",
+        "progress/"
+      ],
+      "next": "如需历史 Vault 图片迁移、图片预览或图像理解检索，另立任务并先确认隐私与向量合同。"
+    },
+    {
       "date": "2026-08-20",
       "taskId": "RET-34-01",
       "action": "开始原生 Obsidian 图片资源保留与 Embedding 排除",

@@ -19,8 +19,8 @@ from domain.embeddings import (
     EmbeddingProfile,
     EmbeddingProfileLocator,
     EmbeddingVectorConsistencyError,
+    embedding_block_input_text,
     embedding_input_sha256,
-    embedding_input_text,
 )
 from domain.evidence import document_locator_from_dict
 from domain.graph_projection import DurableGraphProjection, GraphProjectionKey
@@ -56,6 +56,7 @@ _INDEX_BLOCK_FTS_MIGRATION_ID = "ret-04-01-index-block-fts-v1"
 _INDEX_BLOCK_LEXICAL_MIGRATION_ID = "ret-04-02-index-block-lexical-v1"
 _EMBEDDING_CACHE_MIGRATION_ID = "ret-06-02-embedding-cache-v1"
 _INDEX_BLOCK_VECTOR_MIGRATION_ID = "ret-06-03-index-block-vectors-v1"
+_EMBEDDING_IMAGE_EXCLUSION_MIGRATION_ID = "ret-34-01-embedding-image-exclusion-v1"
 _LEXICAL_BM25_ARGUMENTS = "1.0, 1.0, 10.0, 1.0"
 _RICH_INDEX_BLOCK_COLUMNS = (
     ("block_content_sha256", "TEXT NOT NULL DEFAULT ''"),
@@ -200,6 +201,7 @@ class SqliteIndexRepository:
             self._apply_index_block_lexical_migration(connection)
             self._apply_embedding_cache_migration(connection)
             self._apply_index_block_vector_migration(connection)
+            self._apply_embedding_image_exclusion_migration(connection)
 
     @staticmethod
     def _apply_graph_projection_migration(connection: sqlite3.Connection) -> None:
@@ -588,6 +590,86 @@ class SqliteIndexRepository:
             connection.execute("RELEASE SAVEPOINT index_block_vector_migration")
             raise
         connection.execute("RELEASE SAVEPOINT index_block_vector_migration")
+
+    @classmethod
+    def _apply_embedding_image_exclusion_migration(cls, connection: sqlite3.Connection) -> None:
+        """Invalidate only vectors whose persisted inputs contained image embeds."""
+
+        connection.execute("SAVEPOINT embedding_image_exclusion_migration")
+        try:
+            vector_table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'index_block_vectors'"
+            ).fetchone()
+            if vector_table is None:
+                connection.execute("RELEASE SAVEPOINT embedding_image_exclusion_migration")
+                return
+            existing = connection.execute(
+                "SELECT 1 FROM index_repository_migrations WHERE migration_id = ?",
+                (_EMBEDDING_IMAGE_EXCLUSION_MIGRATION_ID,),
+            ).fetchone()
+            if existing is None:
+                rows = connection.execute(
+                    """
+                    SELECT vectors.document_id, vectors.sequence,
+                           vectors.embedding_profile_fingerprint, vectors.input_sha256,
+                           blocks.contextual_prefix, blocks.retrieval_text, blocks.text
+                    FROM index_block_vectors AS vectors
+                    JOIN index_blocks AS blocks
+                      ON blocks.document_id = vectors.document_id AND blocks.sequence = vectors.sequence
+                    """
+                ).fetchall()
+                stale_bindings: list[tuple[str, int, str]] = []
+                stale_input_sha256s: set[str] = set()
+                for row in rows:
+                    embedding_text = embedding_block_input_text(
+                        str(row["contextual_prefix"]),
+                        str(row["retrieval_text"]),
+                        str(row["text"]),
+                    )
+                    expected_input_sha256 = (
+                        embedding_input_sha256(embedding_text) if embedding_text is not None else None
+                    )
+                    if row["input_sha256"] == expected_input_sha256:
+                        continue
+                    stale_bindings.append(
+                        (
+                            str(row["document_id"]),
+                            int(row["sequence"]),
+                            str(row["embedding_profile_fingerprint"]),
+                        )
+                    )
+                    stale_input_sha256s.add(str(row["input_sha256"]))
+                if stale_bindings:
+                    connection.executemany(
+                        """
+                        DELETE FROM index_block_vectors
+                        WHERE document_id = ? AND sequence = ? AND embedding_profile_fingerprint = ?
+                        """,
+                        stale_bindings,
+                    )
+                    placeholders = ", ".join("?" for _ in stale_input_sha256s)
+                    connection.execute(
+                        f"""
+                        DELETE FROM embedding_cache AS cache
+                        WHERE cache.input_sha256 IN ({placeholders})
+                          AND NOT EXISTS (
+                              SELECT 1 FROM index_block_vectors AS vectors
+                              WHERE vectors.embedding_profile_fingerprint
+                                    = cache.embedding_profile_fingerprint
+                                AND vectors.input_sha256 = cache.input_sha256
+                          )
+                        """,
+                        tuple(stale_input_sha256s),
+                    )
+                connection.execute(
+                    "INSERT INTO index_repository_migrations (migration_id, applied_at) VALUES (?, ?)",
+                    (_EMBEDDING_IMAGE_EXCLUSION_MIGRATION_ID, utc_now()),
+                )
+        except Exception:
+            connection.execute("ROLLBACK TO SAVEPOINT embedding_image_exclusion_migration")
+            connection.execute("RELEASE SAVEPOINT embedding_image_exclusion_migration")
+            raise
+        connection.execute("RELEASE SAVEPOINT embedding_image_exclusion_migration")
 
     def enqueue(self, job: IndexJob) -> None:
         with self._connect() as connection:
@@ -982,10 +1064,11 @@ class SqliteIndexRepository:
         return values / np.float32(norm)
 
     @staticmethod
-    def _embedding_input_sha256(block: IndexBlock) -> str:
-        return embedding_input_sha256(
-            embedding_input_text(block.contextual_prefix, block.retrieval_text, block.text)
+    def _embedding_input_sha256(block: IndexBlock) -> str | None:
+        embedding_text = embedding_block_input_text(
+            block.contextual_prefix, block.retrieval_text, block.text
         )
+        return embedding_input_sha256(embedding_text) if embedding_text is not None else None
 
     def _invalidate_vector_matrices(self, vault_ids: set[str]) -> None:
         if not vault_ids:
@@ -1162,15 +1245,18 @@ class SqliteIndexRepository:
                         "Embedding block content changed. Retry the batch."
                     )
                 try:
-                    expected_input_sha256 = embedding_input_sha256(
-                        embedding_input_text(
-                            str(row["contextual_prefix"]),
-                            str(row["retrieval_text"]),
-                            str(row["text"]),
-                        )
+                    embedding_text = embedding_block_input_text(
+                        str(row["contextual_prefix"]),
+                        str(row["retrieval_text"]),
+                        str(row["text"]),
                     )
                 except ValueError as error:
                     raise EmbeddingVectorConsistencyError("Embedding block input is invalid.") from error
+                if embedding_text is None:
+                    raise EmbeddingVectorConsistencyError(
+                        "Embedding block has no text after excluding image embeds."
+                    )
+                expected_input_sha256 = embedding_input_sha256(embedding_text)
                 if binding.input_sha256 != expected_input_sha256:
                     raise EmbeddingVectorConsistencyError(
                         "Embedding block input changed. Retry the batch."
@@ -2276,12 +2362,16 @@ class SqliteIndexRepository:
         ).fetchall()
         input_sha256s = tuple(
             dict.fromkeys(
-                embedding_input_sha256(
-                    embedding_input_text(
-                        str(row["contextual_prefix"]), str(row["retrieval_text"]), str(row["text"])
+                embedding_input_sha256(embedding_text)
+                for row in input_rows
+                if (
+                    embedding_text := embedding_block_input_text(
+                        str(row["contextual_prefix"]),
+                        str(row["retrieval_text"]),
+                        str(row["text"]),
                     )
                 )
-                for row in input_rows
+                is not None
             )
         )
         fts_rows = connection.execute(
@@ -2418,20 +2508,27 @@ class SqliteIndexRepository:
                 if self.rich_block_reads_enabled
                 else None
             )
-            semantic_eligible_block_count = int(
-                connection.execute(
-                    """
-                    SELECT COUNT(*)
-                    FROM index_documents AS documents
-                    JOIN index_blocks AS blocks ON blocks.document_id = documents.document_id
-                    WHERE documents.vault_id = ?
-                      AND documents.is_current = 1
-                      AND documents.verifiable = 1
-                      AND documents.stale_reason IS NULL
-                      AND documents.pending_association = 0
-                    """,
-                    (vault_id,),
-                ).fetchone()[0]
+            semantic_eligible_rows = connection.execute(
+                """
+                SELECT blocks.contextual_prefix, blocks.retrieval_text, blocks.text
+                FROM index_documents AS documents
+                JOIN index_blocks AS blocks ON blocks.document_id = documents.document_id
+                WHERE documents.vault_id = ?
+                  AND documents.is_current = 1
+                  AND documents.verifiable = 1
+                  AND documents.stale_reason IS NULL
+                  AND documents.pending_association = 0
+                """,
+                (vault_id,),
+            ).fetchall()
+            semantic_eligible_block_count = sum(
+                embedding_block_input_text(
+                    str(row["contextual_prefix"]),
+                    str(row["retrieval_text"]),
+                    str(row["text"]),
+                )
+                is not None
+                for row in semantic_eligible_rows
             )
             invalid_vector = connection.execute(
                 """
@@ -2508,13 +2605,15 @@ class SqliteIndexRepository:
                 try:
                     vector = self._decode_embedding_vector(row["vector"], int(row["dimension"]))
                     self._normalized_float32_vector(vector, int(row["dimension"]))
-                    expected_input_sha256 = embedding_input_sha256(
-                        embedding_input_text(
-                            str(row["contextual_prefix"]),
-                            str(row["retrieval_text"]),
-                            str(row["text"]),
-                        )
+                    embedding_text = embedding_block_input_text(
+                        str(row["contextual_prefix"]),
+                        str(row["retrieval_text"]),
+                        str(row["text"]),
                     )
+                    if embedding_text is None:
+                        invalid_vector = row
+                        break
+                    expected_input_sha256 = embedding_input_sha256(embedding_text)
                 except (EmbeddingCacheConsistencyError, EmbeddingVectorConsistencyError, ValueError):
                     invalid_vector = row
                     break

@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from hashlib import sha256
 from math import isfinite
 
+from domain.obsidian_assets import strip_image_references
+
 
 class EmbeddingCacheConsistencyError(ValueError):
     """Raised when a persisted cache row cannot be safely reused."""
@@ -35,6 +37,23 @@ def embedding_input_text(contextual_prefix: str, retrieval_text: str, block_text
     retrieval = retrieval_text.strip() or block_text.strip()
     prefix = contextual_prefix.strip()
     return normalize_embedding_input("\n\n".join(value for value in (prefix, retrieval) if value))
+
+
+def embedding_block_input_text(
+    contextual_prefix: str, retrieval_text: str, block_text: str
+) -> str | None:
+    """Build an embedding input after excluding local Obsidian image embeds.
+
+    Image-only blocks remain available to the lexical index but do not have a
+    textual embedding input or semantic coverage requirement.
+    """
+
+    prefix = strip_image_references(contextual_prefix)
+    retrieval = strip_image_references(retrieval_text)
+    text = strip_image_references(block_text)
+    if not retrieval and not text:
+        return None
+    return embedding_input_text(prefix, retrieval, text)
 
 
 def embedding_cache_key(profile_fingerprint: str, value: str) -> str:

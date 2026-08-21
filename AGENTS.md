@@ -99,6 +99,8 @@ npm run progress:check
 - 页面或 Figma 输入若与 `DESIGN.md` 冲突，必须先指出冲突并取得用户确认；确认改变标准后，先更新或在同一变更中同步更新 `DESIGN.md`，不得静默偏离。
 - 设计例外必须写入任务 `executionBoundary`，包含原因、影响范围、退出条件和 follow-up。现有不合规界面不构成新实现的先例。
 - UI 验证至少覆盖 `1440×900`、`1024×768`、`390×844`，检查键盘、焦点、触控尺寸、减少动态、loading/empty/recoverable/failed、布局溢出和关键点击流程。
+- 图表的设计必须使用并遵守C:\Users\panshimao\.codex\skills\lieflat-charts技能
+- UI的设计和修改必须使用和遵守C:\Users\panshimao\.codex\skills\ui-ux-pro-max技能
 
 ### 4.5 SQLite 与迁移
 

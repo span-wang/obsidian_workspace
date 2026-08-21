@@ -82,10 +82,10 @@ test("serves the workbench and its API requests from the fixed loopback origin",
   await page.goto("/");
 
   await expect(page).toHaveURL(`${baseUrl}/`);
-  await expect(page.getByRole("heading")).toHaveText("工作台");
+  await expect(page.getByRole("heading", { name: "工作台", exact: true })).toHaveText("工作台");
   await expect(page.getByTestId("health-status")).toHaveText("本机服务可用");
   await expect(page.getByTestId("session-status")).toHaveText("本机会话已建立");
-  await expect(page.getByRole("navigation").getByRole("link")).toHaveCount(5);
+  await expect(page.getByRole("navigation").getByRole("link")).toHaveCount(6);
   expect(healthRequests).toEqual([`${baseUrl}/api/health`]);
   expect(sessionRequests).toEqual([`${baseUrl}/api/session`]);
 });
@@ -289,11 +289,13 @@ test("adds a vault from the materials workspace and closes removal confirmation 
   await page.route("**/api/vaults/select-directory", async (route) => {
     await route.fulfill({ json: { selection_id: "selection-test", label: "English Vault" } });
   });
+  let vaults = [];
   await page.route("**/api/vaults", async (route) => {
     if (route.request().method() === "GET") {
-      await route.fulfill({ json: { vaults: [] } });
+      await route.fulfill({ json: { vaults } });
       return;
     }
+    vaults = [vault];
     await route.fulfill({ json: { vault } });
   });
 
@@ -549,7 +551,7 @@ test("sends a browser-selected folder as relative upload paths", async ({ page }
 
   await page.goto("/");
   await page.getByRole("link", { name: "资料", exact: true }).click();
-  const folderInput = page.getByLabel("上传本机资料文件夹");
+  const folderInput = page.locator('input[type="file"][webkitdirectory]');
   await expect(folderInput).toHaveAttribute("webkitdirectory", "");
   await folderInput.setInputFiles(folderPath);
 
@@ -744,32 +746,39 @@ test("runs import tasks automatically and keeps suggestions read-only", async ({
   const eventSubscription = page.waitForRequest("**/api/import-tasks/task-import/events?after=4");
   await page.goto("/");
   await page.getByRole("link", { name: "资料", exact: true }).click();
-  await page.getByLabel("上传本机资料文件", { exact: true }).setInputFiles({
+  await page.locator('input[type="file"]:not([webkitdirectory])').setInputFiles({
     name: "book.pdf",
     mimeType: "application/pdf",
     buffer: Buffer.from("pdf")
   });
 
   await expect(page.getByRole("heading", { name: "任务", exact: true })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "导入任务详情" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "导入任务", exact: true })).toBeVisible();
   await eventSubscription;
-  await expect(page.getByText("结构化：本地结构化", { exact: true })).toBeVisible();
-  await expect(page.getByText("状态：已完成")).toBeVisible();
-  await expect(page.getByText("当前阶段：完成")).toBeVisible();
-  await expect(page.getByText("解析：已完成")).toBeVisible();
-  await expect(page.getByText("已发现 1")).toBeVisible();
-  await expect(page.getByText("已解析 1")).toBeVisible();
-  await expect(page.getByText("已解析；已选择完整转换图；OCR 完成", { exact: true })).toBeVisible();
+  const detailSummary = page.locator(".import-task-detail-summary");
+  await expect(detailSummary).toContainText("已完成");
+  await expect(detailSummary).toContainText("1 项资料");
+  const processingDetails = page.locator(".import-task-processing-details");
+  await expect(processingDetails).not.toHaveAttribute("open", "");
+  await processingDetails.locator("summary").click();
+  await expect(processingDetails).toContainText("本地结构化");
+  await expect(processingDetails).toContainText("解析 · 已完成");
+  await expect(page.getByText("已转换", { exact: true })).toBeVisible();
   await expect(page.getByText("PDF（电子/扫描待识别）")).toBeVisible();
   const sourceParses = page.getByLabel("源解析内容");
-  await expect(sourceParses.getByRole("heading", { name: "源解析内容" })).toBeVisible();
+  await expect(sourceParses.getByRole("heading", { name: "源解析" })).toBeVisible();
+  await expect(sourceParses.locator("details")).not.toHaveAttribute("open", "");
+  await sourceParses.locator("summary").click();
   await expect(sourceParses).toContainText("Source parsing preview text");
   const markdownResults = page.getByLabel("Markdown 结果");
   await expect(markdownResults.getByRole("heading", { name: "Markdown 结果" })).toBeVisible();
+  await expect(markdownResults.locator("details")).not.toHaveAttribute("open", "");
+  await markdownResults.locator("summary").click();
   await expect(markdownResults.locator("pre.markdown-preview").nth(0)).toContainText("# Book index");
   await expect(markdownResults.locator("pre.markdown-preview").nth(1)).toContainText("# Chapter One");
   await expect(markdownResults.locator("pre.markdown-preview").nth(2)).toContainText("# Chapter Two");
   await expect(page.getByRole("heading", { name: "分类建议" })).toBeVisible();
+  await page.getByLabel("分类建议").locator("summary").click();
   await expect(page.getByText("No supported domain terms were found in the private proposal.")).toBeVisible();
   await expect(page.locator("body")).not.toContainText("元数据与标签");
   await expect(page.locator("body")).not.toContainText("候选链接");
@@ -908,7 +917,7 @@ test("verifies a durable projection after deleting its completed import task", a
   await expect.poll(() => rebuilt).toBe(true);
   await expect(page.getByText("验证通过：任务已删除，索引重建成功，投影结构摘要保持一致。")).toBeVisible();
   await expect(page.getByTestId("projection-after-summary")).toContainText("DOCX 内容 1 处");
-  await expect(page.getByRole("heading", { name: "导入任务详情" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "导入任务", exact: true })).toBeVisible();
   await expect(page.locator("body")).not.toContainText("graph-projection");
   await expect(page.locator("body")).not.toContainText("docx-ooxml");
 });
@@ -970,8 +979,11 @@ test("does not expose a manual commit request for an automatic import", async ({
   await page.goto("/");
   await page.getByRole("link", { name: "任务", exact: true }).click();
   await page.getByRole("button", { name: /^book\.pdf/ }).click();
-  await expect(page.getByText("状态：已完成")).toBeVisible();
-  await expect(page.getByText("当前阶段：完成")).toBeVisible();
+  await expect(page.locator(".import-task-detail-summary")).toContainText("已完成");
+  await page.locator(".import-task-processing-details summary").click();
+  await expect(page.locator(".import-task-metadata")).toContainText("当前阶段");
+  await expect(page.locator(".import-task-metadata")).toContainText("完成");
+  await page.getByLabel("分类建议").locator("summary").click();
   await expect(page.getByText("只读分类观察。", { exact: true })).toBeVisible();
   await expect(page.locator("body")).not.toContainText("只读链接候选");
   await expect(page.getByText("提交记录", { exact: true })).toBeVisible();
@@ -2042,5 +2054,5 @@ test("keeps the current session detail when an earlier selection resolves last",
 
   await expect(page.getByText("B 的内容", { exact: true })).toBeVisible();
   await expect(page.getByText("A 的内容", { exact: true })).toHaveCount(0);
-  await expect(page.locator(".context-location")).toContainText("Vault B");
+  await expect(page.locator(".context-vault-marker")).toContainText("Vault B");
 });

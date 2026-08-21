@@ -1,7 +1,7 @@
 {
   "projectName": "Obsidian Personal Knowledge Platform",
   "initiativeName": "Retrieval Redesign",
-  "updatedOn": "2026-08-17",
+  "updatedOn": "2026-08-21",
   "planDocument": "docs/retrieval-redesign.md",
   "generatedFile": "docs/retrieval-progress.md",
   "sourceFiles": [
@@ -208,6 +208,11 @@
       "id": "RET-34",
       "label": "Obsidian 图片资源保留",
       "goal": "解析和入库原生 Obsidian Markdown 时保留本地图片资源，同时确保图片不进入 embedding 出网输入。"
+    },
+    {
+      "id": "RET-35",
+      "label": "文件管理与安全在线阅读",
+      "goal": "直接管理各 Vault 的 sources 原件，提供本地全文检索、受控预览、下载和不复制原件的 Office 临时渲染。"
     }
   ],
   "trackingRules": [

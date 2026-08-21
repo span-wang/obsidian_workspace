@@ -1,6 +1,6 @@
 {
   "initiativeId": "RET",
-  "updatedOn": "2026-08-17",
+  "updatedOn": "2026-08-21",
   "tasks": [
     {
       "id": "RET-00-01",
@@ -2562,7 +2562,7 @@
       "order": 1,
       "title": "iOS 设计语言统一前端 UI 重构",
       "priority": "P0",
-      "status": "进行中",
+      "status": "已完成",
       "dependsOn": [
         "RET-21-01",
         "RET-24-02"
@@ -2603,7 +2603,13 @@
         "桌面、紧凑桌面和移动端可操作的视觉与交互回归证据"
       ],
       "acceptance": "五个生产入口均遵循 DESIGN.md 的 iOS 设计语言、中文简洁文案、状态连续和无障碍标准；桌面三栏与移动端逐层路径完整可操作；刷新不闪白或丢失阅读位置；关键单测、构建、浏览器和视觉检查通过。",
-      "verification": []
+      "verification": [
+        "npm --prefix apps/web run test（39 passed）",
+        "npm --prefix apps/web run lint（通过）",
+        "npm --prefix apps/web run build（通过）",
+        "OBSIDIAN_PLATFORM_TEST_PORT=6451 npm run browser-test（24 passed）",
+        "Playwright CLI 检查 1440x900、1024x768、390x844、Tab 焦点与 prefers-reduced-motion（通过；无横向溢出、控制台错误或布局跳动）"
+      ]
     },
     {
       "id": "RET-26-01",
@@ -3013,7 +3019,7 @@
       "order": 1,
       "title": "原生 Obsidian 图片资源保留与 Embedding 排除",
       "priority": "P0",
-      "status": "进行中",
+      "status": "已完成",
       "dependsOn": [
         "RET-18-02",
         "RET-26-01"
@@ -3051,7 +3057,67 @@
         "导入、索引、向量和删除链路回归测试"
       ],
       "acceptance": "原生 Obsidian Markdown 导入后，存在的本地图片可在 Vault 中随 Markdown 使用且引用有效；缺失或不安全引用不会产生部分完成态；图片正文、路径和二进制内容不进入 Embedding Provider；删除任务不会删除仍被其他 Markdown 或用户文件引用的共享图片。",
-      "verification": []
+      "verification": [
+        "图片资源、Embedding、迁移和导入定向回归（80 passed）",
+        "服务完整 unit 回归（678 passed，2 skipped）",
+        "服务 Ruff（All checks passed）",
+        "服务 compileall（通过）",
+        "npm run build（通过）",
+        "npm run progress:build && npm run progress:check（通过）",
+        "git diff --check（通过；仅既有 Windows 行尾提示）",
+        "npm run integration（未执行：既有本机服务占用 127.0.0.1:6240）"
+      ]
+    },
+    {
+      "id": "RET-35-01",
+      "phaseId": "RET-35",
+      "order": 1,
+      "title": "Vault 原件文件管理、检索与安全在线阅读",
+      "priority": "P0",
+      "status": "已完成",
+      "dependsOn": [
+        "RET-18-02",
+        "RET-24-02",
+        "RET-34-01"
+      ],
+      "executionBoundary": {
+        "inScope": [
+          "新增文件管理一级导航，当前 Vault 递归枚举 managed_root/sources；全局搜索仅跨 active 且 available 的 Vault，并标识来源 Vault。",
+          "服务端分页、按最近修改/文件名/大小排序，以及文件类型、文件夹和本地全文过滤；搜索聚合文件名、相对路径、索引中的标签和已解析/OCR 正文，不调用 Embedding 或 Provider。",
+          "仅对 PDF、图片、TXT、Markdown 与可信本机 Office 临时 PDF 产物提供在线阅读；HTML、SVG、脚本、压缩包、可执行文件和未知格式只能下载。",
+          "DOC/DOCX、XLS/XLSX、PPT/PPTX 统一通过受控 LibreOffice runtime 临时渲染为 PDF；缺失时仅从官方固定版本来源下载并校验，产物按预览会话临时保存并在关闭、超时、重启后清理。",
+          "桌面端提供文件列表和右侧阅读区，移动端进入独立阅读层；刷新和返回保留筛选、分页与阅读位置。"
+        ],
+        "outOfScope": [
+          "不复制、迁移、重命名、移动或删除 Vault 原件；不从浏览器上传暂存、导入任务记录或派生 notes 读取文件列表。",
+          "不做 AI 自动整理、语义检索、Provider 外发、Embedding 写入或将解析状态暴露给用户。",
+          "不执行、不内嵌 HTML、SVG、脚本、压缩包、可执行文件或未知格式，不提供远程浏览或非 loopback API。"
+        ],
+        "followup": [
+          "如需移动、批量重命名、删除、版本控制或 AI 自动整理，另立具备预览、回滚与权限边界的文件操作任务。",
+          "如需在预览中高亮原始 Office/PDF 的精确匹配位置，另立渲染坐标与定位合同任务。"
+        ],
+      "verification": [
+        "apps/service/.venv/Scripts/python.exe -m pytest apps/service/tests/unit -q --disable-warnings --maxfail=1（678 passed, 2 skipped）。",
+        "apps/service/.venv/Scripts/python.exe -m py_compile apps/service/application/file_management.py apps/service/application/file_preview.py apps/service/api/main.py apps/service/adapters/filesystem_vault_adapter.py（通过）。",
+        "apps/web npm run lint（通过）与 npm run build（通过）。",
+        "文件管理关键流程 Playwright CLI 真实本机回归：桌面阅读器 1440px 视口与移动端 390x844 均确认 file-management、file-preview-pane、file-preview-body 和 PDF iframe 从标题栏延伸至工作区底部；抽屉打开、选中文件后自动收起、PDF 在线阅读和下载入口通过。",
+        "npm run progress:build && npm run progress:check",
+        "git diff --check"
+      ]
+      },
+      "deliverables": [
+        "不复制原件的 Vault sources 文件枚举、全局本地检索与下载合同",
+        "安全格式预览和 Office 临时 PDF 渲染运行时",
+        "响应式文件管理页面及端到端回归"
+      ],
+      "acceptance": "用户可在文件管理中浏览当前 Vault 的所有已提交 sources 原件、在 active 且 available Vault 范围内检索文件名和可用解析正文、打开安全格式在线阅读或下载原文件。Office 文件以本机临时 PDF 保持版式阅读，原件不重复存储且用户正文不出网；危险或未知格式永不执行或内嵌。文件列表不依赖任务记录，任务删除后仍可读取实际仍存在的 sources 文件。",
+      "verification": [
+        "前端单元测试 39 passed、lint 与生产构建通过",
+        "Playwright CLI 文件管理桌面/移动端阅读器高度与抽屉回归通过",
+        "npm run progress:build && npm run progress:check",
+        "git diff --check"
+      ]
     }
   ]
 }

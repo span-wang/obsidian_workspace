@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import os
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -11,6 +12,7 @@ from application.import_selections import ImportSelection
 from application.vaults import VaultService
 from domain.derived_notes import (
     DerivedMarkdownProposal,
+    NativeMarkdownAsset,
     NativeMarkdownProposal,
     merge_adjacent_notes,
     native_markdown_proposal,
@@ -20,6 +22,11 @@ from domain.derived_notes import (
     render_document_graph,
     split_note_at_unit,
     structure_graph_markdown_proposal,
+)
+from domain.obsidian_assets import (
+    ObsidianImageReferenceError,
+    parse_image_references,
+    rewrite_image_references,
 )
 from domain.local_markdown_structure import DEFAULT_LOCAL_MARKDOWN_STRUCTURE_PROFILE
 from domain.classification import (
@@ -97,6 +104,9 @@ _DIRECT_PARSE_DOCUMENT_KINDS = frozenset(
     }
 )
 _PARSE_DOCUMENT_KINDS = _CONVERSION_DOCUMENT_KINDS | _DIRECT_PARSE_DOCUMENT_KINDS
+_NATIVE_IMAGE_SUFFIXES = frozenset(
+    {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".avif", ".heic", ".tif", ".tiff"}
+)
 
 
 @dataclass(frozen=True)
@@ -576,6 +586,24 @@ class ImportTaskService:
                 raise ImportTaskError(str(error)) from error
             if {backup.relative_path for backup in predelete_backups} != set(expected_current_sha256):
                 raise ImportTaskError("The current Vault file backup is incomplete.")
+            protected_shared_assets = {
+                file.relative_path
+                for file in journal.unit.files
+                if file.kind == "asset"
+                and self._asset_referenced_by_other_markdown(
+                    vault.path,
+                    file.relative_path,
+                    {owned.relative_path for owned in journal.unit.files if owned.kind == "markdown"},
+                )
+            }
+            if protected_shared_assets:
+                current_by_path = {backup.relative_path: backup for backup in predelete_backups}
+                committed_backups = tuple(
+                    current_by_path[file.relative_path]
+                    if file.relative_path in protected_shared_assets
+                    else backup
+                    for file, backup in zip(journal.unit.files, committed_backups, strict=True)
+                )
             rollbacks.append(
                 _CommittedVaultRollback(
                     journal=journal,
@@ -585,6 +613,28 @@ class ImportTaskService:
                 )
             )
         return tuple(rollbacks)
+
+    @staticmethod
+    def _asset_referenced_by_other_markdown(
+        vault_path: Path, asset_relative_path: str, owned_markdown_paths: set[str]
+    ) -> bool:
+        asset_name = PurePosixPath(asset_relative_path).name.casefold()
+        normalized_target = asset_relative_path.replace("\\", "/").casefold()
+        for markdown_path in vault_path.rglob("*.md"):
+            try:
+                relative = markdown_path.relative_to(vault_path).as_posix()
+            except ValueError:
+                continue
+            if relative in owned_markdown_paths:
+                continue
+            try:
+                content = markdown_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                continue
+            lowered = content.casefold().replace("\\", "/")
+            if normalized_target in lowered or f"[[{asset_name}" in lowered or f"]({asset_name}" in lowered:
+                return True
+        return False
 
     def _restore_committed_vault_files(
         self, vault, rollbacks: tuple[_CommittedVaultRollback, ...]
@@ -1624,6 +1674,11 @@ class ImportTaskService:
             except OSError:
                 self._record_source_change(task, item.item_id)
                 return False
+            try:
+                markdown, assets = self._prepare_native_markdown_assets(task, item, vault, markdown)
+            except ImportTaskError as error:
+                self._record_native_markdown_asset_failure(task, item.item_id, str(error))
+                return False
             if not self._markdown_outbound_allowed(task, relative_path):
                 self._record_markdown_outbound_failure(task, item.item_id)
                 return False
@@ -1634,6 +1689,7 @@ class ImportTaskService:
                 except MarkdownStructuringError as error:
                     self._record_markdown_structure_failure(task, item.item_id, str(error))
                     return False
+            provider_markdown = self._restore_native_asset_embeds(provider_markdown, assets)
             self.repository.record_note_proposal(
                 item.item_id,
                 native_markdown_proposal(
@@ -1642,9 +1698,116 @@ class ImportTaskService:
                     relative_path=relative_path,
                     content_sha256=item.content_sha256,
                     markdown=provider_markdown,
+                    assets=assets,
                 ),
             )
         return True
+
+    @staticmethod
+    def _restore_native_asset_embeds(
+        markdown: str, assets: tuple[NativeMarkdownAsset, ...]
+    ) -> str:
+        if not assets:
+            return markdown
+        missing = tuple(
+            f"![[{asset.target_relative_path}]]"
+            for asset in assets
+            if asset.target_relative_path not in markdown
+        )
+        return markdown.rstrip() + ("\n\n" + "\n\n".join(missing) if missing else "")
+
+    def _prepare_native_markdown_assets(
+        self, task: ImportTask, item: ImportTaskItem, vault, markdown: str
+    ) -> tuple[str, tuple[NativeMarkdownAsset, ...]]:
+        try:
+            relative_path = item.source_path.resolve().relative_to(vault.path.resolve()).as_posix()
+            inside_vault = True
+        except (ValueError, OSError):
+            relative_path = item.source_path.name
+            inside_vault = False
+        try:
+            references = parse_image_references(markdown, relative_path)
+        except ObsidianImageReferenceError as error:
+            raise ImportTaskError(str(error)) from error
+        assets_by_target: dict[str, NativeMarkdownAsset] = {}
+        target_by_source: dict[str, str] = {}
+        seen_sources: set[str] = set()
+        for reference in references:
+            suffix = Path(reference.source_relative_path).suffix.lower()
+            if suffix not in _NATIVE_IMAGE_SUFFIXES:
+                continue
+            if reference.source_relative_path in seen_sources:
+                continue
+            seen_sources.add(reference.source_relative_path)
+            source = self._resolve_native_image_path(
+                item.source_path, vault.path, reference.source_relative_path, reference.syntax, inside_vault
+            )
+            try:
+                content = source.read_bytes()
+            except OSError as error:
+                raise ImportTaskError(f"Native Markdown image cannot be read: {reference.source_relative_path}") from error
+            content_sha256 = sha256(content).hexdigest()
+            target_relative_path = (
+                f"{vault.managed_root_relative_path}/assets/{content_sha256}{suffix}"
+            )
+            try:
+                source_relative_path = source.resolve().relative_to(vault.path.resolve()).as_posix()
+            except ValueError:
+                source_relative_path = os.path.relpath(
+                    source.resolve(), item.source_path.parent.resolve()
+                ).replace("\\", "/")
+            assets_by_target.setdefault(
+                target_relative_path,
+                NativeMarkdownAsset(
+                    source_relative_path=source_relative_path,
+                    target_relative_path=target_relative_path,
+                    content_sha256=content_sha256,
+                ),
+            )
+            target_by_source[reference.source_relative_path] = target_relative_path
+        try:
+            return (
+                rewrite_image_references(markdown, references, target_by_source),
+                tuple(assets_by_target.values()),
+            )
+        except ObsidianImageReferenceError as error:
+            raise ImportTaskError(str(error)) from error
+
+    @staticmethod
+    def _resolve_native_image_path(
+        markdown_path: Path,
+        vault_path: Path,
+        reference: str,
+        syntax: str,
+        inside_vault: bool,
+    ) -> Path:
+        root = vault_path.resolve() if inside_vault else markdown_path.parent.resolve()
+        candidate = (vault_path / reference) if syntax == "wikilink" else (markdown_path.parent / reference)
+        if syntax == "wikilink" and not candidate.exists() and not inside_vault:
+            candidate = markdown_path.parent / reference
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(root)
+        except (OSError, ValueError) as error:
+            raise ImportTaskError(f"Native Markdown image is missing or outside the allowed root: {reference}") from error
+        if not resolved.is_file() or candidate.is_symlink():
+            raise ImportTaskError(f"Native Markdown image is not a regular local file: {reference}")
+        return resolved
+
+    def _record_native_markdown_asset_failure(self, task: ImportTask, item_id: int, reason: str) -> None:
+        current = self.get(task.task_id)
+        self.repository.save(
+            replace(
+                current,
+                lifecycle="recoverable",
+                phase="failed",
+                current_item_label=None,
+                recovery_actions=("restart-derivation",),
+                failure_reason=f"Native Markdown image asset processing failed: {reason[:200]}",
+                updated_at=utc_now(),
+            ),
+            "native-markdown-assets-failed",
+        )
 
     def _record_native_markdown_failure(self, task: ImportTask, item_id: int) -> None:
         self.repository.record_parse_failure(
@@ -2570,6 +2733,7 @@ class ImportTaskService:
             files.extend(self._commit_asset_files(proposal, item, vault_path))
         else:
             note_contents = [(proposal.relative_path, proposal.markdown)]
+            files.extend(self._commit_native_asset_files(proposal, item, vault_path))
         for relative_path, markdown in note_contents:
             expected = None
             target = vault_path / relative_path
@@ -2586,6 +2750,35 @@ class ImportTaskService:
                     content=markdown,
                     content_sha256=sha256(markdown.encode("utf-8")).hexdigest(),
                     expected_existing_sha256=expected,
+                )
+            )
+        return tuple(files)
+
+    def _commit_native_asset_files(
+        self, proposal: NativeMarkdownProposal, item: ImportTaskItem, vault_path: Path
+    ) -> tuple[CommitFile, ...]:
+        if not proposal.assets:
+            return ()
+        files: list[CommitFile] = []
+        for asset in proposal.assets:
+            source = vault_path / asset.source_relative_path
+            source_parts = PurePosixPath(asset.source_relative_path).parts
+            if ".." in source_parts or not source.is_file() or source.is_symlink():
+                try:
+                    source = item.source_path.parent / asset.source_relative_path
+                except OSError as error:
+                    raise ImportTaskError("Native Markdown asset source is unavailable.") from error
+            try:
+                content = source.read_bytes()
+            except OSError as error:
+                raise ImportTaskError("Native Markdown asset source is unavailable.") from error
+            if sha256(content).hexdigest() != asset.content_sha256:
+                raise ImportTaskError("Native Markdown asset changed after parsing.")
+            files.append(
+                CommitFile.asset(
+                    relative_path=asset.target_relative_path,
+                    content=content,
+                    expected_existing_sha256=self._existing_file_hash(vault_path, asset.target_relative_path),
                 )
             )
         return tuple(files)

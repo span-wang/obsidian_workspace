@@ -23,6 +23,7 @@ _CJK_OR_WORD = re.compile(
     r"[\u3400-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]+|[A-Za-z0-9_]+|[^\s]"
 )
 _SENTENCE_BOUNDARY = re.compile(r"(?<=[。！？!?])\s*|(?<=\.)\s+")
+_IMAGE_ONLY = re.compile(r"^\s*(?:!\[\[[^\]]+\]\]|!\[[^\]]*\]\([^\)]+\))\s*$")
 
 
 @dataclass(frozen=True)
@@ -380,6 +381,10 @@ def _native_units(body: tuple[tuple[int, str], ...]) -> tuple[_NativeUnit, ...]:
         if _LIST_ITEM.match(line):
             list_units, index = _native_list_units(body, index)
             units.extend(list_units)
+            continue
+        if _IMAGE_ONLY.match(line):
+            units.append(_NativeUnit("image", line_number, line.strip()))
+            index += 1
             continue
 
         end = index + 1

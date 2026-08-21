@@ -178,6 +178,16 @@ def test_embedding_service_uses_cache_hits_without_resending_block_text(tmp_path
     assert len(index_repository.block_vectors) == 2
 
 
+def test_embedding_service_excludes_obsidian_image_embeds_from_provider_input(tmp_path: Path) -> None:
+    service, vault_id, _index_repository, provider = _service(
+        tmp_path, ("Body ![[platform/assets/diagram.png|diagram]] text",)
+    )
+
+    service.execute(vault_id, _vault_scope())
+
+    assert provider.calls == [("Unit A\n\nBody text",)]
+
+
 def test_embedding_service_rechecks_inputs_before_each_network_batch(tmp_path: Path) -> None:
     texts = tuple(f"Block {index}" for index in range(65))
     service, vault_id, index_repository, provider = _service(

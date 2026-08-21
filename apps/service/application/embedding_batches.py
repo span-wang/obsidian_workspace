@@ -13,7 +13,7 @@ from domain.embedding_batches import (
     EmbeddingBatchScope,
     EmbeddingBlockedDocument,
 )
-from domain.embeddings import EmbeddingInput, embedding_input_text
+from domain.embeddings import EmbeddingInput, embedding_block_input_text
 from ports.index_repository import IndexRepository
 
 
@@ -83,17 +83,23 @@ class EmbeddingBatchService:
             )
             if evaluation.allowed:
                 relative_paths.append(document.relative_path)
-                document_inputs = tuple(
-                    EmbeddingInput(
-                        document_id=document.document_id,
-                        sequence=block.sequence,
-                        content_sha256=block.block_content_sha256,
-                        text=embedding_input_text(
-                            block.contextual_prefix, block.retrieval_text, block.text
-                        ),
+                document_inputs: list[EmbeddingInput] = []
+                for block in document.blocks:
+                    embedding_text = embedding_block_input_text(
+                        block.contextual_prefix, block.retrieval_text, block.text
                     )
-                    for block in document.blocks
-                )
+                    if embedding_text is None:
+                        continue
+                    document_inputs.append(
+                        EmbeddingInput(
+                            document_id=document.document_id,
+                            sequence=block.sequence,
+                            content_sha256=block.block_content_sha256,
+                            text=embedding_text,
+                        )
+                    )
+                if not document_inputs:
+                    continue
                 frozen_documents.append(
                     {
                         "blocks": [

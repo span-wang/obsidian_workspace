@@ -18,6 +18,7 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request,
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -43,6 +44,8 @@ from application.embedding_batches import (
     EmbeddingBatchValidationError,
 )
 from application.embedding_service import EmbeddingExecutionError, EmbeddingService
+from application.file_management import FileManagementError, FileManagementService
+from application.file_preview import FilePreviewError, LocalOfficeRenderer, preview_content_type
 from application.import_selections import ImportSelectionError, ImportSelectionStore
 from application.ingest import ImportTaskError, ImportTaskService
 from application.indexing import IndexingService
@@ -64,6 +67,7 @@ from application.sessions import SessionNotFoundError, SessionService, SessionVa
 from application.vaults import VaultConflictError, VaultService, VaultValidationError
 from application.workbench_overview import WorkbenchOverview, WorkbenchOverviewService
 from ports.import_upload_store import ImportUploadStore, ImportUploadStoreError
+from ports.source_file_store import SourceFileStoreError
 from workers.converters.artifact_store import PrivateArtifactStore
 from workers.converters.online_launcher import OnlinePdfConversionLauncher
 from workers.converters.launcher import ProvisionedConversionLauncher
@@ -197,6 +201,20 @@ class SessionListQuery(BaseModel):
     order: Literal["asc", "desc"] = "desc"
     page: int = Field(default=1, ge=1, le=MAX_SESSION_PAGE)
     page_size: int = Field(default=25, ge=1, le=100)
+
+
+class FileListQuery(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = ""
+    vault_id: str | None = None
+    global_scope: bool = False
+    file_type: Literal["pdf", "image", "text", "markdown", "office", "download"] | None = None
+    folder: str | None = None
+    sort: Literal["modified_at", "name", "size"] = "modified_at"
+    order: Literal["asc", "desc"] = "desc"
+    page: int = Field(default=1, ge=1)
+    page_size: int = Field(default=50, ge=1, le=100)
 
 
 class SessionCreateCommand(BaseModel):
@@ -505,7 +523,13 @@ async def reconcile_indexes_after_startup(app: FastAPI):
         name="obsidian-index-reconcile",
         daemon=True,
     ).start()
-    yield
+    try:
+        yield
+    finally:
+        renderer = getattr(app.state, "file_preview_renderer", None)
+        clear_cache = getattr(renderer, "clear_cache", None)
+        if callable(clear_cache):
+            clear_cache()
 
 
 def workbench_response(local_session: LocalSession) -> FileResponse:
@@ -1354,6 +1378,38 @@ def vault_payload(
     return payload
 
 
+def managed_file_payload(result) -> dict[str, object]:
+    source_file = result.file
+    return {
+        "vault_id": source_file.vault_id,
+        "vault_label": source_file.vault_label,
+        "relative_path": source_file.relative_path,
+        "filename": source_file.filename,
+        "folder": source_file.folder,
+        "extension": source_file.extension,
+        "size_bytes": source_file.size_bytes,
+        "modified_at": source_file.modified_at.isoformat(),
+        "preview_kind": result.preview_kind,
+        "match_count": result.match_count,
+        "name_or_path_match": result.name_or_path_match,
+        "matches": [
+            {"excerpt": match.excerpt, "location": match.location, "page": match.page}
+            for match in result.matches
+        ],
+    }
+
+
+def managed_file_page_payload(page) -> dict[str, object]:
+    return {
+        "files": [managed_file_payload(result) for result in page.files],
+        "total": page.total,
+        "page": page.page,
+        "page_size": page.page_size,
+        "total_pages": page.total_pages,
+        "folders": list(page.folders),
+    }
+
+
 def index_health_payload(health: IndexHealth) -> dict[str, object]:
     return {
         "status": health.status,
@@ -1813,6 +1869,38 @@ def vault_error(error: Exception) -> HTTPException:
     )
 
 
+def file_management_error(error: Exception) -> HTTPException:
+    if isinstance(error, (FileManagementError, SourceFileStoreError)):
+        return HTTPException(
+            status_code=400,
+            detail={
+                "code": "file_management_validation_failed",
+                "message": str(error),
+                "details": {},
+                "retryable": True,
+            },
+        )
+    if isinstance(error, FilePreviewError):
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": "file_preview_unavailable",
+                "message": str(error),
+                "details": {},
+                "retryable": True,
+            },
+        )
+    return HTTPException(
+        status_code=500,
+        detail={
+            "code": "file_management_operation_failed",
+            "message": "The file-management operation could not be completed.",
+            "details": {},
+            "retryable": True,
+        },
+    )
+
+
 def import_task_error(error: Exception) -> HTTPException:
     if isinstance(error, ImportUploadStoreError):
         return HTTPException(
@@ -2108,6 +2196,12 @@ def create_app(
         LocalVaultFilesystem(),
         app.state.policy_service,
     )
+    app.state.file_management_service = FileManagementService(
+        app.state.vault_service,
+        LocalVaultFilesystem(),
+        app.state.indexing_service.repository,
+    )
+    app.state.file_preview_renderer = LocalOfficeRenderer()
     app.state.provider_service = provider_service or ProviderService(
         repository=SqliteProviderRepository(runtime.data_directory / "vaults.sqlite3"),
         credentials=WindowsCredentialManager(),
@@ -3432,6 +3526,73 @@ def create_app(
     def get_workbench_overview(request: Request) -> dict[str, object]:
         require_local_session(app, request)
         return workbench_overview_payload(app.state.workbench_overview_service.read())
+
+    @app.get("/api/files", dependencies=[Depends(require_current_local_session)])
+    def list_managed_files(
+        request: Request, filters: Annotated[FileListQuery, Query()]
+    ) -> dict[str, object]:
+        try:
+            page = app.state.file_management_service.list_files(
+                vault_id=filters.vault_id,
+                global_scope=filters.global_scope,
+                query=filters.query,
+                file_type=filters.file_type,
+                folder=filters.folder,
+                sort=filters.sort,
+                order=filters.order,
+                page=filters.page,
+                page_size=filters.page_size,
+            )
+            return managed_file_page_payload(page)
+        except Exception as error:
+            raise file_management_error(error) from error
+
+    def file_response(request: Request, vault_id: str, relative_path: str, *, preview: bool) -> FileResponse:
+        try:
+            source_file, source_path = app.state.file_management_service.resolve_file(vault_id, relative_path)
+            preview_type = preview_content_type(source_file)
+            temporary_directory: Path | None = None
+            if preview:
+                if preview_type is None and source_file.extension in {"doc", "docx", "ppt", "pptx", "xls", "xlsx"}:
+                    rendered = app.state.file_preview_renderer.render(source_path)
+                    source_path = rendered
+                    preview_type = "application/pdf"
+                    temporary_directory = rendered.parent
+                elif preview_type is None:
+                    raise FilePreviewError("此格式不支持在线阅读，请下载原文件。")
+            headers = {"X-Content-Type-Options": "nosniff"}
+            if preview:
+                # The frontend includes the source mtime in preview URLs, so a
+                # changed Vault file gets a new cache key without disabling reuse.
+                headers["Cache-Control"] = "private, max-age=300, must-revalidate"
+            else:
+                headers["Cache-Control"] = "no-store"
+            background = (
+                BackgroundTask(
+                    app.state.file_preview_renderer.release_preview_directory,
+                    temporary_directory,
+                )
+                if temporary_directory is not None
+                else None
+            )
+            return FileResponse(
+                source_path,
+                media_type=preview_type or "application/octet-stream",
+                filename=source_file.filename,
+                content_disposition_type="inline" if preview else "attachment",
+                headers=headers,
+                background=background,
+            )
+        except Exception as error:
+            raise file_management_error(error) from error
+
+    @app.get("/api/files/{vault_id}/download", dependencies=[Depends(require_current_local_session)])
+    def download_managed_file(request: Request, vault_id: str, relative_path: str = Query()) -> FileResponse:
+        return file_response(request, vault_id, relative_path, preview=False)
+
+    @app.get("/api/files/{vault_id}/preview", dependencies=[Depends(require_current_local_session)])
+    def preview_managed_file(request: Request, vault_id: str, relative_path: str = Query()) -> FileResponse:
+        return file_response(request, vault_id, relative_path, preview=True)
 
     @app.post("/api/vaults")
     def authorize_vault(request: Request, command: VaultPathCommand) -> dict[str, object]:

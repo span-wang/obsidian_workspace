@@ -1,17 +1,24 @@
 import React from "react";
 import {
   ChevronLeft,
+  Download,
   FileText,
+  Files,
   FolderOpen,
   LayoutDashboard,
   ListTodo,
   Menu,
   MessageCircle,
+  PanelLeftClose,
+  PanelLeftOpen,
   Paperclip,
   RefreshCw,
   Search,
   Settings,
   SlidersHorizontal,
+  Sparkles,
+  Sun,
+  Moon,
   Trash2,
   X
 } from "lucide-react";
@@ -26,6 +33,7 @@ export const MARKDOWN_STRUCTURE_BUDGET_ENDPOINT = "/api/providers/markdown-struc
 export const SESSIONS_ENDPOINT = "/api/sessions";
 export const RETRIEVAL_MODE_ENDPOINT = "/api/retrieval/mode";
 export const WORKBENCH_OVERVIEW_ENDPOINT = "/api/workbench/overview";
+export const FILES_ENDPOINT = "/api/files";
 export const IMPORT_TASKS_ENDPOINT = "/api/import-tasks";
 export const IMPORT_FILES_SELECTION_ENDPOINT = "/api/import-selections/files";
 export const IMPORT_UPLOAD_ENDPOINT = "/api/import-selections/uploads";
@@ -33,6 +41,11 @@ export const IMPORT_DIRECTORY_SELECTION_ENDPOINT = "/api/import-selections/direc
 export const ONLINE_PARSE_SELECTION_STORAGE_KEY = "obsidian-platform.online-parse-selection.v1";
 export const ONLINE_PARSE_ENABLED_STORAGE_KEY = "obsidian-platform.online-parse-enabled.v1";
 export const MARKDOWN_PIPELINE_STORAGE_KEY = "obsidian-platform.markdown-pipeline.v1";
+export const KNOWLEDGE_THEME_STORAGE_KEY = "obsidian-platform.knowledge-theme.v1";
+export const KNOWLEDGE_THEME_OPTIONS = [
+  { id: "light", label: "标准浅色", description: "清晰、克制的工作台界面", icon: Sun },
+  { id: "digital-void", label: "Digital Void", description: "沉浸式未来知识空间", icon: Sparkles }
+];
 export const IMPORT_TASK_EVENT_NAMES = [
   "task-update",
   "scan-started",
@@ -85,6 +98,7 @@ export const IMPORT_TASK_EVENT_NAMES = [
 export const NAVIGATION_DESTINATIONS = [
   { id: "workbench", label: "工作台", emptyState: "尚未选择 vault。" },
   { id: "materials", label: "资料", emptyState: "当前没有已授权的 vault。" },
+  { id: "files", label: "文件管理", emptyState: "当前没有可管理的源文件。" },
   { id: "sessions", label: "会话", emptyState: "当前没有已保存的会话。" },
   { id: "tasks", label: "任务", emptyState: "当前没有任务。" },
   { id: "settings", label: "设置", emptyState: "当前没有可用设置。" }
@@ -93,6 +107,7 @@ export const NAVIGATION_DESTINATIONS = [
 const NAVIGATION_ICONS = {
   workbench: LayoutDashboard,
   materials: FolderOpen,
+  files: Files,
   sessions: MessageCircle,
   tasks: ListTodo,
   settings: Settings
@@ -172,6 +187,26 @@ export function saveMarkdownPipeline(pipeline, storage) {
     target.setItem(MARKDOWN_PIPELINE_STORAGE_KEY, pipeline === "local" ? "local" : "ai");
   } catch {
     // Browser storage can be unavailable or blocked; the choice remains usable for this page.
+  }
+}
+
+export function loadKnowledgeTheme(storage) {
+  try {
+    const saved = browserStorage(storage)?.getItem(KNOWLEDGE_THEME_STORAGE_KEY);
+    return KNOWLEDGE_THEME_OPTIONS.some((option) => option.id === saved) ? saved : "light";
+  } catch {
+    return "light";
+  }
+}
+
+export function saveKnowledgeTheme(theme, storage) {
+  try {
+    const target = browserStorage(storage);
+    if (!target) return;
+    const nextTheme = KNOWLEDGE_THEME_OPTIONS.some((option) => option.id === theme) ? theme : "light";
+    target.setItem(KNOWLEDGE_THEME_STORAGE_KEY, nextTheme);
+  } catch {
+    // Browser storage can be unavailable; the theme remains active for this page.
   }
 }
 
@@ -322,6 +357,7 @@ function importPhaseText(phase) {
     failed: "失败",
     cancelled: "已取消",
     complete: "完成",
+    completed: "完成",
     "completed-with-confirmed-gaps": "带已确认缺口完成"
   }[phase] || phase;
 }
@@ -406,6 +442,58 @@ function importOcrStatusText(status) {
 
 function importOcrTargetStatusText(status) {
   return { processing: "处理中", completed: "已完成", failed: "失败" }[status] || status;
+}
+
+function importTaskTone(lifecycle) {
+  if (["complete", "completed-with-confirmed-gaps"].includes(lifecycle)) return "success";
+  if (["failed", "recoverable"].includes(lifecycle)) return "danger";
+  if (["running", "queued"].includes(lifecycle)) return "active";
+  return "neutral";
+}
+
+function importTaskPhaseSummary(task) {
+  const phase = importPhaseText(task.phase);
+  const lifecycle = importLifecycleText(task.lifecycle);
+  return phase === lifecycle || ["完成", "已取消", "失败"].includes(phase) ? "" : phase;
+}
+
+function importTaskAttention(task) {
+  const counts = task.counts || {};
+  const failureCount = (counts.failed || 0) + (counts.parse_failed || 0) + (counts.ocr_failed || 0);
+  if (failureCount) return { label: `异常 ${failureCount}`, tone: "danger" };
+  if (counts.required_check) return { label: `待审核 ${counts.required_check}`, tone: "warning" };
+  if (task.recovery_actions?.length) return { label: `可${task.recovery_actions.map(importRecoveryActionText).join("、")}`, tone: "warning" };
+  if (counts.duplicate) return { label: `重复 ${counts.duplicate}`, tone: "neutral" };
+  return null;
+}
+
+function ImportTaskSummary({ task, className = "" }) {
+  const phase = importTaskPhaseSummary(task);
+  const attention = importTaskAttention(task);
+  const discovered = task.counts?.discovered || 0;
+  return React.createElement(
+    "div",
+    { className: `import-task-summary ${className}`.trim() },
+    React.createElement(
+      "span",
+      { className: `import-task-status is-${importTaskTone(task.lifecycle)}` },
+      importLifecycleText(task.lifecycle)
+    ),
+    phase ? React.createElement("span", { className: "import-task-phase" }, phase) : null,
+    discovered ? React.createElement("span", { className: "import-task-count" }, `${discovered} 项资料`) : null,
+    attention ? React.createElement("span", { className: `import-task-attention is-${attention.tone}` }, attention.label) : null
+  );
+}
+
+function importItemOutcome(item) {
+  if (item.category !== "supported") return { label: importCategoryText(item.category), tone: "danger" };
+  if (item.parse_status === "parse-failed") return { label: "解析失败", tone: "danger" };
+  if (["ocr-failed", "required-check"].includes(item.ocr_status)) return { label: importOcrStatusText(item.ocr_status), tone: "danger" };
+  if (item.conversion_status === "rejected") return { label: "转换失败", tone: "danger" };
+  if (item.conversion_status === "selected") return { label: "已转换", tone: "success" };
+  if (item.parse_status === "parsed") return { label: "已解析", tone: "success" };
+  if (item.ocr_status === "ocr-completed") return { label: "OCR 完成", tone: "success" };
+  return { label: importParseStatusText(item.parse_status), tone: "active" };
 }
 
 const DOCUMENT_BLOCK_KINDS = ["heading", "paragraph", "list", "table", "formula", "image", "caption", "code", "unresolved"];
@@ -691,7 +779,8 @@ function userFacingProviderReason(reason) {
     "Provider request could not be completed.": "Provider 请求未完成。请检查网络后重试。",
     "Choose a model type before testing the model.": "请先选择模型类型，再进行验证。",
     "Run Provider discovery before testing this model.": "请先测试 Provider，完成模型发现后再验证模型。",
-    "The model must appear in the latest successful Provider discovery.": "该模型不在最近一次发现结果中。请先重新测试 Provider。"
+    "The model must appear in the latest successful Provider discovery.": "该模型不在最近一次发现结果中。请先重新测试 Provider。",
+    "The selected markdown Model is unavailable. Choose another model.": "所选 Markdown 模型不可用。请选择其他模型。"
   };
   if (exact[normalized]) return exact[normalized];
   const verification = /^(?:Chat|Embedding|Rerank) model verification could not be completed\.\s*(.*)$/.exec(normalized);
@@ -782,6 +871,47 @@ function IconButton({ icon: Icon, label, className = "icon-button", ...buttonPro
       "aria-label": label
     },
     React.createElement(Icon, { "aria-hidden": "true", size: 18, strokeWidth: 2 })
+  );
+}
+
+export function ThemeSettings({ theme, onChange }) {
+  return React.createElement(
+    "section",
+    { className: "theme-settings", "aria-labelledby": "theme-settings-heading" },
+    React.createElement(
+      "div",
+      { className: "theme-settings-heading" },
+      React.createElement("span", { className: "theme-settings-icon", "aria-hidden": "true" }, React.createElement(Moon, { size: 18, strokeWidth: 1.8 })),
+      React.createElement(
+        "div",
+        null,
+        React.createElement("h2", { id: "theme-settings-heading" }, "界面主题"),
+        React.createElement("p", { className: "theme-settings-description" }, "主题仅保存在当前浏览器，不改变知识库内容。")
+      )
+    ),
+    React.createElement(
+      "div",
+      { className: "theme-switcher", role: "group", "aria-label": "选择界面主题" },
+      KNOWLEDGE_THEME_OPTIONS.map((option) => {
+        const Icon = option.icon;
+        const selected = theme === option.id;
+        return React.createElement(
+          "button",
+          {
+            className: `theme-option${selected ? " is-selected" : ""}`,
+            key: option.id,
+            type: "button",
+            "aria-pressed": selected,
+            onClick: () => onChange(option.id)
+          },
+          React.createElement(Icon, { size: 17, strokeWidth: 1.8, "aria-hidden": "true" }),
+          React.createElement("span", { className: "theme-option-copy" },
+            React.createElement("strong", null, option.label),
+            React.createElement("small", null, option.description)
+          )
+        );
+      })
+    )
   );
 }
 
@@ -2143,7 +2273,7 @@ export function SessionManagement({
           "aria-label": "搜索会话",
           placeholder: "搜索会话"
         }),
-        React.createElement(IconButton, { icon: Search, label: "搜索会话", className: "icon-button session-search-button", type: "submit", disabled: isSubmitting })
+        React.createElement(IconButton, { icon: Search, label: "搜索", className: "icon-button session-search-button", type: "submit", disabled: isSubmitting })
       ),
       React.createElement(
         "label",
@@ -3110,14 +3240,13 @@ export function WorkbenchOverview({ overview, isLoading, error, selectedVaultId,
         "div",
         { className: "workbench-summary-strip", "aria-label": "全局摘要" },
         React.createElement(WorkbenchMetric, { label: "已授权 Vault", value: summary.total, note: `${summary.available} 个可用`, tone: "neutral" }),
-        React.createElement(WorkbenchMetric, { label: "需要处理", value: summary.attention, note: "索引、任务或访问状态", tone: summary.attention ? "warning" : "neutral", onClick: () => setFilter("attention") }),
-        React.createElement(WorkbenchMetric, { label: "运行中任务", value: summary.running, note: "保持上下文即可离开", tone: summary.running ? "accent" : "neutral", onClick: () => setFilter("running") }),
-        React.createElement(WorkbenchMetric, { label: "可检索块", value: summary.blocks, note: "仅统计当前索引", tone: "neutral" })
+        React.createElement(WorkbenchMetric, { label: "需要处理", value: summary.attention, note: "索引、任务或访问", tone: summary.attention ? "warning" : "neutral", onClick: () => setFilter("attention") }),
+        React.createElement(WorkbenchMetric, { label: "运行中任务", value: summary.running, note: "", tone: summary.running ? "accent" : "neutral", onClick: () => setFilter("running") }),
+        React.createElement(WorkbenchMetric, { label: "可检索块", value: summary.blocks, note: "", tone: "neutral" })
       ),
       React.createElement(
         "div",
-        { className: "workbench-filter-bar" },
-        React.createElement("span", { className: "workbench-filter-label" }, "查看范围"),
+        { className: "workbench-filter-bar", "aria-label": "筛选 Vault" },
         [
           ["all", "全部 Vault"],
           ["attention", "需处理"],
@@ -3147,7 +3276,7 @@ export function WorkbenchOverview({ overview, isLoading, error, selectedVaultId,
         "div",
         { className: "workbench-lower-grid" },
         React.createElement("section", { className: "workbench-lower-section", "aria-labelledby": "workbench-attention-heading" }, React.createElement("div", { className: "workbench-section-heading" }, React.createElement("h3", { id: "workbench-attention-heading" }, "优先处理"), React.createElement("span", null, `${overview?.attention?.length || 0} 项`)), attentionContent),
-        React.createElement("section", { className: "workbench-lower-section", "aria-labelledby": "workbench-activity-heading" }, React.createElement("div", { className: "workbench-section-heading" }, React.createElement("h3", { id: "workbench-activity-heading" }, "最近动态"), React.createElement("span", null, "按 Vault 汇总")), activityContent)
+        React.createElement("section", { className: "workbench-lower-section", "aria-labelledby": "workbench-activity-heading" }, React.createElement("div", { className: "workbench-section-heading" }, React.createElement("h3", { id: "workbench-activity-heading" }, "最近动态")), activityContent)
       )
     ),
     selectedVault ? React.createElement(VaultOverviewDrawer, { vault: selectedVault, onClose: () => onSelectVault(null), onNavigate, onRefresh }) : null
@@ -3284,7 +3413,7 @@ function ProviderForm({ provider, onCancel, onComplete }) {
     "form",
     { className: "provider-form", onSubmit: submit, "aria-label": isEditing ? "编辑 Provider" : "添加 Provider" },
     React.createElement("h2", null, isEditing ? "编辑 Provider" : "添加 Provider"),
-    React.createElement("p", { className: "form-description" }, "支持 Chat Completions 和 Responses API。API Key 可选；本地服务留空时不会发送鉴权头。"),
+    React.createElement("p", { className: "form-description" }, "API Key 可选。"),
     React.createElement(
       "label",
       { className: "form-row", htmlFor: "provider-name" },
@@ -3390,7 +3519,7 @@ function ModelDefaultSelector({ modelType, label, providers, modelDefault, onCha
       : null,
       options.map(({ provider, model }) => React.createElement("option", { key: `${provider.provider_id}-${model.model_id}`, value: JSON.stringify([provider.provider_id, model.model_id]) }, `${provider.name} / ${model.model_id}`))
     ),
-    modelDefault.reason ? React.createElement("span", { className: "provider-default-status" }, modelDefault.reason) : null
+    modelDefault.reason ? React.createElement("span", { className: "provider-default-status" }, userFacingProviderReason(modelDefault.reason)) : null
   );
 }
 
@@ -3542,7 +3671,6 @@ function OnlineParseProviderSettings() {
     "section",
     { className: "online-parse-provider-settings", "aria-labelledby": "online-parse-provider-heading" },
     React.createElement("h3", { id: "online-parse-provider-heading" }, "在线解析"),
-    React.createElement("p", { className: "model-default-description" }, "仅用于创建时明确启用的 PDF 任务。保存凭据后需单独执行连接测试。"),
     isLoading ? React.createElement("p", { className: "empty-state", role: "status" }, "正在读取在线解析 Provider。") : null,
     providers.map((provider) => React.createElement(
       "div",
@@ -3730,7 +3858,7 @@ export function ProviderManagement({ providers, isLoading, modelDefaults, onOpen
         "div",
         { className: "provider-list-title" },
         React.createElement("span", { className: "provider-list-icon", "aria-hidden": "true" }, React.createElement(Settings, { size: 18, strokeWidth: 1.8 })),
-        React.createElement("div", null, React.createElement("h2", { id: "provider-settings-heading" }, "Provider"), React.createElement("p", { className: "provider-list-description" }, "管理连接、验证状态和可用模型。"))
+        React.createElement("div", null, React.createElement("h2", { id: "provider-settings-heading" }, "Provider"))
       ),
       React.createElement("button", { className: "primary-button", type: "button", onClick: () => onOpenForm(null) }, "添加 Provider")
     ),
@@ -3738,10 +3866,10 @@ export function ProviderManagement({ providers, isLoading, modelDefaults, onOpen
       "div",
       { className: "provider-model-settings", "aria-label": "默认模型设置" },
       [
-        ["chat", "对话与文本", "用于解析、分类、标签和会话。", MessageCircle],
-        ["embedding", "语义检索", "用于本地知识库的语义索引与检索。", Search],
+        ["chat", "对话与文本", "", MessageCircle],
+        ["embedding", "语义检索", "", Search],
         ["rerank", "候选重排", "默认关闭；启用后仅发送允许外发的候选。", RefreshCw],
-        ["markdown", "Markdown 结构化", "用于导入任务的长文结构识别与安全分块。", FileText]
+        ["markdown", "Markdown 结构化", "", FileText]
       ].map(([modelType, title, description, Icon]) => React.createElement(
         "section",
         { className: "model-default-section model-default-card", key: modelType, "aria-labelledby": `${modelType}-model-heading` },
@@ -3749,7 +3877,7 @@ export function ProviderManagement({ providers, isLoading, modelDefaults, onOpen
           "div",
           { className: "model-default-heading" },
           React.createElement("span", { className: "model-default-icon", "aria-hidden": "true" }, React.createElement(Icon, { size: 18, strokeWidth: 1.8 })),
-          React.createElement("div", null, React.createElement("h3", { id: `${modelType}-model-heading` }, title), React.createElement("p", { className: "model-default-description" }, description))
+          React.createElement("div", null, React.createElement("h3", { id: `${modelType}-model-heading` }, title), description ? React.createElement("p", { className: "model-default-description" }, description) : null)
         ),
         React.createElement(ModelDefaultSelector, {
           modelType,
@@ -4058,7 +4186,8 @@ function ImportTaskLauncher({ vault, onCreated }) {
             className: "visually-hidden",
             type: "file",
             multiple: true,
-            "aria-label": "上传本机资料文件",
+            tabIndex: -1,
+            "aria-hidden": true,
             onChange: uploadAndCreate
           }),
           React.createElement("input", {
@@ -4067,7 +4196,8 @@ function ImportTaskLauncher({ vault, onCreated }) {
             type: "file",
             multiple: true,
             webkitdirectory: "",
-            "aria-label": "上传本机资料文件夹",
+            tabIndex: -1,
+            "aria-hidden": true,
             onChange: (event) => uploadAndCreate(event, "directory")
           }),
           React.createElement(
@@ -4086,7 +4216,7 @@ function ImportTaskLauncher({ vault, onCreated }) {
             React.createElement(
               "button",
               {
-                className: "primary-button",
+                className: "secondary-button",
                 type: "button",
                 disabled: isSelecting,
                 onClick: () => uploadDirectoryInputRef.current?.click()
@@ -4145,7 +4275,7 @@ function ImportTaskLauncher({ vault, onCreated }) {
                 )
               ),
               onlineParseActive
-                ? React.createElement("p", { className: "form-help" }, "将把所选 PDF 原件与文件名发送至所选 Provider。")
+                ? React.createElement("p", { className: "form-help" }, "PDF 原件会发送至所选 Provider。")
                 : null
             ) : null,
             React.createElement(
@@ -4173,8 +4303,8 @@ function ImportTaskLauncher({ vault, onCreated }) {
                 ))
               ),
               markdownPipeline === "ai"
-                ? React.createElement("p", { className: "form-help" }, "AI 结构化会将选定 DocumentGraph 的 Markdown 发送至已配置的 Markdown Provider。")
-                : React.createElement("p", { className: "form-help" }, "本地结构化不调用 Markdown Provider。")
+                ? React.createElement("p", { className: "form-help" }, "会发送至 Markdown Provider。")
+                : React.createElement("p", { className: "form-help" }, "不调用 Provider。")
             ),
             verifiedOnlineParseProviders.length === 0
               ? React.createElement("p", { className: "form-help" }, onlineParseLoadError || "请先在设置中保存凭据并完成在线解析 Provider 的连接测试。")
@@ -5313,20 +5443,33 @@ export function SourceParseResults({ sourceParses = [], items = [] }) {
   return React.createElement(
     "section",
     { className: "source-parse-list", "aria-label": "源解析内容" },
-    React.createElement("h3", null, "源解析内容"),
-    visibleParses.length === 0
-      ? React.createElement("p", { className: "empty-state" }, "正在等待可查看的源解析内容。")
-      : visibleParses.map((sourceParse) => React.createElement(
+    React.createElement(
+      "details",
+      { className: "import-content-disclosure" },
+      React.createElement(
+        "summary",
+        null,
+        React.createElement("h3", null, "源解析"),
+        React.createElement("span", { className: "import-content-count" }, `${visibleParses.length} 项`)
+      ),
+      React.createElement(
         "div",
-        { className: "source-parse", key: sourceParse.item_id },
-        React.createElement("p", { className: "row-title" }, itemLabels.get(sourceParse.item_id) || `资料项 ${sourceParse.item_id}`),
-        sourceParse.blocks.map((block, index) => React.createElement(
-          "div",
-          { className: "source-parse-block", key: `${sourceParse.item_id}:${index}` },
-          React.createElement("span", { className: "row-meta" }, `${sourceParseBlockKindText(block.kind)}${block.location ? ` · ${block.location}` : ""}`),
-          React.createElement("pre", { className: "source-parse-content" }, block.content)
-        ))
-      ))
+        { className: "import-content-disclosure-body" },
+        visibleParses.length === 0
+          ? React.createElement("p", { className: "empty-state" }, "正在等待可查看的源解析内容。")
+          : visibleParses.map((sourceParse) => React.createElement(
+            "div",
+            { className: "source-parse", key: sourceParse.item_id },
+            React.createElement("p", { className: "row-title" }, itemLabels.get(sourceParse.item_id) || `资料项 ${sourceParse.item_id}`),
+            sourceParse.blocks.map((block, index) => React.createElement(
+              "div",
+              { className: "source-parse-block", key: `${sourceParse.item_id}:${index}` },
+              React.createElement("span", { className: "row-meta" }, `${sourceParseBlockKindText(block.kind)}${block.location ? ` · ${block.location}` : ""}`),
+              React.createElement("pre", { className: "source-parse-content" }, block.content)
+            ))
+          ))
+      )
+    )
   );
 }
 
@@ -5335,10 +5478,21 @@ export function AutomaticMarkdownResults({ noteProposals = [], items = [] }) {
   return React.createElement(
     "section",
     { className: "note-proposal-list", "aria-label": "Markdown 结果" },
-    React.createElement("h3", null, "Markdown 结果"),
-    noteProposals.length === 0
-      ? React.createElement("p", { className: "empty-state" }, "正在等待可查看的 Markdown 结果。")
-      : noteProposals.map((proposal) => React.createElement(
+    React.createElement(
+      "details",
+      { className: "import-content-disclosure" },
+      React.createElement(
+        "summary",
+        null,
+        React.createElement("h3", null, "Markdown 结果"),
+        React.createElement("span", { className: "import-content-count" }, `${noteProposals.length} 项`)
+      ),
+      React.createElement(
+        "div",
+        { className: "import-content-disclosure-body" },
+        noteProposals.length === 0
+          ? React.createElement("p", { className: "empty-state" }, "正在等待可查看的 Markdown 结果。")
+          : noteProposals.map((proposal) => React.createElement(
         "div",
         { className: "note-proposal", key: `${proposal.kind}:${proposal.item_id}` },
         itemLabels.get(proposal.item_id)
@@ -5372,7 +5526,9 @@ export function AutomaticMarkdownResults({ noteProposals = [], items = [] }) {
               React.createElement("pre", { className: "markdown-preview" }, derivedMarkdownPreview(note.markdown))
             ))
           )
-      ))
+          ))
+      )
+    )
   );
 }
 
@@ -5476,37 +5632,57 @@ function AutomaticImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskDelete
   const canResume = task.lifecycle === "recoverable" || task.lifecycle === "cancelled";
   const canVerifyProjectionRebuild = ["complete", "completed-with-confirmed-gaps"].includes(task.lifecycle)
     && conversionGraphs.some((graph) => typeof graph.graph_id === "string" && Number.isInteger(graph.graph_revision));
+  const detailOpen = ["running", "recoverable", "failed", "cancelled"].includes(task.lifecycle);
 
   return React.createElement(
     "section",
     { className: "import-task-detail", "aria-label": "导入任务详情" },
-    React.createElement("button", { className: "back-button", type: "button", onClick: () => onBack(null) }, "返回任务列表"),
-    React.createElement("h2", null, "导入任务详情"),
-    React.createElement("p", { className: "scope-summary" }, `目标 vault：${task.vault_label}；范围：${task.scope_label}`),
-    task.markdown_pipeline
-      ? React.createElement("p", { className: "row-note" }, `结构化：${task.markdown_pipeline === "ai" ? "AI 结构化" : "本地结构化"}`)
-      : null,
-    task.online_parse?.enabled
-      ? React.createElement("p", { className: "row-note" }, `在线解析：${task.online_parse.provider_name} / ${task.online_parse.model}`)
-      : null,
+    React.createElement("button", { className: "back-button", type: "button", onClick: () => onBack(null) }, "返回"),
     React.createElement(
-      "div",
-      { className: "progress-sequence", "aria-live": "polite" },
-      React.createElement("span", { className: "status-marker" }, `状态：${importLifecycleText(task.lifecycle)}`),
-      React.createElement("span", null, `当前阶段：${importPhaseText(task.phase)}`),
-      ...IMPORT_PROGRESS_PHASES.map((phase) => React.createElement(
-        "span",
-        { key: phase },
-        `${importPhaseText(phase)}：${progressPhaseStatus(task, phase)}`
-      )),
-      React.createElement("span", null, `已发现 ${task.counts.discovered}`),
-      React.createElement("span", null, `已解析 ${task.counts.parsed || 0}`),
-      React.createElement("span", null, `已生成笔记 ${task.counts.derived_notes || 0}`),
-      React.createElement("span", null, `异常 ${task.counts.failed + task.counts.parse_failed + task.counts.ocr_failed}`)
+      "header",
+      { className: "import-task-detail-header" },
+      React.createElement("h2", null, "导入任务"),
+      React.createElement("p", { className: "import-task-detail-name" }, task.scope_label),
+      React.createElement("p", { className: "import-task-detail-vault" }, task.vault_label),
+      React.createElement(ImportTaskSummary, { task, className: "import-task-detail-summary" })
     ),
-    index
-      ? React.createElement("p", { className: "row-note", role: "status" }, `索引：${index.status}；已索引 ${index.current_count} 项；失败 ${index.failure_count} 项。`)
-      : null,
+    React.createElement(
+      "details",
+      { className: "import-task-processing-details", open: detailOpen },
+      React.createElement(
+        "summary",
+        null,
+        React.createElement("span", null, "处理详情"),
+        React.createElement("span", null, importTaskPhaseSummary(task) || "已完成")
+      ),
+      React.createElement(
+        "div",
+        { className: "import-task-processing-body" },
+        React.createElement(
+          "dl",
+          { className: "import-task-metadata" },
+          React.createElement("div", null, React.createElement("dt", null, "当前阶段"), React.createElement("dd", null, importPhaseText(task.phase))),
+          task.markdown_pipeline
+            ? React.createElement("div", null, React.createElement("dt", null, "结构化"), React.createElement("dd", null, task.markdown_pipeline === "ai" ? "AI 结构化" : "本地结构化"))
+            : null,
+          task.online_parse?.enabled
+            ? React.createElement("div", null, React.createElement("dt", null, "在线解析"), React.createElement("dd", null, `${task.online_parse.provider_name} / ${task.online_parse.model}`))
+            : null,
+          index
+            ? React.createElement("div", null, React.createElement("dt", null, "索引"), React.createElement("dd", null, `${index.status} · ${index.current_count} 项`))
+            : null
+        ),
+        React.createElement(
+          "div",
+          { className: "import-task-phase-list", "aria-label": "处理阶段" },
+          ...IMPORT_PROGRESS_PHASES.map((phase) => React.createElement(
+            "span",
+            { key: phase },
+            `${importPhaseText(phase)} · ${progressPhaseStatus(task, phase)}`
+          ))
+        )
+      )
+    ),
     task.current_item_label ? React.createElement("p", { className: "status-line" }, `当前文件：${task.current_item_label}`) : null,
     task.failure_reason ? React.createElement("p", { className: "status-line status-danger" }, `失败原因：${task.failure_reason}`) : null,
     React.createElement(
@@ -5532,43 +5708,80 @@ function AutomaticImportTaskDetail({ taskId, onBack, onTaskChanged, onTaskDelete
         ? React.createElement("p", { className: "empty-state" }, "正在扫描资料。")
         : items.map((item) => React.createElement(
           "div",
-          { className: "section-row", key: item.item_id },
+          { className: "section-row import-item-row", key: item.item_id },
           React.createElement("span", { className: "row-title" }, item.label),
-          React.createElement("span", { className: "row-meta" }, `${importDocumentKindText(item.document_kind)}；${importCategoryText(item.category)}`),
-          React.createElement("span", { className: "row-note" }, `${importParseStatusText(item.parse_status)}；${importConversionStatusText(item.conversion_status)}；${importOcrStatusText(item.ocr_status)}`),
-          React.createElement(ImportParserTag, { engine: item.conversion_engine }),
-          userFacingImportIssue(item.parse_issue_summary || item.ocr_issue_summary)
-            ? React.createElement("span", { className: "row-note" }, userFacingImportIssue(item.parse_issue_summary || item.ocr_issue_summary))
-            : null
+          React.createElement("span", { className: "row-meta" }, importDocumentKindText(item.document_kind)),
+          React.createElement("span", { className: `import-item-status is-${importItemOutcome(item).tone}` }, importItemOutcome(item).label),
+          React.createElement(
+            "details",
+            { className: "import-item-details" },
+            React.createElement("summary", null, "处理信息"),
+            React.createElement(
+              "div",
+              { className: "import-item-details-body" },
+              React.createElement("span", null, `${importCategoryText(item.category)} · ${importIdentityStatusText(item.identity_status)}`),
+              React.createElement("span", null, `${importParseStatusText(item.parse_status)} · ${importConversionStatusText(item.conversion_status)} · ${importOcrStatusText(item.ocr_status)}`),
+              item.conversion_engine ? React.createElement(ImportParserTag, { engine: item.conversion_engine }) : null,
+              userFacingImportIssue(item.parse_issue_summary || item.ocr_issue_summary)
+                ? React.createElement("span", { className: "row-note" }, userFacingImportIssue(item.parse_issue_summary || item.ocr_issue_summary))
+                : null
+            )
+          )
         ))
     ),
     React.createElement(ImportContentComparison, { items, sourceParses, noteProposals }),
-    React.createElement(
-      "section",
-      { className: "classification-list", "aria-label": "分类建议" },
-      React.createElement("h3", null, "分类建议"),
-      classifications.length === 0
-        ? React.createElement("p", { className: "empty-state" }, "暂无分类建议。")
-        : classifications.map((suggestion) => React.createElement(
-          "div",
-          { className: "section-row", key: suggestion.item_id },
-          React.createElement("span", { className: "row-title" }, suggestion.filename || suggestion.domain),
-          React.createElement("span", { className: "row-meta" }, suggestion.domain),
-          React.createElement("span", { className: "row-note" }, suggestion.reason)
-        ))
-    ),
+    classifications.length
+      ? React.createElement(
+        "section",
+        { className: "classification-list", "aria-label": "分类建议" },
+        React.createElement(
+          "details",
+          { className: "import-secondary-disclosure" },
+          React.createElement(
+            "summary",
+            null,
+            React.createElement("h3", null, "分类建议"),
+            React.createElement("span", { className: "import-content-count" }, `${classifications.length} 项`)
+          ),
+          React.createElement(
+            "div",
+            { className: "import-secondary-disclosure-body" },
+            classifications.map((suggestion) => React.createElement(
+              "div",
+              { className: "section-row", key: suggestion.item_id },
+              React.createElement("span", { className: "row-title" }, suggestion.filename || suggestion.domain),
+              React.createElement("span", { className: "row-meta" }, suggestion.domain),
+              React.createElement("span", { className: "row-note" }, suggestion.reason)
+            ))
+          )
+        )
+      )
+      : null,
     commitJournals.length
       ? React.createElement(
         "section",
         { className: "commit-journal-list", "aria-label": "提交记录" },
-        React.createElement("h3", null, "提交记录"),
-        commitJournals.map((journal, index) => React.createElement(
-          "div",
-          { className: "section-row", key: `${journal.unit_id}:${index}` },
-          React.createElement("span", { className: "row-title" }, journal.source_label),
-          React.createElement("span", { className: "row-meta" }, journal.status),
-          journal.reason ? React.createElement("span", { className: "row-note" }, journal.reason) : null
-        ))
+        React.createElement(
+          "details",
+          { className: "import-secondary-disclosure" },
+          React.createElement(
+            "summary",
+            null,
+            React.createElement("h3", null, "提交记录"),
+            React.createElement("span", { className: "import-content-count" }, `${commitJournals.length} 条`)
+          ),
+          React.createElement(
+            "div",
+            { className: "import-secondary-disclosure-body" },
+            commitJournals.map((journal, index) => React.createElement(
+              "div",
+              { className: "section-row", key: `${journal.unit_id}:${index}` },
+              React.createElement("span", { className: "row-title" }, journal.source_label),
+              React.createElement("span", { className: "row-meta" }, journal.status),
+              journal.reason ? React.createElement("span", { className: "row-note" }, journal.reason) : null
+            ))
+          )
+        )
       )
       : null,
     canVerifyProjectionRebuild
@@ -5724,11 +5937,7 @@ export function ImportTaskCenter({ tasks, error, isLoading, selectedTaskId, onSe
                 "button",
                 { className: "import-task-open", type: "button", onClick: () => onSelect(task.task_id) },
                 React.createElement("span", { className: "row-title" }, task.scope_label),
-                React.createElement("span", { className: "row-meta" }, `目标：${task.vault_label}`),
-                React.createElement("span", { className: "row-status" }, `${importLifecycleText(task.lifecycle)} · ${importPhaseText(task.phase)}`),
-                React.createElement("span", { className: "row-note" }, task.recovery_actions.length
-                  ? `恢复：${task.recovery_actions.map(importRecoveryActionText).join("、")}`
-                  : `发现 ${task.counts.discovered}；新资料 ${task.counts.new || 0}；重复资料 ${task.counts.duplicate || 0}；可能版本 ${task.counts.possible_version || 0}；识别失败 ${task.counts.identity_failed || 0}；已解析 ${task.counts.parsed || 0}；解析失败 ${task.counts.parse_failed || 0}；待审核问题 ${task.counts.required_check || 0}；失败 ${task.counts.failed}`)
+                React.createElement(ImportTaskSummary, { task, className: "import-task-open-summary" })
               ),
               task.lifecycle !== "running"
                 ? React.createElement(
@@ -5783,8 +5992,224 @@ export function ImportTaskCenter({ tasks, error, isLoading, selectedTaskId, onSe
   );
 }
 
+function fileSizeText(value) {
+  if (!Number.isFinite(value)) return "未知大小";
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function filePreviewUrl(file, mode = "preview") {
+  const search = new window.URLSearchParams({ relative_path: file.relative_path });
+  if (mode === "preview" && file.modified_at) search.set("v", file.modified_at);
+  return `${FILES_ENDPOINT}/${encodeURIComponent(file.vault_id)}/${mode}?${search}`;
+}
+
+function escapePreviewHtml(value) {
+  return value.replace(/[&<>"']/g, (character) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;"
+  }[character]));
+}
+
+export function markdownPreviewHtml(markdown) {
+  const lines = markdown.split(/\r?\n/);
+  const chunks = [];
+  let chunk = [];
+  let listOpen = false;
+  const flush = () => {
+    if (listOpen) {
+      chunk.push("</ul>");
+      listOpen = false;
+    }
+    chunks.push(`<section class="file-markdown-chunk">${chunk.join("")}</section>`);
+    chunk = [];
+  };
+  lines.forEach((line) => {
+    if (!line.trim()) {
+      if (listOpen) { chunk.push("</ul>"); listOpen = false; }
+      chunk.push('<div class="file-reader-spacer"></div>');
+    } else {
+      const heading = line.match(/^(#{1,6})\s+(.+)$/);
+      const item = line.match(/^[-*]\s+(.+)$/);
+      if (heading) {
+        if (listOpen) { chunk.push("</ul>"); listOpen = false; }
+        const level = Math.min(6, heading[1].length);
+        chunk.push(`<h${level}>${escapePreviewHtml(heading[2])}</h${level}>`);
+      } else if (item) {
+        if (!listOpen) { chunk.push("<ul>"); listOpen = true; }
+        chunk.push(`<li>${escapePreviewHtml(item[1])}</li>`);
+      } else {
+        if (listOpen) { chunk.push("</ul>"); listOpen = false; }
+        chunk.push(`<p>${escapePreviewHtml(line)}</p>`);
+      }
+    }
+    if (chunk.length >= 96) flush();
+  });
+  if (chunk.length || !chunks.length) flush();
+  return chunks.join("");
+}
+
+const fileTextPreviewCache = new Map();
+const MAX_CACHED_TEXT_PREVIEW_BYTES = 4 * 1024 * 1024;
+
+const FileTextReader = React.memo(function FileTextReader({ file }) {
+  const [state, setState] = React.useState({ status: "loading", content: "", error: "" });
+  const fileKey = `${file.vault_id}:${file.relative_path}:${file.modified_at || file.size_bytes}`;
+  React.useEffect(() => {
+    const controller = new window.AbortController();
+    let cancelled = false;
+    const cached = fileTextPreviewCache.get(fileKey);
+    if (cached !== undefined) {
+      setState({ status: "ready", content: cached, error: "" });
+      return () => { cancelled = true; controller.abort(); };
+    }
+    setState({ status: "loading", content: "", error: "" });
+    fetch(filePreviewUrl(file), { signal: controller.signal })
+      .then(async (response) => {
+        if (!response.ok) throw new Error((await response.json().catch(() => ({})))?.message || "文件预览失败。");
+        return response.text();
+      })
+      .then((content) => {
+        if (content.length <= MAX_CACHED_TEXT_PREVIEW_BYTES) {
+          fileTextPreviewCache.delete(fileKey);
+          fileTextPreviewCache.set(fileKey, content);
+          while (fileTextPreviewCache.size > 6) fileTextPreviewCache.delete(fileTextPreviewCache.keys().next().value);
+        }
+        if (!cancelled) setState({ status: "ready", content, error: "" });
+      })
+      .catch((requestError) => {
+        if (!cancelled && requestError.name !== "AbortError") setState({ status: "failed", content: "", error: requestError.message });
+      });
+    return () => { cancelled = true; controller.abort(); };
+  }, [fileKey]);
+  if (state.status === "failed") return React.createElement("p", { className: "empty-state" }, state.error);
+  if (state.status === "loading") return React.createElement("p", { className: "empty-state", role: "status" }, "正在打开文件…");
+  if (file.preview_kind === "markdown") {
+    return React.createElement("div", {
+      className: "file-markdown-reader",
+      dangerouslySetInnerHTML: { __html: markdownPreviewHtml(state.content) }
+    });
+  }
+  return React.createElement(
+    "pre",
+    { className: "file-text-reader" },
+    state.content
+  );
+});
+
+function FilePreviewPane({ file, onClose, drawerOpen, onToggleDrawer }) {
+  if (!file) return React.createElement(
+    "section",
+    { className: "file-preview-pane file-preview-empty", "aria-label": "文件阅读区" },
+    React.createElement("header", { className: "file-preview-header" }, React.createElement("button", { className: "icon-button", type: "button", onClick: onToggleDrawer, title: drawerOpen ? "隐藏文件列表" : "显示文件列表", "aria-label": drawerOpen ? "隐藏文件列表" : "显示文件列表", "aria-expanded": drawerOpen }, React.createElement(drawerOpen ? PanelLeftClose : PanelLeftOpen, { size: 18 }))),
+    React.createElement("div", { className: "file-preview-empty-content" }, React.createElement(FileText, { size: 26, "aria-hidden": "true" }), React.createElement("p", null, "选择文件开始阅读"))
+  );
+  let body;
+  if (file.preview_kind === "image") body = React.createElement("img", { className: "file-image-preview", src: filePreviewUrl(file), alt: file.filename, decoding: "async" });
+  else if (["pdf", "office"].includes(file.preview_kind)) body = React.createElement("iframe", { className: "file-pdf-preview", src: filePreviewUrl(file), title: `阅读 ${file.filename}` });
+  else if (["text", "markdown"].includes(file.preview_kind)) body = React.createElement(FileTextReader, { file });
+  else body = React.createElement("div", { className: "file-download-only" }, React.createElement("p", null, "此格式不支持在线阅读。"), React.createElement("a", { className: "primary-button", href: filePreviewUrl(file, "download") }, React.createElement(Download, { size: 16, "aria-hidden": "true" }), "下载原文件"));
+  return React.createElement(
+    "section",
+    { className: "file-preview-pane", "aria-label": `阅读 ${file.filename}` },
+    React.createElement(
+      "header",
+      { className: "file-preview-header" },
+      React.createElement(
+        "div",
+        { className: "file-preview-title" },
+        React.createElement("strong", null, file.filename),
+        React.createElement("span", null, `${file.vault_label} · ${file.relative_path}`)
+      ),
+      React.createElement(
+        "div",
+        { className: "file-preview-actions" },
+        React.createElement("button", { className: "icon-button", type: "button", onClick: onToggleDrawer, title: drawerOpen ? "隐藏文件列表" : "显示文件列表", "aria-label": drawerOpen ? "隐藏文件列表" : "显示文件列表", "aria-expanded": drawerOpen }, React.createElement(drawerOpen ? PanelLeftClose : PanelLeftOpen, { size: 18 })),
+        React.createElement("a", { className: "icon-button", href: filePreviewUrl(file, "download"), title: "下载原文件", "aria-label": "下载原文件" }, React.createElement(Download, { size: 18 })),
+        React.createElement("button", { className: "icon-button file-preview-close", type: "button", onClick: onClose, title: "关闭阅读", "aria-label": "关闭阅读" }, React.createElement(ChevronLeft, { size: 18 }))
+      )
+    ),
+    React.createElement("div", { className: "file-preview-body" }, body)
+  );
+}
+
+function FileManagement({ currentVault }) {
+  const [page, setPage] = React.useState({ files: [], folders: [], total: 0, page: 1, page_size: 50, total_pages: 1 });
+  const [filters, setFilters] = React.useState({ query: "", global_scope: false, file_type: "", folder: "", sort: "modified_at", order: "desc", page: 1 });
+  const [draftQuery, setDraftQuery] = React.useState("");
+  const [selectedFile, setSelectedFile] = React.useState(null);
+  const [drawerOpen, setDrawerOpen] = React.useState(true);
+  const [isLoading, setIsLoading] = React.useState(true);
+  const [error, setError] = React.useState("");
+  const load = React.useCallback(async (nextFilters) => {
+    const requested = nextFilters || filters;
+    setIsLoading(true); setError("");
+    const search = new window.URLSearchParams({ query: requested.query, global_scope: String(requested.global_scope), sort: requested.sort, order: requested.order, page: String(requested.page), page_size: "50" });
+    if (requested.file_type) search.set("file_type", requested.file_type);
+    if (requested.folder) search.set("folder", requested.folder);
+    if (!requested.global_scope && currentVault?.vault_id) search.set("vault_id", currentVault.vault_id);
+    try {
+      const response = await requestJson(`${FILES_ENDPOINT}?${search}`);
+      setPage(response); setFilters(requested);
+      setSelectedFile((current) => response.files.find((file) => file.vault_id === current?.vault_id && file.relative_path === current?.relative_path) || response.files[0] || null);
+    } catch (requestError) { setError(requestError.message); setPage((current) => ({ ...current, files: [] })); }
+    finally { setIsLoading(false); }
+  }, [currentVault?.vault_id, filters]);
+  React.useEffect(() => { void load({ ...filters, page: 1 }); }, [currentVault?.vault_id]);
+  React.useEffect(() => {
+    const closeOnEscape = (event) => {
+      if (event.key === "Escape" && drawerOpen) setDrawerOpen(false);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [drawerOpen]);
+  function updateFilter(name, value) { void load({ ...filters, [name]: value, page: 1 }); }
+  function submitSearch(event) { event.preventDefault(); void load({ ...filters, query: draftQuery, page: 1 }); }
+  const selected = selectedFile;
+  const toolbar = React.createElement(
+    "section",
+    { className: "file-toolbar", "aria-label": "文件检索工具" },
+    React.createElement(
+      "form",
+      { className: "file-search-form", onSubmit: submitSearch },
+      React.createElement(Search, { size: 18, "aria-hidden": "true" }),
+      React.createElement("input", { value: draftQuery, onChange: (event) => setDraftQuery(event.target.value), placeholder: "搜索文件名、路径、标签或正文", "aria-label": "搜索文件" }),
+      React.createElement("button", { className: "primary-button", type: "submit" }, "搜索")
+    ),
+    React.createElement(
+      "div",
+      { className: "file-filter-row" },
+      React.createElement("label", { className: "file-scope-toggle" }, React.createElement("input", { type: "checkbox", checked: filters.global_scope, onChange: (event) => updateFilter("global_scope", event.target.checked) }), "全局搜索"),
+      React.createElement("select", { value: filters.file_type, onChange: (event) => updateFilter("file_type", event.target.value), "aria-label": "文件类型" }, React.createElement("option", { value: "" }, "所有类型"), ["pdf", "image", "text", "markdown", "office", "download"].map((type) => React.createElement("option", { key: type, value: type }, type.toUpperCase()))),
+      React.createElement("select", { value: filters.folder, onChange: (event) => updateFilter("folder", event.target.value), "aria-label": "文件夹" }, React.createElement("option", { value: "" }, "所有文件夹"), page.folders.map((folder) => React.createElement("option", { key: folder, value: folder }, folder))),
+      React.createElement("select", { value: `${filters.sort}:${filters.order}`, onChange: (event) => { const [sort, order] = event.target.value.split(":"); void load({ ...filters, sort, order, page: 1 }); }, "aria-label": "文件排序" }, React.createElement("option", { value: "modified_at:desc" }, "最近修改"), React.createElement("option", { value: "name:asc" }, "文件名"), React.createElement("option", { value: "size:desc" }, "文件大小"))
+    )
+  );
+  const list = React.createElement(
+    "section",
+    { className: "file-list-pane", "aria-label": "文件列表" },
+    React.createElement("p", { className: "file-list-count" }, isLoading ? "正在读取文件…" : `${page.total} 个文件`),
+    error ? React.createElement("p", { className: "error-state", role: "alert" }, error) : null,
+    !isLoading && !error && !page.files.length ? React.createElement("p", { className: "empty-state" }, currentVault || filters.global_scope ? "没有匹配的文件。" : "请先选择可用 Vault。") : null,
+    React.createElement("div", { className: "file-list" }, page.files.map((file) => React.createElement("button", { key: `${file.vault_id}:${file.relative_path}`, className: `file-list-item${selected?.vault_id === file.vault_id && selected?.relative_path === file.relative_path ? " is-selected" : ""}`, type: "button", onClick: () => { setSelectedFile(file); setDrawerOpen(false); } }, React.createElement(FileText, { size: 18, "aria-hidden": "true" }), React.createElement("span", { className: "file-list-item-copy" }, React.createElement("strong", null, file.filename), React.createElement("span", null, `${file.vault_label} · ${file.relative_path} · ${fileSizeText(file.size_bytes)}`), file.matches?.length ? React.createElement("small", null, file.matches[0].excerpt) : null), React.createElement("span", { className: "file-extension" }, file.extension || "文件")))),
+    page.total_pages > 1 ? React.createElement("div", { className: "file-pagination" }, React.createElement("button", { className: "secondary-button", disabled: page.page <= 1, onClick: () => void load({ ...filters, page: page.page - 1 }) }, "上一页"), React.createElement("span", null, `${page.page} / ${page.total_pages}`), React.createElement("button", { className: "secondary-button", disabled: page.page >= page.total_pages, onClick: () => void load({ ...filters, page: page.page + 1 }) }, "下一页")) : null
+  );
+  return React.createElement(
+    "div",
+    { className: `file-management${drawerOpen ? " drawer-open" : " drawer-closed"}` },
+    React.createElement("div", { className: "file-drawer-scrim", role: "presentation", onClick: () => setDrawerOpen(false), hidden: !drawerOpen }),
+    React.createElement("aside", { className: "file-list-drawer", "aria-label": "文件列表抽屉", "aria-hidden": !drawerOpen, inert: !drawerOpen }, toolbar, list),
+    React.createElement("div", { className: "file-reader-surface" }, React.createElement(FilePreviewPane, { file: selected, drawerOpen, onToggleDrawer: () => setDrawerOpen((open) => !open), onClose: () => setSelectedFile(null) }))
+  );
+}
+
 export function App() {
   const [activeDestination, setActiveDestination] = React.useState("workbench");
+  const [theme, setTheme] = React.useState(() => loadKnowledgeTheme());
   const [healthStatus, setHealthStatus] = React.useState("本机服务正在验证");
   const [sessionStatus, setSessionStatus] = React.useState("本机会话正在建立");
   const [menuOpen, setMenuOpen] = React.useState(false);
@@ -5837,6 +6262,11 @@ export function App() {
   const menuButtonRef = React.useRef(null);
   const firstMenuLinkRef = React.useRef(null);
   const menuPanelRef = React.useRef(null);
+
+  React.useEffect(() => {
+    if (typeof document !== "undefined") document.documentElement.dataset.theme = theme;
+    saveKnowledgeTheme(theme);
+  }, [theme]);
 
   const loadVaults = React.useCallback(() => {
     setVaultsLoading(true);
@@ -5990,6 +6420,10 @@ export function App() {
   React.useEffect(() => {
     if (sessionStatus !== "本机会话已建立" || activeDestination === "workbench") return;
     if (activeDestination === "materials") {
+      void loadVaults();
+      return;
+    }
+    if (activeDestination === "files") {
       void loadVaults();
       return;
     }
@@ -6312,6 +6746,7 @@ export function App() {
     workspaceContent = React.createElement(
       React.Fragment,
       null,
+      React.createElement(ThemeSettings, { theme, onChange: setTheme }),
       React.createElement(ProviderManagement, {
         providers,
         isLoading: providersLoading,
@@ -6344,6 +6779,8 @@ export function App() {
       onTaskSnapshot: syncTask,
       vault: currentVault
     });
+  } else if (activeDestination === "files") {
+    workspaceContent = React.createElement(FileManagement, { currentVault });
   } else if (activeDestination === "sessions") {
     workspaceContent = React.createElement(SessionManagement, {
       sessionPage,
@@ -6418,7 +6855,9 @@ export function App() {
     ? vaults.find((vault) => vault.vault_id === contextSession.selected_vault_id)
     : null;
   const contextLocation = contextSession ? "会话" : "本机工作区";
-  const contextVaultName = contextVault ? vaultName(contextVault) : null;
+  const contextVaultName = contextSession
+    ? contextSessionVault ? vaultName(contextSessionVault) : contextSession.selected_vault_label || null
+    : contextVault ? vaultName(contextVault) : null;
   const contextOutbound = contextSessionVault
     ? `外发：${outboundModeText(policyFor(contextSessionVault).outbound_mode)}`
     : currentPolicy ? `外发：${outboundModeText(currentPolicy.outbound_mode)}` : null;
@@ -6439,7 +6878,7 @@ export function App() {
     ),
     React.createElement(
       "section",
-      { className: `application-content${activeDestination === "sessions" ? " application-content-sessions" : ""}` },
+      { className: `application-content${activeDestination === "sessions" ? " application-content-sessions" : ""}${activeDestination === "files" ? " application-content-files" : ""}` },
       React.createElement(
         "header",
         { className: "context-bar" },
@@ -6478,12 +6917,12 @@ export function App() {
       React.createElement(
         "main",
         {
-          className: `workspace${activeDestination === "sessions" ? " session-workspace" : ""}`,
+          className: `workspace${activeDestination === "sessions" ? " session-workspace" : ""}${activeDestination === "files" ? " workspace-files" : ""}`,
           ...(activeDestination === "sessions"
             ? { "aria-label": "会话工作区" }
             : { "aria-labelledby": "workspace-title" })
         },
-        activeDestination === "sessions"
+        activeDestination === "sessions" || activeDestination === "files"
           ? workspaceContent
           : React.createElement(
               "div",
